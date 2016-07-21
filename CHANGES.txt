@@ -1,4 +1,5 @@
 3.10
+ * Remove disk io from gossip severity calculation (CASSANDRA-11738)
  * Option to leave omitted columns in INSERT JSON unset (CASSANDRA-11424)
  * Support json/yaml output in nodetool tpstats (CASSANDRA-12035)
  * Expose metrics for successful/failed authentication attempts (CASSANDRA-10635)
