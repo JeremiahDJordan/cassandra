@@ -25,6 +25,7 @@ import io.github.jbellis.jvector.util.RamUsageEstimator;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.io.sstable.SSTableId;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
@@ -66,7 +67,8 @@ public class PrimaryKeyWithByteComparable extends PrimaryKeyWithSortKey
         {
             ByteSource byteSource = byteComparable.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION);
             byte[] indexedValue = ByteSourceInverse.readBytes(byteSource);
-            return Arrays.compare(indexedValue, value.array()) == 0;
+            byte[] liveValue = ByteBufferUtil.getArray(value);
+            return Arrays.compare(indexedValue, liveValue) == 0;
         }
         else
         {
