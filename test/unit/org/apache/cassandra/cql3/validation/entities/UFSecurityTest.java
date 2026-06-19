@@ -22,12 +22,14 @@ import java.security.AccessControlException;
 import java.util.List;
 
 import org.junit.Assert;
+import org.junit.Assume;
 import org.junit.Test;
 
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.exceptions.FunctionExecutionException;
+import org.apache.cassandra.security.ThreadAwareSecurityManager;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.utils.JavaDriverUtils;
 
@@ -41,20 +43,38 @@ public class UFSecurityTest extends CQLTester
 
         // Java UDFs
 
-        try
+        // System.getProperty is one of the few dangerous operations that java.lang.System still exposes to a
+        // UDF (System must stay loadable because UDFs need currentTimeMillis/nanoTime/arraycopy). The legacy
+        // SecurityManager allows it at CREATE FUNCTION time and blocks it at runtime; the SecurityManager-free
+        // sandbox rejects it at CREATE FUNCTION time via the byte-code verifier. Either way it must never run.
+        // The legacy branch below also demonstrates the call is NOT rejected at creation without the verifier
+        // block (the function is created successfully), which is what makes the sandbox rejection meaningful.
+        if (ThreadAwareSecurityManager.useSecurityManager())
         {
-            String fName = createFunction(KEYSPACE_PER_TEST, "double",
-                                          "CREATE OR REPLACE FUNCTION %s(val double) " +
-                                          "RETURNS NULL ON NULL INPUT " +
-                                          "RETURNS double " +
-                                          "LANGUAGE JAVA\n" +
-                                          "AS 'System.getProperty(\"foo.bar.baz\"); return 0d;';"); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
-            execute("SELECT " + fName + "(dval) FROM %s WHERE key=1");
-            Assert.fail();
+            try
+            {
+                String fName = createFunction(KEYSPACE_PER_TEST, "double",
+                                              "CREATE OR REPLACE FUNCTION %s(val double) " +
+                                              "RETURNS NULL ON NULL INPUT " +
+                                              "RETURNS double " +
+                                              "LANGUAGE JAVA\n" +
+                                              "AS 'System.getProperty(\"foo.bar.baz\"); return 0d;';"); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+                execute("SELECT " + fName + "(dval) FROM %s WHERE key=1");
+                Assert.fail();
+            }
+            catch (FunctionExecutionException e)
+            {
+                assertAccessControlException("System.getProperty(\"foo.bar.baz\"); return 0d;", e); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+            }
         }
-        catch (FunctionExecutionException e)
+        else
         {
-            assertAccessControlException("System.getProperty(\"foo.bar.baz\"); return 0d;", e); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+            assertInvalidMessage("Java UDF validation failed: [call to java.lang.System.getProperty()]", // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+                                 "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".invalid_get_property(val double) " +
+                                 "RETURNS NULL ON NULL INPUT " +
+                                 "RETURNS double " +
+                                 "LANGUAGE JAVA\n" +
+                                 "AS 'System.getProperty(\"foo.bar.baz\"); return 0d;';"); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
         }
 
         String[] cfnSources =
@@ -124,7 +144,15 @@ public class UFSecurityTest extends CQLTester
          "     org.apache.cassandra.utils.vint.VIntCoding.computeUnsignedVIntSize(0L); return 0d;" +
          "} catch (Exception t) {" +
          "     throw new RuntimeException(t);" +
-         '}'}
+         '}'},
+        // Classes/APIs added after JDK 8 that must also be blocked by the UDF class loader so the sandbox does
+        // not rely on a SecurityManager (which cannot be installed on JDK 24+). ProcessHandle/StackWalker
+        // exist since JDK 9 (so this is meaningful on the JDK 11 build JDK); java.lang.foreign is JDK 22+
+        // (meaningful when running on JDK 25). All are valid Java that would resolve if not blocked.
+        {"java.lang.ProcessHandle", "java.lang.ProcessHandle.current(); return 0d;"},
+        {"java.lang.StackWalker",   "java.lang.StackWalker.getInstance(); return 0d;"},
+        {"java.lang.foreign.Linker","java.lang.foreign.Linker.nativeLinker(); return 0d;"},
+        {"java.lang.classfile.ClassFile","java.lang.classfile.ClassFile.of(); return 0d;"} // JDK 24+
         };
 
         for (String[] typeAndSource : typesAndSources)
@@ -136,6 +164,23 @@ public class UFSecurityTest extends CQLTester
                                  "LANGUAGE JAVA\n" +
                                  "AS '" + typeAndSource[1] + "';");
         }
+
+        // The JDK 9 module API cannot be blocked by the class loader (java.lang.Class references
+        // java.lang.Module), so it is blocked by the byte-code verifier on every JDK. Class.getModule() is the
+        // entry point to a Module, and ModuleLayer is reachable via Module.getLayer()/ModuleLayer.boot().
+        // These statements compile (Module/ModuleLayer are resolvable) but are rejected at CREATE FUNCTION.
+        String[][] moduleApiSources =
+        {
+        {"java.lang.Class.getModule",   "java.lang.Integer.class.getModule(); return 0d;"},
+        {"java.lang.ModuleLayer.boot",  "java.lang.ModuleLayer.boot(); return 0d;"}
+        };
+        for (String[] moduleApiSource : moduleApiSources)
+            assertInvalidMessage("Java UDF validation failed: [call to " + moduleApiSource[0] + "()]",
+                                 "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".invalid_module_access(val double) " +
+                                 "RETURNS NULL ON NULL INPUT " +
+                                 "RETURNS double " +
+                                 "LANGUAGE JAVA\n" +
+                                 "AS '" + moduleApiSource[1] + "';");
     }
 
     private static void assertAccessControlException(String script, FunctionExecutionException e)
@@ -144,6 +189,87 @@ public class UFSecurityTest extends CQLTester
             if (t instanceof AccessControlException)
                 return;
         Assert.fail("no AccessControlException for " + script + " (got " + e + ')');
+    }
+
+    /**
+     * The SecurityManager-free sandbox rejects dangerous {@code java.lang.System} methods at CREATE FUNCTION
+     * time (the legacy SecurityManager blocked them at runtime instead). This test only applies when the
+     * SecurityManager-free sandbox is active (JDK 24+, or {@code cassandra.udf.security_mechanism=sandbox}).
+     * Without these byte-code verifier rules the same statements compile and the function is created
+     * successfully (System is an allowed class and these are ordinary method calls), which is what makes the
+     * rejection meaningful; the safe System methods that UDFs rely on must remain usable.
+     */
+    @Test
+    public void testSandboxBlocksDangerousSystemMethods() throws Throwable
+    {
+        Assume.assumeFalse("legacy SecurityManager mechanism in use; covered by testSecurityPermissions",
+                           ThreadAwareSecurityManager.useSecurityManager());
+
+        String[][] methodAndSource =
+        {
+        {"exit",                "System.exit(1); return 0d;"},
+        {"setProperty",         "System.setProperty(\"foo\", \"bar\"); return 0d;"}, // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+        {"getProperty",         "System.getProperty(\"foo\"); return 0d;"}, // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+        {"getenv",              "System.getenv(\"PATH\"); return 0d;"}, // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+        {"loadLibrary",         "System.loadLibrary(\"foo\"); return 0d;"},
+        {"setSecurityManager",  "System.setSecurityManager(null); return 0d;"}
+        };
+
+        for (String[] ms : methodAndSource)
+            assertInvalidMessage("Java UDF validation failed: [call to java.lang.System." + ms[0] + "()]",
+                                 "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".invalid_system_" + ms[0].toLowerCase() + "(val double) " +
+                                 "RETURNS NULL ON NULL INPUT " +
+                                 "RETURNS double " +
+                                 "LANGUAGE JAVA\n" +
+                                 "AS '" + ms[1] + "';");
+
+        // Property-read aliases on other allowed classes (Integer.getInteger / Long.getLong /
+        // Boolean.getBoolean are thin wrappers over System.getProperty) plus the system logger factory.
+        int alias = 0;
+        String[][] aliasSources =
+        {
+        {"java.lang.System.getLogger",   "System.getLogger(\"x\"); return 0d;"},
+        {"java.lang.System$LoggerFinder.getLoggerFinder", "System.LoggerFinder.getLoggerFinder(); return 0d;"},
+        {"java.lang.Integer.getInteger", "Integer.getInteger(\"x\"); return 0d;"}, // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+        {"java.lang.Long.getLong",       "Long.getLong(\"x\"); return 0d;"}, // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+        {"java.lang.Boolean.getBoolean", "Boolean.getBoolean(\"x\"); return 0d;"} // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+        };
+        for (String[] as : aliasSources)
+            assertInvalidMessage("Java UDF validation failed: [call to " + as[0] + "()]",
+                                 "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".invalid_alias_" + (alias++) + "(val double) " +
+                                 "RETURNS NULL ON NULL INPUT " +
+                                 "RETURNS double " +
+                                 "LANGUAGE JAVA\n" +
+                                 "AS '" + as[1] + "';");
+
+        // Safe System methods that UDFs legitimately use must still allow the function to be created.
+        String fName = createFunction(KEYSPACE_PER_TEST, "double",
+                                      "CREATE OR REPLACE FUNCTION %s(val double) " +
+                                      "RETURNS NULL ON NULL INPUT " +
+                                      "RETURNS double " +
+                                      "LANGUAGE JAVA\n" +
+                                      "AS 'return (double) (System.nanoTime() - System.currentTimeMillis());';");
+        Assert.assertNotNull(fName);
+    }
+
+    /**
+     * A UDF must compile to exactly one class. Declaring an inner/anonymous class emits a second class file
+     * that the byte-code verifier (which inspects a single class) would only partially cover, so it is
+     * rejected at CREATE FUNCTION on every JDK and for every mechanism. The body below references only the
+     * allowed java.util.ArrayList, so without the guard the function would be created successfully.
+     */
+    @Test
+    public void testRejectsAdditionalClasses() throws Throwable
+    {
+        // An anonymous subclass of java.lang.Object emits a second class file but compiles cleanly (Object's
+        // whole API resolves under the allow list, unlike e.g. ArrayList). Without the guard the function
+        // would be created, leaving the anonymous class only partially covered by the byte-code verifier.
+        assertInvalidMessage("the function must not declare additional classes",
+                             "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".invalid_inner_class(val double) " +
+                             "RETURNS NULL ON NULL INPUT " +
+                             "RETURNS double " +
+                             "LANGUAGE JAVA\n" +
+                             "AS 'return (double) new Object(){}.hashCode();';");
     }
 
     @Test

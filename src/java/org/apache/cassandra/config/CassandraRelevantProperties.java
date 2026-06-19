@@ -701,6 +701,18 @@ public enum CassandraRelevantProperties
     UCS_SURVIVAL_FACTOR("unified_compaction.survival_factor", "1"),
     UCS_TARGET_SSTABLE_SIZE("unified_compaction.target_sstable_size", "1GiB"),
     UDF_EXECUTOR_THREAD_KEEPALIVE_MS("cassandra.udf_executor_thread_keepalive_ms", "30000"),
+    /**
+     * Selects the mechanism used to sandbox user-defined functions:
+     * <ul>
+     *   <li>{@code auto} (default): use the legacy {@link java.lang.SecurityManager}-based mechanism when a
+     *       SecurityManager can be installed (JDK &lt; 24), otherwise use the SecurityManager-free sandbox.</li>
+     *   <li>{@code securitymanager}: force the legacy SecurityManager mechanism (fails fast on JDK 24+ where a
+     *       SecurityManager can no longer be installed).</li>
+     *   <li>{@code sandbox}: force the SecurityManager-free sandbox on any JDK (used to exercise the new
+     *       mechanism on JDK 11/17/21 in CI).</li>
+     * </ul>
+     */
+    UDF_SECURITY_MECHANISM("cassandra.udf.security_mechanism", "auto"),
     UNSAFE_SYSTEM("cassandra.unsafesystem"),
     /** User's home directory. */
     USER_HOME("user.home"),
