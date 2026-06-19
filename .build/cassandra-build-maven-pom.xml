@@ -42,9 +42,17 @@
       <groupId>org.mockito</groupId>
       <artifactId>mockito-core</artifactId>
     </dependency>
+    <!-- Declare byte-buddy and byte-buddy-agent as direct dependencies so they take the managed
+         (bytebuddy.version) version rather than the older versions pulled in transitively. The managed
+         version is a release with native JDK 25 support, which Mockito's inline mock maker requires there.
+         Mockito is compatible with this newer Byte Buddy (Byte Buddy is backwards compatible within 1.x). -->
     <dependency>
-      <groupId>org.mockito</groupId>
-      <artifactId>mockito-inline</artifactId>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>net.bytebuddy</groupId>
+      <artifactId>byte-buddy-agent</artifactId>
     </dependency>
     <dependency>
       <groupId>org.ow2.asm</groupId>
