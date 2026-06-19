@@ -22,7 +22,6 @@ import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Paths;
-import java.security.Permission;
 
 import com.google.common.net.HostAndPort;
 
@@ -216,22 +215,9 @@ public class LoaderOptionsTest
 
     private void failureHelper(String[] args, int expectedErrorCode)
     {
-        // install security manager to get informed about the exit-code
-        System.setSecurityManager(new SecurityManager()
-        {
-            public void checkExit(int status)
-            {
-                throw new SystemExitException(status);
-            }
-
-            public void checkPermission(Permission perm)
-            {
-            }
-
-            public void checkPermission(Permission perm, Object context)
-            {
-            }
-        });
+        // intercept System.exit to get informed about the exit-code (replaces the SecurityManager,
+        // which cannot be installed on JDK 24+)
+        blockExit();
         try
         {
             LoaderOptions.builder().parseArgs(args).build();
@@ -242,7 +228,7 @@ public class LoaderOptionsTest
         }
         finally
         {
-            System.setSecurityManager(null);
+            unblockExit();
         }
     }
 
@@ -269,15 +255,85 @@ public class LoaderOptionsTest
         return dataDir;
     }
 
-    // Copied from SystemExitException in unit tests
+    // Self-contained System.exit interception (this sstableloader test module cannot reference the main
+    // test module's org.apache.cassandra.tools.SystemExitManager). Uses Byteman to turn Runtime.exit/halt
+    // into a catchable SystemExitException, replacing the SecurityManager (unusable on JDK 24+).
 
-    private static class SystemExitException extends Error
+    public static class SystemExitException extends Error
     {
         public final int status;
 
         public SystemExitException(int status)
         {
             this.status = status;
+        }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicInteger exitBlocked = new java.util.concurrent.atomic.AtomicInteger(0);
+    private static volatile boolean exitRuleInstalled = false;
+
+    public static boolean isExitBlocked()
+    {
+        return exitBlocked.get() > 0;
+    }
+
+    private static void blockExit()
+    {
+        ensureExitRuleInstalled();
+        exitBlocked.incrementAndGet();
+    }
+
+    private static void unblockExit()
+    {
+        exitBlocked.updateAndGet(n -> n > 0 ? n - 1 : 0);
+    }
+
+    private static synchronized void ensureExitRuleInstalled()
+    {
+        if (exitRuleInstalled)
+            return;
+        try
+        {
+            String host = "127.0.0.1";
+            String pid = Long.toString(ProcessHandle.current().pid());
+            // setPolicy (3rd arg) must be false: Byteman's Policy.setPolicy() throws on JDK 24+ (JEP 486).
+            // If the agent is already attached (e.g. by a BMUnit test in this JVM), reuse it on Byteman's
+            // default listener port instead of installing again.
+            int port;
+            if (org.jboss.byteman.agent.install.Install.isAgentAttached(pid))
+            {
+                port = 9091; // org.jboss.byteman.agent default listener port
+            }
+            else
+            {
+                try (java.net.ServerSocket socket = new java.net.ServerSocket(0))
+                {
+                    port = socket.getLocalPort();
+                }
+                org.jboss.byteman.agent.install.Install.install(pid, true, false, host, port, new String[]{ "org.jboss.byteman.transform.all=true" });
+            }
+            String rule =
+            "RULE loaderoptions intercept Runtime.exit\n" +
+            "CLASS java.lang.Runtime\n" +
+            "METHOD exit\n" +
+            "AT ENTRY\n" +
+            "IF org.apache.cassandra.tools.LoaderOptionsTest.isExitBlocked()\n" +
+            "DO throw new org.apache.cassandra.tools.LoaderOptionsTest$SystemExitException($1)\n" +
+            "ENDRULE\n" +
+            "RULE loaderoptions intercept Runtime.halt\n" +
+            "CLASS java.lang.Runtime\n" +
+            "METHOD halt\n" +
+            "AT ENTRY\n" +
+            "IF org.apache.cassandra.tools.LoaderOptionsTest.isExitBlocked()\n" +
+            "DO throw new org.apache.cassandra.tools.LoaderOptionsTest$SystemExitException($1)\n" +
+            "ENDRULE\n";
+            new org.jboss.byteman.agent.submit.Submit(host, port)
+                .addRulesFromResources(com.google.common.collect.Lists.newArrayList(org.apache.commons.io.IOUtils.toInputStream(rule, "UTF-8")));
+            exitRuleInstalled = true;
+        }
+        catch (Throwable t)
+        {
+            throw new RuntimeException("Failed to install Byteman System.exit interception rule", t);
         }
     }
 }

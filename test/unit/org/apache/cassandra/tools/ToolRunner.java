@@ -24,7 +24,6 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.PrintStream;
 import java.lang.reflect.InvocationTargetException;
-import java.security.Permission;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -68,28 +67,17 @@ public class ToolRunner
     public static final ImmutableList<String> DEFAULT_CLEANERS = ImmutableList.of("(?im)^picked up.*\\R",
                                                                                   "(?im)^.*package jdk.internal.util.jar not in java.base*\\R",
                                                                                   "(?im)^.*Not generating a deterministic id for table.*\\R",
-                                                                                  "(?im)^.*`USE <keyspace>` with prepared statements is.*\\R");
+                                                                                  "(?im)^.*`USE <keyspace>` with prepared statements is.*\\R",
+                                                                                  // jamm 0.4.0 prints this once on JDK 25 (the UseEmptySlotsInSupers flag was removed); the sizes are still correct
+                                                                                  "(?im)^WARNING: Jamm is starting with.*\\R");
 
     public static int runClassAsTool(String clazz, String... args)
     {
         try
         {
-            // install security manager to get informed about the exit-code
-            System.setSecurityManager(new SecurityManager()
-            {
-                public void checkExit(int status)
-                {
-                    throw new SystemExitException(status);
-                }
-
-                public void checkPermission(Permission perm)
-                {
-                }
-
-                public void checkPermission(Permission perm, Object context)
-                {
-                }
-            });
+            // intercept System.exit/Runtime.exit to capture the exit-code (replaces the SecurityManager,
+            // which cannot be installed on JDK 24+)
+            SystemExitManager.blockExit();
 
             try
             {
@@ -121,8 +109,7 @@ public class ToolRunner
         }
         finally
         {
-            // uninstall security manager
-            System.setSecurityManager(null);
+            SystemExitManager.unblockExit();
         }
     }
 

@@ -39,6 +39,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.ObjectSizes;
 
 import static org.apache.cassandra.utils.FBUtilities.preventIllegalAccessWarnings;
 import static org.junit.Assert.assertFalse;
@@ -215,6 +216,18 @@ public abstract class OfflineToolUtils
 
         // may start an async appender
         LoggerFactory.getLogger(OfflineToolUtils.class);
+
+        // ToolRunner.invokeClass()/runClassAsTool() install the Byteman System.exit interceptor on first use,
+        // which starts a listener thread. Install it now, before the baseline thread snapshot below, so that
+        // thread is part of the baseline and not flagged by assertNoUnexpectedThreadsStarted().
+        SystemExitManager.ensureInstalled();
+
+        // Force jamm (via ObjectSizes) to initialize now so that its one-time startup warning about the
+        // UseEmptySlotsInSupers JVM option (printed to stdout by jamm 0.4.0 because that flag was removed in
+        // JDK 25) is emitted here, in @BeforeClass, rather than polluting a tool's captured stdout later. The
+        // measured sizes themselves are correct on JDK 25 (verified by ObjectSizesTest); only the warning is
+        // spurious.
+        ObjectSizes.measureDeep(new Object());
 
         ThreadMXBean threads = ManagementFactory.getThreadMXBean();
         initialThreads = Arrays.asList(threads.getThreadInfo(threads.getAllThreadIds()));
