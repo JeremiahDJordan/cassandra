@@ -18,22 +18,23 @@
 
 package org.apache.cassandra.simulator.logging;
 
-import accord.utils.Invariants;
-
 import org.apache.cassandra.config.CassandraRelevantProperties;
 
 import ch.qos.logback.core.PropertyDefinerBase;
 
 public class RunStartDefiner extends PropertyDefinerBase
 {
-    static
-    {
-        Invariants.require(CassandraRelevantProperties.SIMULATOR_STARTED.getString() != null);
-    }
-
     @Override
     public String getPropertyValue()
     {
+        // Handle the property not yet being set gracefully (matching SeedDefiner) rather than failing in a
+        // static initializer: depending on class-load and logging order (which differs on JDK 25), logback
+        // can instantiate this definer before SimulationRunner sets cassandra.simulator.started.
+        if (CassandraRelevantProperties.SIMULATOR_STARTED.getString() == null)
+        {
+            System.err.println("RunStartDefiner is being called before the run start has been set, check static init order");
+            CassandraRelevantProperties.SIMULATOR_STARTED.setString("<undefined>");
+        }
         return CassandraRelevantProperties.SIMULATOR_STARTED.getString();
     }
 }

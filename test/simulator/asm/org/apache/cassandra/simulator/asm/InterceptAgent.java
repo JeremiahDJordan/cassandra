@@ -47,8 +47,10 @@ import static org.apache.cassandra.simulator.asm.Flag.NO_PROXY_METHODS;
 import static org.apache.cassandra.simulator.asm.Flag.SYSTEM_CLOCK;
 import static org.apache.cassandra.simulator.asm.InterceptClasses.BYTECODE_VERSION;
 import static org.objectweb.asm.Opcodes.ALOAD;
+import static org.objectweb.asm.Opcodes.F_SAME;
 import static org.objectweb.asm.Opcodes.GETFIELD;
 import static org.objectweb.asm.Opcodes.GETSTATIC;
+import static org.objectweb.asm.Opcodes.IFEQ;
 import static org.objectweb.asm.Opcodes.INVOKESPECIAL;
 import static org.objectweb.asm.Opcodes.INVOKESTATIC;
 import static org.objectweb.asm.Opcodes.INVOKEVIRTUAL;
@@ -204,7 +206,15 @@ public class InterceptAgent
     }
 
     /**
-     * We want Enum to have a deterministic hashCode() so we simply forward calls to ordinal()
+     * We want enums to have a deterministic hashCode() (the ordinal), so simulated enum-keyed collections
+     * iterate reproducibly. But this rewrite of java.lang.Enum.hashCode() is global (the agent redefines the
+     * already-loaded bootstrap Enum), so it also reaches JDK enums — and hashing THOSE by ordinal corrupts
+     * JDK-internal immutable collections keyed by an enum's identity hash. Most visibly
+     * AccessFlag.FINAL.locations() is a Set.of(...) built at CDS init (before the redefine) with the real
+     * identity hash; on JDK 25 that breaks invokedynamic type switches with "unexpected flag: FINAL use in
+     * target location: CLASS". So hash by ordinal for every enum EXCEPT JDK-internal ones
+     * (Global.ordinalEnumHash), and fall back to the real identity hash (Object.hashCode, which
+     * transformObject leaves untouched) for those — see ordinalEnumHash for why only JDK enums need this.
      */
     private static byte[] transformEnum(byte[] bytes)
     {
@@ -221,11 +231,22 @@ public class InterceptAgent
                 if (descriptor.equals("()I") && name.equals("hashCode"))
                 {
                     MethodVisitor visitor = super.visitMethod(access, name, descriptor, signature, exceptions);
+                    Label identity = new Label();
                     visitor.visitLabel(new Label());
-                    visitor.visitIntInsn(ALOAD, 0);
+                    // if (!Global.ordinalEnumHash(this)) goto identity;
+                    visitor.visitVarInsn(ALOAD, 0);
+                    visitor.visitMethodInsn(INVOKESTATIC, "org/apache/cassandra/simulator/systems/InterceptorOfSystemMethods$Global", "ordinalEnumHash", "(Ljava/lang/Object;)Z", false);
+                    visitor.visitJumpInsn(IFEQ, identity);
+                    // simulated enum: return this.ordinal;
+                    visitor.visitVarInsn(ALOAD, 0);
                     visitor.visitFieldInsn(GETFIELD, "java/lang/Enum", "ordinal", "I");
                     visitor.visitInsn(IRETURN);
-                    visitor.visitLabel(new Label());
+                    // everything else: return the real identity hash (Object.hashCode is not rewritten)
+                    visitor.visitLabel(identity);
+                    visitor.visitFrame(F_SAME, 0, null, 0, null);
+                    visitor.visitVarInsn(ALOAD, 0);
+                    visitor.visitMethodInsn(INVOKESPECIAL, "java/lang/Object", "hashCode", "()I", false);
+                    visitor.visitInsn(IRETURN);
                     visitor.visitMaxs(1, 1);
                     visitor.visitEnd();
 
@@ -316,25 +337,47 @@ public class InterceptAgent
                 {
                     if (unsafeFieldName == null)
                     {
+                        // Fallback only when ThreadLocalRandom did not expose an Unsafe field above. JDK 8 used
+                        // sun.misc.Unsafe in field UNSAFE; JDK 11+ (incl. 17/21/25) use jdk.internal.misc.Unsafe
+                        // in field U. Earlier this threw "Unsupported Java Version" for anything but 11/8, which
+                        // broke the simulator on 17/21/25 (CI only runs it on the default JDK 11).
                         String version = System.getProperty("java.version");
-                        if (version.startsWith("11.")) { unsafeFieldName = "U"; unsafeDescriptor = "Ljdk/internal/misc/Unsafe;"; }
-                        else if (version.startsWith("1.8")) { unsafeFieldName = "UNSAFE"; unsafeDescriptor = "Lsun/misc/Unsafe;"; }
-                        else throw new AssertionError("Unsupported Java Version");
+                        if (version.startsWith("1.8")) { unsafeFieldName = "UNSAFE"; unsafeDescriptor = "Lsun/misc/Unsafe;"; }
+                        else { unsafeFieldName = "U"; unsafeDescriptor = "Ljdk/internal/misc/Unsafe;"; }
                     }
+
+                    // INVOKEVIRTUAL's owner is an internal name (e.g. jdk/internal/misc/Unsafe), not a type
+                    // descriptor (Ljdk/internal/misc/Unsafe;). Using the descriptor produced an illegal class
+                    // name in the rewritten ThreadLocalRandom on JDK 25.
+                    String unsafeOwner = unsafeDescriptor.substring(1, unsafeDescriptor.length() - 1);
 
                     MethodVisitor visitor = super.visitMethod(access, name, descriptor, signature, exceptions);
                     visitor.visitLabel(new Label());
-                    visitor.visitIntInsn(ALOAD, 0);
+                    // NB: no `aload 0` here. localInit() is a static method (no `this`, no locals — it is
+                    // static on OpenJDK 8/11/25), so loading local 0 references a non-existent local and is
+                    // invalid bytecode. The loaded value was never consumed anyway — putLong/putInt take their
+                    // receiver from `getstatic U` below — so the aload was a dead instruction; it slipped
+                    // through before but JDK 25 rejects it ("Bad local variable type"), so just drop it.
                     visitor.visitFieldInsn(GETSTATIC, "java/util/concurrent/ThreadLocalRandom", unsafeFieldName, unsafeDescriptor);
                     visitor.visitMethodInsn(INVOKESTATIC, "java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", false);
                     visitor.visitFieldInsn(GETSTATIC, "java/util/concurrent/ThreadLocalRandom", "SEED", "J");
                     visitor.visitMethodInsn(INVOKESTATIC, "org/apache/cassandra/simulator/systems/InterceptorOfSystemMethods$Global", "randomSeed", "()J", false);
-                    visitor.visitMethodInsn(INVOKEVIRTUAL, unsafeDescriptor, "putLong", "(Ljava/lang/Object;JJ)V", false);
+                    visitor.visitMethodInsn(INVOKEVIRTUAL, unsafeOwner, "putLong", "(Ljava/lang/Object;JJ)V", false);
                     visitor.visitFieldInsn(GETSTATIC, "java/util/concurrent/ThreadLocalRandom", unsafeFieldName, unsafeDescriptor);
                     visitor.visitMethodInsn(INVOKESTATIC, "java/lang/Thread", "currentThread", "()Ljava/lang/Thread;", false);
                     visitor.visitFieldInsn(GETSTATIC, "java/util/concurrent/ThreadLocalRandom", "PROBE", "J");
-                    visitor.visitLdcInsn(0);
-                    visitor.visitMethodInsn(INVOKEVIRTUAL, unsafeDescriptor, "putInt", "(Ljava/lang/Object;JI)V", false);
+                    // The per-thread PROBE must be NON-ZERO. JDK 25's ForkJoinPool.submissionQueue() only
+                    // attempts q.tryLockPhase() when the probe-derived 'reuse' value is non-zero, and the
+                    // probe is advanced with an xorshift for which advanceProbe(0) == 0 — so a probe pinned to
+                    // 0 leaves 'reuse' == 0 forever and, once a submission queue slot already exists, the loop
+                    // never terminates and the thread spins (livelock). (JDK 11's externalPush has no such
+                    // gate, which is why 0 worked there.) PROBE only selects queue/striping indices, never the
+                    // random values (those come from SEED), so pinning it to a deterministic non-zero constant
+                    // preserves the simulator's determinism. Use the JDK's own probe increment for parity and
+                    // good slot distribution; any non-zero constant works (the xorshift is full-period over
+                    // non-zero ints, so it never returns to 0).
+                    visitor.visitLdcInsn(0x9e3779b9);
+                    visitor.visitMethodInsn(INVOKEVIRTUAL, unsafeOwner, "putInt", "(Ljava/lang/Object;JI)V", false);
                     visitor.visitInsn(RETURN);
                     visitor.visitLabel(new Label());
                     visitor.visitMaxs(6, 1);
