@@ -24,6 +24,9 @@
 # variables, with defaults
 [ "x${cassandra_dir}" != "x" ] || cassandra_dir="$(readlink -f $(dirname -- "$0")/../..)"
 [ "x${cassandra_dtest_dir}" != "x" ] || cassandra_dtest_dir="${cassandra_dir}/../cassandra-dtest"
+# optional: a local cassandra-ccm working copy to use instead of the ccm pinned in the dtest
+# requirements.txt. when set, it is mounted into the container and pip-installed over that ccm.
+[ "x${cassandra_ccm_dir}" != "x" ] || cassandra_ccm_dir=""
 [ "x${build_dir}" != "x" ] || build_dir="${cassandra_dir}/build"
 # parameterise the maven repository host directory, as it cannot be shared across containers.
 # m2_dir fails under /tmp on macos
@@ -205,6 +208,7 @@ case ${test_target/-repeat/} in
         [ -f "${cassandra_dtest_dir}/dtest.py" ] || { error 1 "${cassandra_dtest_dir}/dtest.py not found. please specify 'cassandra_dtest_dir' to point to the local cassandra-dtest source"; }
         test_script="run-python-dtests.sh"
         docker_mounts="${docker_mounts} -v ${cassandra_dtest_dir}:/home/cassandra/cassandra-dtest"
+        [ -n "${cassandra_ccm_dir}" ] && docker_mounts="${docker_mounts} -v ${cassandra_ccm_dir}:/home/cassandra/cassandra-ccm"
         [[ ${mem} -gt $((15 * 1024 * 1024 * 1024 * ${jenkins_executors})) ]] || { error 1 "${target} require minimum docker memory 16g (per jenkins executor (${jenkins_executors})), found ${mem}"; }
         docker_flags="-m 15g --memory-swap 15g"
     ;;
