@@ -28,6 +28,7 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
@@ -38,6 +39,7 @@ import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.MapMaker;
 
 import net.nicoulaj.compilecommand.annotations.Inline;
 
@@ -138,6 +140,40 @@ public class BufferPool
     private static final Logger logger = LoggerFactory.getLogger(BufferPool.class);
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 15L, TimeUnit.MINUTES);
     private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.allocateDirect(0);
+
+    /**
+     * Whether to attach a per-chunk {@code java.nio.Buffer} marker to pooled buffers and recover the owning
+     * {@link Chunk} via {@link #CHUNK_BY_MARKER} (CASSANDRA-21171). JDK 25 rewrote AES-GCM
+     * {@code GaloisCounterMode.overlapDetection} to walk a direct buffer's attachment chain casting each link to
+     * {@code java.nio.Buffer} ({@code NIO_ACCESS.getBufferAddress((Buffer) att)}); JDK&nbsp;&le;&nbsp;24 cast to
+     * {@code sun.nio.ch.DirectBuffer} and called {@code address()}. BufferPool stashes the owning {@link Chunk} (or a
+     * {@link DirectBufferRef} when {@code -Dcassandra.debugrefcount} is enabled) in the pooled buffer's
+     * {@code DirectByteBuffer.att} field, and neither is a {@code java.nio.Buffer}; since AES-GCM is the default TLS
+     * cipher, every encrypted connection fails on JDK 25 with a {@link ClassCastException}. On JDK 25+ we therefore
+     * stash a per-chunk marker instead. JDK&nbsp;&le;&nbsp;24 keeps the original zero-overhead direct {@link Chunk}
+     * attachment (no map, no per-free lookup).
+     */
+    private static final boolean GCM_NEEDS_BUFFER_ATTACHMENT = Runtime.version().feature() >= 25;
+
+    /**
+     * Recovers the owning {@link Chunk} for a pooled buffer from its per-chunk {@link Chunk#attachmentMarker}, keyed by
+     * the marker's object identity. The marker carries a {@code null} attachment, so the overlap-detection walk stops
+     * at the marker (whose address is the chunk base) rather than chaining up to the 8&nbsp;MB macro root; that keeps
+     * the false-overlap window - which makes {@code overlapDetection} defensively heap-copy {@code dst} - down to a
+     * single 128&nbsp;KB chunk instead of a whole macro. Holds one entry per live {@link Chunk}, including macro,
+     * normal, and tiny chunks. Entries are dropped in {@link Chunk#dropAttachmentMarker()} (from
+     * {@link Chunk#unsafeFree()} and when a tiny chunk is recycled back to its parent).
+     * <p>
+     * This is a {@code weakKeys()} (identity-equality) map: tiny chunks - and therefore their markers - are created and
+     * retired millions of times per second under load, and a strong-reference map (e.g. NonBlockingIdentityHashMap)
+     * retains removed keys in its internal table until a resize, leaking the marker buffers and OOMing the heap on
+     * JDK 25 (CASSANDRA-21171). Weak keys reclaim a marker's entry once the marker is unreferenced even if an explicit
+     * remove is missed, and use identity comparison, which is required because nested chunks share a base address (a
+     * macro chunk and its first normal child both start at offset 0). {@code null} (never populated) on
+     * JDK&nbsp;&le;&nbsp;24.
+     */
+    private static final ConcurrentMap<ByteBuffer, Chunk> CHUNK_BY_MARKER =
+        GCM_NEEDS_BUFFER_ATTACHMENT ? new MapMaker().weakKeys().makeMap() : null;
 
     private volatile Debug debug = Debug.NO_OP;
     private volatile DebugLeaks debugLeaks = DebugLeaks.NO_OP;
@@ -991,6 +1027,11 @@ public class BufferPool
             ByteBuffer buffer = chunk.slab;
             Chunk parentChunk = Chunk.getParentChunk(buffer);
             assert parentChunk != null;  // tiny chunk always has a parent chunk
+            // The tiny chunk is permanently retired here - its slab returns to the parent normal chunk and the Chunk
+            // object is discarded - so drop its CHUNK_BY_MARKER entry. Tiny chunks never go through unsafeFree(), so
+            // without this every recycled tiny chunk would leak its marker buffer on JDK 25 and the node would slowly
+            // exhaust the heap (CASSANDRA-21171).
+            chunk.dropAttachmentMarker();
             put(buffer, parentChunk);
         }
 
@@ -1167,6 +1208,11 @@ public class BufferPool
         @VisibleForTesting
         Object debugAttachment;
 
+        // On JDK 25+ (GCM_NEEDS_BUFFER_ATTACHMENT) a per-chunk java.nio.Buffer marker with a null attachment and an
+        // address of the chunk base, stashed in each sliced buffer's att so AES-GCM overlapDetection can walk it and
+        // stop at the chunk boundary; the owning Chunk is recovered via CHUNK_BY_MARKER. null on JDK <= 24.
+        private final ByteBuffer attachmentMarker;
+
         Chunk(Chunk recycle)
         {
             assert recycle.freeSlots == 0L;
@@ -1175,6 +1221,9 @@ public class BufferPool
             this.shift = recycle.shift;
             this.freeSlots = -1L;
             this.recycler = recycle.recycler;
+            this.attachmentMarker = recycle.attachmentMarker; // same slab/base, so the marker is identical
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                CHUNK_BY_MARKER.put(attachmentMarker, this);
         }
 
         Chunk(Recycler recycler, ByteBuffer slab)
@@ -1189,6 +1238,22 @@ public class BufferPool
             this.shift = 31 & (Integer.numberOfTrailingZeros(slab.capacity() / 64));
             // -1 means all free whilst 0 means all in use
             this.freeSlots = slab.capacity() == 0 ? 0L : -1L;
+            this.attachmentMarker = GCM_NEEDS_BUFFER_ATTACHMENT ? newAttachmentMarker(baseAddress, slab.capacity()) : null;
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                CHUNK_BY_MARKER.put(attachmentMarker, this);
+        }
+
+        /**
+         * A hollow direct buffer aliasing this chunk's memory with a {@code null} attachment and an address of the
+         * chunk base. Stashed (rather than the {@link Chunk} itself) in each sliced buffer's {@code att} field so JDK
+         * 25's AES-GCM overlapDetection, which casts attachments to {@code java.nio.Buffer}, can walk it and terminate
+         * at the chunk boundary (see {@link #CHUNK_BY_MARKER}).
+         */
+        private static ByteBuffer newAttachmentMarker(long baseAddress, int capacity)
+        {
+            ByteBuffer marker = MemoryUtil.getHollowDirectByteBuffer(ByteOrder.BIG_ENDIAN);
+            MemoryUtil.setDirectByteBuffer(marker, baseAddress, capacity);
+            return marker;
         }
 
         @Override
@@ -1329,12 +1394,27 @@ public class BufferPool
             if (attachment instanceof DirectBufferRef)
                 return ((DirectBufferRef<Chunk>) attachment).get();
 
+            // On JDK 25+ the attachment is the per-chunk marker (a java.nio.Buffer); recover the exact chunk by the
+            // marker's object identity. Gated on GCM_NEEDS_BUFFER_ATTACHMENT because on JDK <= 24 a macro-root
+            // attachment is still a ByteBuffer here but the map is null - those chunks resolve via the Chunk branch
+            // above (or fall through to the clean() path).
+            if (GCM_NEEDS_BUFFER_ATTACHMENT && attachment instanceof ByteBuffer)
+                return CHUNK_BY_MARKER.get(attachment);
+
             return null;
         }
 
         void setAttachment(ByteBuffer buffer)
         {
-            if (REF_TRACE_ENABLED)
+            // On JDK 25+ stash the per-chunk marker (a java.nio.Buffer whose null attachment stops AES-GCM
+            // overlapDetection at the chunk boundary); the owning Chunk is recovered via CHUNK_BY_MARKER. A
+            // DirectBufferRef cannot be used there even when Ref.TRACE_ENABLED, as it is not a java.nio.Buffer and would
+            // throw ClassCastException on every encrypted (AES-GCM) connection (BufferPool keeps its own leak detection
+            // via debug/debugLeaks). On JDK <= 24 keep the original zero-overhead direct Chunk (or DirectBufferRef)
+            // attachment, so getParentChunk stays a plain instanceof with no map lookup on the hot path.
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                MemoryUtil.setAttachment(buffer, attachmentMarker);
+            else if (REF_TRACE_ENABLED)
                 MemoryUtil.setAttachment(buffer, new DirectBufferRef<>(this, null));
             else
                 MemoryUtil.setAttachment(buffer, this);
@@ -1346,7 +1426,7 @@ public class BufferPool
             if (attachment == null)
                 return false;
 
-            if (REF_TRACE_ENABLED)
+            if (REF_TRACE_ENABLED && attachment instanceof DirectBufferRef)
                 ((DirectBufferRef<Chunk>) attachment).release();
 
             return true;
@@ -1560,8 +1640,20 @@ public class BufferPool
         }
 
         @VisibleForTesting
+        /**
+         * Drop this chunk's {@link #CHUNK_BY_MARKER} entry. Must be called whenever the chunk is permanently retired
+         * (freed, or - for a tiny chunk - returned to its parent normal chunk) so the per-chunk marker buffer is not
+         * leaked on JDK 25. No-op on JDK &le; 24, where no marker is used (CASSANDRA-21171).
+         */
+        private void dropAttachmentMarker()
+        {
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                CHUNK_BY_MARKER.remove(attachmentMarker, this);
+        }
+
         void unsafeFree()
         {
+            dropAttachmentMarker();
             Chunk parent = getParentChunk(slab);
             if (parent != null)
                 parent.free(slab);
