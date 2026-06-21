@@ -112,8 +112,10 @@
               value="${build.src.resources}/org/apache/cassandra/config/" />
     <property name="final.name" value="${ant.project.name}-${version}"/>
     <property name="accord.dir" value="modules/accord" />
+    <property name="jamm.dir" value="modules/jamm" />
     <!-- The reason not to use ant.project.name is we publish as "cassandra-accord" so the file names won't be named apache-cassandra-accord -->
     <property name="accord.final.name" value="cassandra-accord-${version}"/>
+    <property name="jamm.final.name" value="cassandra-jamm-${version}"/>
 
     <property name="local.repository" value="${user.home}/.m2/repository" />
     <property name="accord.local.repository" value="${local.repository}/org/apache/cassandra/cassandra-accord/${version}" />
@@ -743,7 +745,7 @@
         </classpath>
         <jvmarg value="-Dstorage-config=${test.conf}"/>
         <jvmarg value="-Dcassandra.reads.thresholds.coordinator.defensive_checks_enabled=true" /> <!-- enable defensive checks -->
-        <jvmarg value="-javaagent:${build.dir.lib}/jars/jamm-${jamm.version}.jar" />
+        <jvmarg value="-javaagent:${build.dir.lib}/jars/${jamm.final.name}.jar" />
         <jvmarg value="-ea"/>
         <jvmarg line="${java-jvmargs}"/>
       </java>
@@ -752,7 +754,7 @@
     <!--
         The build target builds all the .class files
     -->
-    <target name="_build_subprojects" depends="_build-accord" description="Builds all subprojects needed for the build" />
+    <target name="_build_subprojects" depends="_build-accord,_build-jamm" description="Builds all subprojects needed for the build" />
     <target name="build" depends="resolver-retrieve-build,_build_subprojects,build-project" description="Compile Cassandra classes"/>
     <target name="codecoverage" depends="jacoco-run,jacoco-report" description="Create code coverage report"/>
 
@@ -1439,7 +1441,7 @@
         <jvmarg value="-Dstorage-config=${test.conf}"/>
         <jvmarg value="-Djava.awt.headless=true"/>
         <!-- Cassandra 3.0+ needs <jvmarg line="... ${additionalagent}" /> here! (not value=) -->
-        <jvmarg line="-javaagent:${build.dir.lib}/jars/jamm-${jamm.version}.jar ${additionalagent}" />
+        <jvmarg line="-javaagent:${build.dir.lib}/jars/${jamm.final.name}.jar ${additionalagent}" />
         <jvmarg value="-ea"/>
         <jvmarg value="-Djava.io.tmpdir=${tmp.dir}"/>
         <jvmarg value="-Dcassandra.debugrefcount=true"/>
@@ -1800,7 +1802,7 @@
         <formatter type="brief" usefile="false"/>
         <jvmarg value="-Dstorage-config=${test.conf}"/>
         <jvmarg value="-Djava.awt.headless=true"/>
-        <jvmarg value="-javaagent:${build.dir.lib}/jars/jamm-${jamm.version}.jar" />
+        <jvmarg value="-javaagent:${build.dir.lib}/jars/${jamm.final.name}.jar" />
         <jvmarg value="-ea"/>
         <jvmarg value="${jvm_xss}"/>
         <jvmarg value="-Dcassandra.memtable_row_overhead_computation_step=100"/>
@@ -1846,7 +1848,7 @@
         <formatter type="brief" usefile="false"/>
         <jvmarg value="-Dstorage-config=${test.conf}"/>
         <jvmarg value="-Djava.awt.headless=true"/>
-        <jvmarg value="-javaagent:${build.dir.lib}/jars/jamm-${jamm.version}.jar" />
+        <jvmarg value="-javaagent:${build.dir.lib}/jars/${jamm.final.name}.jar" />
         <jvmarg value="-ea"/>
         <jvmarg value="${jvm_xss}"/>
         <jvmarg value="-Dcassandra.test.use_prepared=${cassandra.test.use_prepared}"/>
@@ -2439,5 +2441,6 @@
   <import file="${build.helpers.dir}/build-bench.xml"/>
   <import file="${build.helpers.dir}/build-sonar.xml"/>
   <import file="${build.helpers.dir}/build-accord.xml" />
+  <import file="${build.helpers.dir}/build-jamm.xml" />
   <import file="${basedir}/tools/sstableloader/build.xml"/>
 </project>

@@ -198,7 +198,10 @@ fi
 JVM_OPTS="$JVM_OPTS -XX:CompileCommandFile=$CASSANDRA_CONF/hotspot_compiler"
 
 # add the jamm javaagent
-JVM_OPTS="$JVM_OPTS -javaagent:$CASSANDRA_HOME/lib/jamm-0.4.0.jar"
+# cassandra-jamm-<version>.jar - the version tracks the build, so resolve it by glob rather than a hardcoded name
+for jamm_jar in "$CASSANDRA_HOME"/lib/cassandra-jamm-*.jar; do
+    if [ -f "$jamm_jar" ]; then JVM_OPTS="$JVM_OPTS -javaagent:$jamm_jar"; break; fi
+done
 
 
 if [ "x$CASSANDRA_HEAPDUMP_DIR" = "x" ]; then

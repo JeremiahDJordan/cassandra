@@ -507,9 +507,12 @@
         <version>1.0.6</version>
       </dependency>
       <dependency>
-        <groupId>com.github.jbellis</groupId>
-        <artifactId>jamm</artifactId>
-        <version>${jamm.version}</version>
+        <!-- jamm is built from the modules/jamm submodule (a fork corrected for JDK 25) and installed to
+             the local Maven repository as org.apache.cassandra:cassandra-jamm by build-jamm.xml, mirroring
+             cassandra-accord, rather than resolving the upstream com.github.jbellis:jamm release. -->
+        <groupId>org.apache.cassandra</groupId>
+        <artifactId>cassandra-jamm</artifactId>
+        <version>@version@</version>
       </dependency>
       <dependency>
         <groupId>tools.profiler</groupId>
