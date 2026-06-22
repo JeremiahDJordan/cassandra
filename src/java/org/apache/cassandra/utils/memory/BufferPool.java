@@ -153,7 +153,22 @@ public class BufferPool
      * stash a per-chunk marker instead. JDK&nbsp;&le;&nbsp;24 keeps the original zero-overhead direct {@link Chunk}
      * attachment (no map, no per-free lookup).
      */
-    private static final boolean GCM_NEEDS_BUFFER_ATTACHMENT = Runtime.version().feature() >= 25;
+    private static final boolean GCM_NEEDS_BUFFER_ATTACHMENT = computeGcmNeedsBufferAttachment();
+
+    /**
+     * CASSANDRA-21171 validation hook only. The marker workaround is normally enabled on JDK 25+. The
+     * {@code cassandra.test.bufferpool.gcm_marker} system property lets a test force it on or off so that the
+     * Netty-pooled transport allocator (Option B) can be proven to make AES-GCM TLS round-trips succeed on JDK 25
+     * <em>without</em> the marker safety net. Not for production use; absent the property, behaviour is unchanged
+     * (auto-detect by JDK feature version).
+     */
+    private static boolean computeGcmNeedsBufferAttachment()
+    {
+        String override = System.getProperty("cassandra.test.bufferpool.gcm_marker");
+        if (override != null)
+            return Boolean.parseBoolean(override);
+        return Runtime.version().feature() >= 25;
+    }
 
     /**
      * Recovers the owning {@link Chunk} for a pooled buffer from its per-chunk {@link Chunk#attachmentMarker}, keyed by

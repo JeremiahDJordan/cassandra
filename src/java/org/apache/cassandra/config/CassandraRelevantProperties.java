@@ -115,6 +115,14 @@ public enum CassandraRelevantProperties
     CASSANDRA_JMX_REMOTE_PORT("cassandra.jmx.remote.port"),
     CASSANDRA_MAX_HINT_TTL("cassandra.maxHintTTL", convertToString(Integer.MAX_VALUE)),
     CASSANDRA_MINIMUM_REPLICATION_FACTOR("cassandra.minimum_replication_factor"),
+    /**
+     * CASSANDRA-21171 "Netty Option B": when true, the internode and native-transport Netty channels use Netty's own
+     * {@code PooledByteBufAllocator} for the channel allocator instead of {@link org.apache.cassandra.net.GlobalBufferPoolAllocator}
+     * (which wraps the main {@code BufferPool}). This makes the TLS {@code SslHandler}'s AES-GCM operands Netty buffers
+     * with a legal {@code att} chain, so AES-GCM works on every JDK without the per-chunk marker workaround. Default
+     * false (preserve current behaviour + the marker safety net). See BufferPool_Netty_Pooling.md.
+     */
+    CASSANDRA_NETTY_TRANSPORT_USES_NETTY_POOL("cassandra.net.netty_transport_allocator", "false"),
     CASSANDRA_NETTY_USE_HEAP_ALLOCATOR("cassandra.netty_use_heap_allocator"),
     /**
      * Number of attempts to generate a valid password before giving up.

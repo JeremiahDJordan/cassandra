@@ -111,7 +111,9 @@ public class InboundConnectionInitiator
 
             channelGroup.add(channel);
 
-            channel.config().setOption(ChannelOption.ALLOCATOR, GlobalBufferPoolAllocator.instance);
+            // CASSANDRA-21171 Option B: the channel allocator backs the SslHandler's AES-GCM operands. Use Netty's
+            // pooled allocator when enabled so those operands carry a legal att chain on JDK 25 (no marker needed).
+            channel.config().setOption(ChannelOption.ALLOCATOR, TransportByteBufAllocator.instance());
             channel.config().setOption(ChannelOption.SO_KEEPALIVE, true);
             channel.config().setOption(ChannelOption.SO_REUSEADDR, true);
             channel.config().setOption(ChannelOption.TCP_NODELAY, true); // we only send handshake messages; no point ever delaying
@@ -172,7 +174,7 @@ public class InboundConnectionInitiator
         ServerBootstrap bootstrap = initializer.settings.socketFactory
                                     .newServerBootstrap()
                                     .option(ChannelOption.SO_BACKLOG, 1 << 9)
-                                    .option(ChannelOption.ALLOCATOR, GlobalBufferPoolAllocator.instance)
+                                    .option(ChannelOption.ALLOCATOR, TransportByteBufAllocator.instance())
                                     .option(ChannelOption.SO_REUSEADDR, true)
                                     .childHandler(initializer);
 

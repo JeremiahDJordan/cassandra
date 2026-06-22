@@ -195,7 +195,9 @@ public class OutboundConnectionInitiator<SuccessType extends OutboundConnectionI
     {
         Bootstrap bootstrap = settings.socketFactory
                                       .newClientBootstrap(eventLoop, settings.tcpUserTimeoutInMS)
-                                      .option(ChannelOption.ALLOCATOR, GlobalBufferPoolAllocator.instance)
+                                      // CASSANDRA-21171 Option B: Netty-pooled channel allocator backs the SslHandler
+                                      // AES-GCM operands (legal att chain on JDK 25, no marker) when enabled.
+                                      .option(ChannelOption.ALLOCATOR, TransportByteBufAllocator.instance())
                                       .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, settings.tcpConnectTimeoutInMS)
                                       .option(ChannelOption.SO_KEEPALIVE, true)
                                       .option(ChannelOption.SO_REUSEADDR, true)

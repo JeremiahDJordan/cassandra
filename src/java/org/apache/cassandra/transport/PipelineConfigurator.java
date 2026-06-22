@@ -296,8 +296,11 @@ public class PipelineConfigurator
                                         ProtocolVersion version,
                                         Map<String, String> options)
     {
+        // CASSANDRA-21171 Option B: keep the frame decoder/encoder on the BufferPool allocator (their Payload/adopt
+        // ownership model is BufferPool-based), but set the *channel* allocator - which backs the SslHandler's
+        // AES-GCM operands - to Netty's pooled allocator when enabled, so TLS works on JDK 25 without the marker.
         BufferPoolAllocator allocator = GlobalBufferPoolAllocator.instance;
-        ctx.channel().config().setOption(ChannelOption.ALLOCATOR, allocator);
+        ctx.channel().config().setOption(ChannelOption.ALLOCATOR, org.apache.cassandra.net.TransportByteBufAllocator.instance());
 
         // Transport level encoders/decoders
         String compression = options.get(StartupMessage.COMPRESSION);
