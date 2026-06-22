@@ -17,6 +17,11 @@
  */
 package org.apache.cassandra.net;
 
+import java.nio.ByteBuffer;
+
+import org.apache.cassandra.utils.memory.BufferPools;
+
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocator;
 
@@ -33,9 +38,12 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_
  * gate. When false (the default), the channels use {@link GlobalBufferPoolAllocator} (the main {@code BufferPool})
  * exactly as before, relying on the shipped per-chunk marker workaround on JDK 25.
  *
- * <p><b>Known residual (prototype):</b> the encrypt-path wrap <em>source</em> is the {@link FrameEncoder.Payload}
- * buffer, drawn directly from the main {@code BufferPool} independent of this channel allocator. Pointing the channel
- * allocator at Netty does not by itself move that operand; see working/DECISIONS.md.
+ * <p>The channel allocator covers the unwrap source/destination and the wrap destination. The encrypt-path wrap
+ * <em>source</em> (the {@link FrameEncoder.Payload} frame buffer, streaming send buffers and the {@code Initiate}
+ * handshake message) is drawn directly from the main {@code BufferPool} independent of this channel allocator, so it is
+ * moved onto the Netty pool separately by {@link #wrapFrame(java.nio.ByteBuffer)}. With both in place, every AES-GCM
+ * operand on the Option B path is a Netty (att-legal) buffer and the marker is not needed for transport; see
+ * working/DECISIONS.md (Phase 6).
  */
 public final class TransportByteBufAllocator
 {
@@ -58,5 +66,58 @@ public final class TransportByteBufAllocator
     public static ByteBufAllocator instance()
     {
         return USE_NETTY_POOL ? NETTY_POOL : GlobalBufferPoolAllocator.instance;
+    }
+
+    /**
+     * The Netty pooled allocator backing Option B, regardless of whether {@link #USE_NETTY_POOL} is set. Used by the
+     * frame encoders to obtain the wrap-source buffer; only consulted on the Option B path.
+     */
+    public static PooledByteBufAllocator nettyPool()
+    {
+        return NETTY_POOL;
+    }
+
+    /**
+     * Produce the on-wire {@link ByteBuf} that the frame encoders hand to the channel (and thus, under TLS, to the
+     * {@code SslHandler} as its <em>wrap source</em>) from a fully-assembled frame sitting in a main-{@code BufferPool}
+     * {@code ByteBuffer}.
+     *
+     * <p><b>Option B off (default):</b> behaves exactly as before - returns a {@link BufferPoolAllocator.Wrapped} over
+     * the BufferPool buffer ({@link GlobalBufferPoolAllocator#wrap}); the buffer is returned to the pool when Netty
+     * deallocates the {@code Wrapped}.
+     *
+     * <p><b>Option B on:</b> copies the finished frame into a Netty {@link PooledByteBufAllocator} direct buffer and
+     * returns the {@code BufferPool} buffer to the pool immediately. This moves the encrypt-path <em>wrap source</em>
+     * off the main {@code BufferPool} so that - together with the channel-allocator swap that covers the unwrap
+     * source/destination and wrap destination - <b>every</b> AES-GCM operand is a Netty buffer with a legal {@code att}
+     * chain, so JDK 25's {@code GaloisCounterMode.overlapDetection} never casts a {@code Chunk} to {@code java.nio.Buffer}.
+     * The frame is already fully built (header + payload + trailer/CRC), so a single copy of the finished bytes
+     * suffices; the buffer-building logic upstream is untouched.
+     *
+     * <p>Refcount/ownership: the returned Netty {@code ByteBuf} starts at refCnt 1, owned by the channel write path,
+     * and is released by Netty (or the {@code SslHandler}) once written - standard Netty semantics. The source
+     * {@code BufferPool} buffer is unconditionally returned to the pool here, so there is no double-free and no leak on
+     * either branch.
+     */
+    public static ByteBuf wrapFrame(ByteBuffer frame)
+    {
+        if (!USE_NETTY_POOL)
+            return GlobalBufferPoolAllocator.wrap(frame);
+
+        ByteBuf out = NETTY_POOL.directBuffer(frame.remaining());
+        try
+        {
+            out.writeBytes(frame.duplicate());
+            return out;
+        }
+        catch (Throwable t)
+        {
+            out.release();
+            throw t;
+        }
+        finally
+        {
+            BufferPools.forNetworking().put(frame);
+        }
     }
 }

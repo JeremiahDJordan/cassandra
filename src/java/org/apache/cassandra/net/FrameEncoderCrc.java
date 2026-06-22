@@ -87,7 +87,7 @@ public class FrameEncoderCrc extends FrameEncoder
             frame.putInt(frameLength - TRAILER_LENGTH, frameCrc);
             frame.position(0);
 
-            return GlobalBufferPoolAllocator.wrap(frame);
+            return TransportByteBufAllocator.wrapFrame(frame);
         }
         catch (Throwable t)
         {

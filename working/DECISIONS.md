@@ -249,3 +249,148 @@ Reasoning:
   a TLS-load benchmark. Only after (1)-(3) can the marker/map/gate be removed. Until then Option B is additive, not
   a replacement.
 
+---
+
+# PHASE 6 — All the way down the rabbit hole (this session)
+
+Goal of this phase: take Option B from the "additive SslHandler-level proof" of Phase 1-5 to a **fully Netty-pooled
+transport**, so that on the Option B path **every** AES-GCM operand is a Netty buffer and the marker can be retired for
+transport. Phase 1-5 ended NO-GO because (a) the encrypt-path wrap *source* (frame payload) and streaming send buffers
+were still BufferPool buffers and (b) `FrameDecoder.channelRead` hard-required `BufferPoolAllocator.Wrapped` and threw
+otherwise. This phase implements both, and proves it on a real encrypted cluster.
+
+## What changed, layer by layer
+
+### Layer A — the inbound path now accepts Netty `ByteBuf` (the Phase-1 BLOCKER)
+`net/FrameDecoder.channelRead(ctx, msg)`:
+- Old: `if (msg instanceof BufferPoolAllocator.Wrapped) { adopt(); ... } else throw new IllegalArgumentException();`
+- New: keeps the `Wrapped` fast path verbatim (zero-copy `adopt()` -> BufferPool ownership), and adds an
+  `else if (msg instanceof ByteBuf)` branch that **copies** the Netty buffer's readable bytes into a fresh BufferPool
+  buffer (`allocator.getAtLeast(len)`), then `in.release()`s the Netty buffer in a `finally`. The copied BufferPool
+  buffer flows through the unchanged `ShareableBytes`/slice/stash machinery.
+- **Why copy and not zero-copy-adopt the Netty buffer?** The decoder hands downstream `IntactFrame`s that hold
+  `ShareableBytes.slice(...)` views which **outlive** `channelRead` (consumed later by `InboundMessageHandler` /
+  `CQLMessageHandler`), and `ShareableBytes.doRelease()` is hard-wired to `BufferPools.forNetworking().put(bytes)`.
+  A Netty `PooledByteBuf` is governed by Netty refcounting (retain/release), not BufferPool get/put; threading a
+  per-`ShareableBytes` release strategy through every slice/duplicate would be invasive and easy to get wrong
+  (the slices share one nio view but the refcount lives on the `ByteBuf`, not the view). The copy keeps the Netty
+  buffer's lifetime entirely inside `channelRead` (exactly one `release()`), so **nothing downstream ever sees a
+  Netty-owned buffer** and the BufferPool ownership invariant is untouched. Cost: one memcpy per inbound read on the
+  Option B path. This is the deliberate, low-risk refcount decision.
+- The streaming inbound path needed **no change**: `NettyStreamingChannel.channelRead` already appends the raw
+  `ByteBuf` to `AsyncStreamingInputPlus`, which queues it, reads via `next.nioBuffer()` and releases via
+  `next.release()` — already allocator-agnostic and refcount-correct. (Phase 1 over-stated this as a blocker.)
+
+### Layer B — the encrypt-path wrap SOURCE moved off the main BufferPool
+New `TransportByteBufAllocator.wrapFrame(ByteBuffer frame)`:
+- Option B **off**: returns `GlobalBufferPoolAllocator.wrap(frame)` exactly as before (a `Wrapped` over the pool buffer;
+  pool buffer returned on Netty deallocate). Zero behavioural change.
+- Option B **on**: allocates a Netty `PooledByteBufAllocator.directBuffer(frame.remaining())`, copies the
+  fully-assembled frame into it, and returns the BufferPool buffer to the pool immediately (`finally`). The frame is
+  already built (header+payload+trailer/CRC) so a single copy of the finished bytes suffices and the upstream
+  buffer-building logic is untouched. Refcount: the returned Netty `ByteBuf` is at refCnt 1, owned by the channel
+  write path / `SslHandler`, released by Netty once written; the source pool buffer is unconditionally `put` here, so
+  no double-free, no leak on either branch (incl. the copy-throws path which `out.release()`s before rethrow).
+- Routed every TLS **wrap source** through it:
+  - `FrameEncoderCrc.encode`, `FrameEncoderLZ4.encode`, `FrameEncoderUnprotected.encode` (internode + native V5 frames);
+  - `AsyncStreamingOutputPlus.doFlush` and `.writeToChannel` (streaming send buffers);
+  - `HandshakeProtocol.Initiate.encode` (the internode TLS handshake message, a wrap source on encrypted connections).
+- `NettyStreamingChannel.send` (the streaming `Factory`) now takes its send buffer from
+  `TransportByteBufAllocator.nettyPool().directBuffer(size)` under Option B (else `GlobalBufferPoolAllocator.buffer`).
+- `StreamCompressionSerializer` already takes the channel `ByteBufAllocator` and used `allocator.directBuffer(...)`,
+  so under Option B it is already on the Netty pool — no change needed.
+
+Files changed this phase:
+- `net/FrameDecoder.java` (accept Netty `ByteBuf` inbound)
+- `net/TransportByteBufAllocator.java` (`wrapFrame`, `nettyPool`)
+- `net/FrameEncoderCrc.java`, `net/FrameEncoderLZ4.java`, `net/FrameEncoderUnprotected.java` (wrap source)
+- `net/AsyncStreamingOutputPlus.java`, `net/HandshakeProtocol.java` (wrap source)
+- `streaming/async/NettyStreamingChannel.java` (streaming send buffer)
+- new test `net/TransportFrameTlsRoundTripTest.java` (real frame codec through real SslHandler, marker off)
+
+## Validation — exact results
+
+### Builds (cross-JDK, `rm -rf build/classes build/test/classes build/anttasks` between switches)
+- JDK 11 (`11.0.31-amzn`) `build-test`: BUILD SUCCESSFUL.
+- JDK 25 (`25.0.3-amzn`) `build-test`: BUILD SUCCESSFUL.
+
+### THE END-TO-END PROOF — real encrypted in-JVM cluster on JDK 25 (the bar Phase 1 could not reach)
+`InternodeEncryptionEnforcementTest.testConnectionsAreAcceptedWhenAuthSucceds` — a 2-node in-JVM cluster with
+`internode_encryption: all` + `require_client_auth: true`, which establishes mutual-TLS internode connections AND
+sends real `PingRequest` messages over them (real FrameEncoder -> SslHandler -> SslHandler -> FrameDecoder path).
+Control matrix on JDK 25:
+- marker OFF, **Option B OFF**  => `errors=1`: `ClassCastException: Ref$DirectBufferRef cannot be cast to
+  java.nio.Buffer` at `GaloisCounterMode.overlapDetection(GaloisCounterMode.java:926)` — i.e. the exact JDK 25 bug,
+  reproduced on a live encrypted cluster.
+- marker OFF, **Option B ON**   => `errors=0 failures=0 tests=1` PASS. Logs show
+  `PoolThreadCache - Freed N thread-local buffer(s) from thread node{1,2}_Messaging-EventLoop-*` = Netty arenas were
+  actually used by the transport (Option B engaged).
+- marker ON,  Option B OFF (default/shipped) => PASS (no regression).
+- JDK 11, Option B ON => PASS.
+This is the decisive result: **with the marker neutralised, encrypted internode messaging works on JDK 25 iff Option B
+is on**, so the correctness comes from the Netty-pooled operands, not a surviving marker.
+
+### Streaming over TLS (real cluster)
+`SSTableLoaderEncryptionOptionsTest.bulkLoaderSuccessfullyStreamsOverSsl` (bulk loader streams SSTables over SSL +
+native TLS), JDK 25, Option B ON + marker OFF => `errors=0 failures=0 tests=1` PASS. Exercises the streaming send
+buffers (`NettyStreamingChannel.send` / `AsyncStreamingOutputPlus`) and the streaming inbound path with no marker.
+
+### Native transport TLS (real cluster)
+`NativeTransportEncryptionOptionsTest.optionalTlsConnectionAllowedWithKeystoreTest`, JDK 25, Option B ON + marker OFF
+=> PASS. Native V5 modern pipeline's channel allocator swap + FrameDecoder both exercised.
+
+### Faithful in-JVM frame proof (new unit test)
+`TransportFrameTlsRoundTripTest.framedEncryptedRoundTrip` — REAL `FrameEncoderCrc` -> REAL Netty `SslHandler`
+(tcnative, direct engine) -> REAL `SslHandler` -> REAL `FrameDecoderCrc` over `TransportByteBufAllocator`, asserting an
+exact byte round trip of a framed message. JDK 25 + Option B ON + marker OFF => PASS (tests=1, errors=0). JDK 11 ON =>
+PASS. Flag OFF => skips (default frame path already covered by `FramingTest`). This drives the two new code paths
+(wrap-source `wrapFrame`, inbound Netty-`ByteBuf` `channelRead`) through real crypto.
+
+### Default-off / no-regression
+- `FramingTest` (real frame encode/decode, default pool): JDK 25 PASS (3), JDK 11 PASS (3).
+- `CQLConnectionTest` (native V5 frame codec, 9 tests): JDK 25 default-off PASS; JDK 25 Option B ON + marker OFF PASS
+  (exercises the inbound Netty-`ByteBuf` FrameDecoder branch without TLS).
+- `SslHandlerGcmAllocatorTest` (2), `TransportTlsRoundTripTest` (1): PASS JDK 11 & 25.
+- `InternodeEncryptionEnforcementTest` default (marker on, B off): PASS.
+
+### Main pool undisturbed (req 5)
+`LongBufferPoolTest` burn on JDK 25: BUILD SUCCESSFUL (2m29s). (An earlier "failure" was a build-artifact race — a
+concurrent `rm -rf build/` deleted classes mid-run, time=7s; the clean re-run is green. Lesson: never `rm -rf build`
+while another ant target is running.)
+
+## REVISED MARKER-RETIREMENT VERDICT
+
+**YES — for the transport paths, behind the flag, the marker / `CHUNK_BY_MARKER` map / `GCM_NEEDS_BUFFER_ATTACHMENT`
+gate can be retired, and this is now validated on a real encrypted cluster, not just a unit test.** With Option B on:
+- wrap source (frame payload / streaming send / handshake Initiate): Netty buffer (Layer B). ✔
+- wrap destination, unwrap source, unwrap destination: channel allocator = Netty pool (Phase 1). ✔
+- inbound decrypted buffer accepted without `IllegalArgumentException` and without breaking BufferPool ownership
+  (Layer A). ✔
+- proven: marker OFF + Option B ON => encrypted internode + native + streaming all round-trip on JDK 25 with NO
+  ClassCastException; marker OFF + Option B OFF => the JDK 25 CCE reproduces. ✔
+Per design-note §8 (re-confirmed Phase 4): no non-TLS pooled buffer is ever a GCM operand (chunk-cache / SSTable / TDE
+paths are not GCM operands), so once transport is Netty-pooled the marker has **no remaining GCM operand to protect**.
+
+### What still blocks making Option B the *default* (i.e. removing the marker unconditionally / flipping the flag on)
+These are not GCM-correctness blockers — the GCM problem is fully solved above — but engineering/operational items
+before the flag can default ON and the marker code can be deleted:
+1. **Memory accounting split (unchanged from Phase 4).** Transport TLS/socket buffers + (now) the copied wrap-source
+   and streaming send buffers live in Netty arenas, outside `networking_cache_size` and invisible to
+   `BufferPoolMetrics`. Operators get a second off-heap pool to size/observe. Needs `PooledByteBufAllocatorMetric`
+   surfaced before defaulting on.
+2. **Two extra memcpys on the Option B path** (one per outbound frame in `wrapFrame`, one per inbound read in
+   `FrameDecoder`). Faithful but not zero-copy. A production default would want either a zero-copy wrap source
+   (build the frame directly into a Netty buffer — larger surgery in `FrameEncoder.Payload`) or a refcount-aware
+   `ShareableBytes` so the inbound Netty buffer can be adopted zero-copy. Functionally correct as-is; a perf cost.
+3. **TLS-load benchmark** (throughput/latency/RSS: Netty arenas vs the global BufferPool) is still not done; required
+   before flipping the default.
+
+### Bottom line (brutally honest)
+- **Validated:** Option B, flag-on, marker-off, makes AES-GCM TLS work end-to-end on JDK 25 across internode, native,
+  and streaming, on a real in-JVM cluster — and the negative control reproduces the bug. The marker is genuinely
+  retired on the Option B path; correctness is from the Netty operands.
+- **Not validated / not a goal here:** a real network (non-in-JVM) cluster, sustained load, perf, and the memory-metrics
+  follow-up. A passing in-JVM dtest with mutual TLS + real message/stream traffic is a strong faithful proof but is not
+  a soak test.
+- **Verdict:** marker retirement for transport behind the flag = **YES, proven**. Marker *deletion* / flag-default-on =
+  blocked only by metrics (1) + a perf/zero-copy pass (2,3), not by any remaining GCM operand.

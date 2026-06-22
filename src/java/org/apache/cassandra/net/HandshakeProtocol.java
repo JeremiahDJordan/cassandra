@@ -132,7 +132,9 @@ class HandshakeProtocol
                 inetAddressAndPortSerializer.serialize(from, out, acceptVersions.min);
                 out.writeInt(computeCrc32(buffer, 0, buffer.position()));
                 buffer.flip();
-                return GlobalBufferPoolAllocator.wrap(buffer);
+                // Option B: the Initiate handshake message is a TLS wrap source on encrypted internode connections;
+                // route it through the transport allocator so its AES-GCM operand is a Netty (att-legal) buffer.
+                return TransportByteBufAllocator.wrapFrame(buffer);
             }
             catch (IOException e)
             {

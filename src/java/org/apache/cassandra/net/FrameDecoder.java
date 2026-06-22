@@ -25,6 +25,7 @@ import java.util.Deque;
 
 import com.google.common.annotations.VisibleForTesting;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelPipeline;
@@ -255,12 +256,26 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
     }
 
     /**
-     * Called by Netty pipeline when a new message arrives; we anticipate in normal operation
-     * this will receive messages of type {@link BufferPoolAllocator.Wrapped} or
-     * {@link BufferPoolAllocator.Wrapped}.
+     * Called by Netty pipeline when a new message arrives.
      *
-     * These buffers are unwrapped and passed to {@link #decode(Collection, ShareableBytes)},
-     * which collects decoded frames into {@link #frames}, which we send upstream in {@link #deliver}
+     * <p>In the default ({@link GlobalBufferPoolAllocator}) configuration the inbound buffer is a
+     * {@link BufferPoolAllocator.Wrapped}: we {@link BufferPoolAllocator.Wrapped#adopt() adopt} its underlying
+     * {@code BufferPool} {@link ByteBuffer} (taking ownership) and hand it to {@link #decode(Collection, ShareableBytes)}
+     * via a {@link ShareableBytes}, whose release returns it to the pool. This is the zero-copy fast path.
+     *
+     * <p>Under CASSANDRA-21171 "Netty Option B" ({@code cassandra.net.netty_transport_allocator=true}) the channel
+     * allocator is Netty's own {@link io.netty.buffer.PooledByteBufAllocator}, so the {@code SslHandler}'s decrypted
+     * output (and the plaintext socket read) arrive here as a plain reference-counted Netty {@link ByteBuf}, NOT a
+     * {@code Wrapped}. We cannot {@code adopt()} a Netty buffer (its lifetime is governed by Netty refcounting, not
+     * {@code BufferPool} get/put, and downstream {@link IntactFrame} slices outlive this call and release via the pool).
+     * So we <em>copy</em> the readable bytes into a fresh {@code BufferPool} buffer and release the Netty buffer here.
+     * The copied buffer then flows through the unchanged {@code ShareableBytes}/slice/stash machinery exactly as the
+     * adopted path does, preserving the downstream ownership model. Cost: one memcpy per inbound read on the Option B
+     * path; correctness: the Netty buffer's refcount is balanced ({@code release()} once) and nothing downstream ever
+     * sees a Netty-owned buffer.
+     *
+     * <p>These buffers are passed to {@link #decode(Collection, ShareableBytes)}, which collects decoded frames into
+     * {@link #frames}, which we send upstream in {@link #deliver}.
      */
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) throws IOException
@@ -272,9 +287,29 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
             allocator.putUnusedPortion(buf);
             channelRead(ShareableBytes.wrap(buf));
         }
+        else if (msg instanceof ByteBuf)
+        {
+            // Option B: a Netty-pooled, reference-counted buffer that we cannot adopt into the BufferPool ownership
+            // model. Copy its readable bytes into a BufferPool buffer and release the Netty buffer immediately.
+            ByteBuf in = (ByteBuf) msg;
+            try
+            {
+                int length = in.readableBytes();
+                ByteBuffer copy = allocator.getAtLeast(length);
+                copy.limit(length);
+                in.getBytes(in.readerIndex(), copy);
+                copy.flip();
+                channelRead(ShareableBytes.wrap(copy));
+            }
+            finally
+            {
+                in.release();
+            }
+        }
         else
         {
-            throw new IllegalArgumentException();
+            throw new IllegalArgumentException("Unexpected inbound message type: "
+                                               + (msg == null ? "null" : msg.getClass().getName()));
         }
     }
 

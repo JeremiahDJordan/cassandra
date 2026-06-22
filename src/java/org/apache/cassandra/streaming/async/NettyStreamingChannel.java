@@ -35,6 +35,7 @@ import org.apache.cassandra.net.AsyncChannelPromise;
 import org.apache.cassandra.net.AsyncStreamingInputPlus;
 import org.apache.cassandra.net.AsyncStreamingOutputPlus;
 import org.apache.cassandra.net.GlobalBufferPoolAllocator;
+import org.apache.cassandra.net.TransportByteBufAllocator;
 import org.apache.cassandra.streaming.StreamingChannel;
 import org.apache.cassandra.streaming.StreamingDataInputPlus;
 import org.apache.cassandra.streaming.StreamingDataOutputPlus;
@@ -157,7 +158,11 @@ public class NettyStreamingChannel extends ChannelInboundHandlerAdapter implemen
             @Override
             public StreamingDataOutputPlus apply(int size)
             {
-                buf = GlobalBufferPoolAllocator.instance.buffer(size);
+                // Option B: take the streaming send buffer (a TLS wrap source) from Netty's pool so the AES-GCM
+                // operand carries a legal att chain on JDK 25; otherwise the main BufferPool as before.
+                buf = TransportByteBufAllocator.USE_NETTY_POOL
+                      ? TransportByteBufAllocator.nettyPool().directBuffer(size)
+                      : GlobalBufferPoolAllocator.instance.buffer(size);
                 buffer = buf.nioBuffer(buf.writerIndex(), size);
                 return new StreamingDataOutputPlusFixed(buffer);
             }
