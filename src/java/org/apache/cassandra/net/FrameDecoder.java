@@ -266,13 +266,23 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
      * <p>Under CASSANDRA-21171 "Netty Option B" ({@code cassandra.net.netty_transport_allocator=true}) the channel
      * allocator is Netty's own {@link io.netty.buffer.PooledByteBufAllocator}, so the {@code SslHandler}'s decrypted
      * output (and the plaintext socket read) arrive here as a plain reference-counted Netty {@link ByteBuf}, NOT a
-     * {@code Wrapped}. We cannot {@code adopt()} a Netty buffer (its lifetime is governed by Netty refcounting, not
-     * {@code BufferPool} get/put, and downstream {@link IntactFrame} slices outlive this call and release via the pool).
-     * So we <em>copy</em> the readable bytes into a fresh {@code BufferPool} buffer and release the Netty buffer here.
-     * The copied buffer then flows through the unchanged {@code ShareableBytes}/slice/stash machinery exactly as the
-     * adopted path does, preserving the downstream ownership model. Cost: one memcpy per inbound read on the Option B
-     * path; correctness: the Netty buffer's refcount is balanced ({@code release()} once) and nothing downstream ever
-     * sees a Netty-owned buffer.
+     * {@code Wrapped}.
+     *
+     * <p><b>Zero-copy path (default when Option B is on).</b> When the {@code ByteBuf} has a single NIO component
+     * ({@code nioBufferCount() == 1}), we wrap its {@code nioBuffer(readerIndex, readableBytes)} - a zero-copy view of
+     * the pooled direct buffer - in a Netty-backed {@link ShareableBytes} (see {@link ShareableBytes#wrap(ByteBuffer,
+     * ByteBuf)}). We retain the {@code ByteBuf} exactly once so that the {@code ShareableBytes}'s terminal release calls
+     * {@code byteBuf.release()} exactly once - balancing the retain - once the whole share/slice tree is released
+     * downstream (the {@link IntactFrame} slices outlive this call). The original inbound reference is released in the
+     * {@code finally}. The slice/stash/deliver machinery downstream is unchanged: a held slice now pins a Netty arena
+     * chunk rather than a BufferPool chunk (see working/DECISIONS.md Phase 7 pinning audit).
+     *
+     * <p><b>Composite / multi-component fallback.</b> A {@code CompositeByteBuf} (e.g. from the JDK SSL engine
+     * accumulating across records) has {@code nioBufferCount() != 1}, so {@code nioBuffer()} would itself copy/
+     * consolidate the components. In that case (and when the zero-copy toggle is off) we fall back to copying the
+     * readable bytes into a fresh {@code BufferPool} buffer and releasing the Netty buffer here. The copied buffer flows
+     * through the same {@code ShareableBytes} machinery, preserving the BufferPool ownership model. The cross-read
+     * {@link #stash} copy is always a BufferPool buffer regardless of branch.
      *
      * <p>These buffers are passed to {@link #decode(Collection, ShareableBytes)}, which collects decoded frames into
      * {@link #frames}, which we send upstream in {@link #deliver}.
@@ -290,11 +300,51 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
         else if (msg instanceof ByteBuf)
         {
             // Option B: a Netty-pooled, reference-counted buffer that we cannot adopt into the BufferPool ownership
-            // model. Copy its readable bytes into a BufferPool buffer and release the Netty buffer immediately.
-            ByteBuf in = (ByteBuf) msg;
+            // model.
+            channelReadByteBuf((ByteBuf) msg, TransportByteBufAllocator.INBOUND_ZERO_COPY);
+        }
+        else
+        {
+            throw new IllegalArgumentException("Unexpected inbound message type: "
+                                               + (msg == null ? "null" : msg.getClass().getName()));
+        }
+    }
+
+    /**
+     * Decode a Netty {@link ByteBuf} inbound (Option B). When {@code zeroCopy} and the buffer has a single NIO component
+     * ({@code nioBufferCount() == 1}), wrap a zero-copy {@code nioBuffer()} view in a Netty-backed {@link ShareableBytes}
+     * (retaining the {@code ByteBuf} once, terminal release drops it once); otherwise (multi-component / toggle off) copy
+     * the readable bytes into a {@code BufferPool} buffer and release the Netty buffer. The {@code ByteBuf} is released
+     * exactly once in every branch.
+     */
+    private void channelReadByteBuf(ByteBuf in, boolean zeroCopy) throws IOException
+    {
+        int length = in.readableBytes();
+
+        if (zeroCopy && in.nioBufferCount() == 1)
+        {
+            // Zero-copy: wrap a nioBuffer() view of the pooled buffer and hand ByteBuf ownership to ShareableBytes.
+            // Retain once for the ShareableBytes; its terminal release (once the whole share/slice tree is freed,
+            // which can outlive this call) releases() that one reference. nioBuffer(idx, len) does not retain.
+            // decode() always drives newBytes to terminal release in its finally even if it throws, so the retained
+            // reference is never leaked. The original inbound reference is dropped in our finally below.
             try
             {
-                int length = in.readableBytes();
+                ByteBuffer view = in.nioBuffer(in.readerIndex(), length);
+                in.retain();
+                channelRead(ShareableBytes.wrap(view, in));
+            }
+            finally
+            {
+                in.release();
+            }
+        }
+        else
+        {
+            // Composite / multi-component (or toggle off): nioBuffer() would copy anyway. Copy the readable bytes
+            // into a BufferPool buffer and release the Netty buffer immediately.
+            try
+            {
                 ByteBuffer copy = allocator.getAtLeast(length);
                 copy.limit(length);
                 in.getBytes(in.readerIndex(), copy);
@@ -306,11 +356,30 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
                 in.release();
             }
         }
-        else
-        {
-            throw new IllegalArgumentException("Unexpected inbound message type: "
-                                               + (msg == null ? "null" : msg.getClass().getName()));
-        }
+    }
+
+    /**
+     * Test-only: drive the Netty-{@code ByteBuf} inbound branch without an active processor or {@code ChannelHandlerContext}.
+     * The decoder is left inactive, so frames are decoded into {@link #frames} but not delivered; use
+     * {@link #processBacklogForTest} to deliver them. Lets {@code FrameDecoderNettyRefcountTest} assert the inbound
+     * {@code ByteBuf}'s refcount is balanced across stash / backpressure paths.
+     */
+    @VisibleForTesting
+    void channelReadForTest(ByteBuf in, boolean zeroCopy) throws IOException
+    {
+        channelReadByteBuf(in, zeroCopy);
+    }
+
+    @VisibleForTesting
+    void processBacklogForTest(FrameProcessor processor) throws IOException
+    {
+        processBacklog(processor);
+    }
+
+    @VisibleForTesting
+    void discardForTest()
+    {
+        discard();
     }
 
     void channelRead(ShareableBytes bytes) throws IOException

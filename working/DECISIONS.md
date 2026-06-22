@@ -394,3 +394,158 @@ before the flag can default ON and the marker code can be deleted:
   a soak test.
 - **Verdict:** marker retirement for transport behind the flag = **YES, proven**. Marker *deletion* / flag-default-on =
   blocked only by metrics (1) + a perf/zero-copy pass (2,3), not by any remaining GCM operand.
+
+---
+
+# PHASE 7 — Zero-copy inbound path (this session)
+
+Goal: remove the per-inbound-read memcpy that Phase 6 left in `FrameDecoder.channelRead`'s `ByteBuf` branch (item (2) of
+the "what still blocks flag-default-on" list). Phase 6 copied the decrypted Netty `ByteBuf` into a `BufferPool` buffer
+and released the Netty buffer, because `ShareableBytes.doRelease()` hard-wired the terminal free to
+`BufferPools.forNetworking().put(bytes)`. This phase makes the inbound path **zero-copy for frames self-contained in a
+single read**, by generalising `ShareableBytes` to be ownership-model-agnostic and wrapping the Netty buffer's
+`nioBuffer()` view directly. The cross-read `stash` reassembly copy and the multi-component (`CompositeByteBuf`)
+fallback remain copies — stated honestly below.
+
+## Grounded analysis (verified before implementing)
+- The decode/slice machinery is **pure `ByteBuffer`**: `ShareableBytes.slice()` is `bytes.duplicate()` + position/limit;
+  `FrameDecoderWith8bHeader.decode` reads headers via `in.get*`. No `MemoryUtil`/`att`/pool-specific ops. Confirmed: the
+  decode machinery needs **no** change.
+- `ShareableBytes` was already a self-contained refcounter (`count`/`retain`/`slice`/`release`); the ONLY pool-specific
+  thing was the terminal `RELEASED` action `BufferPools.forNetworking().put(bytes)` in `doRelease()`.
+- The terminal release fires **exactly once** for the whole share/slice tree, on the `owner`, when `count` reaches
+  `RELEASED`. Slices delegate every `release()`/`retain()` to `owner`. So attaching the Netty `byteBuf.release()` to the
+  owner gives exactly-once Netty release.
+
+## The `ShareableBytes` shape chosen
+Added a single `private final Runnable onRelease` field, held **only on the owner** (slices pass `onRelease=null`, since
+they delegate release to the owner). `doRelease()` at `RELEASED` now runs `onRelease.run()` if non-null, else the
+unchanged `BufferPools.forNetworking().put(bytes)`. Two factories:
+- `wrap(ByteBuffer)` — unchanged default; `onRelease=null` → pool put. Every existing caller (`FrameDecoderWith8bHeader`
+  stash, `FrameDecoderLZ4` decompressed buffer, the `Wrapped.adopt()` path, `ChunkedInputPlusTest`) keeps BufferPool
+  semantics byte-for-byte.
+- `wrap(ByteBuffer view, ByteBuf byteBuf)` — Netty path; `onRelease = () -> ReferenceCountUtil.release(byteBuf)`. The
+  `view` is a zero-copy `nioBuffer()` window over `byteBuf`'s backing memory.
+This is the smallest possible change: refcount/slice/retain logic is **identical**; only the terminal action is
+pluggable. (Rejected: subtypes / a `Releaser` interface — a nullable `Runnable` is less code and the lambda captures the
+`ByteBuf` cleanly.)
+
+## The `channelRead` zero-copy branch + composite fallback
+Refactored the `ByteBuf` branch into `channelReadByteBuf(ByteBuf in, boolean zeroCopy)`:
+- **Zero-copy branch** (taken when `zeroCopy && in.nioBufferCount() == 1`): `view = in.nioBuffer(readerIndex, length)`
+  (zero-copy view of the pooled direct buffer), then `in.retain()` (one extra reference for the `ShareableBytes`), then
+  `channelRead(ShareableBytes.wrap(view, in))`. The original inbound reference is dropped in `finally { in.release() }`.
+  Net: 1 original ref + 1 retain = 2 references; balanced by the `ShareableBytes` terminal `release()` (once the whole
+  share/slice tree is freed, which can outlive `channelRead`) + the `finally` release. Ordering is deliberate:
+  `nioBuffer()` (a read-only op) first, then `retain()`, then hand off — if `nioBuffer()` throws, no retain happened and
+  the `finally` releases the single original ref (no leak, no double-free). `decode()` always drives `newBytes` to
+  terminal release in its `finally` even on throw, so the retained reference is never leaked.
+- **Composite / multi-component fallback** (`nioBufferCount() != 1`, e.g. a `CompositeByteBuf` from the JDK SSL engine
+  accumulating across TLS records): `nioBuffer()` would itself copy/consolidate, so we fall back to the Phase-6 copy
+  (`getAtLeast` + `getBytes` + release). Same fallback when the toggle is off.
+
+## Measurable A/B toggle
+`TransportByteBufAllocator.INBOUND_ZERO_COPY` (`-Dcassandra.net.netty_transport_inbound_zero_copy`, default **true**).
+On the Option-B path it selects zero-copy (default) vs the Phase-6 copy strategy, so a future benchmark can A/B the two
+inbound strategies on the same build. Irrelevant when Option B is off (inbound is a `Wrapped`, adopted as before).
+
+## What is still copied (honest scope of the win)
+1. **Cross-read `stash`** (`FrameDecoder.stash` / `FrameDecoderWith8bHeader.decode`): a frame split across TCP reads is
+   inherently reassembled into a fresh `BufferPool` buffer (`allocator.getAtLeast`) wrapped via the default
+   `ShareableBytes.wrap(ByteBuffer)` (BufferPool-owned). Unchanged. So the win is **"zero-copy for frames
+   self-contained in one read"** — the common case for small/medium messages — not for fragmented frames.
+2. **Composite `ByteBuf`** (`nioBufferCount() != 1`): copied, as above.
+3. **`FrameDecoderLZ4` decompression**: the decompressed payload is always a new `BufferPool` buffer regardless of
+   branch (it must be — decompression is a copy by nature). Only the LZ4 `uncompressedLength==0` and the CRC decoders
+   take a zero-copy `slice()` of the inbound buffer.
+4. The Phase-6 outbound **wrap-source** `wrapFrame` copy is unchanged (out of scope for this phase; still one memcpy per
+   outbound frame on the Option B path).
+
+## Validation — exact results
+
+### Refcount balance / no leak / no double-free (the #1 risk) — `FrameDecoderNettyRefcountTest` (new)
+A new unit test drives `FrameDecoder`'s `ByteBuf` branch with REAL `FrameEncoderCrc` frames decoded by a REAL
+`FrameDecoderCrc`, asserting the inbound `ByteBuf.refCnt()` returns to **exactly 0** in each scenario, run under
+`-Dio.netty.leakDetection.level=paranoid`:
+- single self-contained frame (zero-copy AND copy toggle) — refCnt 0;
+- multiple self-contained frames in one read — refCnt 0;
+- frame split across two reads (stash path) — each read's `ByteBuf` refCnt 0; frame assembled from stash;
+- partially-consumed read (one full frame + a stashed trailing partial) — single `ByteBuf` refCnt 0;
+- flow-control paused/reactivate (processor returns false after frame 1; frame 2 held as a slice that **keeps the
+  `ByteBuf` alive**, `refCnt >= 1`, until reactivate delivers+releases it, then refCnt 0);
+- `CompositeByteBuf` (JDK-SSL shape) — falls back to copy, composite refCnt 0;
+- real `PooledByteBufAllocator` (Option B's allocator) zero-copy round trip — pooled `ByteBuf` refCnt 0.
+Result on **JDK 11** and **JDK 25**: `tests=7, errors=0, failures=0`, **no Netty LEAK reported** with paranoid detection.
+
+### Byte-exactness — `TransportFrameTlsRoundTripTest` (real `FrameEncoderCrc → SslHandler(OpenSSL,direct) → FrameDecoderCrc`)
+With `-Dcassandra.net.netty_transport_allocator=true -Dcassandra.test.bufferpool.gcm_marker=false
+-Dio.netty.leakDetection.level=paranoid`: byte-exact framed round trip **PASS on JDK 11 and JDK 25** with the zero-copy
+inbound path engaged (default toggle on). No leak.
+
+### End-to-end encrypted cluster (marker OFF + Option B ON), JDK 25
+`InternodeEncryptionEnforcementTest.testConnectionsAreAcceptedWhenAuthSucceds` (2-node mutual-TLS in-JVM cluster, real
+`PingRequest` over `FrameEncoder → SslHandler → SslHandler → FrameDecoder`):
+- **Option B ON + zero-copy ON (default) + marker OFF** → `tests=1 errors=0 failures=0` **PASS**. Logs show
+  `PoolThreadCache - Freed N thread-local buffer(s) from node{1,2}_Messaging-EventLoop-*` = Netty arenas engaged.
+- **Negative control: Option B OFF + marker OFF** → `errors=1` (internode messaging broken; the JDK 25 GCM
+  `ClassCastException` prevents the encrypted handshake/messaging, surfaced as "Found no candidates / seeds up"). So the
+  correctness comes from the Netty-pooled operands + zero-copy path, not a surviving marker.
+- **A/B copy variant: Option B ON + `inbound_zero_copy=false` + marker OFF** → **PASS** (the Phase-6 copy fallback still
+  works end-to-end under real TLS).
+- **Default shipped path: marker ON + Option B OFF** → **PASS** (no regression).
+- Native transport TLS (`NativeTransportEncryptionOptionsTest.optionalTlsConnectionAllowedWithKeystoreTest`) ON+markerOFF
+  → **PASS**. Streaming over TLS (`SSTableLoaderEncryptionOptionsTest.bulkLoaderSuccessfullyStreamsOverSsl`) ON+markerOFF
+  → **PASS**.
+
+### Default-off / no-regression
+- `FramingTest` (real frame encode/decode, default pool): JDK 11 **PASS (3)**.
+- `CQLConnectionTest` (native V5 frame codec, 9 tests) with Option B ON + zero-copy + marker OFF + paranoid leak
+  detection: JDK 11 **PASS (9)** — drives the inbound Netty-`ByteBuf` zero-copy branch without TLS, no leak.
+
+### Builds (clean, `rm -rf build/{classes,test/classes,anttasks}` between JDKs)
+- JDK 11 (`11.0.31-amzn`) `build-test`: **BUILD SUCCESSFUL**.
+- JDK 25 (`25.0.3-amzn`) `build-test`: **BUILD SUCCESSFUL**.
+
+### Main pool undisturbed
+`LongBufferPoolTest` burn on JDK 25: `Tests run: 2, Failures: 0, Errors: 0` (240.7 s). The `ShareableBytes` change is
+additive (nullable releaser); the default path is byte-for-byte unchanged.
+
+## Lifetime / pinning audit (documented; not fixed — by design)
+A held inbound **zero-copy** slice now pins a whole Netty arena `PoolChunk` (Netty default chunk 16 MiB) rather than a
+128 KiB BufferPool chunk, for as long as the slice is retained. Audited where inbound frame bytes are held:
+- **Small messages (the common case) — SAFE.** `InboundMessageHandler.processSmallMessage` /
+  `CQLMessageHandler` deserialize the message **in place, immediately**, within `channelRead` delivery; the producing
+  frame's `ShareableBytes` is released as soon as the frame is consumed. The deserialized `Message`/objects do not
+  reference the buffer. No long-term pinning. (Internode small-message slices live microseconds.)
+- **Large messages — PINS until reassembly + deserialize.** `AbstractMessageHandler.LargeMessage.onIntactFrame` does
+  `buffers.add(frame.contents.sliceAndConsume(frameSize).share())`, holding a slice **per frame** in a `List` until the
+  whole large message is reassembled (`onComplete`) and deserialized on a stage thread (internode) /
+  `assembleFrame()` → `Unpooled.wrappedBuffer(...buffers...)` (native). Under zero-copy, every such held slice that
+  arrived self-contained in one read is **Netty-backed**, so a single in-flight large message pins one (or more) 16 MiB
+  arena chunk(s) until it is deserialized. Under sustained large-message load with many concurrent large messages, this
+  is an **arena-pinning / RSS amplification risk** (a few KiB of live frame bytes can pin a 16 MiB chunk). This is the
+  same class of "slice outlives the read" hold the Phase-6 copy avoided by construction — the zero-copy win trades the
+  per-read memcpy for this pinning exposure on the large-message path.
+  - Note: large-message frames that span TCP reads go through `stash` → BufferPool copy, so those are **not** Netty-
+    pinned; only large-message frames self-contained in a single read are. The exposure scales with read sizes vs frame
+    sizes.
+  - Mitigation options (not implemented): (a) copy out in `LargeMessage.onIntactFrame` when the slice is Netty-backed;
+    (b) cap/observe Netty arena chunk size for transport; (c) keep large-message inbound on the copy path while
+    zero-copying only small/self-contained frames. Deferred — needs the perf/RSS soak to decide.
+- **Flow-control `stash` / backpressure queueing — SAFE-ish.** The `stash` is always a BufferPool copy (not Netty), so a
+  paused decoder's stashed bytes do **not** pin a Netty chunk. A paused decoder *does* hold any already-decoded frames
+  in its `frames` deque (slices over the inbound buffer) until reactivate — bounded by one read's worth of frames, short
+  -lived under normal flow control, but under sustained backpressure a stalled connection holds its last read's Netty
+  chunk pinned until the processor resumes. Bounded per connection (one in-flight read), not unbounded.
+
+## What remains UNVALIDATED (honest list)
+1. **RSS / throughput / latency soak under TLS load** — the decisive remaining item. The arena-pinning exposure on the
+   large-message path (above) is a *potential* RSS amplifier that only a sustained large-message + many-connection soak
+   (Netty arenas vs the BufferPool, RSS + GC + p99) can quantify. **Not run.**
+2. **Perf comparison zero-copy vs copy** — the A/B toggle is wired and both paths pass functionally, but no benchmark of
+   "memcpy saved per read" vs "arena pinning cost" has been run.
+3. The Phase-6 unvalidated items still stand: real (non-in-JVM) network cluster; Netty-arena metrics
+   (`PooledByteBufAllocatorMetric`) surfaced to operators; the outbound wrap-source `wrapFrame` is still a copy.
+Conclusion: the **zero-copy inbound path is functionally correct and refcount-balanced (paranoid-leak-clean) on JDK 11
+and 25, byte-exact under real TLS, and green end-to-end on a real encrypted cluster** — but whether it should default on
+over the copy path depends on the **unrun RSS/perf soak**, given the documented large-message arena-pinning exposure.

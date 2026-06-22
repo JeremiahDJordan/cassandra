@@ -20,11 +20,25 @@ package org.apache.cassandra.net;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.util.ReferenceCountUtil;
 import org.apache.cassandra.utils.memory.BufferPools;
 
 /**
- * A wrapper for possibly sharing portions of a single, {@link BufferPools#forNetworking()} managed, {@link ByteBuffer};
- * optimised for the case where no sharing is necessary.
+ * A wrapper for possibly sharing portions of a single {@link ByteBuffer}, optimised for the case where no sharing is
+ * necessary.
+ *
+ * <p>The underlying buffer's storage is owned by one of two terminal release strategies, selected at {@code wrap} time
+ * and held only on the {@code owner}:
+ * <ul>
+ *   <li>the default {@link #wrap(ByteBuffer)} path, where the buffer comes from {@link BufferPools#forNetworking()} and
+ *       the terminal release returns it to the pool ({@code put(bytes)}); and</li>
+ *   <li>the CASSANDRA-21171 "Netty Option B" {@link #wrap(ByteBuffer, ByteBuf)} path, where the buffer is a zero-copy
+ *       {@code nioBuffer()} view of a reference-counted Netty {@link ByteBuf} and the terminal release calls
+ *       {@code byteBuf.release()} exactly once.</li>
+ * </ul>
+ * The reference-count / slice / retain machinery is identical for both; only the terminal {@link #RELEASED} action
+ * differs. Slices share the owner (and hence the owner's releaser), so the terminal release fires exactly once.
  *
  * When sharing is necessary, {@link #share()} method must be invoked by the owning thread
  * before a {@link ShareableBytes} instance can be shared with another thread.
@@ -33,6 +47,12 @@ public class ShareableBytes
 {
     private final ByteBuffer bytes;
     private final ShareableBytes owner;
+    /**
+     * The terminal release action, run exactly once when the owner's count reaches {@link #RELEASED}. Held only on the
+     * owner (slices delegate every release to the owner), so it fires once for the whole share/slice tree. Null for the
+     * default BufferPool path (whose terminal action is the hard-wired {@code BufferPools.forNetworking().put(bytes)}).
+     */
+    private final Runnable onRelease;
     private volatile int count;
 
     private static final int UNSHARED = -1;
@@ -42,15 +62,23 @@ public class ShareableBytes
 
     private ShareableBytes(ByteBuffer bytes)
     {
+        this(bytes, null);
+    }
+
+    private ShareableBytes(ByteBuffer bytes, Runnable onRelease)
+    {
         this.count = UNSHARED;
         this.owner = this;
         this.bytes = bytes;
+        this.onRelease = onRelease;
     }
 
     private ShareableBytes(ShareableBytes owner, ByteBuffer bytes)
     {
         this.owner = owner;
         this.bytes = bytes;
+        // slices delegate release to the owner; the releaser lives on the owner only.
+        this.onRelease = null;
     }
 
     public ByteBuffer get()
@@ -136,7 +164,12 @@ public class ShareableBytes
             throw new IllegalStateException("Already released");
 
         if (count == RELEASED)
-            BufferPools.forNetworking().put(bytes);
+        {
+            if (onRelease != null)
+                onRelease.run();
+            else
+                BufferPools.forNetworking().put(bytes);
+        }
     }
 
     boolean isReleased()
@@ -169,6 +202,22 @@ public class ShareableBytes
     public static ShareableBytes wrap(ByteBuffer buffer)
     {
         return new ShareableBytes(buffer);
+    }
+
+    /**
+     * CASSANDRA-21171 "Netty Option B" zero-copy inbound path. Wrap a (zero-copy) {@code nioBuffer()} view of a
+     * reference-counted Netty {@link ByteBuf}; the terminal release ({@link #RELEASED}) calls {@code byteBuf.release()}
+     * exactly once instead of returning a buffer to the {@code BufferPool}.
+     *
+     * <p>The caller must have retained {@code byteBuf} exactly once for this {@code ShareableBytes} (the
+     * {@code nioBuffer()} view does not retain), so that the single terminal {@code release()} balances that retain. The
+     * {@code view} must be a window over {@code byteBuf}'s backing memory (e.g. {@code byteBuf.nioBuffer(idx, len)}); it
+     * is read/sliced exactly like a BufferPool buffer and never returned to any pool. Slices share this owner and hence
+     * this releaser, so the {@code ByteBuf} is released once for the whole share/slice tree.
+     */
+    public static ShareableBytes wrap(ByteBuffer view, ByteBuf byteBuf)
+    {
+        return new ShareableBytes(view, () -> ReferenceCountUtil.release(byteBuf));
     }
 }
 

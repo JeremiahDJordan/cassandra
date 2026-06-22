@@ -51,6 +51,20 @@ public final class TransportByteBufAllocator
     public static final boolean USE_NETTY_POOL = CASSANDRA_NETTY_TRANSPORT_USES_NETTY_POOL.getBoolean();
 
     /**
+     * CASSANDRA-21171: when Option B is on, the inbound {@code FrameDecoder} path defaults to <em>zero-copy</em> -
+     * wrapping the decrypted Netty {@code ByteBuf}'s {@code nioBuffer()} view directly in a Netty-backed
+     * {@link ShareableBytes} - instead of copying the readable bytes into a {@code BufferPool} buffer. This internal
+     * toggle ({@code -Dcassandra.net.netty_transport_inbound_zero_copy=false}) forces the original copy strategy so the
+     * two inbound strategies can be A/B'd in a benchmark. Defaults to {@code true} (zero-copy) whenever Option B is on;
+     * irrelevant when Option B is off (the inbound buffer is then a {@code BufferPoolAllocator.Wrapped}, adopted as
+     * before). Only the single-NIO-component case is zero-copied; a multi-component {@code ByteBuf} (e.g. a
+     * {@code CompositeByteBuf} from the JDK SSL engine) always falls back to the copy path - see
+     * {@code FrameDecoder.channelRead}.
+     */
+    public static final boolean INBOUND_ZERO_COPY =
+        Boolean.parseBoolean(System.getProperty("cassandra.net.netty_transport_inbound_zero_copy", "true"));
+
+    /**
      * A single shared Netty pooled allocator for all transport channels when {@link #USE_NETTY_POOL} is set. Using one
      * instance keeps the per-thread arena caches shared across the internode and native pipelines (they run on the same
      * Netty event loops), matching how {@code GlobalBufferPoolAllocator} was a single shared instance.
