@@ -18,8 +18,17 @@
 
 package org.apache.cassandra.cql3.validation.entities;
 
+import java.io.InputStream;
+import java.lang.reflect.Method;
+import java.lang.reflect.Modifier;
+import java.net.URL;
 import java.security.AccessControlException;
+import java.util.Arrays;
+import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Stream;
 
 import org.junit.Assert;
 import org.junit.Assume;
@@ -181,6 +190,109 @@ public class UFSecurityTest extends CQLTester
                                  "RETURNS double " +
                                  "LANGUAGE JAVA\n" +
                                  "AS '" + moduleApiSource[1] + "';");
+    }
+
+    /**
+     * java.lang.ClassLoader is reachable under the allowed {@code java/lang/} class-load prefix, and several of
+     * its methods hand back a live ClassLoader or resource stream. {@code configureBaseDisallowed} denies the
+     * class wholesale, so the byte-code verifier rejects any call on it at CREATE FUNCTION time - on every JDK
+     * and for both the SecurityManager and SecurityManager-free mechanisms (the base verifier runs regardless).
+     * These three methods were historically absent from the per-method denylist; see CASSANDRA-21171.
+     */
+    @Test
+    public void testClassLoaderAccessRejected() throws Throwable
+    {
+        // getPlatformClassLoader (static) and getParent (instance) both return java.lang.ClassLoader - a type the
+        // UDF sandbox can resolve - so they compile and are then rejected by the byte-code verifier. The cast to
+        // ClassLoader is a CHECKCAST, which the verifier does not flag, so each body yields the single "[call to
+        // ...]" rejection. These two were the methods historically missing from the per-method denylist.
+        assertInvalidMessage("Java UDF validation failed: [call to java.lang.ClassLoader.getPlatformClassLoader()]",
+                             createClassLoaderFunction("java.lang.ClassLoader.getPlatformClassLoader(); return 0d;"));
+        assertInvalidMessage("Java UDF validation failed: [call to java.lang.ClassLoader.getParent()]",
+                             createClassLoaderFunction("((java.lang.ClassLoader) null).getParent(); return 0d;"));
+
+        // resources(String) returns Stream<URL>; neither java.util.stream.Stream nor java.net.URL is resolvable in
+        // the UDF sandbox, so the call is rejected even earlier, at compilation. (Were those types resolvable, the
+        // wholesale ClassLoader denial would reject it at verification instead.) Either way it cannot be created.
+        assertInvalid(createClassLoaderFunction("((java.lang.ClassLoader) null).resources(\"x\"); return 0d;"));
+    }
+
+    private static String createClassLoaderFunction(String body)
+    {
+        return "CREATE OR REPLACE FUNCTION " + KEYSPACE + ".invalid_classloader_access(val double) " +
+               "RETURNS NULL ON NULL INPUT " +
+               "RETURNS double " +
+               "LANGUAGE JAVA\n" +
+               "AS '" + body + "';";
+    }
+
+    /**
+     * Self-policing guard for the {@code java.lang.ClassLoader} denial (CASSANDRA-21171). Reflectively finds
+     * every public ClassLoader method that returns a loader/resource type (ClassLoader, Class, URL, InputStream,
+     * or a Stream/Enumeration of those) and asserts a UDF calling it is rejected at CREATE FUNCTION time. The
+     * class is denied wholesale, so this holds for current and future such methods; were the denial ever
+     * downgraded to an incomplete per-method list, the methods it misses (e.g. getPlatformClassLoader/getParent/
+     * resources, none of which are listed individually) would fail this test instead of silently widening the
+     * sandbox surface.
+     */
+    @Test
+    public void testClassLoaderLoaderYieldingMethodsDenied() throws Throwable
+    {
+        Set<Class<?>> loaderYielding = new HashSet<>(Arrays.asList(
+            ClassLoader.class, Class.class, URL.class, InputStream.class, Stream.class, Enumeration.class));
+
+        int checked = 0;
+        for (Method m : ClassLoader.class.getMethods())
+        {
+            if (m.getDeclaringClass() != ClassLoader.class || !Modifier.isPublic(m.getModifiers()))
+                continue;
+            if (!loaderYielding.contains(m.getReturnType()))
+                continue;
+
+            String target = Modifier.isStatic(m.getModifiers())
+                            ? "java.lang.ClassLoader"
+                            : "((java.lang.ClassLoader) null)";
+            StringBuilder args = new StringBuilder();
+            for (Class<?> p : m.getParameterTypes())
+            {
+                if (args.length() > 0)
+                    args.append(", ");
+                args.append(defaultArg(p));
+            }
+            // Wrap in try/catch so methods that declare checked exceptions still compile; the body is never
+            // executed because it is rejected before that.
+            String body = "try { " + target + '.' + m.getName() + '(' + args + "); } catch (Throwable __t) {} return 0d;";
+
+            // Rejected either by the byte-code verifier (methods whose return type the sandbox can resolve, e.g.
+            // ClassLoader/Class) or at compilation (methods returning sandbox-unresolvable types such as
+            // Stream/URL/InputStream/Enumeration). Both outcomes mean the call cannot reach a live loader; the
+            // verifier-reachable ones (getParent/getPlatformClassLoader) are what would regress if the wholesale
+            // ClassLoader denial were dropped, and they would then create successfully and fail this assertion.
+            assertInvalid("CREATE OR REPLACE FUNCTION " + KEYSPACE + ".invalid_classloader_enum(val double) " +
+                          "RETURNS NULL ON NULL INPUT " +
+                          "RETURNS double " +
+                          "LANGUAGE JAVA\n" +
+                          "AS '" + body + "';");
+            checked++;
+        }
+        // Sanity: reflection must have found the known loader/resource-yielding methods (getParent,
+        // getPlatformClassLoader, getSystemClassLoader, getResource(s), resources, ...). If a future JDK removed
+        // them all this guard would silently pass, so require a representative minimum.
+        Assert.assertTrue("Expected several loader/resource-yielding ClassLoader methods, found " + checked, checked >= 3);
+    }
+
+    private static String defaultArg(Class<?> type)
+    {
+        if (type == String.class)  return "\"x\"";
+        if (type == boolean.class) return "false";
+        if (type == char.class)    return "'a'";
+        if (type == byte.class || type == short.class || type == int.class) return "0";
+        if (type == long.class)    return "0L";
+        if (type == float.class)   return "0f";
+        if (type == double.class)  return "0d";
+        // Object/array parameter: a cast null. The cast is a CHECKCAST, which the verifier does not flag, so
+        // the ClassLoader call stays the only disallowed instruction in the body.
+        return "(" + type.getCanonicalName() + ") null";
     }
 
     private static void assertAccessControlException(String script, FunctionExecutionException e)

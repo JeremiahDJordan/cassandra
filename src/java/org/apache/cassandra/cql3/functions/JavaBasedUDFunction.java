@@ -224,6 +224,13 @@ public final class JavaBasedUDFunction extends UDFunction
         verifier.addDisallowedMethodCall("java/lang/Class", "getModule");
         verifier.addDisallowedClass("java/lang/Module");
         verifier.addDisallowedClass("java/lang/ModuleLayer");
+        // Deny java.lang.ClassLoader wholesale (CASSANDRA-21171). It is reachable under the allowed java/lang/
+        // prefix, and several of its methods hand back a live ClassLoader or resource stream (getPlatformClassLoader,
+        // getParent, resources, ...). Denying the class - rather than enumerating individual methods - also covers
+        // any loader/resource-yielding method a future JDK may add. The verifier rejects any call whose owner is a
+        // disallowed class, and the generated UDF wrapper never references ClassLoader, so no legitimate UDF breaks.
+        // The explicit per-method entries below are retained as documentation of the surface being closed.
+        verifier.addDisallowedClass("java/lang/ClassLoader");
         verifier.addDisallowedMethodCall("java/lang/ClassLoader", "clearAssertionStatus");
         verifier.addDisallowedMethodCall("java/lang/ClassLoader", "getResource");
         verifier.addDisallowedMethodCall("java/lang/ClassLoader", "getResourceAsStream");
