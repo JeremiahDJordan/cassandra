@@ -31,8 +31,10 @@ import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.Arrays;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
@@ -142,38 +144,33 @@ public class BufferPool
     private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.allocateDirect(0);
 
     /**
-     * Whether to attach a per-chunk {@code java.nio.Buffer} marker to pooled buffers and recover the owning
-     * {@link Chunk} via {@link #CHUNK_BY_MARKER} (CASSANDRA-21171). JDK 25 rewrote AES-GCM
-     * {@code GaloisCounterMode.overlapDetection} to walk a direct buffer's attachment chain casting each link to
-     * {@code java.nio.Buffer} ({@code NIO_ACCESS.getBufferAddress((Buffer) att)}); JDK&nbsp;&le;&nbsp;24 cast to
-     * {@code sun.nio.ch.DirectBuffer} and called {@code address()}. BufferPool stashes the owning {@link Chunk} (or a
-     * {@link DirectBufferRef} when {@code -Dcassandra.debugrefcount} is enabled) in the pooled buffer's
-     * {@code DirectByteBuffer.att} field, and neither is a {@code java.nio.Buffer}; since AES-GCM is the default TLS
-     * cipher, every encrypted connection fails on JDK 25 with a {@link ClassCastException}. On JDK 25+ we therefore
-     * stash a per-chunk marker instead. JDK&nbsp;&le;&nbsp;24 keeps the original zero-overhead direct {@link Chunk}
-     * attachment (no map, no per-free lookup).
+     * Recovers the owning {@link Chunk} for a pooled buffer from its memory <em>address</em> (CASSANDRA-21171
+     * follow-up), instead of from a field on the buffer object. The pool memory is hierarchical - 8&nbsp;MB macro
+     * chunks, sliced at a 128&nbsp;KB stride into normal chunks, sliced at a 2&nbsp;KB stride into tiny chunks - so a
+     * buffer's address already encodes its owner; {@link #MACRO_CHUNK_INDEX} plus the per-chunk dense child arrays turn an
+     * address back into the {@link Chunk} with pure arithmetic (a {@code floor} binary search over a few-hundred-entry
+     * sorted array + two array loads). No per-buffer field, no per-chunk side-map, no version gate.
+     * <p>
+     * This lets pooled buffers carry {@code att == null}: AES-GCM {@code GaloisCounterMode.overlapDetection} (rewritten
+     * in JDK 25 to walk a direct buffer's attachment chain casting each link to {@code java.nio.Buffer}) sees a null
+     * attachment and terminates immediately on every JDK - no {@link ClassCastException}, no defensive heap copy of
+     * {@code dst}. The previous scheme stashed the owning {@link Chunk} (a non-{@code Buffer}) in {@code att} and broke
+     * every encrypted (AES-GCM) connection on JDK 25.
+     * <p>
+     * The index is process-global (static): a direct buffer's address is globally unique, so it identifies its macro
+     * chunk regardless of which {@link BufferPool} instance owns it, and {@link Chunk#getParentChunk(ByteBuffer)} stays a
+     * static method callable from any pool.
      */
-    private static final boolean GCM_NEEDS_BUFFER_ATTACHMENT = Runtime.version().feature() >= 25;
+    private static final MacroChunkIndex MACRO_CHUNK_INDEX = new MacroChunkIndex();
 
     /**
-     * Recovers the owning {@link Chunk} for a pooled buffer from its per-chunk {@link Chunk#attachmentMarker}, keyed by
-     * the marker's object identity. The marker carries a {@code null} attachment, so the overlap-detection walk stops
-     * at the marker (whose address is the chunk base) rather than chaining up to the 8&nbsp;MB macro root; that keeps
-     * the false-overlap window - which makes {@code overlapDetection} defensively heap-copy {@code dst} - down to a
-     * single 128&nbsp;KB chunk instead of a whole macro. Holds one entry per live {@link Chunk}, including macro,
-     * normal, and tiny chunks. Entries are dropped in {@link Chunk#dropAttachmentMarker()} (from
-     * {@link Chunk#unsafeFree()} and when a tiny chunk is recycled back to its parent).
-     * <p>
-     * This is a {@code weakKeys()} (identity-equality) map: tiny chunks - and therefore their markers - are created and
-     * retired millions of times per second under load, and a strong-reference map (e.g. NonBlockingIdentityHashMap)
-     * retains removed keys in its internal table until a resize, leaking the marker buffers and OOMing the heap on
-     * JDK 25 (CASSANDRA-21171). Weak keys reclaim a marker's entry once the marker is unreferenced even if an explicit
-     * remove is missed, and use identity comparison, which is required because nested chunks share a base address (a
-     * macro chunk and its first normal child both start at offset 0). {@code null} (never populated) on
-     * JDK&nbsp;&le;&nbsp;24.
+     * Debug-only reference tracking for {@code -Dcassandra.debugrefcount} ({@link Ref#TRACE_ENABLED}). Previously the
+     * {@link DirectBufferRef} lived in the buffer's {@code att} field; now that pooled buffers carry {@code att == null}
+     * it is re-homed here, keyed by buffer object identity. Off (never populated) unless ref tracing is enabled, so the
+     * default hot path pays nothing.
      */
-    private static final ConcurrentMap<ByteBuffer, Chunk> CHUNK_BY_MARKER =
-        GCM_NEEDS_BUFFER_ATTACHMENT ? new MapMaker().weakKeys().makeMap() : null;
+    private static final ConcurrentMap<ByteBuffer, DirectBufferRef<Chunk>> REF_TRACKING =
+        REF_TRACE_ENABLED ? new MapMaker().weakKeys().makeMap() : null;
 
     private volatile Debug debug = Debug.NO_OP;
     private volatile DebugLeaks debugLeaks = DebugLeaks.NO_OP;
@@ -509,13 +506,17 @@ public class BufferPool
             }
 
             chunk.acquire(null);
+            // Publish the macro chunk into the address index BEFORE any of its normal children are created. The
+            // children's slabs (and hence the buffers later sliced from them) carry addresses inside this macro chunk,
+            // and getParentChunk resolves them macro-chunk-first, so it must be indexed before any child buffer escapes.
+            MACRO_CHUNK_INDEX.add(chunk);
             macroChunks.add(chunk);
 
-            final Chunk callerChunk = new Chunk(this, chunk.get(NORMAL_CHUNK_SIZE));
+            final Chunk callerChunk = new Chunk(this, chunk.get(NORMAL_CHUNK_SIZE), chunk);
             debug.registerNormal(callerChunk);
             for (int i = NORMAL_CHUNK_SIZE; i < MACRO_CHUNK_SIZE; i += NORMAL_CHUNK_SIZE)
             {
-                Chunk add = new Chunk(this, chunk.get(NORMAL_CHUNK_SIZE));
+                Chunk add = new Chunk(this, chunk.get(NORMAL_CHUNK_SIZE), chunk);
                 chunks.add(add);
                 debug.registerNormal(add);
             }
@@ -567,6 +568,99 @@ public class BufferPool
         boolean isFullyFreed(Chunk chunk)
         {
             return chunks.contains(chunk);
+        }
+    }
+
+    /**
+     * Maps a memory address to the macro chunk {@link Chunk} (8&nbsp;MB slab) that contains it, so the owning chunk can
+     * be recovered from a buffer's address alone (see {@link #MACRO_CHUNK_INDEX}). Macro chunks are page-aligned but not
+     * 8&nbsp;MB aligned, so {@code addr >> 23} does not uniquely identify a macro chunk; we keep the macro-chunk base
+     * addresses in a sorted {@code long[]} and {@code floor}-binary-search it, then range-check against
+     * {@link GlobalPool#MACRO_CHUNK_SIZE}.
+     * <p>
+     * Reads ({@link #macroChunkFor}) are lock-free against an immutable, volatile snapshot of two parallel arrays
+     * ({@code bases}, {@code macroChunks}). Writes ({@link #add}/{@link #remove}) are rare - one per 8&nbsp;MB allocated,
+     * and production never frees a macro chunk - so they take a coarse lock and publish a fresh copy-on-write snapshot.
+     */
+    private static final class MacroChunkIndex
+    {
+        private static final long[] EMPTY_BASES = new long[0];
+        private static final Chunk[] EMPTY_MACRO_CHUNKS = new Chunk[0];
+
+        private static final class Snapshot
+        {
+            final long[] bases;          // sorted ascending
+            final Chunk[] macroChunks;   // macroChunks[i] owns [bases[i], bases[i] + MACRO_CHUNK_SIZE)
+            Snapshot(long[] bases, Chunk[] macroChunks) { this.bases = bases; this.macroChunks = macroChunks; }
+        }
+
+        private volatile Snapshot snapshot = new Snapshot(EMPTY_BASES, EMPTY_MACRO_CHUNKS);
+
+        void add(Chunk macroChunk)
+        {
+            synchronized (this)
+            {
+                Snapshot cur = snapshot;
+                int n = cur.bases.length;
+                int pos = Arrays.binarySearch(cur.bases, macroChunk.baseAddress);
+                assert pos < 0 : "macro chunk base already indexed: " + macroChunk.baseAddress;
+                int insert = -(pos + 1);
+                long[] bases = new long[n + 1];
+                Chunk[] macroChunks = new Chunk[n + 1];
+                System.arraycopy(cur.bases, 0, bases, 0, insert);
+                System.arraycopy(cur.macroChunks, 0, macroChunks, 0, insert);
+                bases[insert] = macroChunk.baseAddress;
+                macroChunks[insert] = macroChunk;
+                System.arraycopy(cur.bases, insert, bases, insert + 1, n - insert);
+                System.arraycopy(cur.macroChunks, insert, macroChunks, insert + 1, n - insert);
+                snapshot = new Snapshot(bases, macroChunks);
+            }
+        }
+
+        void remove(Chunk macroChunk)
+        {
+            synchronized (this)
+            {
+                Snapshot cur = snapshot;
+                int pos = Arrays.binarySearch(cur.bases, macroChunk.baseAddress);
+                if (pos < 0)
+                    return;
+                int n = cur.bases.length;
+                long[] bases = new long[n - 1];
+                Chunk[] macroChunks = new Chunk[n - 1];
+                System.arraycopy(cur.bases, 0, bases, 0, pos);
+                System.arraycopy(cur.macroChunks, 0, macroChunks, 0, pos);
+                System.arraycopy(cur.bases, pos + 1, bases, pos, n - pos - 1);
+                System.arraycopy(cur.macroChunks, pos + 1, macroChunks, pos, n - pos - 1);
+                snapshot = new Snapshot(bases, macroChunks);
+            }
+        }
+
+        /** The macro chunk whose slab contains {@code address}, or {@code null} if the address is not in this pool. */
+        @Inline
+        Chunk macroChunkFor(long address)
+        {
+            Snapshot s = snapshot;
+            long[] bases = s.bases;
+            // floor binary search: largest index with bases[i] <= address
+            int lo = 0, hi = bases.length - 1, floor = -1;
+            while (lo <= hi)
+            {
+                int mid = (lo + hi) >>> 1;
+                if (bases[mid] <= address)
+                {
+                    floor = mid;
+                    lo = mid + 1;
+                }
+                else
+                {
+                    hi = mid - 1;
+                }
+            }
+            if (floor < 0)
+                return null;
+            Chunk macroChunk = s.macroChunks[floor];
+            return address < macroChunk.baseAddress + GlobalPool.MACRO_CHUNK_SIZE ? macroChunk : null;
         }
     }
 
@@ -834,7 +928,13 @@ public class BufferPool
         {
             this.parent = () -> {
                 ByteBuffer buffer = parent.tryGetInternal(TINY_CHUNK_SIZE, false);
-                return buffer == null ? null : new Chunk(parent, buffer);
+                if (buffer == null)
+                    return null;
+                // The tiny slab was just carved from a normal chunk; resolve that normal chunk (its tiny-child slot is
+                // not yet published for this address) and make it the new tiny chunk's parent, so the tiny chunk
+                // publishes itself into the normal chunk's tiny-child array for address-based recovery.
+                Chunk normalParent = Chunk.getParentChunk(buffer);
+                return new Chunk(parent, buffer, normalParent);
             };
             this.tinyLimit = 0; // we only currently permit one layer of nesting (which brings us down to 32 byte allocations, so is plenty)
             this.reuseObjects = parent.reuseObjects; // we share the same ByteBuffer object reuse pool, as we both have the same exclusive access to it
@@ -1025,13 +1125,14 @@ public class BufferPool
         public void recycle(Chunk chunk)
         {
             ByteBuffer buffer = chunk.slab;
-            Chunk parentChunk = Chunk.getParentChunk(buffer);
+            Chunk parentChunk = chunk.parent;
             assert parentChunk != null;  // tiny chunk always has a parent chunk
             // The tiny chunk is permanently retired here - its slab returns to the parent normal chunk and the Chunk
-            // object is discarded - so drop its CHUNK_BY_MARKER entry. Tiny chunks never go through unsafeFree(), so
-            // without this every recycled tiny chunk would leak its marker buffer on JDK 25 and the node would slowly
-            // exhaust the heap (CASSANDRA-21171).
-            chunk.dropAttachmentMarker();
+            // object is discarded. Clear its slot from the parent normal chunk's tiny-child array BEFORE returning the
+            // slab, so address-based recovery of any later allocation in that 2 KB region resolves to the normal chunk
+            // (or a fresh tiny chunk) rather than this retired one. We must use the explicit parent pointer (not
+            // getParentChunk(buffer)) because this chunk's tiny slot is still published until we clear it.
+            parentChunk.clearTinyChild(chunk);
             put(buffer, parentChunk);
         }
 
@@ -1053,7 +1154,7 @@ public class BufferPool
         {
             chunks.remove(chunk);
             if (tinyPool != null)
-                tinyPool.chunks.removeIf((child, parent) -> Chunk.getParentChunk(child.slab) == parent, chunk);
+                tinyPool.chunks.removeIf((child, parent) -> child.parent == parent, chunk);
         }
 
         private Chunk addChunkFromParent()
@@ -1074,7 +1175,7 @@ public class BufferPool
             {
                 if (tinyPool != null)
                     // releasing tiny chunks may result in releasing current evicted chunk
-                    tinyPool.chunks.removeIf((child, parent) -> Chunk.getParentChunk(child.slab) == parent, evict);
+                    tinyPool.chunks.removeIf((child, parent) -> child.parent == parent, evict);
                 evict.release();
             }
         }
@@ -1208,10 +1309,24 @@ public class BufferPool
         @VisibleForTesting
         Object debugAttachment;
 
-        // On JDK 25+ (GCM_NEEDS_BUFFER_ATTACHMENT) a per-chunk java.nio.Buffer marker with a null attachment and an
-        // address of the chunk base, stashed in each sliced buffer's att so AES-GCM overlapDetection can walk it and
-        // stop at the chunk boundary; the owning Chunk is recovered via CHUNK_BY_MARKER. null on JDK <= 24.
-        private final ByteBuffer attachmentMarker;
+        /**
+         * The chunk this chunk's slab was carved from: a macro chunk for a normal chunk, a normal chunk for a tiny
+         * chunk, {@code null} for a macro chunk. Used to resolve a chunk's <em>parent</em> from its slab address (recycle / free /
+         * removeIf paths), where address resolution alone would resolve to the chunk itself or - for nested base
+         * addresses - to the wrong level. Distinct from {@link #getParentChunk(ByteBuffer)}, which resolves the
+         * <em>finest owner</em> of an arbitrary user-buffer address.
+         */
+        private final Chunk parent;
+
+        /**
+         * For a macro chunk: the 64 live normal children (8&nbsp;MB / 128&nbsp;KB), indexed by
+         * {@code (addr - baseAddress) >> 17}. For a normal chunk that has served tiny allocations: the live tiny
+         * children (128&nbsp;KB / 2&nbsp;KB), indexed by {@code (addr - baseAddress) >> 11}, allocated lazily. Slots are
+         * published (volatile, via AtomicReferenceArray) when a child Chunk is created and cleared when it is retired;
+         * {@code null} for a tiny chunk (which has no children). See {@link #getParentChunk(ByteBuffer)}.
+         */
+        private final AtomicReferenceArray<Chunk> children;
+        private volatile AtomicReferenceArray<Chunk> tinyChildren; // lazily allocated for normal chunks that serve tiny
 
         Chunk(Chunk recycle)
         {
@@ -1221,39 +1336,82 @@ public class BufferPool
             this.shift = recycle.shift;
             this.freeSlots = -1L;
             this.recycler = recycle.recycler;
-            this.attachmentMarker = recycle.attachmentMarker; // same slab/base, so the marker is identical
-            if (GCM_NEEDS_BUFFER_ATTACHMENT)
-                CHUNK_BY_MARKER.put(attachmentMarker, this);
+            this.parent = recycle.parent;
+            // Recycling a normal chunk replaces the Chunk object for the same slab/base; carry the child array forward
+            // and republish this new Chunk into the parent macro chunk's slot so address resolution returns the live Chunk.
+            this.children = recycle.children;
+            this.tinyChildren = recycle.tinyChildren;
+            if (parent != null)
+                parent.children.set((int)((baseAddress - parent.baseAddress) >> parent.childShift()), this);
         }
 
         Chunk(Recycler recycler, ByteBuffer slab)
+        {
+            this(recycler, slab, null);
+        }
+
+        Chunk(Recycler recycler, ByteBuffer slab, Chunk parent)
         {
             assert MemoryUtil.isExactlyDirect(slab);
             this.recycler = recycler;
             this.slab = slab;
             this.baseAddress = MemoryUtil.getAddress(slab);
+            this.parent = parent;
 
             // The number of bits by which we need to shift to obtain a unit
             // "31 &" is because numberOfTrailingZeros returns 32 when the capacity is zero
             this.shift = 31 & (Integer.numberOfTrailingZeros(slab.capacity() / 64));
             // -1 means all free whilst 0 means all in use
             this.freeSlots = slab.capacity() == 0 ? 0L : -1L;
-            this.attachmentMarker = GCM_NEEDS_BUFFER_ATTACHMENT ? newAttachmentMarker(baseAddress, slab.capacity()) : null;
-            if (GCM_NEEDS_BUFFER_ATTACHMENT)
-                CHUNK_BY_MARKER.put(attachmentMarker, this);
+
+            // A macro chunk (slab == MACRO_CHUNK_SIZE) owns 64 normal children; a normal chunk (== NORMAL_CHUNK_SIZE) owns
+            // (lazily) 64 tiny children; a tiny chunk owns none.
+            this.children = slab.capacity() == GlobalPool.MACRO_CHUNK_SIZE
+                            ? new AtomicReferenceArray<>(GlobalPool.MACRO_CHUNK_SIZE / NORMAL_CHUNK_SIZE)
+                            : null;
+
+            // Publish this chunk into its parent's child slot before any buffer sliced from it can escape, so
+            // getParentChunk can resolve those buffers' addresses back to this chunk.
+            if (parent != null)
+                parent.publishChild(this);
         }
 
-        /**
-         * A hollow direct buffer aliasing this chunk's memory with a {@code null} attachment and an address of the
-         * chunk base. Stashed (rather than the {@link Chunk} itself) in each sliced buffer's {@code att} field so JDK
-         * 25's AES-GCM overlapDetection, which casts attachments to {@code java.nio.Buffer}, can walk it and terminate
-         * at the chunk boundary (see {@link #CHUNK_BY_MARKER}).
-         */
-        private static ByteBuffer newAttachmentMarker(long baseAddress, int capacity)
+        /** Shift to index this chunk's {@link #children}: 17 (128 KB) for a macro chunk, 11 (2 KB) for a normal chunk. */
+        private int childShift()
         {
-            ByteBuffer marker = MemoryUtil.getHollowDirectByteBuffer(ByteOrder.BIG_ENDIAN);
-            MemoryUtil.setDirectByteBuffer(marker, baseAddress, capacity);
-            return marker;
+            return slab.capacity() == GlobalPool.MACRO_CHUNK_SIZE ? 17 : 11;
+        }
+
+        /** Publish {@code child} into the appropriate child-array slot of this (parent) chunk. */
+        private void publishChild(Chunk child)
+        {
+            if (slab.capacity() == GlobalPool.MACRO_CHUNK_SIZE)
+            {
+                children.set((int)((child.baseAddress - baseAddress) >> 17), child);
+            }
+            else
+            {
+                AtomicReferenceArray<Chunk> tiny = tinyChildren;
+                if (tiny == null)
+                    tiny = ensureTinyChildren();
+                tiny.set((int)((child.baseAddress - baseAddress) >> 11), child);
+            }
+        }
+
+        private synchronized AtomicReferenceArray<Chunk> ensureTinyChildren()
+        {
+            AtomicReferenceArray<Chunk> tiny = tinyChildren;
+            if (tiny == null)
+                tinyChildren = tiny = new AtomicReferenceArray<>(NORMAL_CHUNK_SIZE / TINY_CHUNK_SIZE);
+            return tiny;
+        }
+
+        /** Clear {@code child} from this (parent) normal chunk's tiny-child slot when the tiny chunk is retired. */
+        private void clearTinyChild(Chunk child)
+        {
+            AtomicReferenceArray<Chunk> tiny = tinyChildren;
+            if (tiny != null)
+                tiny.compareAndSet((int)((child.baseAddress - baseAddress) >> 11), child, null);
         }
 
         @Override
@@ -1380,55 +1538,55 @@ public class BufferPool
         }
 
         /**
-         * We stash the chunk in the attachment of a buffer
-         * that was returned by get(), this method simply
-         * retrives the chunk that sliced a buffer, if any.
+         * Recovers the finest owning {@link Chunk} of a pooled buffer from its memory address (see
+         * {@link #MACRO_CHUNK_INDEX} and the per-chunk child arrays). Pure arithmetic: floor-binary-search the
+         * macro-chunk index, index the macro chunk's normal-child array, then - if a tiny child occupies that
+         * 2&nbsp;KB region - index the normal chunk's tiny-child array. Returns {@code null} for an address not owned
+         * by any pool (overflow / non-pooled / a reuse buffer object whose address has been zeroed).
          */
+        @Inline
         static Chunk getParentChunk(ByteBuffer buffer)
         {
-            Object attachment = MemoryUtil.getAttachment(buffer);
+            long address = MemoryUtil.getAddress(buffer);
+            if (address == 0)
+                return null;
 
-            if (attachment instanceof Chunk)
-                return (Chunk) attachment;
+            Chunk macroChunk = MACRO_CHUNK_INDEX.macroChunkFor(address);
+            if (macroChunk == null)
+                return null;
 
-            if (attachment instanceof DirectBufferRef)
-                return ((DirectBufferRef<Chunk>) attachment).get();
+            Chunk normal = macroChunk.children.get((int)((address - macroChunk.baseAddress) >> 17));
+            if (normal == null)
+                return null;
 
-            // On JDK 25+ the attachment is the per-chunk marker (a java.nio.Buffer); recover the exact chunk by the
-            // marker's object identity. Gated on GCM_NEEDS_BUFFER_ATTACHMENT because on JDK <= 24 a macro-root
-            // attachment is still a ByteBuffer here but the map is null - those chunks resolve via the Chunk branch
-            // above (or fall through to the clean() path).
-            if (GCM_NEEDS_BUFFER_ATTACHMENT && attachment instanceof ByteBuffer)
-                return CHUNK_BY_MARKER.get(attachment);
-
-            return null;
+            AtomicReferenceArray<Chunk> tiny = normal.tinyChildren;
+            if (tiny != null)
+            {
+                Chunk tinyChunk = tiny.get((int)((address - normal.baseAddress) >> 11));
+                if (tinyChunk != null)
+                    return tinyChunk;
+            }
+            return normal;
         }
 
         void setAttachment(ByteBuffer buffer)
         {
-            // On JDK 25+ stash the per-chunk marker (a java.nio.Buffer whose null attachment stops AES-GCM
-            // overlapDetection at the chunk boundary); the owning Chunk is recovered via CHUNK_BY_MARKER. A
-            // DirectBufferRef cannot be used there even when Ref.TRACE_ENABLED, as it is not a java.nio.Buffer and would
-            // throw ClassCastException on every encrypted (AES-GCM) connection (BufferPool keeps its own leak detection
-            // via debug/debugLeaks). On JDK <= 24 keep the original zero-overhead direct Chunk (or DirectBufferRef)
-            // attachment, so getParentChunk stays a plain instanceof with no map lookup on the hot path.
-            if (GCM_NEEDS_BUFFER_ATTACHMENT)
-                MemoryUtil.setAttachment(buffer, attachmentMarker);
-            else if (REF_TRACE_ENABLED)
-                MemoryUtil.setAttachment(buffer, new DirectBufferRef<>(this, null));
-            else
-                MemoryUtil.setAttachment(buffer, this);
+            // Pooled buffers carry a null attachment: recovery is by address (getParentChunk), and a null att lets
+            // AES-GCM overlapDetection terminate immediately on every JDK. Reference tracking, when enabled, is held in
+            // the off-hot-path REF_TRACKING side map instead of the buffer's att field.
+            MemoryUtil.setAttachment(buffer, null);
+            if (REF_TRACE_ENABLED)
+                REF_TRACKING.put(buffer, new DirectBufferRef<>(this, null));
         }
 
         boolean releaseAttachment(ByteBuffer buffer)
         {
-            Object attachment = MemoryUtil.getAttachment(buffer);
-            if (attachment == null)
-                return false;
-
-            if (REF_TRACE_ENABLED && attachment instanceof DirectBufferRef)
-                ((DirectBufferRef<Chunk>) attachment).release();
-
+            if (REF_TRACE_ENABLED)
+            {
+                DirectBufferRef<Chunk> ref = REF_TRACKING.remove(buffer);
+                if (ref != null)
+                    ref.release();
+            }
             return true;
         }
 
@@ -1639,27 +1797,21 @@ public class BufferPool
             return this.owner;
         }
 
-        @VisibleForTesting
-        /**
-         * Drop this chunk's {@link #CHUNK_BY_MARKER} entry. Must be called whenever the chunk is permanently retired
-         * (freed, or - for a tiny chunk - returned to its parent normal chunk) so the per-chunk marker buffer is not
-         * leaked on JDK 25. No-op on JDK &le; 24, where no marker is used (CASSANDRA-21171).
-         */
-        private void dropAttachmentMarker()
-        {
-            if (GCM_NEEDS_BUFFER_ATTACHMENT)
-                CHUNK_BY_MARKER.remove(attachmentMarker, this);
-        }
-
         void unsafeFree()
         {
-            dropAttachmentMarker();
-            Chunk parent = getParentChunk(slab);
+            // Release this slab's debug ref-tracking entry (no-op unless -Dcassandra.debugrefcount). The internal
+            // macro-chunk->normal slabs live for the lifetime of the pool, so their refs are only released here at teardown.
+            releaseAttachment(slab);
             if (parent != null)
+            {
+                // A normal chunk: free its slab back into its macro chunk. (Tiny chunks never reach unsafeFree.)
                 parent.free(slab);
+            }
             else
             {
-                // slab may be an aligned slice from allocateDirectAligned(); clean the root allocation
+                // A macro chunk: drop it from the address index, then clean the root allocation. The slab is an
+                // aligned slice from allocateDirectAligned(); its attachment is the owning root allocation.
+                MACRO_CHUNK_INDEX.remove(this);
                 ByteBuffer attachment = (ByteBuffer) ((DirectBuffer) slab).attachment();
                 MemoryUtil.clean(attachment != null ? attachment : slab);
             }
