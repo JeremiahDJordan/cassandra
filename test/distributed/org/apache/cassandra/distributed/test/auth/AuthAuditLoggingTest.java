@@ -235,9 +235,11 @@ public class AuthAuditLoggingTest extends TestBaseImpl
     {
         configureMutualTlsAuthenticator();
         // optionally match source/port because in MacOS source/port are null
+        // JDK 25's JSSE prefixes the SSL exception message with the TLS alert description (e.g.
+        // "(certificate_required) "); accept an optional "(alert) " prefix so the test passes on JDK 11/17/21/25.
         CharSequence expectedLogStringRegex = "^user:null\\|host:.*/127.0.0.1:\\d+(\\|source:/127.0.0.1\\|port:\\d+)?" +
                                               "\\|timestamp:\\d+\\|type:LOGIN_ERROR\\|category:AUTH" +
-                                              "\\|operation:LOGIN FAILURE; Empty client certificate chain.*$";
+                                              "\\|operation:LOGIN FAILURE; (\\([a-z_]+\\) )?Empty client certificate chain.*$";
         Path untrustedCertPath = generateSelfSignedCertificate(null, tempFolder.getRoot());
 
         testMtlsAuthenticationFailure(untrustedCertPath, "Authentication should fail with a self-signed certificate", expectedLogStringRegex);
