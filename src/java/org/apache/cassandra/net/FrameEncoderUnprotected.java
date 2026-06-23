@@ -44,7 +44,7 @@ class FrameEncoderUnprotected extends FrameEncoder
         return allocator;
     }
 
-    ByteBuf encode(boolean isSelfContained, ByteBuffer frame)
+    ByteBuf encode(boolean isSelfContained, ByteBuffer frame, boolean encrypted)
     {
         try
         {
@@ -54,7 +54,7 @@ class FrameEncoderUnprotected extends FrameEncoder
                 throw new IllegalArgumentException("Maximum uncompressed payload size is 128KiB");
 
             writeHeader(frame, isSelfContained, dataLength);
-            return TransportByteBufAllocator.wrapFrame(frame);
+            return TransportByteBufAllocator.wrapFrame(frame, encrypted);
         }
         catch (Throwable t)
         {

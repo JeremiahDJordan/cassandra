@@ -22,6 +22,7 @@ import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.util.ReferenceCountUtil;
+import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.memory.BufferPools;
 
 /**
@@ -53,6 +54,14 @@ public class ShareableBytes
      * default BufferPool path (whose terminal action is the hard-wired {@code BufferPools.forNetworking().put(bytes)}).
      */
     private final Runnable onRelease;
+    /**
+     * CASSANDRA-21171 (P2): true when the backing storage is a reference-counted Netty {@link ByteBuf} arena buffer (the
+     * Option B zero-copy inbound path) rather than a {@code BufferPool} buffer. A held slice over a Netty buffer pins a
+     * whole Netty arena {@code PoolChunk} (4 MiB with the configured {@code maxOrder=9,pageSize=8192}) for as long as the
+     * slice lives, so the large-message reassembly path copies such slices out into a {@code BufferPool} buffer and
+     * releases the Netty slice immediately (see {@link #copyToPoolAndRelease()}). Propagated to slices via the owner.
+     */
+    private final boolean nettyBacked;
     private volatile int count;
 
     private static final int UNSHARED = -1;
@@ -62,15 +71,16 @@ public class ShareableBytes
 
     private ShareableBytes(ByteBuffer bytes)
     {
-        this(bytes, null);
+        this(bytes, null, false);
     }
 
-    private ShareableBytes(ByteBuffer bytes, Runnable onRelease)
+    private ShareableBytes(ByteBuffer bytes, Runnable onRelease, boolean nettyBacked)
     {
         this.count = UNSHARED;
         this.owner = this;
         this.bytes = bytes;
         this.onRelease = onRelease;
+        this.nettyBacked = nettyBacked;
     }
 
     private ShareableBytes(ShareableBytes owner, ByteBuffer bytes)
@@ -79,6 +89,8 @@ public class ShareableBytes
         this.bytes = bytes;
         // slices delegate release to the owner; the releaser lives on the owner only.
         this.onRelease = null;
+        // ...but the backing-storage kind is shared with the owner, so a slice knows it pins a Netty arena chunk.
+        this.nettyBacked = owner.nettyBacked;
     }
 
     public ByteBuffer get()
@@ -217,7 +229,46 @@ public class ShareableBytes
      */
     public static ShareableBytes wrap(ByteBuffer view, ByteBuf byteBuf)
     {
-        return new ShareableBytes(view, () -> ReferenceCountUtil.release(byteBuf));
+        return new ShareableBytes(view, () -> ReferenceCountUtil.release(byteBuf), true);
+    }
+
+    /**
+     * CASSANDRA-21171 (P2): true if the backing storage is a reference-counted Netty arena {@link ByteBuf} (the Option B
+     * zero-copy inbound path), as opposed to a {@code BufferPool} buffer. A held slice over such a buffer pins a whole
+     * Netty arena chunk until released, so long-lived holders (large-message reassembly) should
+     * {@link #copyToPoolAndRelease() copy it out} rather than retain the Netty slice.
+     */
+    public boolean isNettyBacked()
+    {
+        return owner.nettyBacked;
+    }
+
+    /**
+     * CASSANDRA-21171 (P2): copy this {@code ShareableBytes}'s remaining bytes into a fresh {@code BufferPool} buffer,
+     * release {@code this} (dropping our hold on the Netty arena chunk), and return a new BufferPool-backed
+     * {@code ShareableBytes} over the copy. Intended for long-lived holders of zero-copy Netty-backed slices (e.g.
+     * large-message reassembly), so a few KiB of live frame bytes do not pin a multi-MiB Netty arena chunk until the
+     * whole message is reassembled and deserialized.
+     *
+     * <p>The returned {@code ShareableBytes} is unshared (count {@code UNSHARED}); the caller may {@link #share()} it as
+     * it would the original slice. The source {@code this} is released exactly once here.
+     */
+    public ShareableBytes copyToPoolAndRelease()
+    {
+        int length = bytes.remaining();
+        ByteBuffer copy = BufferPools.forNetworking().get(length, BufferType.OFF_HEAP);
+        try
+        {
+            copy.put(bytes.duplicate());
+            copy.flip();
+        }
+        catch (Throwable t)
+        {
+            BufferPools.forNetworking().put(copy);
+            throw t;
+        }
+        release();
+        return new ShareableBytes(copy);
     }
 }
 

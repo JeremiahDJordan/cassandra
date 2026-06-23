@@ -63,7 +63,7 @@ public class FrameEncoderCrc extends FrameEncoder
         frame.put(index + 2, (byte)(put3b >>> 16));
     }
 
-    ByteBuf encode(boolean isSelfContained, ByteBuffer frame)
+    ByteBuf encode(boolean isSelfContained, ByteBuffer frame, boolean encrypted)
     {
         try
         {
@@ -87,7 +87,7 @@ public class FrameEncoderCrc extends FrameEncoder
             frame.putInt(frameLength - TRAILER_LENGTH, frameCrc);
             frame.position(0);
 
-            return TransportByteBufAllocator.wrapFrame(frame);
+            return TransportByteBufAllocator.wrapFrame(frame, encrypted);
         }
         catch (Throwable t)
         {

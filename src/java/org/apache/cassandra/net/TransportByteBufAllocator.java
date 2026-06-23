@@ -65,11 +65,40 @@ public final class TransportByteBufAllocator
         Boolean.parseBoolean(System.getProperty("cassandra.net.netty_transport_inbound_zero_copy", "true"));
 
     /**
+     * Explicit arena page size for the transport Netty pool (bytes). With {@link #ARENA_MAX_ORDER} this fixes the arena
+     * {@code PoolChunk} size at {@code pageSize << maxOrder}; see {@link #ARENA_CHUNK_SIZE}.
+     */
+    private static final int ARENA_PAGE_SIZE = 8192;
+
+    /**
+     * Explicit arena {@code maxOrder} for the transport Netty pool. With {@link #ARENA_PAGE_SIZE} = 8192 this gives a
+     * {@code 8192 << 9 = 4 MiB} arena chunk - deliberately a quarter of Netty's 16 MiB default, to bound the worst-case
+     * arena-pinning amplification on the inbound zero-copy held-slice path (CASSANDRA-21171 P2/P3). A held large-message
+     * frame self-contained in one read pins one whole chunk until reassembly/deserialize; 4 MiB caps that exposure, and
+     * the P2 copy-out releases such held slices promptly anyway.
+     */
+    private static final int ARENA_MAX_ORDER = 9;
+
+    /** The transport Netty pool's arena {@code PoolChunk} size in bytes ({@code ARENA_PAGE_SIZE << ARENA_MAX_ORDER}). */
+    public static final int ARENA_CHUNK_SIZE = ARENA_PAGE_SIZE << ARENA_MAX_ORDER;
+
+    /**
      * A single shared Netty pooled allocator for all transport channels when {@link #USE_NETTY_POOL} is set. Using one
      * instance keeps the per-thread arena caches shared across the internode and native pipelines (they run on the same
      * Netty event loops), matching how {@code GlobalBufferPoolAllocator} was a single shared instance.
+     *
+     * <p>CASSANDRA-21171 P3: arenas are sized <em>explicitly</em> (default arena counts, but pageSize/maxOrder fixed for
+     * a {@value #ARENA_CHUNK_SIZE}-byte chunk) rather than relying on Netty's defaults, so the arena geometry is a
+     * deliberate, documented choice. The off-heap allocated here lives in Netty arenas, <b>not</b> in the main
+     * {@code BufferPool}, so it is <b>not</b> bounded by {@code networking_cache_size} and is surfaced via its own
+     * metrics (see {@link org.apache.cassandra.metrics.TransportBufferPoolMetrics} / {@link #pooledMetric()}).
      */
-    private static final PooledByteBufAllocator NETTY_POOL = new PooledByteBufAllocator(true);
+    private static final PooledByteBufAllocator NETTY_POOL =
+        new PooledByteBufAllocator(true,
+                                   PooledByteBufAllocator.defaultNumHeapArena(),
+                                   PooledByteBufAllocator.defaultNumDirectArena(),
+                                   ARENA_PAGE_SIZE,
+                                   ARENA_MAX_ORDER);
 
     private TransportByteBufAllocator() {}
 
@@ -92,6 +121,29 @@ public final class TransportByteBufAllocator
     }
 
     /**
+     * CASSANDRA-21171 (P3): the transport Netty pool's allocator metric ({@code PooledByteBufAllocatorMetric}: arena
+     * counts, per-arena active/allocated bytes, {@code usedDirectMemory}, etc.). Off-heap reported here is invisible to
+     * {@code BufferPoolMetrics} and unbounded by {@code networking_cache_size}; it is surfaced separately by
+     * {@link org.apache.cassandra.metrics.TransportBufferPoolMetrics}.
+     */
+    public static io.netty.buffer.PooledByteBufAllocatorMetric pooledMetric()
+    {
+        return NETTY_POOL.metric();
+    }
+
+    /** Bytes of direct memory the transport Netty pool has reserved across its arenas (allocated, not just live). */
+    public static long usedDirectMemory()
+    {
+        return NETTY_POOL.metric().usedDirectMemory();
+    }
+
+    /** Bytes of direct memory actually pinned by live buffers in the transport Netty pool's arenas. */
+    public static long pinnedDirectMemory()
+    {
+        return NETTY_POOL.pinnedDirectMemory();
+    }
+
+    /**
      * Produce the on-wire {@link ByteBuf} that the frame encoders hand to the channel (and thus, under TLS, to the
      * {@code SslHandler} as its <em>wrap source</em>) from a fully-assembled frame sitting in a main-{@code BufferPool}
      * {@code ByteBuffer}.
@@ -110,28 +162,55 @@ public final class TransportByteBufAllocator
      *
      * <p>Refcount/ownership: the returned Netty {@code ByteBuf} starts at refCnt 1, owned by the channel write path,
      * and is released by Netty (or the {@code SslHandler}) once written - standard Netty semantics. The source
-     * {@code BufferPool} buffer is unconditionally returned to the pool here, so there is no double-free and no leak on
-     * either branch.
+     * {@code BufferPool} buffer is returned to the pool <b>only on success</b>. If allocation or the copy throws (e.g.
+     * {@code OutOfDirectMemoryError} from {@link PooledByteBufAllocator#directBuffer(int)}, which is allocated outside
+     * the {@code try}), the source buffer is <em>not</em> freed here: ownership stays with the caller, whose
+     * {@code catch} block frees it exactly once. (CASSANDRA-21171: previously the {@code put} was in a {@code finally},
+     * which double-freed {@code frame} on the throw path because the caller's {@code catch} freed it too.)
+     *
+     * <p><b>P1 (CASSANDRA-21171):</b> the Netty copy only matters when the channel is TLS-encrypted - AES-GCM is
+     * TLS-only, so a non-encrypted channel never feeds the frame buffer to {@code GaloisCounterMode} and there is no
+     * {@code att}-legality requirement. For non-encrypted channels we therefore skip the copy and return the previous
+     * zero-copy {@link GlobalBufferPoolAllocator#wrap} even under Option B, avoiding a per-frame memcpy on the common
+     * unencrypted internode/native path.
+     *
+     * @param encrypted whether the channel this frame is being written to has an {@code SslHandler} installed. Callers
+     *                  with a {@link ChannelHandlerContext}/pipeline should pass {@code pipeline.get(SslHandler.class)
+     *                  != null}.
      */
-    public static ByteBuf wrapFrame(ByteBuffer frame)
+    public static ByteBuf wrapFrame(ByteBuffer frame, boolean encrypted)
     {
-        if (!USE_NETTY_POOL)
+        // Option B off, or a non-encrypted channel (no GCM operand): keep the zero-copy Wrapped exactly as before.
+        if (!USE_NETTY_POOL || !encrypted)
             return GlobalBufferPoolAllocator.wrap(frame);
 
-        ByteBuf out = NETTY_POOL.directBuffer(frame.remaining());
+        return copyToNetty(frame, NETTY_POOL);
+    }
+
+    /**
+     * CASSANDRA-21171 (C1): copy {@code frame} into a Netty direct buffer from {@code nettyAlloc}, returning the source
+     * {@code BufferPool} buffer to the pool <b>only on success</b>. {@code directBuffer()} is deliberately the first
+     * thing inside the try so an {@code OutOfDirectMemoryError} there does NOT free {@code frame} (the caller still owns
+     * it on every failure path); on a copy failure the partially-allocated {@code out} is released and the throwable
+     * rethrown without freeing {@code frame}. Package-visible + allocator-injectable so the double-free regression can
+     * be exercised by injecting a failing allocator.
+     */
+    @com.google.common.annotations.VisibleForTesting
+    static ByteBuf copyToNetty(ByteBuffer frame, ByteBufAllocator nettyAlloc)
+    {
+        ByteBuf out = null;
         try
         {
+            out = nettyAlloc.directBuffer(frame.remaining());
             out.writeBytes(frame.duplicate());
-            return out;
         }
         catch (Throwable t)
         {
-            out.release();
+            if (out != null)
+                out.release();
             throw t;
         }
-        finally
-        {
-            BufferPools.forNetworking().put(frame);
-        }
+        BufferPools.forNetworking().put(frame);   // only on success; caller's catch owns `frame` on failure
+        return out;
     }
 }

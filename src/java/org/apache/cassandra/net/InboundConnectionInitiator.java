@@ -486,7 +486,16 @@ public class InboundConnectionInitiator
             {
                 // for large messages, swap the global pool allocator for a local one, to optimise utilisation of chunks
                 allocator = new LocalBufferPoolAllocator(pipeline.channel().eventLoop());
-                pipeline.channel().config().setAllocator(allocator);
+                // CASSANDRA-21171 (C2): under Option B the channel allocator is Netty's pool, which is what makes the
+                // SslHandler's AES-GCM operands att-legal on JDK 25. Overwriting it here with a BufferPool-backed
+                // LocalBufferPoolAllocator would feed att=Chunk operands into GCM for *encrypted* LARGE_MESSAGES and
+                // reintroduce the very ClassCastException Option B removes. The FrameDecoder takes its own explicit
+                // `allocator` arg (a legitimate use, downstream of decryption), so we hand the LocalBufferPoolAllocator
+                // only to the decoder and leave the channel allocator as Netty's pool. With Option B off this is a
+                // no-op change: the channel allocator is GlobalBufferPoolAllocator either way, so we keep the original
+                // behaviour of also installing the LocalBufferPoolAllocator on the channel.
+                if (!TransportByteBufAllocator.USE_NETTY_POOL)
+                    pipeline.channel().config().setAllocator(allocator);
             }
 
             FrameDecoder frameDecoder;

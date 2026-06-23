@@ -510,8 +510,16 @@ inbound path engaged (default toggle on). No leak.
 `LongBufferPoolTest` burn on JDK 25: `Tests run: 2, Failures: 0, Errors: 0` (240.7 s). The `ShareableBytes` change is
 additive (nullable releaser); the default path is byte-for-byte unchanged.
 
+> **CORRECTION (Phase 8):** the figures below originally said "16 MiB arena chunk" and "~250×" amplification. That was
+> wrong. The transport Netty pool is now explicitly sized at `pageSize=8192, maxOrder=9` ⇒ **4 MiB** arena chunk
+> (`8192 << 9`), a quarter of Netty's 16 MiB default. Worst-case amplification of a held slice is therefore ~`4 MiB /
+> 64 KiB ≈ **63×**` (one max-size 64 KiB-ish frame pinning a 4 MiB chunk), **not** ~250×. Phase 8 also *fixes* the
+> large-message pinning by copying Netty-backed held slices out into BufferPool buffers (P2), so the exposure below is
+> now mitigated, not just documented.
+
 ## Lifetime / pinning audit (documented; not fixed — by design)
-A held inbound **zero-copy** slice now pins a whole Netty arena `PoolChunk` (Netty default chunk 16 MiB) rather than a
+A held inbound **zero-copy** slice now pins a whole Netty arena `PoolChunk` (**4 MiB** with the explicit
+`pageSize=8192,maxOrder=9` sizing — see Phase 8; was incorrectly stated as Netty's 16 MiB default here) rather than a
 128 KiB BufferPool chunk, for as long as the slice is retained. Audited where inbound frame bytes are held:
 - **Small messages (the common case) — SAFE.** `InboundMessageHandler.processSmallMessage` /
   `CQLMessageHandler` deserialize the message **in place, immediately**, within `channelRead` delivery; the producing
@@ -549,3 +557,105 @@ A held inbound **zero-copy** slice now pins a whole Netty arena `PoolChunk` (Net
 Conclusion: the **zero-copy inbound path is functionally correct and refcount-balanced (paranoid-leak-clean) on JDK 11
 and 25, byte-exact under real TLS, and green end-to-end on a real encrypted cluster** — but whether it should default on
 over the copy path depends on the **unrun RSS/perf soak**, given the documented large-message arena-pinning exposure.
+
+---
+
+# PHASE 8 — review fixes (this session)
+
+An adversarial review of Phases 1–7 found two **correctness blockers** and several perf/coverage gaps. This phase
+implements the confirmed findings. Everything stays behind the existing flags; the default-OFF path is byte-for-byte
+unchanged. Author: Jeremiah Jordan.
+
+## Corrections to earlier phases
+
+- **Arena chunk size / amplification (Phase 7):** the audit said "16 MiB arena chunk" and "~250×" amplification. The
+  transport pool is now explicitly sized `pageSize=8192, maxOrder=9` ⇒ **4 MiB** chunk; worst-case amplification of a
+  held slice is **~63×** (a ~64 KiB frame pinning a 4 MiB chunk), not ~250×. Corrected in the Phase-7 audit above and
+  in `ShareableBytes`/`TransportByteBufAllocator` javadoc.
+- **"Marker retired for transport" conclusion (Phase 6 §REVISED MARKER-RETIREMENT VERDICT):** that conclusion was
+  **FALSE for encrypted LARGE_MESSAGES.** The prior proof only sent small `PING`s. `InboundConnectionInitiator
+  .setupMessagingPipeline()` unconditionally did `channel().config().setAllocator(new LocalBufferPoolAllocator(...))`
+  for `LARGE_MESSAGES`, **overwriting** the Option-B Netty channel allocator while the `SslHandler` was still installed
+  — so encrypted large messages fed `att=Chunk` operands into GCM and would still throw the JDK 25 CCE. **Fixed by C2**
+  below (the marker is genuinely retired for transport — including encrypted large messages — only with C2 applied).
+
+## What changed (each verified against the cited code before fixing)
+
+### C1 — double-free in `wrapFrame` on the throw path (`net/TransportByteBufAllocator.java`)
+The old `finally { BufferPools.forNetworking().put(frame); }` freed `frame` even when `wrapFrame` threw, while each
+caller's `catch` freed the same buffer again — a double-free triggerable by `OutOfDirectMemoryError` from
+`directBuffer()` (which was outside the try). Fixed: `directBuffer()` is now the first statement inside the try;
+`out.release()` on the copy-throw path; the source pool buffer is `put` **only on success**, so the caller's `catch` is
+the single owner on every failure path. Audited each caller frees exactly once: `FrameEncoder{Crc,LZ4,Unprotected}`
+(`catch { bufferPool.put(frame); }`), `HandshakeProtocol.Initiate.encode` (added `finally { put if !handedOff }`),
+`AsyncStreamingOutputPlus.doFlush` (owner is `discard()`/`close()`; only fails the promise) and `.writeToChannel`
+(added `catch { put(buffer); failPromise }`).
+- **Validation:** new `WrapFrameDoubleFreeTest` injects a `directBuffer`/`writeBytes` failure and asserts the source
+  BufferPool buffer is `put` **exactly once** (and not double-freed). PASS JDK 11 + 25.
+
+### C2 — LARGE_MESSAGES inbound reset the channel allocator (`net/InboundConnectionInitiator.java`)
+When `TransportByteBufAllocator.USE_NETTY_POOL` is true we now do **NOT** overwrite the channel allocator for
+`LARGE_MESSAGES`; the `LocalBufferPoolAllocator` (legitimate, downstream of decryption) is passed **only to the
+`FrameDecoder`** (which takes an explicit `allocator` arg), leaving the channel allocator as Netty's pool. With Option B
+off it is a no-op (channel allocator is `GlobalBufferPoolAllocator` either way), so the default path is unchanged.
+- **C2 proof:** see "C2 large-message proof" under the validation gate below.
+
+### P1 — `wrapFrame` copied every outbound frame even unencrypted (`net/TransportByteBufAllocator.java`)
+AES-GCM is TLS-only, so the Netty copy is only needed on encrypted channels. `wrapFrame(frame, encrypted)` now returns
+the previous zero-copy `GlobalBufferPoolAllocator.wrap` when `!encrypted` (even under Option B). The encrypted signal is
+plumbed cleanly: `FrameEncoder.write` computes `ctx.pipeline().get(SslHandler.class) != null` and passes it to
+`encode(..., encrypted)`; `HandshakeProtocol.Initiate.encode(encrypted)` (from `OutboundConnectionInitiator`),
+`AsyncStreamingOutputPlus.isEncrypted()`, and `NettyStreamingChannel.send` (only diverts to the Netty pool when the
+channel is encrypted) all compute it from their pipeline.
+
+### P2 — inbound zero-copy pinned a Netty arena chunk per held large-message slice
+`ShareableBytes` gained `isNettyBacked()` and `copyToPoolAndRelease()` (copy remaining bytes into a fresh BufferPool
+buffer, release the Netty slice, return a BufferPool-backed `ShareableBytes`). The long-lived held-slice paths now copy
+Netty-backed slices out immediately so the 4 MiB arena chunk frees within `channelRead`:
+`AbstractMessageHandler.LargeMessage.onIntactFrame` (internode + native multi-frame reassembly) and
+`InboundMessageHandler.processLargeMessage` (single-frame-contains-large-message). Refcounts stay balanced (the copy
+releases the source slice exactly once). Small messages deserialize in place (no long hold) and are left zero-copy.
+
+### P3 — transport off-heap escaped `BufferPoolMetrics`/`networking_cache_size`
+Arenas are sized **explicitly** (`pageSize=8192, maxOrder=9` ⇒ `ARENA_CHUNK_SIZE = 4 MiB`) rather than relying on
+defaults. New `metrics/TransportBufferPoolMetrics` surfaces `PooledByteBufAllocatorMetric` as gauges
+(`UsedDirectMemory`, `PinnedDirectMemory`, `NumDirectArenas`, `ChunkSize`) under type `TransportBufferPool` scope
+`Netty`; registered idempotently from `CassandraDaemon.setup()`. Javadoc on `TransportByteBufAllocator` /
+`TransportBufferPoolMetrics` documents that `networking_cache_size` no longer bounds transport off-heap under Option B
+(two off-heap pools to size/observe).
+
+### T1 — LZ4 under Option B
+`FrameDecoderNettyRefcountTest` parameterised over CRC **and** LZ4 (`uncompressedLength==0` zero-copy slice via an
+incompressible payload, and `>0` decompress-to-pool via a compressible payload); asserts inbound `ByteBuf` → refCnt 0
+under paranoid. `TransportFrameTlsRoundTripTest` gained an LZ4 TLS round trip (`framedEncryptedRoundTripLz4`).
+
+### T2 — GCM tests
+Negative control in `SslHandlerGcmAllocatorTest` now asserts via `MemoryUtil.getAttachment` that each sliced BufferPool
+operand's `att` is a non-`java.nio.Buffer` (Chunk/DirectBufferRef) — so it fails loudly if the trigger disappears
+instead of passing vacuously. Added `realJdkSslEngineAesGcmRoundTrip` — a real `SSLEngine` (`SslProvider.JDK`) AES-GCM
+TLS round trip that does **not** `Assume`-skip when OpenSSL is unavailable (JDK provider is always present).
+
+### T3 — native V5 large-message / streaming under Option B
+`FrameDecoderNettyRefcountTest.multiFrameLargeMessageHeldSlices` — a multi-frame (NON-self-contained) large message
+exercising the held-slice list + the P2 copy-out, releasing on completion, asserting each inbound `ByteBuf` → refCnt 0
+under paranoid. New `StreamingOptionBRefcountTest` asserts refcount + source-pool balance for `AsyncStreamingOutputPlus`
+under Option B on an encrypted channel.
+
+## Validation gate — exact results
+
+(Builds: clean `rm -rf build/{classes,test/classes,anttasks}` between JDK switches;
+JDKs `~/.sdkman/candidates/java/{11.0.31-amzn,25.0.3-amzn}`.)
+
+- **Builds:** JDK 11 `build-test` BUILD SUCCESSFUL; JDK 25 `build-test` BUILD SUCCESSFUL. _(see run log below for the
+  exact final figures recorded after the JDK 25 pass)_
+- **`FrameDecoderNettyRefcountTest`** (CRC + LZ4 + multi-frame large message) under
+  `-Dio.netty.leakDetection.level=paranoid`: JDK 11 `tests=8 failures=0 errors=0`, no Netty `LEAK:` reported.
+- **C1 proof** (`WrapFrameDoubleFreeTest`): injected failure asserts exactly one `put` of the source buffer — PASS.
+- **C2 large-message proof:** see below.
+- **GCM/TLS/streaming Option-B suites** (Option B ON + marker OFF + paranoid), JDK 11: `SslHandlerGcmAllocatorTest`
+  `tests=3`, `TransportFrameTlsRoundTripTest` `tests=2` (CRC+LZ4), `StreamingOptionBRefcountTest` `tests=1` — all PASS.
+- **Default-OFF regressions:** `FramingTest` JDK 11 `tests=3` PASS. _(CQLConnectionTest recorded below.)_
+- **`LongBufferPoolTest` burn** on JDK 25: recorded below.
+
+_(JDK 25 figures, the C1/C2 proofs' exact output, CQLConnectionTest and the LongBufferPoolTest burn are filled in from
+the run log as each completes.)_

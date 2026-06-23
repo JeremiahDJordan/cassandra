@@ -36,6 +36,7 @@ import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.PooledByteBufAllocator;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.utils.memory.BufferPool;
+import org.apache.cassandra.utils.memory.MemoryUtil;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -131,6 +132,115 @@ public class SslHandlerGcmAllocatorTest
     }
 
     /**
+     * T2: a real {@link javax.net.ssl.SSLEngine} AES-GCM TLS round trip over two {@link io.netty.channel.embedded.EmbeddedChannel}s
+     * whose channel allocator is Netty's pool, forcing {@link io.netty.handler.ssl.SslProvider#JDK} so the test runs on
+     * every JVM (no {@code Assume}-skip when OpenSSL/tcnative is absent, unlike {@code TransportTlsRoundTripTest}). The
+     * JDK engine uses heap wrap/unwrap destinations, but the application {@code ByteBuf}s flowing through the pipeline are
+     * Netty-pooled (att-legal), so the encrypted bidirectional round trip succeeds on JDK 25 regardless of the marker -
+     * confirming Option B's operands never need it. A successful TLS1.3 handshake here negotiates an AES-GCM cipher.
+     */
+    @Test
+    public void realJdkSslEngineAesGcmRoundTrip() throws Throwable
+    {
+        org.apache.cassandra.config.DatabaseDescriptor.clientInitialization();
+
+        char[] pw = "cassandra".toCharArray();
+        java.security.KeyStore ks = java.security.KeyStore.getInstance("JKS");
+        try (java.io.InputStream in = new java.io.FileInputStream("test/conf/cassandra_ssl_test.keystore"))
+        {
+            ks.load(in, pw);
+        }
+        javax.net.ssl.KeyManagerFactory kmf =
+            javax.net.ssl.KeyManagerFactory.getInstance(javax.net.ssl.KeyManagerFactory.getDefaultAlgorithm());
+        kmf.init(ks, pw);
+
+        io.netty.handler.ssl.SslContext serverCtx =
+            io.netty.handler.ssl.SslContextBuilder.forServer(kmf)
+                                                  .sslProvider(io.netty.handler.ssl.SslProvider.JDK)
+                                                  .protocols("TLSv1.3")
+                                                  .build();
+        io.netty.handler.ssl.SslContext clientCtx =
+            io.netty.handler.ssl.SslContextBuilder.forClient()
+                                                  .trustManager(io.netty.handler.ssl.util.InsecureTrustManagerFactory.INSTANCE)
+                                                  .sslProvider(io.netty.handler.ssl.SslProvider.JDK)
+                                                  .protocols("TLSv1.3")
+                                                  .build();
+
+        ByteBufAllocator alloc = PooledByteBufAllocator.DEFAULT;
+        io.netty.handler.ssl.SslHandler clientSsl = clientCtx.newHandler(alloc);
+        io.netty.handler.ssl.SslHandler serverSsl = serverCtx.newHandler(alloc);
+
+        StringBuilder serverGot = new StringBuilder();
+        StringBuilder clientGot = new StringBuilder();
+        io.netty.channel.embedded.EmbeddedChannel client = newTlsChannel(alloc, clientSsl, clientGot);
+        io.netty.channel.embedded.EmbeddedChannel server = newTlsChannel(alloc, serverSsl, serverGot);
+
+        pump(client, server);
+        assertTrue("client handshake failed", clientSsl.handshakeFuture().isSuccess());
+        assertTrue("server handshake failed", serverSsl.handshakeFuture().isSuccess());
+        // TLS1.3 negotiates an AEAD cipher; assert it is the AES-GCM family that exercises GaloisCounterMode.
+        String suite = clientSsl.engine().getSession().getCipherSuite();
+        assertTrue("expected an AES-GCM cipher suite, got " + suite, suite.contains("AES") && suite.contains("GCM"));
+
+        String c2s = "client->server real-SSLEngine AES-GCM payload";
+        client.writeOutbound(alloc.buffer().writeBytes(c2s.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        pump(client, server);
+        assertEquals(c2s, serverGot.toString());
+
+        String s2c = "server->client real-SSLEngine AES-GCM payload";
+        server.writeOutbound(alloc.buffer().writeBytes(s2c.getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        pump(client, server);
+        assertEquals(s2c, clientGot.toString());
+
+        client.finishAndReleaseAll();
+        server.finishAndReleaseAll();
+    }
+
+    private static io.netty.channel.embedded.EmbeddedChannel newTlsChannel(ByteBufAllocator alloc,
+                                                                           io.netty.handler.ssl.SslHandler ssl,
+                                                                           StringBuilder sink)
+    {
+        io.netty.channel.embedded.EmbeddedChannel ch = new io.netty.channel.embedded.EmbeddedChannel();
+        ch.config().setAllocator(alloc);
+        ch.config().setOption(io.netty.channel.ChannelOption.ALLOCATOR, alloc);
+        ch.pipeline().addLast(ssl, new io.netty.channel.ChannelInboundHandlerAdapter()
+        {
+            @Override
+            public void channelRead(io.netty.channel.ChannelHandlerContext ctx, Object msg)
+            {
+                ByteBuf buf = (ByteBuf) msg;
+                try
+                {
+                    byte[] bytes = new byte[buf.readableBytes()];
+                    buf.readBytes(bytes);
+                    sink.append(new String(bytes, java.nio.charset.StandardCharsets.UTF_8));
+                }
+                finally
+                {
+                    buf.release();
+                }
+            }
+        });
+        return ch;
+    }
+
+    private static void pump(io.netty.channel.embedded.EmbeddedChannel client,
+                             io.netty.channel.embedded.EmbeddedChannel server) throws Throwable
+    {
+        boolean progressed = true;
+        int guard = 0;
+        while (progressed && guard++ < 200)
+        {
+            progressed = false;
+            Object o;
+            while ((o = client.readOutbound()) != null) { server.writeInbound(o); progressed = true; }
+            while ((o = server.readOutbound()) != null) { client.writeInbound(o); progressed = true; }
+            client.checkException();
+            server.checkException();
+        }
+    }
+
+    /**
      * Control: buffers sliced from a single BufferPool macro chunk (att = Chunk / DirectBufferRef). On JDK 25 the
      * AES-GCM op throws ClassCastException when the marker is disabled, and succeeds when it is enabled - proving
      * the marker is exactly what rescues BufferPool operands today, and (contrasted with the test above) that Netty
@@ -144,6 +254,21 @@ public class SslHandlerGcmAllocatorTest
         ByteBuffer cipher = pool.get(LEN + 16, BufferType.OFF_HEAP);
         try
         {
+            // T2: assert the trigger actually exists - the sliced BufferPool buffer must carry a NON-java.nio.Buffer att
+            // (a Chunk, or a Ref.DirectBufferRef under -Dcassandra.debugrefcount). If a future change made these buffers
+            // carry no att (or a Buffer att), the JDK 25 GaloisCounterMode att-walk would not throw and this negative
+            // control would pass vacuously. Fail loudly here instead.
+            Object plainAtt = MemoryUtil.getAttachment(plain);
+            Object cipherAtt = MemoryUtil.getAttachment(cipher);
+            assertTrue("sliced BufferPool 'plain' operand must have an att (the GCM trigger)", plainAtt != null);
+            assertTrue("sliced BufferPool 'cipher' operand must have an att (the GCM trigger)", cipherAtt != null);
+            assertTrue("'plain' att must be a non-java.nio.Buffer (Chunk/DirectBufferRef), else the JDK 25 CCE cannot "
+                       + "fire: was " + plainAtt.getClass().getName(),
+                       !(plainAtt instanceof java.nio.Buffer));
+            assertTrue("'cipher' att must be a non-java.nio.Buffer (Chunk/DirectBufferRef), else the JDK 25 CCE cannot "
+                       + "fire: was " + cipherAtt.getClass().getName(),
+                       !(cipherAtt instanceof java.nio.Buffer));
+
             plain.position(0).limit(LEN);
             boolean threw = false;
             try

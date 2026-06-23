@@ -322,7 +322,8 @@ public class OutboundConnectionInitiator<SuccessType extends OutboundConnectionI
             Initiate msg = new Initiate(settings.acceptVersions, type, settings.framing, settings.from);
             logger.trace("starting handshake with peer {}, msg = {}", settings.connectToId(), msg);
 
-            AsyncChannelPromise.writeAndFlush(ctx, msg.encode(),
+            boolean encrypted = ctx.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null;
+            AsyncChannelPromise.writeAndFlush(ctx, msg.encode(encrypted),
                       future -> { if (!future.isSuccess()) exceptionCaught(ctx, future.cause()); });
 
             ctx.fireChannelActive();

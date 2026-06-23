@@ -218,7 +218,13 @@ public class InboundMessageHandler extends AbstractMessageHandler
     // for various reasons, it's possible for a large message to be contained in a single frame
     private void processLargeMessage(ShareableBytes bytes, int size, Header header)
     {
-        new LargeMessage(size, header, bytes.sliceAndConsume(size).share()).schedule();
+        // CASSANDRA-21171 (P2): the LargeMessage holds this slice and is deserialized asynchronously on a stage thread,
+        // outliving channelRead. Under Option B zero-copy the slice pins a Netty arena chunk for that whole duration, so
+        // copy a Netty-backed slice into a BufferPool buffer and release the Netty slice now. No-op for BufferPool slices.
+        ShareableBytes slice = bytes.sliceAndConsume(size);
+        if (slice.isNettyBacked())
+            slice = slice.copyToPoolAndRelease();
+        new LargeMessage(size, header, slice.share()).schedule();
     }
 
     /*

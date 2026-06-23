@@ -106,7 +106,21 @@ public class TransportFrameTlsRoundTripTest
     }
 
     @Test
-    public void framedEncryptedRoundTrip() throws Throwable
+    public void framedEncryptedRoundTripCrc() throws Throwable
+    {
+        framedEncryptedRoundTrip(FrameEncoderCrc.instance,
+                                 FrameDecoderCrc.create(GlobalBufferPoolAllocator.instance));
+    }
+
+    @Test
+    public void framedEncryptedRoundTripLz4() throws Throwable
+    {
+        // T1: an LZ4 round trip through the full TLS frame path under Option B.
+        framedEncryptedRoundTrip(FrameEncoderLZ4.fastInstance,
+                                 FrameDecoderLZ4.fast(GlobalBufferPoolAllocator.instance));
+    }
+
+    private void framedEncryptedRoundTrip(FrameEncoder encoder, FrameDecoder serverDecoder) throws Throwable
     {
         Assume.assumeTrue("Run with -Dcassandra.net.netty_transport_allocator=true to exercise Option B",
                           TransportByteBufAllocator.USE_NETTY_POOL);
@@ -116,15 +130,14 @@ public class TransportFrameTlsRoundTripTest
         SslHandler clientSsl = clientCtx.newHandler(alloc);
         SslHandler serverSsl = serverCtx.newHandler(alloc);
 
-        // Server inbound: SslHandler decrypts -> FrameDecoderCrc decodes frames. FrameDecoder talks to its processor
+        // Server inbound: SslHandler decrypts -> FrameDecoder decodes frames. FrameDecoder talks to its processor
         // out-of-band (not via the pipeline), so we register a collecting FrameProcessor and activate it.
-        FrameDecoderCrc serverDecoder = FrameDecoderCrc.create(GlobalBufferPoolAllocator.instance);
         FrameCollector serverFrames = new FrameCollector();
 
         EmbeddedChannel client = newChannel(alloc);
         EmbeddedChannel server = newChannel(alloc);
 
-        client.pipeline().addLast(clientSsl, FrameEncoderCrc.instance);
+        client.pipeline().addLast(clientSsl, encoder);
         server.pipeline().addLast(serverSsl);
         serverDecoder.addLastTo(server.pipeline());
         serverDecoder.activate(serverFrames);
@@ -135,11 +148,11 @@ public class TransportFrameTlsRoundTripTest
         assertTrue("server handshake failed", serverSsl.handshakeFuture().isSuccess());
 
         // Send a real frame from client to server: build a FrameEncoder.Payload, write into it, hand to the encoder.
-        String message = "CASSANDRA-21171 Option B: a full FrameEncoderCrc -> SslHandler -> FrameDecoderCrc round trip "
+        String message = "CASSANDRA-21171 Option B: a full FrameEncoder -> SslHandler -> FrameDecoder round trip "
                          + "over the Netty transport allocator on JDK 25 with the AES-GCM marker disabled.";
         byte[] payload = message.getBytes(StandardCharsets.UTF_8);
 
-        FrameEncoder.Payload p = FrameEncoderCrc.instance.allocator().allocate(true, payload.length);
+        FrameEncoder.Payload p = encoder.allocator().allocate(true, payload.length);
         p.buffer.put(payload);
         p.finish();
         client.writeOutbound(p);

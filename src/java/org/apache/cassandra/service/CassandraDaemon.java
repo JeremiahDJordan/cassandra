@@ -267,6 +267,10 @@ public class CassandraDaemon
 
         NativeLibrary.tryMlockall();
 
+        // CASSANDRA-21171 (P3): surface the transport Netty pool's off-heap (arena/active/pinned bytes) as metrics.
+        // Under Option B this off-heap lives in Netty arenas, outside networking_cache_size and BufferPoolMetrics.
+        org.apache.cassandra.metrics.TransportBufferPoolMetrics.register();
+
         AsyncProfilerService.instance();
 
         Keyspace.setInitialized();

@@ -67,7 +67,7 @@ class FrameEncoderLZ4 extends FrameEncoder
         frame.putLong(0, header8b);
     }
 
-    public ByteBuf encode(boolean isSelfContained, ByteBuffer in)
+    public ByteBuf encode(boolean isSelfContained, ByteBuffer in, boolean encrypted)
     {
         ByteBuffer frame = null;
         try
@@ -105,7 +105,7 @@ class FrameEncoderLZ4 extends FrameEncoder
             frame.position(0);
 
             bufferPool.putUnusedPortion(frame);
-            return TransportByteBufAllocator.wrapFrame(frame);
+            return TransportByteBufAllocator.wrapFrame(frame, encrypted);
         }
         catch (Throwable t)
         {

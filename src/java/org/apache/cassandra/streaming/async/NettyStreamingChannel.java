@@ -150,6 +150,11 @@ public class NettyStreamingChannel extends ChannelInboundHandlerAdapter implemen
 
     public Future<?> send(Send send)
     {
+        // CASSANDRA-21171 (P1): the streaming send buffer is only a GCM operand when the channel is TLS-encrypted, so
+        // only divert it to Netty's pool then; an unencrypted streaming channel keeps the main BufferPool (no copy/extra
+        // arena pressure). Computed once here, off the event loop hot path.
+        final boolean useNettyPool = TransportByteBufAllocator.USE_NETTY_POOL
+                                     && channel.pipeline().get(io.netty.handler.ssl.SslHandler.class) != null;
         class Factory implements IntFunction<StreamingDataOutputPlus>
         {
             ByteBuf buf;
@@ -160,7 +165,7 @@ public class NettyStreamingChannel extends ChannelInboundHandlerAdapter implemen
             {
                 // Option B: take the streaming send buffer (a TLS wrap source) from Netty's pool so the AES-GCM
                 // operand carries a legal att chain on JDK 25; otherwise the main BufferPool as before.
-                buf = TransportByteBufAllocator.USE_NETTY_POOL
+                buf = useNettyPool
                       ? TransportByteBufAllocator.nettyPool().directBuffer(size)
                       : GlobalBufferPoolAllocator.instance.buffer(size);
                 buffer = buf.nioBuffer(buf.writerIndex(), size);

@@ -192,7 +192,7 @@ public class FramingTest
             payload.buffer.put(bytes);
             payload.finish();
 
-            ByteBuf buffer = encoder.encode(true, payload.buffer);
+            ByteBuf buffer = encoder.encode(true, payload.buffer, false);
             compressed.add(buffer);
             cumulativeCompressedLength[i] = (i == 0 ? 0 : cumulativeCompressedLength[i - 1]) + buffer.readableBytes();
         }

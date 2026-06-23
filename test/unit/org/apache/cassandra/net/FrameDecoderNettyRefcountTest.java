@@ -70,13 +70,36 @@ public class FrameDecoderNettyRefcountTest
         ClusterMetadataTestHelper.setInstanceForTest();
     }
 
-    /** Build a real CRC self-contained frame whose payload is {@code payload} into a heap ByteBuffer (header+CRC). */
-    private static ByteBuffer crcFrame(byte[] payload)
+    /**
+     * The two framings exercised under Option B. CRC takes a zero-copy slice of the inbound buffer on decode; LZ4
+     * either slices (when {@code uncompressedLength==0}, i.e. the payload did not compress) or decompresses into a fresh
+     * BufferPool buffer (when {@code uncompressedLength>0}).
+     */
+    enum Codec
     {
-        FrameEncoder.Payload p = FrameEncoderCrc.instance.allocator().allocate(true, payload.length);
+        CRC
+        {
+            FrameEncoder encoder() { return FrameEncoderCrc.instance; }
+            FrameDecoder decoder() { return FrameDecoderCrc.create(GlobalBufferPoolAllocator.instance); }
+        },
+        LZ4
+        {
+            FrameEncoder encoder() { return FrameEncoderLZ4.fastInstance; }
+            FrameDecoder decoder() { return FrameDecoderLZ4.fast(GlobalBufferPoolAllocator.instance); }
+        };
+
+        abstract FrameEncoder encoder();
+        abstract FrameDecoder decoder();
+    }
+
+    /** Build a real self-contained frame (CRC or LZ4) carrying {@code payload}, materialised into a heap ByteBuffer. */
+    private static ByteBuffer frame(Codec codec, boolean selfContained, byte[] payload)
+    {
+        FrameEncoder enc = codec.encoder();
+        FrameEncoder.Payload p = enc.allocator().allocate(selfContained, payload.length);
         p.buffer.put(payload);
         p.finish();
-        ByteBuf framed = FrameEncoderCrc.instance.encode(true, p.buffer);
+        ByteBuf framed = enc.encode(selfContained, p.buffer, false);
         try
         {
             ByteBuffer out = ByteBuffer.allocate(framed.readableBytes());
@@ -88,6 +111,12 @@ public class FrameDecoderNettyRefcountTest
         {
             framed.release();
         }
+    }
+
+    /** Build a real CRC self-contained frame whose payload is {@code payload} into a heap ByteBuffer (header+CRC). */
+    private static ByteBuffer crcFrame(byte[] payload)
+    {
+        return frame(Codec.CRC, true, payload);
     }
 
     /** Concatenate several framed byte sequences into one contiguous byte[]. */
@@ -145,25 +174,49 @@ public class FrameDecoderNettyRefcountTest
     @Test
     public void singleSelfContainedFrame() throws Exception
     {
-        for (boolean zeroCopy : new boolean[]{ true, false })
-            runSingle(zeroCopy);
+        // T1: parameterise over CRC and LZ4. For LZ4, use both an incompressible payload (uncompressedLength==0 -> the
+        // decoder takes a zero-copy slice, like CRC) and a highly-compressible payload (uncompressedLength>0 -> the
+        // decoder decompresses into a fresh BufferPool buffer). All must leave the inbound ByteBuf at refCnt 0.
+        for (Codec codec : Codec.values())
+            for (boolean zeroCopy : new boolean[]{ true, false })
+            {
+                runSingle(codec, zeroCopy, randomIncompressible(64));
+                runSingle(codec, zeroCopy, compressible(4096));
+            }
     }
 
-    private void runSingle(boolean zeroCopy) throws Exception
+    /** Random bytes that LZ4 cannot shrink, so an LZ4 frame stores them raw (uncompressedLength==0, slice on decode). */
+    private static byte[] randomIncompressible(int n)
+    {
+        byte[] b = new byte[n];
+        new java.util.Random(n * 31L + 7).nextBytes(b);
+        return b;
+    }
+
+    /** Highly-compressible bytes, so an LZ4 frame really compresses (uncompressedLength>0, decompress-to-pool on decode). */
+    private static byte[] compressible(int n)
+    {
+        byte[] b = new byte[n];
+        for (int i = 0; i < n; i++)
+            b[i] = (byte) ('a' + (i % 4));
+        return b;
+    }
+
+    private void runSingle(Codec codec, boolean zeroCopy, byte[] payload) throws Exception
     {
         ByteBufAllocator alloc = new UnpooledByteBufAllocator(true);
-        FrameDecoderCrc decoder = newDecoder();
+        FrameDecoder decoder = codec.decoder();
         Collector collector = new Collector();
-        byte[] payload = "hello-21171".getBytes();
-        byte[] framed = concat(java.util.Collections.singletonList(crcFrame(payload)));
+        byte[] framed = concat(java.util.Collections.singletonList(frame(codec, true, payload)));
 
         ByteBuf in = directBuf(alloc, framed, 0, framed.length);
         decoder.channelReadForTest(in, zeroCopy);
         decoder.processBacklogForTest(collector);
 
-        assertEquals("exactly one frame", 1, collector.payloads.size());
+        assertEquals("exactly one frame (" + codec + ")", 1, collector.payloads.size());
         assertArrayEquals(payload, collector.payloads.get(0));
-        assertEquals("ByteBuf released exactly once (zeroCopy=" + zeroCopy + ")", 0, in.refCnt());
+        assertEquals("ByteBuf released exactly once (" + codec + ", zeroCopy=" + zeroCopy + ", len=" + payload.length + ')',
+                     0, in.refCnt());
         decoder.discardForTest();
     }
 
@@ -305,6 +358,90 @@ public class FrameDecoderNettyRefcountTest
         assertEquals(1, collector.payloads.size());
         assertArrayEquals(payload, collector.payloads.get(0));
         assertEquals("composite (and its components) released exactly once", 0, composite.refCnt());
+        decoder.discardForTest();
+    }
+
+    @Test
+    public void multiFrameLargeMessageHeldSlices() throws Exception
+    {
+        // T3: a large message split into several NON-self-contained frames, each self-contained within one read. The
+        // processor mimics LargeMessage reassembly: it holds a slice per frame (sliceAndConsume(...).share()), then on
+        // the last frame reassembles, deserializes and releases all held slices. This exercises the P2 copy-out: a
+        // Netty-backed held slice is copied into a BufferPool buffer and the Netty slice released immediately, so the
+        // inbound ByteBuf returns to refCnt 0 once channelRead's own reference is dropped - NOT pinned until reassembly.
+        for (boolean zeroCopy : new boolean[]{ true, false })
+            runLargeMessage(zeroCopy);
+    }
+
+    private void runLargeMessage(boolean zeroCopy) throws Exception
+    {
+        ByteBufAllocator alloc = new PooledByteBufAllocator(true);
+        FrameDecoderCrc decoder = newDecoder();
+
+        // three non-self-contained frames; their concatenated payloads are the large message body
+        byte[][] parts = { "large-message-part-one-".getBytes(),
+                           "large-message-part-two-".getBytes(),
+                           "large-message-part-three".getBytes() };
+
+        // A reassembling processor: holds each frame's slice (copying out Netty-backed slices, per P2), then on the
+        // final frame concatenates the held bytes and releases everything.
+        class Reassembler implements FrameDecoder.FrameProcessor
+        {
+            final List<ShareableBytes> held = new ArrayList<>();
+            byte[] assembled;
+            int frames;
+
+            @Override
+            public boolean process(FrameDecoder.Frame frame)
+            {
+                FrameDecoder.IntactFrame intact = (FrameDecoder.IntactFrame) frame;
+                assertTrue("large-message frames are not self-contained", !intact.isSelfContained);
+                ShareableBytes slice = intact.contents.sliceAndConsume(intact.frameSize);
+                // P2: copy out a Netty-backed held slice so it does not pin a Netty arena chunk until reassembly.
+                if (slice.isNettyBacked())
+                    slice = slice.copyToPoolAndRelease();
+                held.add(slice.share());
+                if (++frames == parts.length)
+                {
+                    int total = 0;
+                    for (ShareableBytes b : held)
+                        total += b.get().remaining();
+                    assembled = new byte[total];
+                    int off = 0;
+                    for (ShareableBytes b : held)
+                    {
+                        ByteBuffer bb = b.get().duplicate();
+                        int n = bb.remaining();
+                        bb.get(assembled, off, n);
+                        off += n;
+                    }
+                    held.forEach(ShareableBytes::release);
+                    held.clear();
+                }
+                return true;
+            }
+        }
+        Reassembler reassembler = new Reassembler();
+
+        // Feed each non-self-contained frame as its own read (each self-contained within the read, so eligible for the
+        // zero-copy held-slice path that P2 must copy out).
+        byte[] expected = concat(java.util.Arrays.asList(ByteBuffer.wrap(parts[0]),
+                                                         ByteBuffer.wrap(parts[1]),
+                                                         ByteBuffer.wrap(parts[2])));
+        List<ByteBuf> reads = new ArrayList<>();
+        for (byte[] part : parts)
+        {
+            byte[] framed = concat(java.util.Collections.singletonList(frame(Codec.CRC, false, part)));
+            ByteBuf in = directBuf(alloc, framed, 0, framed.length);
+            reads.add(in);
+            decoder.channelReadForTest(in, zeroCopy);
+            decoder.processBacklogForTest(reassembler);
+        }
+
+        assertArrayEquals("large message reassembled byte-exact", expected, reassembler.assembled);
+        for (int i = 0; i < reads.size(); i++)
+            assertEquals("read " + i + " ByteBuf released exactly once (P2 copy-out frees the chunk; zeroCopy=" + zeroCopy + ')',
+                         0, reads.get(i).refCnt());
         decoder.discardForTest();
     }
 

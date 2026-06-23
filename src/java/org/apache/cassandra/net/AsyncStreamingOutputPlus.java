@@ -35,6 +35,7 @@ import org.apache.cassandra.streaming.StreamingDataOutputPlus;
 import org.apache.cassandra.utils.memory.BufferPool;
 import org.apache.cassandra.utils.memory.BufferPools;
 
+import io.netty.buffer.ByteBuf;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultFileRegion;
@@ -77,6 +78,15 @@ public class AsyncStreamingOutputPlus extends AsyncChannelOutputPlus implements 
         buffer = bufferPool.getAtLeast(8 << 10, BufferType.OFF_HEAP);
     }
 
+    /**
+     * CASSANDRA-21171 (P1): true if this channel has a TLS {@code SslHandler}. The per-frame Netty copy in
+     * {@code wrapFrame} is only needed for encrypted channels (AES-GCM operand att-legality); skip it otherwise.
+     */
+    private boolean isEncrypted()
+    {
+        return channel.pipeline().get(SslHandler.class) != null;
+    }
+
     @Override
     protected void doFlush(int count) throws IOException
     {
@@ -91,7 +101,20 @@ public class AsyncStreamingOutputPlus extends AsyncChannelOutputPlus implements 
         flush.flip();
         int byteCount = flush.limit();
         ChannelPromise promise = beginFlush(byteCount, 0, Integer.MAX_VALUE);
-        channel.writeAndFlush(TransportByteBufAllocator.wrapFrame(flush), promise);
+        // CASSANDRA-21171: wrapFrame returns `flush` to the pool only on success. On failure `buffer` still references
+        // `flush` (allocateBuffer() has not run), so the single owner is discard()/close() which frees it exactly once;
+        // we only need to fail the in-flight promise so the channel write path does not hang.
+        ByteBuf wrapped;
+        try
+        {
+            wrapped = TransportByteBufAllocator.wrapFrame(flush, isEncrypted());
+        }
+        catch (Throwable t)
+        {
+            promise.tryFailure(t);
+            throw t;
+        }
+        channel.writeAndFlush(wrapped, promise);
         allocateBuffer();
     }
 
@@ -142,7 +165,21 @@ public class AsyncStreamingOutputPlus extends AsyncChannelOutputPlus implements 
         bufferPool.putUnusedPortion(buffer);
 
         int length = buffer.limit();
-        channel.writeAndFlush(TransportByteBufAllocator.wrapFrame(buffer), holder.promise);
+        // CASSANDRA-21171: wrapFrame returns `buffer` to the pool only on success; if it throws (e.g.
+        // OutOfDirectMemoryError allocating the Netty buffer under Option B) we still own `buffer` and must free it
+        // exactly once, and fail the in-flight promise.
+        ByteBuf wrapped;
+        try
+        {
+            wrapped = TransportByteBufAllocator.wrapFrame(buffer, isEncrypted());
+        }
+        catch (Throwable t)
+        {
+            bufferPool.put(buffer);
+            holder.promise.tryFailure(t);
+            throw t;
+        }
+        channel.writeAndFlush(wrapped, holder.promise);
         return length;
     }
 

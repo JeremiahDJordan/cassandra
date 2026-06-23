@@ -27,6 +27,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
+import io.netty.handler.ssl.SslHandler;
 
 public abstract class FrameEncoder extends ChannelOutboundHandlerAdapter
 {
@@ -122,9 +123,14 @@ public abstract class FrameEncoder extends ChannelOutboundHandlerAdapter
     }
 
     /**
-     * Takes ownership of the lifetime of the provided buffer, which can be assumed to be managed by BufferPool
+     * Takes ownership of the lifetime of the provided buffer, which can be assumed to be managed by BufferPool.
+     *
+     * <p>{@code encrypted} (CASSANDRA-21171 P1) indicates whether the channel this frame is destined for has a TLS
+     * {@code SslHandler}; it is forwarded to {@link TransportByteBufAllocator#wrapFrame(ByteBuffer, boolean)} so that
+     * under Option B the per-frame Netty copy (needed only to give AES-GCM an {@code att}-legal operand) is skipped for
+     * non-encrypted channels.
      */
-    abstract ByteBuf encode(boolean isSelfContained, ByteBuffer buffer);
+    abstract ByteBuf encode(boolean isSelfContained, ByteBuffer buffer, boolean encrypted);
 
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) throws Exception
     {
@@ -132,7 +138,8 @@ public abstract class FrameEncoder extends ChannelOutboundHandlerAdapter
             throw new IllegalStateException("Unexpected type: " + msg);
 
         Payload payload = (Payload) msg;
-        ByteBuf write = encode(payload.isSelfContained, payload.buffer);
+        boolean encrypted = ctx.pipeline().get(SslHandler.class) != null;
+        ByteBuf write = encode(payload.isSelfContained, payload.buffer, encrypted);
         ctx.write(write, promise);
     }
 }

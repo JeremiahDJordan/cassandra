@@ -572,7 +572,15 @@ public abstract class AbstractMessageHandler extends ChannelInboundHandlerAdapte
             {
                 if (!expires)
                 {
-                    buffers.add(frame.contents.sliceAndConsume(frame.frameSize).share());
+                    // CASSANDRA-21171 (P2): this slice is held in `buffers` until the whole large message is reassembled
+                    // and deserialized, which outlives channelRead. Under Option B zero-copy the slice is backed by a
+                    // Netty arena chunk (4 MiB), so a held slice pins that whole chunk - a few KiB of frame can pin
+                    // multiple MiB. Copy Netty-backed held slices into a BufferPool buffer and release the Netty slice
+                    // immediately so the arena chunk frees within channelRead. BufferPool-backed slices are held as-is.
+                    ShareableBytes slice = frame.contents.sliceAndConsume(frame.frameSize);
+                    if (slice.isNettyBacked())
+                        slice = slice.copyToPoolAndRelease();
+                    buffers.add(slice.share());
                     return;
                 }
                 releaseBuffersAndCapacity(); // release resources once we transition from normal state to expired

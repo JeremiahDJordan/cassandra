@@ -122,9 +122,10 @@ class HandshakeProtocol
             return flags;
         }
 
-        ByteBuf encode()
+        ByteBuf encode(boolean encrypted)
         {
             ByteBuffer buffer = BufferPools.forNetworking().get(MAX_LENGTH, BufferType.OFF_HEAP);
+            boolean handedOff = false;
             try (DataOutputBufferFixed out = new DataOutputBufferFixed(buffer))
             {
                 out.writeInt(Message.PROTOCOL_MAGIC);
@@ -133,12 +134,22 @@ class HandshakeProtocol
                 out.writeInt(computeCrc32(buffer, 0, buffer.position()));
                 buffer.flip();
                 // Option B: the Initiate handshake message is a TLS wrap source on encrypted internode connections;
-                // route it through the transport allocator so its AES-GCM operand is a Netty (att-legal) buffer.
-                return TransportByteBufAllocator.wrapFrame(buffer);
+                // route it through the transport allocator so its AES-GCM operand is a Netty (att-legal) buffer. On a
+                // non-encrypted connection (P1) wrapFrame skips the copy and returns the zero-copy Wrapped as before.
+                // CASSANDRA-21171: wrapFrame returns `buffer` to the pool only on success, so on any failure path
+                // (incl. an OutOfDirectMemoryError from wrapFrame) we still own `buffer` and free it exactly once.
+                ByteBuf wrapped = TransportByteBufAllocator.wrapFrame(buffer, encrypted);
+                handedOff = true;
+                return wrapped;
             }
             catch (IOException e)
             {
                 throw new IllegalStateException(e);
+            }
+            finally
+            {
+                if (!handedOff)
+                    BufferPools.forNetworking().put(buffer);
             }
         }
 
