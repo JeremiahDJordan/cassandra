@@ -644,18 +644,40 @@ under Option B on an encrypted channel.
 ## Validation gate — exact results
 
 (Builds: clean `rm -rf build/{classes,test/classes,anttasks}` between JDK switches;
-JDKs `~/.sdkman/candidates/java/{11.0.31-amzn,25.0.3-amzn}`.)
+JDKs `~/.sdkman/candidates/java/{11.0.31-amzn,25.0.3-amzn}`, ant `~/.sdkman/candidates/ant/current/bin/ant`.)
 
-- **Builds:** JDK 11 `build-test` BUILD SUCCESSFUL; JDK 25 `build-test` BUILD SUCCESSFUL. _(see run log below for the
-  exact final figures recorded after the JDK 25 pass)_
-- **`FrameDecoderNettyRefcountTest`** (CRC + LZ4 + multi-frame large message) under
-  `-Dio.netty.leakDetection.level=paranoid`: JDK 11 `tests=8 failures=0 errors=0`, no Netty `LEAK:` reported.
-- **C1 proof** (`WrapFrameDoubleFreeTest`): injected failure asserts exactly one `put` of the source buffer — PASS.
-- **C2 large-message proof:** see below.
-- **GCM/TLS/streaming Option-B suites** (Option B ON + marker OFF + paranoid), JDK 11: `SslHandlerGcmAllocatorTest`
-  `tests=3`, `TransportFrameTlsRoundTripTest` `tests=2` (CRC+LZ4), `StreamingOptionBRefcountTest` `tests=1` — all PASS.
-- **Default-OFF regressions:** `FramingTest` JDK 11 `tests=3` PASS. _(CQLConnectionTest recorded below.)_
-- **`LongBufferPoolTest` burn** on JDK 25: recorded below.
+- **Builds (clean, both JDKs):** JDK 11 `build-test` BUILD SUCCESSFUL; JDK 25 `build-test` BUILD SUCCESSFUL.
+- **`FrameDecoderNettyRefcountTest`** (CRC + LZ4 incompressible/compressible + multi-frame large message) under
+  `-Dio.netty.leakDetection.level=paranoid`: **JDK 11 `tests=8 failures=0 errors=0`**, **JDK 25 `tests=8 failures=0
+  errors=0`**, no Netty `LEAK:` reported on either.
+- **C1 proof** (`WrapFrameDoubleFreeTest`): the injected `directBuffer()` failure asserts the source BufferPool buffer is
+  NOT freed on the throw path (caller owns it) and is then freed exactly once; the success case frees it exactly once.
+  **JDK 11 `tests=2`**, **JDK 25 `tests=2`** — PASS.
+- **C2 large-message proof** (`InternodeEncryptionEnforcementTest.testEncryptedLargeMessageRoundTrip` — real
+  internode_encryption=all + require_client_auth=true cluster; PINGs over the LARGE_MESSAGES connection both directions
+  + a ~100 KiB RF=2 replicated blob driving a multi-frame large mutation over encrypted TLS), JDK 25:
+  - **Option B ON + marker OFF ⇒ `tests=1 errors=0 failures=0` PASS**, NO `GaloisCounterMode.overlapDetection`
+    ClassCastException in the logs; `PoolThreadCache - Freed N thread-local buffer(s) from node{1,2}_Messaging-EventLoop`
+    confirms Netty arenas were used by the transport.
+  - **Negative control: Option B OFF + marker OFF ⇒ `errors=1`** — `ClassCastException:
+    Ref$DirectBufferRef cannot be cast to class java.nio.Buffer` at `GaloisCounterMode.overlapDetection` (surfaced as
+    "Found no candidates ... Check if the seeds are up"): the exact JDK 25 GCM bug, reproduced on a live encrypted
+    cluster over the LARGE_MESSAGES path — so the test is a faithful, non-vacuous proof and C2 is what fixes it.
+  - **Default shipped config: marker ON + Option B OFF ⇒ `tests=1 errors=0 failures=0` PASS** (no regression).
+- **GCM/TLS/streaming Option-B suites** (Option B ON + marker OFF + paranoid):
+  - `SslHandlerGcmAllocatorTest` (incl. the new att-non-Buffer assertion + real-`SSLEngine(JDK)` AES-GCM round trip):
+    JDK 11 `tests=3`, JDK 25 `tests=3` — PASS.
+  - `TransportFrameTlsRoundTripTest` (CRC + LZ4 over real OpenSSL TLS): JDK 11 `tests=2`, JDK 25 `tests=2` — PASS.
+  - `StreamingOptionBRefcountTest` (AsyncStreamingOutputPlus source-pool balance on an encrypted channel): JDK 11
+    `tests=1`, JDK 25 `tests=1` — PASS.
+- **Default-OFF regressions:** `FramingTest` JDK 11 `tests=3` / JDK 25 `tests=3` PASS; `CQLConnectionTest` JDK 25
+  default-off `tests=9` PASS and JDK 25 Option B ON + marker OFF + paranoid `tests=9` PASS (drives the inbound
+  Netty-`ByteBuf` FrameDecoder branch without TLS, no leak).
+- **`LongBufferPoolTest` burn** on JDK 25: `Tests run: 2, Failures: 0, Errors: 0` (240.7 s) — main pool undisturbed.
 
-_(JDK 25 figures, the C1/C2 proofs' exact output, CQLConnectionTest and the LongBufferPoolTest burn are filled in from
-the run log as each completes.)_
+## Not fully validated (honest)
+- The Phase-6/7 unrun items still stand: a real (non-in-JVM) network cluster, and a sustained RSS/throughput/latency
+  **soak** comparing Netty arenas vs the BufferPool (the metric `PinnedDirectMemory`/`UsedDirectMemory` gauges added by
+  P3 are now available to drive that soak, but the soak itself was not run here).
+- P3 metrics are registered and read live values, but a JMX/virtual-table scrape under load was not exercised beyond
+  unit-level registration.
