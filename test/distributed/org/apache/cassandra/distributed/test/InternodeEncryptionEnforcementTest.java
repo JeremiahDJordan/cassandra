@@ -46,6 +46,7 @@ import org.apache.cassandra.auth.AllowAllInternodeAuthenticator;
 import org.apache.cassandra.auth.IInternodeAuthenticator;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.distributed.Cluster;
+import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
 import org.apache.cassandra.distributed.api.IIsolatedExecutor.SerializableRunnable;
 import org.apache.cassandra.distributed.shared.NetworkTopology;
@@ -179,6 +180,62 @@ public final class InternodeEncryptionEnforcementTest extends TestBaseImpl
     public void testConnectionsAreAcceptedWhenAuthSucceds() throws IOException
     {
         verifyAuthenticationSucceeds(AllowAllInternodeAuthenticator.class);
+    }
+
+    /**
+     * CASSANDRA-21171 (C2 proof): a real encrypted (internode_encryption=all, require_client_auth=true) LARGE_MESSAGES
+     * round trip. The prior Option-B proof only sent small PINGs over the SMALL_MESSAGES connection and so missed that
+     * {@code InboundConnectionInitiator.setupMessagingPipeline} reset the LARGE_MESSAGES channel allocator back to a
+     * BufferPool-backed {@code LocalBufferPoolAllocator} while the SslHandler was still installed - feeding att=Chunk
+     * operands into GCM and throwing the JDK 25 ClassCastException for encrypted large messages.
+     *
+     * <p>This explicitly exercises the LARGE_MESSAGES connection in BOTH directions and additionally writes a >64 KiB
+     * value (RF=2) so a genuinely multi-frame large mutation is replicated over the encrypted large-messages path,
+     * driving the held-slice reassembly. With marker OFF + Option B ON on JDK 25 (the harness passes those via
+     * test.jvm.args) this must NOT throw the GCM CCE; the connections must establish and the read must return the value.
+     */
+    @Test
+    public void testEncryptedLargeMessageRoundTrip() throws IOException
+    {
+        Cluster.Builder builder = createCluster(AllowAllInternodeAuthenticator.class);
+        try (Cluster cluster = builder.start())
+        {
+            openConnections(cluster);
+
+            // Send PINGs explicitly over the LARGE_MESSAGES connection in both directions. Under the C2 bug the
+            // receiver's large-messages pipeline would throw the GCM CCE on JDK 25 (marker off, Option B on).
+            openConnections(cluster, 1, 2, Verb.PING_REQ, ConnectionType.LARGE_MESSAGES, false);
+            openConnections(cluster, 2, 1, Verb.PING_REQ, ConnectionType.LARGE_MESSAGES, false);
+
+            // A genuinely large replicated write (RF=2) -> a multi-frame large internode mutation over encrypted TLS.
+            cluster.schemaChange("CREATE KEYSPACE large_msg WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2};",
+                                 false, cluster.get(1), 30, TimeUnit.SECONDS);
+            cluster.schemaChange("CREATE TABLE large_msg.t (k int PRIMARY KEY, v blob);",
+                                 false, cluster.get(1), 30, TimeUnit.SECONDS);
+
+            StringBuilder hex = new StringBuilder("0x");
+            for (int i = 0; i < 200_000; i++) // ~100 KiB blob -> exceeds the 64 KiB large-message threshold
+                hex.append("ab");
+
+            cluster.coordinator(1).execute("INSERT INTO large_msg.t (k, v) VALUES (1, " + hex + ");",
+                                           ConsistencyLevel.ALL);
+
+            Object[][] rows = cluster.coordinator(2).execute("SELECT k FROM large_msg.t WHERE k = 1;",
+                                                             ConsistencyLevel.ALL);
+            assertEquals("the large replicated row must be readable at ALL (no GCM CCE on the encrypted large path)",
+                         1, rows.length);
+
+            // Connections established on both nodes.
+            SerializableRunnable runnable = () ->
+            {
+                InboundMessageHandlers inbound = getOnlyElement(MessagingService.instance().messageHandlers.values());
+                assertTrue(inbound.count() > 0);
+                OutboundConnections outbound = getOnlyElement(MessagingService.instance().channelManagers.values());
+                assertTrue(outbound.small.isConnected() || outbound.large.isConnected() || outbound.urgent.isConnected());
+            };
+            cluster.get(1).runOnInstance(runnable);
+            cluster.get(2).runOnInstance(runnable);
+        }
     }
 
     @Test
