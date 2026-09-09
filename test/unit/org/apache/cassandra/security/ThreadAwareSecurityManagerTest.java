@@ -37,6 +37,8 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.utils.logging.VirtualTableAppender;
 
 import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.Appender;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -121,16 +123,18 @@ public class ThreadAwareSecurityManagerTest
 
     public static class LoggingStartup
     {
+        @SuppressWarnings("unchecked")
         public static void main(String[] args)
         {
             DatabaseDescriptor.clientInitialization();
-            VirtualTableAppender first = new VirtualTableAppender();
-            VirtualTableAppender second = new VirtualTableAppender();
+            Appender<?> first = new VirtualTableAppender();
+            Appender<?> second = new VirtualTableAppender();
             first.setName("first");
             second.setName("second");
             Logger logger = (Logger) LoggerFactory.getLogger(LoggingStartup.class);
-            logger.addAppender(first);
-            logger.addAppender(second);
+            // Logback supplies LoggingEvent instances to these appenders.
+            logger.addAppender((Appender<ILoggingEvent>) first);
+            logger.addAppender((Appender<ILoggingEvent>) second);
             try
             {
                 ThreadAwareSecurityManager.install();
