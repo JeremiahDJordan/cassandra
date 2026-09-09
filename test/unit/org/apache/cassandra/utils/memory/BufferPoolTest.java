@@ -30,6 +30,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
+
 import com.google.common.collect.Iterables;
 
 import org.junit.Before;
@@ -38,6 +39,8 @@ import org.junit.Test;
 
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.utils.concurrent.Ref;
+import org.apache.cassandra.utils.concurrent.Ref.DirectBufferRef;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -57,6 +60,34 @@ public class BufferPoolTest
     public void setUp()
     {
         bufferPool = new BufferPool("test_pool", 8 * 1024 * 1024, true);
+    }
+
+    @Test
+    public void testPooledBuffersRetainTheirOwnersDirectly()
+    {
+        for (int size : new int[]{ 32, 1024, 8192, 65536 })
+        {
+            ByteBuffer buffer = bufferPool.get(size, BufferType.OFF_HEAP);
+            try
+            {
+                Object attachment = MemoryUtil.getAttachment(buffer);
+                BufferPool.Chunk chunk = BufferPool.Chunk.getParentChunk(buffer);
+                assertNotNull(chunk);
+                if (Ref.TRACE_ENABLED)
+                {
+                    assertTrue(attachment instanceof DirectBufferRef);
+                    assertSame(chunk, ((DirectBufferRef<?>) attachment).get());
+                }
+                else
+                {
+                    assertSame(chunk, attachment);
+                }
+            }
+            finally
+            {
+                bufferPool.put(buffer);
+            }
+        }
     }
 
     @Test

@@ -62,6 +62,8 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.channel.unix.Errors;
+import io.netty.handler.ssl.CassandraSslEngine;
+import io.netty.handler.ssl.JdkSslContext;
 import io.netty.handler.ssl.SslClosedEngineException;
 import io.netty.handler.ssl.SslContext;
 import io.netty.handler.ssl.SslHandler;
@@ -221,11 +223,22 @@ public final class SocketFactory
      */
     public static SslHandler newSslHandler(Channel channel, SslContext sslContext, @Nullable InetSocketAddress peer)
     {
+        SslHandler sslHandler;
+        if (Runtime.version().feature() >= 25 && sslContext instanceof JdkSslContext)
+        {
+            sslHandler = CassandraSslEngine.newHandler((JdkSslContext) sslContext, channel.alloc(),
+                                                      peer == null ? null : peer.getHostString(),
+                                                      peer == null ? -1 : peer.getPort());
+        }
+        else
+        {
+            sslHandler = peer == null ? sslContext.newHandler(channel.alloc())
+                                      : sslContext.newHandler(channel.alloc(), peer.getHostString(), peer.getPort());
+        }
         if (peer == null)
-            return sslContext.newHandler(channel.alloc());
+            return sslHandler;
 
         logger.debug("Creating SSL handler for {}:{}", peer.getHostString(), peer.getPort());
-        SslHandler sslHandler = sslContext.newHandler(channel.alloc(), peer.getHostString(), peer.getPort());
         SSLEngine engine = sslHandler.engine();
         SSLParameters sslParameters = engine.getSSLParameters();
         sslParameters.setEndpointIdentificationAlgorithm("HTTPS");
