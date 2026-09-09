@@ -18,11 +18,14 @@
 
 package org.apache.cassandra.utils.memory;
 
+import java.lang.invoke.MethodHandles;
+import java.lang.invoke.VarHandle;
 import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Queue;
 import java.util.Set;
@@ -138,6 +141,124 @@ public class BufferPool
     private static final Logger logger = LoggerFactory.getLogger(BufferPool.class);
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 15L, TimeUnit.MINUTES);
     private static final ByteBuffer EMPTY_BUFFER = ByteBuffer.allocateDirect(0);
+
+    /**
+     * JDK 25 AES-GCM casts each direct-buffer attachment to {@code java.nio.Buffer}. BufferPool normally
+     * attaches a {@link Chunk} or {@link DirectBufferRef}, which causes {@link ClassCastException} on JDK 25.
+     * Use a Buffer marker on JDK 25+ with an integer index identifying the owning chunk.
+     */
+    private static final boolean GCM_NEEDS_BUFFER_ATTACHMENT = Runtime.version().feature() >= 25;
+
+    private static final AttachmentRegistry ATTACHMENTS = GCM_NEEDS_BUFFER_ATTACHMENT ? new AttachmentRegistry() : null;
+
+    /**
+     * Each normal chunk has a stable page: slot zero holds its current incarnation and slots 1..64 hold tiny
+     * children by their offset in the slab. Only allocating or freeing a macro/normal slab takes the registry
+     * lock. Tiny chunks reuse these slots without global allocation or hashing, including on cross-thread returns.
+     *
+     * A private direct-buffer marker carries the page/slot index in its mark field. Negative marks remain undefined
+     * to Buffer.reset(); position, limit, capacity and the real base address are unchanged. The terminal marker
+     * preserves GCM overlap detection for slices of the same chunk without walking up to the macro allocation.
+     */
+    private static final class AttachmentRegistry
+    {
+        private static final int SLOT_BITS = 7;
+        private static final int SLOT_MASK = (1 << SLOT_BITS) - 1;
+        private static final int PAGE_SIZE = 65;
+        private static final int MAX_PAGES = 1 << (31 - SLOT_BITS);
+        private static final VarHandle PAGE = MethodHandles.arrayElementVarHandle(Chunk[][].class);
+        private static final VarHandle CHUNK = MethodHandles.arrayElementVarHandle(Chunk[].class);
+
+        private volatile Chunk[][] pages = new Chunk[256][];
+        private final ArrayDeque<Integer> unusedPages = new ArrayDeque<>();
+        private int nextPage;
+
+        private synchronized int allocatePage()
+        {
+            int page;
+            if (!unusedPages.isEmpty())
+                page = unusedPages.removeLast();
+            else
+            {
+                if (nextPage == MAX_PAGES)
+                    throw new IllegalStateException("BufferPool attachment index exhausted");
+                page = nextPage++;
+                if (page == pages.length)
+                    pages = Arrays.copyOf(pages, Math.min(MAX_PAGES, pages.length * 2));
+            }
+            PAGE.setRelease(pages, page, new Chunk[PAGE_SIZE]);
+            return page << SLOT_BITS;
+        }
+
+        private static int index(ByteBuffer marker)
+        {
+            return -MemoryUtil.getAttachmentMarker(marker) - 2;
+        }
+
+        void register(Chunk chunk)
+        {
+            Chunk parent = chunk.slab.capacity() == TINY_CHUNK_SIZE ? Chunk.getParentChunk(chunk.slab) : null;
+            int index;
+            if (parent != null && parent.capacity() == NORMAL_CHUNK_SIZE)
+            {
+                int slot = 1 + (int) ((chunk.baseAddress - parent.baseAddress) / TINY_CHUNK_SIZE);
+                assert slot > 0 && slot < PAGE_SIZE;
+                index = index(parent.attachmentMarker) + slot;
+            }
+            else
+                index = allocatePage();
+
+            MemoryUtil.setAttachmentMarker(chunk.attachmentMarker, -index - 2);
+            replace(chunk);
+        }
+
+        void replace(Chunk chunk)
+        {
+            int index = index(chunk.attachmentMarker);
+            Chunk[] page = (Chunk[]) PAGE.getAcquire(pages, index >>> SLOT_BITS);
+            CHUNK.setRelease(page, index & SLOT_MASK, chunk);
+        }
+
+        Chunk get(ByteBuffer marker)
+        {
+            int index = index(marker);
+            Chunk[][] directory = pages;
+            int pageIndex = index >>> SLOT_BITS;
+            int slot = index & SLOT_MASK;
+            if (index < 0 || pageIndex >= directory.length || slot >= PAGE_SIZE)
+                return null;
+            Chunk[] page = (Chunk[]) PAGE.getAcquire(directory, pageIndex);
+            if (page == null)
+                return null;
+            Chunk chunk = (Chunk) CHUNK.getAcquire(page, slot);
+            // Slots can be reused. An unrelated buffer or retired marker must never resolve to a new owner.
+            return chunk != null && chunk.attachmentMarker == marker ? chunk : null;
+        }
+
+        void remove(Chunk chunk)
+        {
+            int index = index(chunk.attachmentMarker);
+            int slot = index & SLOT_MASK;
+            if (slot == 0)
+            {
+                removePage(index >>> SLOT_BITS, chunk);
+                return;
+            }
+            Chunk[] page = (Chunk[]) PAGE.getAcquire(pages, index >>> SLOT_BITS);
+            if (page != null)
+                CHUNK.compareAndSet(page, slot, chunk, null);
+        }
+
+        private synchronized void removePage(int index, Chunk chunk)
+        {
+            Chunk[] page = (Chunk[]) PAGE.getAcquire(pages, index);
+            if (page != null && CHUNK.compareAndSet(page, 0, chunk, null))
+            {
+                PAGE.setRelease(pages, index, null);
+                unusedPages.addLast(index);
+            }
+        }
+    }
 
     private volatile Debug debug = Debug.NO_OP;
     private volatile DebugLeaks debugLeaks = DebugLeaks.NO_OP;
@@ -991,6 +1112,8 @@ public class BufferPool
             ByteBuffer buffer = chunk.slab;
             Chunk parentChunk = Chunk.getParentChunk(buffer);
             assert parentChunk != null;  // tiny chunk always has a parent chunk
+            // Tiny chunks do not call unsafeFree. Remove the marker before returning the slab to the parent.
+            chunk.dropAttachmentMarker();
             put(buffer, parentChunk);
         }
 
@@ -1167,6 +1290,9 @@ public class BufferPool
         @VisibleForTesting
         Object debugAttachment;
 
+        // JDK 25+ Buffer attachment used by AES-GCM; its mark indexes ATTACHMENTS.
+        private final ByteBuffer attachmentMarker;
+
         Chunk(Chunk recycle)
         {
             assert recycle.freeSlots == 0L;
@@ -1175,6 +1301,9 @@ public class BufferPool
             this.shift = recycle.shift;
             this.freeSlots = -1L;
             this.recycler = recycle.recycler;
+            this.attachmentMarker = recycle.attachmentMarker; // Recycled chunks retain the same slab and marker.
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                ATTACHMENTS.replace(this);
         }
 
         Chunk(Recycler recycler, ByteBuffer slab)
@@ -1189,6 +1318,17 @@ public class BufferPool
             this.shift = 31 & (Integer.numberOfTrailingZeros(slab.capacity() / 64));
             // -1 means all free whilst 0 means all in use
             this.freeSlots = slab.capacity() == 0 ? 0L : -1L;
+            this.attachmentMarker = GCM_NEEDS_BUFFER_ATTACHMENT ? newAttachmentMarker(baseAddress, slab.capacity()) : null;
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                ATTACHMENTS.register(this);
+        }
+
+        /** Creates a Buffer attachment at the chunk base with no parent attachment. */
+        private static ByteBuffer newAttachmentMarker(long baseAddress, int capacity)
+        {
+            ByteBuffer marker = MemoryUtil.getHollowDirectByteBuffer(ByteOrder.BIG_ENDIAN);
+            MemoryUtil.setDirectByteBuffer(marker, baseAddress, capacity);
+            return marker;
         }
 
         @Override
@@ -1329,12 +1469,19 @@ public class BufferPool
             if (attachment instanceof DirectBufferRef)
                 return ((DirectBufferRef<Chunk>) attachment).get();
 
+            // JDK 25+ attachments are marker buffers carrying a registry index.
+            if (GCM_NEEDS_BUFFER_ATTACHMENT && attachment instanceof ByteBuffer)
+                return ATTACHMENTS.get((ByteBuffer) attachment);
+
             return null;
         }
 
         void setAttachment(ByteBuffer buffer)
         {
-            if (REF_TRACE_ENABLED)
+            // JDK 25+ uses a Buffer attachment for AES-GCM. JDK 24 and lower use the Chunk attachment.
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                MemoryUtil.setAttachment(buffer, attachmentMarker);
+            else if (REF_TRACE_ENABLED)
                 MemoryUtil.setAttachment(buffer, new DirectBufferRef<>(this, null));
             else
                 MemoryUtil.setAttachment(buffer, this);
@@ -1346,7 +1493,7 @@ public class BufferPool
             if (attachment == null)
                 return false;
 
-            if (REF_TRACE_ENABLED)
+            if (REF_TRACE_ENABLED && attachment instanceof DirectBufferRef)
                 ((DirectBufferRef<Chunk>) attachment).release();
 
             return true;
@@ -1560,8 +1707,16 @@ public class BufferPool
         }
 
         @VisibleForTesting
+        /** Removes this chunk from the attachment registry when its slab is retired. */
+        private void dropAttachmentMarker()
+        {
+            if (GCM_NEEDS_BUFFER_ATTACHMENT)
+                ATTACHMENTS.remove(this);
+        }
+
         void unsafeFree()
         {
+            dropAttachmentMarker();
             Chunk parent = getParentChunk(slab);
             if (parent != null)
                 parent.free(slab);

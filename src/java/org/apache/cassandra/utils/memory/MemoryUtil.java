@@ -41,6 +41,7 @@ public abstract class MemoryUtil
     private static final long DIRECT_BYTE_BUFFER_LIMIT_OFFSET;
     private static final long DIRECT_BYTE_BUFFER_POSITION_OFFSET;
     private static final long DIRECT_BYTE_BUFFER_ATTACHMENT_OFFSET;
+    private static final long BUFFER_MARK_OFFSET;
     protected static final Class<?> BYTE_BUFFER_CLASS;
     private static final long BYTE_ARRAY_BASE_OFFSET;
 
@@ -56,6 +57,7 @@ public abstract class MemoryUtil
             DIRECT_BYTE_BUFFER_CAPACITY_OFFSET = unsafe.objectFieldOffset(Buffer.class.getDeclaredField("capacity"));
             DIRECT_BYTE_BUFFER_LIMIT_OFFSET = unsafe.objectFieldOffset(Buffer.class.getDeclaredField("limit"));
             DIRECT_BYTE_BUFFER_POSITION_OFFSET = unsafe.objectFieldOffset(Buffer.class.getDeclaredField("position"));
+            BUFFER_MARK_OFFSET = unsafe.objectFieldOffset(Buffer.class.getDeclaredField("mark"));
             DIRECT_BYTE_BUFFER_ATTACHMENT_OFFSET = unsafe.objectFieldOffset(clazz.getDeclaredField("att"));
             DIRECT_BYTE_BUFFER_CLASS = clazz;
             RO_DIRECT_BYTE_BUFFER_CLASS = ByteBuffer.allocateDirect(0).asReadOnlyBuffer().getClass();
@@ -148,6 +150,18 @@ public abstract class MemoryUtil
     {
         assert instance.getClass() == DIRECT_BYTE_BUFFER_CLASS;
         return unsafe.getObject(instance, DIRECT_BYTE_BUFFER_ATTACHMENT_OFFSET);
+    }
+
+    // Only private BufferPool attachment markers carry an index in this otherwise undefined mark.
+    static void setAttachmentMarker(ByteBuffer marker, int value)
+    {
+        assert isExactlyDirect(marker) && value < -1;
+        unsafe.putInt(marker, BUFFER_MARK_OFFSET, value);
+    }
+
+    static int getAttachmentMarker(ByteBuffer marker)
+    {
+        return unsafe.getInt(marker, BUFFER_MARK_OFFSET);
     }
 
     // Note: If encryption is used, the Object attached must implement sun.nio.ch.DirectBuffer
