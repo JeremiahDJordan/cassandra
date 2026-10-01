@@ -266,6 +266,17 @@ public class VectorMemoryIndexTest extends SAITester
     }
 
     /**
+     * With more writers than OnHeapGraph allows into jvector at once, a writer that loses the race to add a shared vector
+     * must return its graph insert permit. A leaked permit would leave later writers waiting forever.
+     */
+    @Test
+    public void testConcurrentAddsOfSharedVectorsExceedingJVectorPoolCap() throws Exception
+    {
+        int numThreads = 2 * OnHeapGraph.MAX_CONCURRENT_GRAPH_INSERTS;
+        testConcurrentAddsAreEventuallyConsistent(numThreads, VECTORS_PER_THREAD_BEYOND_POOL_CAP, (threadId, i) -> makeSharedVector(i));
+    }
+
+    /**
      * Verifies that concurrent calls to add() do not corrupt the graph or lose data.
      * <p>
      * GraphIndexBuilder.addGraphNode() is designed for concurrent use: insertionsInProgress
