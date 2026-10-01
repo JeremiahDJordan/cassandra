@@ -175,55 +175,56 @@ public class OnHeapGraph<T>
 
         long bytesUsed = 0L;
 
-        // Store a cached reference to the vector for brute force computations later. Because insertions
-        // for the same primary key are guaranteed to be sequential, there is no race condition here.
-        if (vectorsByKey != null)
-        {
-            vectorsByKey.put(key, vector);
-            // The size of the entries themselves are counted below, so just count the two extra references
-            bytesUsed += RamUsageEstimator.NUM_BYTES_OBJECT_REF * 2L;
-        }
-
         VectorPostings<T> postings = postingsMap.get(vector);
-        // if the vector is already in the graph, all that happens is that the postings list is updated
-        // otherwise, we add the vector in this order:
-        // 1. to the postingsMap
-        // 2. to the vectorValues
-        // 3. to the graph
-        // This way, concurrent searches of the graph won't see the vector until it's visible
-        // in the other structures as well.
-        if (postings == null)
+        // A new vector needs a graph insert permit. Wait for it before changing anything, so that an interrupted wait
+        // leaves the graph and the cached vector for the key unchanged. A vector registered but never added to the
+        // graph would not be added by a retry either.
+        boolean holdsPermit = postings == null && graphInsertPermits != null;
+        if (holdsPermit)
+            graphInsertPermits.acquireThrowUncheckedOnInterrupt(1);
+        try
         {
-            postings = new VectorPostings<>(key);
-            // since we are using ConcurrentSkipListMap, it is NOT correct to use computeIfAbsent here
-            if (postingsMap.putIfAbsent(vector, postings) == null)
+            // Store a cached reference to the vector for brute force computations later. Because insertions
+            // for the same primary key are guaranteed to be sequential, there is no race condition here.
+            if (vectorsByKey != null)
             {
-                // we won the race to add the new entry; assign it an ordinal and add to the other structures
-                int ordinal = nextOrdinal.getAndIncrement();
-                postings.setOrdinal(ordinal);
-                bytesUsed += RamEstimation.concurrentHashMapRamUsed(1); // the new posting Map entry
-                bytesUsed += (vectorValues instanceof ConcurrentVectorValues)
-                             ? ((ConcurrentVectorValues) vectorValues).add(ordinal, vector)
-                             : ((CompactionVectorValues) vectorValues).add(ordinal, term);
-                bytesUsed += VectorPostings.emptyBytesUsed() + VectorPostings.bytesPerPosting();
-                postingsByOrdinal.put(ordinal, postings);
-                if (graphInsertPermits != null)
-                    graphInsertPermits.acquireThrowUncheckedOnInterrupt(1);
-                try
-                {
-                    bytesUsed += builder.addGraphNode(ordinal, vectorValues);
-                }
-                finally
-                {
-                    if (graphInsertPermits != null)
-                        graphInsertPermits.release(1);
-                }
-                return bytesUsed;
+                vectorsByKey.put(key, vector);
+                // The size of the entries themselves are counted below, so just count the two extra references
+                bytesUsed += RamUsageEstimator.NUM_BYTES_OBJECT_REF * 2L;
             }
-            else
+
+            // if the vector is already in the graph, all that happens is that the postings list is updated
+            // otherwise, we add the vector in this order:
+            // 1. to the postingsMap
+            // 2. to the vectorValues
+            // 3. to the graph
+            // This way, concurrent searches of the graph won't see the vector until it's visible
+            // in the other structures as well.
+            if (postings == null)
             {
+                postings = new VectorPostings<>(key);
+                // since we are using ConcurrentSkipListMap, it is NOT correct to use computeIfAbsent here
+                if (postingsMap.putIfAbsent(vector, postings) == null)
+                {
+                    // we won the race to add the new entry; assign it an ordinal and add to the other structures
+                    int ordinal = nextOrdinal.getAndIncrement();
+                    postings.setOrdinal(ordinal);
+                    bytesUsed += RamEstimation.concurrentHashMapRamUsed(1); // the new posting Map entry
+                    bytesUsed += (vectorValues instanceof ConcurrentVectorValues)
+                                 ? ((ConcurrentVectorValues) vectorValues).add(ordinal, vector)
+                                 : ((CompactionVectorValues) vectorValues).add(ordinal, term);
+                    bytesUsed += VectorPostings.emptyBytesUsed() + VectorPostings.bytesPerPosting();
+                    postingsByOrdinal.put(ordinal, postings);
+                    bytesUsed += builder.addGraphNode(ordinal, vectorValues);
+                    return bytesUsed;
+                }
                 postings = postingsMap.get(vector);
             }
+        }
+        finally
+        {
+            if (holdsPermit)
+                graphInsertPermits.release(1);
         }
         // postings list already exists, just add the new key (if it's not already in the list)
         if (postings.add(key))
