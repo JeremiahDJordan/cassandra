@@ -124,5 +124,7 @@
 ### Enable vector incubator feature (simd support)
 
 --add-modules jdk.incubator.vector
+# JVector selects Highway when its native library is available, otherwise Java.
+--enable-native-access=ALL-UNNAMED
 
 # The newline in the end of file is intentional

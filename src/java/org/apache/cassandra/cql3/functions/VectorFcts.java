@@ -22,7 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Random;
 
-import io.github.jbellis.jvector.vector.ArrayVectorFloat;
+import io.github.jbellis.jvector.vector.types.FloatArray;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorUtil;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
@@ -234,7 +234,7 @@ public class VectorFcts
                     VectorUtil.l2normalize(vector);
 
                     // serialize the normalized vector
-                    return vectorType.getSerializer().serializeFloatArray(((ArrayVectorFloat) vector).get());
+                    return vectorType.getSerializer().serializeFloatArray(((FloatArray) vector).array());
                 }
             };
         }

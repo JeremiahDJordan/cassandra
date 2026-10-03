@@ -1004,6 +1004,9 @@ public enum CassandraRelevantProperties
     SAI_VECTOR_SEARCH_MAX_MATERIALIZE_KEYS("cassandra.sai.vector_search.max_materialized_keys", "16000"),
     /** Controls the maximum top-k limit for vector search */
     SAI_VECTOR_SEARCH_MAX_TOP_K("cassandra.sai.vector_search.max_top_k", "1000"),
+    /** Prepare eligible standalone PQ codebooks using the active provider's preferred search layout. */
+    SAI_VECTOR_TRANSPOSED_SMALL_SUBVECTORS("cassandra.sai.ann_small_subvector_transposed", "true"),
+
     SAI_VECTOR_USE_PRUNING_DEFAULT("cassandra.sai.jvector.use_pruning_default", "false"),
 
     /** The class to use for selecting the current version of the SAI on-disk index format on a per-keyspace basis. */

@@ -18,17 +18,31 @@
 
 package org.apache.cassandra.index.sai.disk.vector;
 
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+
+import org.junit.Rule;
 import org.junit.Test;
+import org.junit.rules.TemporaryFolder;
+
+import io.github.jbellis.jvector.vector.types.FloatArray;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.SequentialWriter;
+import org.apache.cassandra.io.util.SequentialWriterOption;
 
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertEquals;
 
 
 public class ConcurrentVectorValuesTest
 {
+    @Rule
+    public TemporaryFolder temporaryFolder = new TemporaryFolder();
+
     private final VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
 
     @Test(expected = IllegalStateException.class)
@@ -47,6 +61,25 @@ public class ConcurrentVectorValuesTest
         vectorValues.add(2, vts.createFloatVector(new float[]{ 2.0f }));
 
         assertNull(vectorValues.getVector(0));
-        assertArrayEquals(new float[]{ 1.0f }, (float[]) vectorValues.getVector(1).get(), 0f);
+        assertArrayEquals(new float[]{ 1.0f }, ((FloatArray) vectorValues.getVector(1)).array(), 0f);
+    }
+
+    @Test
+    public void testWriteProviderVectorsInMappedOrder() throws Exception
+    {
+        var vectors = new ConcurrentVectorValues(2);
+        vectors.add(2, vts.createFloatVector(new float[]{ -0.0f, 3.5f }));
+        vectors.add(7, vts.createFloatVector(new float[]{ 1.25f, -2.5f }));
+        File file = new File(temporaryFolder.newFile());
+        try (SequentialWriter writer = new SequentialWriter(file, SequentialWriterOption.newBuilder().finishOnClose(true).build()))
+        {
+            vectors.write(writer, ordinal -> ordinal == 0 ? 7 : 2);
+        }
+        ByteBuffer bytes = ByteBuffer.wrap(Files.readAllBytes(file.toPath()));
+        assertEquals(2, bytes.getInt());
+        assertEquals(2, bytes.getInt());
+        for (float value : new float[]{ 1.25f, -2.5f, -0.0f, 3.5f })
+            assertEquals(Float.floatToRawIntBits(value), Float.floatToRawIntBits(bytes.getFloat()));
+        assertEquals(0, bytes.remaining());
     }
 }

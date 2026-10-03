@@ -57,12 +57,15 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.CloseableIterator;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VECTOR_TRANSPOSED_SMALL_SUBVECTORS;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 
 public class CassandraDiskAnn
 {
     private static final Logger logger = LoggerFactory.getLogger(CassandraDiskAnn.class.getName());
+
+    private static final boolean TRANSPOSED_SMALL_SUBVECTORS = SAI_VECTOR_TRANSPOSED_SMALL_SUBVECTORS.getBoolean();
 
     public static final int PQ_MAGIC = 0xB011A61C; // PQ_MAGIC, with a lot of liberties taken
     protected final PerIndexFiles indexFiles;
@@ -138,7 +141,9 @@ public class CassandraDiskAnn
             {
                 if (compressionType == VectorCompression.CompressionType.PRODUCT_QUANTIZATION)
                 {
-                    compressedVectors = PQVectors.load(reader, reader.getFilePointer());
+                    compressedVectors = TRANSPOSED_SMALL_SUBVECTORS
+                                        ? PQVectors.loadForSearch(reader, reader.getFilePointer(), similarityFunction)
+                                        : PQVectors.load(reader, reader.getFilePointer());
                     pq = ((PQVectors) compressedVectors).getCompressor();
                     compression = new VectorCompression(compressionType,
                                                         compressedVectors.getOriginalSize(),

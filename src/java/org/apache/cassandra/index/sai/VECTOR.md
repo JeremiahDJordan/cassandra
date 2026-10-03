@@ -390,8 +390,37 @@ policy, including nonpositive values that disable reranking. Memtable budgets ar
 This policy does not make the shared approximate score floor safe; use
 `cassandra.sai.rerank_floor=false` for the tested configuration.
 
-The fraction is a workload-dependent accuracy/latency tradeoff, not a recall guarantee. See
-`tools/ann_recall/RESULTS_FRACTION.md` for the 100k/million-vector sweep and individual-query
-regressions. Proportional result shares are enabled by default with a `0.30` minimum
+The fraction is a workload-dependent accuracy/latency tradeoff, not a recall guarantee.
+Proportional result shares are enabled by default with a `0.30` minimum
 rerank fraction and the shared score floor disabled. Set
 `cassandra.sai.reduce_topk_across_sstables=false` to use full local limits instead.
+
+
+### SIMD provider and search codebook layout
+
+On JDK 22 or newer, JVector automatically tries its bundled Google Highway library.
+Highway selects a supported ISA for the host. If native support is missing or cannot load,
+JVector uses Java's Vector API when available, or the scalar Java implementation. The
+JDK 22 server options enable the Vector API and native access. Earlier JVMs retain their
+Java provider. Use `-Djvector.enable_native_vectorization=false` to select Java explicitly.
+The older `jvector.experimental.enable_native_vectorization` switch remains an alias,
+with the new property taking precedence. `jvector.vectorization_provider` is a strict
+diagnostic override; forcing an unavailable provider is an error.
+
+Standalone cosine and dot-product PQ readers may read the unchanged codebook bytes
+directly into one transposed in-memory representation. This permits the native kernel
+to score multiple centroids together. Selection requires an available transposed kernel,
+an active NEON dispatcher, 256 centroids, and subvector widths from one through eight.
+Other ISAs, shapes, Java providers, and Euclidean readers retain centroid-major storage.
+Selection depends on hardware, codebook shape, and similarity, with no dataset identities
+or query-specific thresholds. Fused PQ and NVQ keep their existing paths. Codebooks on
+disk and index versions remain unchanged; no index rebuild is required.
+
+`cassandra.sai.ann_small_subvector_transposed` defaults to `true`. Set it to `false` and
+restart to keep the original in-memory layout while retaining automatic Highway selection.
+Neither layout changes the configured ANN search budget.
+
+The local branch uses `io.github.jbellis:jvector:4.0.2-ann-search-SNAPSHOT` to make the
+paired JVector changes reviewable and reproducible. Build and install that branch before
+building Cassandra. A release must replace this local coordinate with a published artifact
+and validate the native packages on the supported operating systems and architectures.
