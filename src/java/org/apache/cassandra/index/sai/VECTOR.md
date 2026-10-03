@@ -410,7 +410,7 @@ diagnostic override; forcing an unavailable provider is an error.
 Standalone cosine and dot-product PQ readers may read the unchanged codebook bytes
 directly into one transposed in-memory representation. This permits the native kernel
 to score multiple centroids together. Selection requires an available transposed kernel,
-an active NEON dispatcher, 256 centroids, and subvector widths from one through eight.
+an active NEON or AVX2 dispatcher, 256 centroids, and subvector widths from one through eight.
 Other ISAs, shapes, Java providers, and Euclidean readers retain centroid-major storage.
 Selection depends on hardware, codebook shape, and similarity, with no dataset identities
 or query-specific thresholds. Fused PQ and NVQ keep their existing paths. Codebooks on
