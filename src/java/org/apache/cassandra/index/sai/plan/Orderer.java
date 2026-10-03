@@ -68,6 +68,7 @@ public class Orderer
     private float[] rawVector;
     private VectorFloat<?> vector;
     private final ANNOptions annOptions;
+    private final int annGlobalLimit;
 
     // BM25 search parameter
     private List<ByteBuffer> queryTerms;
@@ -84,11 +85,35 @@ public class Orderer
      */
     public Orderer(IndexContext context, Operator operator, ByteBuffer term, ANNOptions annOptions)
     {
+        this(context, operator, term, annOptions, 0);
+    }
+
+    private Orderer(IndexContext context, Operator operator, ByteBuffer term, ANNOptions annOptions, int annGlobalLimit)
+    {
+        this.annGlobalLimit = annGlobalLimit;
         this.context = context;
         assert ORDER_BY_OPERATORS.contains(operator) : "Invalid operator for order by clause " + operator;
         this.operator = operator;
         this.annOptions = annOptions;
         this.term = term;
+    }
+
+    /**
+     * Preserve the request limit before reducing each segment's output share. The copy is local to
+     * this search/planning operation, so concurrent searches cannot overwrite each other's budget.
+     */
+    public Orderer withAnnGlobalLimit(int limit)
+    {
+        if (!isANN() || annGlobalLimit == limit)
+            return this;
+
+        if (limit <= 0)
+            throw new IllegalArgumentException("ANN global limit must be positive");
+
+        Orderer copy = new Orderer(context, operator, term, annOptions, limit);
+        copy.rawVector = rawVector;
+        copy.vector = vector;
+        return copy;
     }
 
     public String getIndexName()
@@ -130,9 +155,16 @@ public class Orderer
     public int rerankKFor(int limit, VectorCompression vc)
     {
         assert isANN() : "rerankK is only valid for ANN queries";
-        return annOptions.rerankK != null
-               ? annOptions.rerankK
-               : context.getIndexWriterConfig().getSourceModel().rerankKFor(limit, vc);
+        if (annOptions.rerankK != null)
+            return annOptions.rerankK;
+
+        var model = context.getIndexWriterConfig().getSourceModel();
+        int localBudget = model.rerankKFor(limit, vc);
+        if (annGlobalLimit <= limit || AnnSearchBudget.MIN_RERANK_FRACTION == 0)
+            return localBudget;
+
+        return AnnSearchBudget.applyFraction(localBudget, model.rerankKFor(annGlobalLimit, vc),
+                                            AnnSearchBudget.MIN_RERANK_FRACTION);
     }
 
     /**

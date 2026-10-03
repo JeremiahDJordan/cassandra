@@ -369,3 +369,29 @@ that the "filter" in step 7 additionally applies the boolean predicates and filt
 
 The primary cost of post-filtering is that we might materialize many rows before finding the ones that match the boolean
 predicates. As such, we have a cost based optimizer that helps determine which approach is best for a given query.
+
+### Automatic budgets across vector segments
+
+When `cassandra.sai.reduce_topk_across_sstables=true`, each segment initially returns a proportional
+share of the request limit. Automatic exploration and reranking use a separate budget:
+
+`max(model(local limit), ceil(fraction * model(unreduced request limit)))`
+
+Configure the fraction with the server JVM property `cassandra.sai.ann_min_rerank_fraction`
+(default `0.30`, finite range `[0, 1]`). Restart the server to change it. Zero preserves the
+original proportional search depth; one gives every segment the unreduced model's reranking
+budget while still returning proportional result shares. That can incur more resume/merge work
+than disabling proportional limits entirely. A single graph whose local limit equals the
+request limit retains its existing model budget for every fraction. Source model and compression
+adjustments apply to both budget calculations, and planning uses the same policy as execution.
+
+Explicit `ANN_OPTIONS.rerank_k` values retain their existing semantics and bypass this automatic
+policy, including nonpositive values that disable reranking. Memtable budgets are unchanged.
+This policy does not make the shared approximate score floor safe; use
+`cassandra.sai.rerank_floor=false` for the tested configuration.
+
+The fraction is a workload-dependent accuracy/latency tradeoff, not a recall guarantee. See
+`tools/ann_recall/RESULTS_FRACTION.md` for the 100k/million-vector sweep and individual-query
+regressions. Proportional result shares are enabled by default with a `0.30` minimum
+rerank fraction and the shared score floor disabled. Set
+`cassandra.sai.reduce_topk_across_sstables=false` to use full local limits instead.

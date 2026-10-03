@@ -210,6 +210,7 @@ public class V1SearchableIndex implements SearchableIndex
                                                                   int limit,
                                                                   long totalRows) throws IOException
     {
+        Orderer segmentOrderer = orderer.withAnnGlobalLimit(limit);
         var iterators = new ArrayList<CloseableIterator<PrimaryKeyWithSortKey>>(segments.size());
         try
         {
@@ -218,10 +219,9 @@ public class V1SearchableIndex implements SearchableIndex
                 if (segment.intersects(keyRange))
                 {
                     context.addSegmentsHit(1);
-                    // Note that the proportionality is not used when the user supplies a rerank_k value in the
-                    // ANN_OPTIONS map.
+                    // Output shares remain proportional; automatic search depth also uses the unreduced limit.
                     var segmentLimit = segment.proportionalAnnLimit(limit, totalRows);
-                    iterators.add(segment.orderBy(orderer, slice, keyRange, context, segmentLimit));
+                    iterators.add(segment.orderBy(segmentOrderer, slice, keyRange, context, segmentLimit));
                 }
             }
 
@@ -237,6 +237,7 @@ public class V1SearchableIndex implements SearchableIndex
     @Override
     public List<CloseableIterator<PrimaryKeyWithSortKey>> orderResultsBy(QueryContext context, List<PrimaryKey> keys, Orderer orderer, int limit, long totalRows) throws IOException
     {
+        Orderer segmentOrderer = orderer.withAnnGlobalLimit(limit);
         var results = new ArrayList<CloseableIterator<PrimaryKeyWithSortKey>>(segments.size());
         try
         {
@@ -246,7 +247,7 @@ public class V1SearchableIndex implements SearchableIndex
                 // Only pass the primary keys in a segment's range to the segment index.
                 var segmentKeys = PrimaryKeyListUtil.getKeysInRange(keys, segment.metadata.minKey, segment.metadata.maxKey);
                 var segmentLimit = segment.proportionalAnnLimit(limit, totalRows);
-                results.add(segment.orderResultsBy(context, segmentKeys, orderer, segmentLimit));
+                results.add(segment.orderResultsBy(context, segmentKeys, segmentOrderer, segmentLimit));
             }
 
             return results;

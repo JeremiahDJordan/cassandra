@@ -52,6 +52,24 @@ public class OrdererTest extends VectorTester
         assertToString(orderer, "col DESC", "col DESC");
     }
 
+    @Test
+    public void automaticAnnBudgetUsesUnreducedLimit()
+    {
+        VectorType<Float> vectorType = VectorType.getInstance(FloatType.instance, 2);
+        IndexContext context = SAITester.createIndexContext("col", vectorType);
+        Orderer orderer = new Orderer(context, Operator.ANN, vectorType.decompose(vector(1f, 2f)), ANNOptions.NONE);
+        var compression = context.getIndexWriterConfig().getSourceModel().compressionProvider.apply(384);
+        for (int limit : new int[] { 10, 20, 50, 100 })
+        {
+            int original = orderer.rerankKFor(limit, compression);
+            Assertions.assertThat(orderer.withAnnGlobalLimit(limit).rerankKFor(limit, compression)).isEqualTo(original);
+            int local = orderer.rerankKFor(1, compression);
+            int expected = AnnSearchBudget.applyFraction(local, original, AnnSearchBudget.MIN_RERANK_FRACTION);
+            Assertions.assertThat(orderer.withAnnGlobalLimit(limit).rerankKFor(1, compression)).isEqualTo(expected);
+            Assertions.assertThat(orderer.rerankKFor(1, compression)).isEqualTo(local);
+        }
+    }
+
     private static void assertToString(Orderer orderer, String expectedRedacted, String expectedUnredacted)
     {
         Assertions.assertThat(orderer.toString(Redaction.REDACT))

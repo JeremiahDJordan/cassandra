@@ -809,6 +809,9 @@ public enum CassandraRelevantProperties
      */
     SAI_ALL_QUERIES_LATENCY_HISTOGRAM_ENABLED("cassandra.sai.metrics.histograms.all_queries.enabled", "true"),
 
+    /** Minimum automatic segment rerank budget as a fraction of the unreduced model budget; range [0, 1]. */
+    SAI_ANN_MIN_RERANK_FRACTION("cassandra.sai.ann_min_rerank_fraction", "0.30"),
+
     /** Class used to discover/load the proper SAI index components file for a given sstable. */
     SAI_ANN_USE_SYNTHETIC_SCORE("cassandra.sai.ann_use_synthetic_score", "false"),
 
@@ -820,7 +823,10 @@ public enum CassandraRelevantProperties
     SAI_ENABLE_GENERAL_ORDER_BY("cassandra.sai.general_order_by", "true"),
     SAI_ENABLE_JVECTOR_DELETES("cassandra.sai.enable_jvector_deletes", "true"),
     SAI_ENABLE_LTM_CONSTRUCTION("cassandra.sai.ltm_construction", "true"),
-    SAI_ENABLE_RERANK_FLOOR("cassandra.sai.rerank_floor", "true"),
+    // A proportional segment top-k does not establish a safe global rerank cutoff. Candidates below
+    // that approximate score can have better exact scores than the iterator head, and resuming later
+    // cannot reliably repair the ordering assumed by the cross-segment merge. Keep this opt-in.
+    SAI_ENABLE_RERANK_FLOOR("cassandra.sai.rerank_floor", "false"),
     // When building a compaction graph, encode layer 0 nodes in parallel and subsequently use async io for writes.
     // This feature is experimental, so defaults to false.
     SAI_ENCODE_AND_WRITE_VECTOR_GRAPH_IN_PARALLEL_ENABLED("cassandra.sai.vector.encode_and_write_graph_in_parallel.enabled", "false"),
@@ -938,6 +944,8 @@ public enum CassandraRelevantProperties
      */
     SAI_QUERY_PLAN_METRICS_ENABLED("cassandra.sai.metrics.query_plan.enabled", "true"),
 
+    // Use proportional result shares with an automatic rerank budget bounded below by
+    // SAI_ANN_MIN_RERANK_FRACTION of the unreduced query budget. Disable for full local limits.
     SAI_REDUCE_TOPK_ACROSS_SSTABLES("cassandra.sai.reduce_topk_across_sstables", "true"),
 
     /**

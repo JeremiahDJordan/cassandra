@@ -1119,6 +1119,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
         QueryView queryView = getQueryView(orderer.context);
 
+        Orderer segmentOrderer = orderer.withAnnGlobalLimit(limit);
         int memoryRerankK = orderer.rerankKFor(limit, VectorCompression.NO_COMPRESSION);
         double cost = 0;
         for (MemtableIndex index : queryView.memtableIndexes)
@@ -1140,7 +1141,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
                     continue;
                 int segmentLimit = segment.proportionalAnnLimit(limit, totalRows);
                 int segmentCandidates = max(1, (int) (candidates * (double) segment.metadata.numRows / totalRows));
-                cost += segment.estimateAnnSearchCost(orderer, segmentLimit, segmentCandidates);
+                cost += segment.estimateAnnSearchCost(segmentOrderer, segmentLimit, segmentCandidates);
             }
         }
         return cost;
