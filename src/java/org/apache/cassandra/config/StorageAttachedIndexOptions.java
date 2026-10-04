@@ -38,8 +38,30 @@ public class StorageAttachedIndexOptions
 
     public volatile boolean prioritize_over_legacy_index = true;
 
+    // Captured during configuration validation, before the node accepts queries.
+    private double annMinRerankFraction = 0.30;
+
+    public double getAnnMinRerankFraction()
+    {
+        return annMinRerankFraction;
+    }
+
     public void validate()
     {
+        var property = CassandraRelevantProperties.SAI_ANN_MIN_RERANK_FRACTION;
+        final double fraction;
+        try
+        {
+            fraction = property.getDouble();
+        }
+        catch (ConfigurationException e)
+        {
+            throw new ConfigurationException(property.getKey() + " must be a finite number in [0, 1]", e);
+        }
+        if (!Double.isFinite(fraction) || fraction < 0 || fraction > 1)
+            throw new ConfigurationException(property.getKey() + " must be a finite number in [0, 1]");
+        annMinRerankFraction = fraction;
+
         if (segment_write_buffer_size == null || segment_write_buffer_size.toMebibytes() > MAXIMUM_SEGMENT_BUFFER_MB)
         {
             throw new ConfigurationException("Invalid value for segment_write_buffer_size. " +

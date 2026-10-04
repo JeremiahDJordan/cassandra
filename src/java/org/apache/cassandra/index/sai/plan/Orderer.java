@@ -32,6 +32,7 @@ import javax.annotation.Nullable;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.filter.ANNOptions;
 import org.apache.cassandra.db.filter.RowFilter;
@@ -160,11 +161,11 @@ public class Orderer
 
         var model = context.getIndexWriterConfig().getSourceModel();
         int localBudget = model.rerankKFor(limit, vc);
-        if (annGlobalLimit <= limit || AnnSearchBudget.MIN_RERANK_FRACTION == 0)
+        double fraction = DatabaseDescriptor.getSaiAnnMinRerankFraction();
+        if (annGlobalLimit <= limit || fraction == 0)
             return localBudget;
 
-        return AnnSearchBudget.applyFraction(localBudget, model.rerankKFor(annGlobalLimit, vc),
-                                            AnnSearchBudget.MIN_RERANK_FRACTION);
+        return AnnSearchBudget.applyFraction(localBudget, model.rerankKFor(annGlobalLimit, vc), fraction);
     }
 
     /**

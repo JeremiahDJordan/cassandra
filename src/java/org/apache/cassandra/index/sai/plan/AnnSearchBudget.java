@@ -18,23 +18,10 @@
 
 package org.apache.cassandra.index.sai.plan;
 
-import org.apache.cassandra.exceptions.ConfigurationException;
-
-import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_ANN_MIN_RERANK_FRACTION;
-
 /** Separates a segment's expected result share from the depth needed to find accurate neighbors. */
 final class AnnSearchBudget
 {
-    static final double MIN_RERANK_FRACTION = validateFraction(SAI_ANN_MIN_RERANK_FRACTION.getDouble());
-
     private AnnSearchBudget() {}
-
-    static double validateFraction(double fraction)
-    {
-        if (!Double.isFinite(fraction) || fraction < 0 || fraction > 1)
-            throw new ConfigurationException(SAI_ANN_MIN_RERANK_FRACTION.getKey() + " must be finite and in [0, 1]");
-        return fraction;
-    }
 
     static int applyFraction(int localBudget, int globalBudget, double fraction)
     {

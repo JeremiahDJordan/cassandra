@@ -22,13 +22,11 @@ import org.junit.Test;
 
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.filter.ANNOptions;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.index.sai.disk.vector.VectorCompression;
 import org.apache.cassandra.index.sai.disk.vector.VectorSourceModel;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
-import static org.junit.Assert.fail;
 
 public class AnnSearchBudgetTest
 {
@@ -74,22 +72,6 @@ public class AnnSearchBudgetTest
                     previous = budget;
                 }
             }
-    }
-
-    @Test
-    public void rejectsInvalidFractions()
-    {
-        assertEquals(0, AnnSearchBudget.validateFraction(0), 0);
-        assertEquals(1, AnnSearchBudget.validateFraction(1), 0);
-        for (double fraction : new double[] { -0.01, 1.01, Double.NaN, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY })
-        {
-            try
-            {
-                AnnSearchBudget.validateFraction(fraction);
-                fail("Accepted " + fraction);
-            }
-            catch (ConfigurationException expected) {}
-        }
     }
 
     @Test

@@ -18,6 +18,7 @@ package org.apache.cassandra.index.sai.plan;
 
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.filter.ANNOptions;
 import org.apache.cassandra.db.marshal.FloatType;
@@ -64,7 +65,7 @@ public class OrdererTest extends VectorTester
             int original = orderer.rerankKFor(limit, compression);
             Assertions.assertThat(orderer.withAnnGlobalLimit(limit).rerankKFor(limit, compression)).isEqualTo(original);
             int local = orderer.rerankKFor(1, compression);
-            int expected = AnnSearchBudget.applyFraction(local, original, AnnSearchBudget.MIN_RERANK_FRACTION);
+            int expected = AnnSearchBudget.applyFraction(local, original, DatabaseDescriptor.getSaiAnnMinRerankFraction());
             Assertions.assertThat(orderer.withAnnGlobalLimit(limit).rerankKFor(1, compression)).isEqualTo(expected);
             Assertions.assertThat(orderer.rerankKFor(1, compression)).isEqualTo(local);
         }

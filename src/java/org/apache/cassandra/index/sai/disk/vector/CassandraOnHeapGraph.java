@@ -610,14 +610,14 @@ public class CassandraOnHeapGraph<T> implements Accountable
                         // We can exit now because we won't find a better candidate
                         var candidate = new PqInfo(searcher.getPQ(), searcher.containsUnitVectors(), segment.metadata.numRows);
                         if (segment.metadata.numRows >= ProductQuantization.MAX_PQ_TRAINING_SET_SIZE)
-                            return candidate;
+                            return candidate.forEncoding();
 
                         cvi = candidate;
                         maxRows = segment.metadata.numRows;
                     }
                 }
             }
-            return cvi;
+            return cvi == null ? null : cvi.forEncoding();
         }
         finally
         {
@@ -730,6 +730,13 @@ public class CassandraOnHeapGraph<T> implements Accountable
             this.pq = pq;
             this.unitVectors = unitVectors;
             this.rowCount = rowCount;
+        }
+
+        /** Detach write-heavy reuse from the source segment's search layout. */
+        PqInfo forEncoding()
+        {
+            var encoder = pq.forEncoding();
+            return encoder == pq ? this : new PqInfo(encoder, unitVectors, rowCount);
         }
     }
 

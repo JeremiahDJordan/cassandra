@@ -5579,6 +5579,11 @@ public class DatabaseDescriptor
         conf.paxos_repair_race_wait = paxosRepairRaceWait;
     }
 
+    public static double getSaiAnnMinRerankFraction()
+    {
+        return conf.sai_options.getAnnMinRerankFraction();
+    }
+
     public static int getSAISegmentWriteBufferSpace()
     {
         return conf == null ? StorageAttachedIndexOptions.DEFAULT_SEGMENT_BUFFER_MB : conf.sai_options.segment_write_buffer_size.toMebibytes();

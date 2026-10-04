@@ -377,8 +377,15 @@ share of the request limit. Automatic exploration and reranking use a separate b
 
 `max(model(local limit), ceil(fraction * model(unreduced request limit)))`
 
+PQ reuse for flush and compaction selects a detached centroid-major compressor through
+`ProductQuantization.forEncoding()`. The source segment keeps its transposed search
+layout. Conversion occurs only for the selected source compressor, with one write-owned
+codebook copy, so encoding and graph building retain their original bulk access paths.
+
 Configure the fraction with the server JVM property `cassandra.sai.ann_min_rerank_fraction`
-(default `0.30`, finite range `[0, 1]`). Restart the server to change it. Zero preserves the
+(default `0.30`, finite range `[0, 1]`). Node startup rejects invalid values,
+including non-numeric input. The validated value is captured during configuration;
+restart the server to change it. Zero preserves the
 original proportional search depth; one gives every segment the unreduced model's reranking
 budget while still returning proportional result shares. That can incur more resume/merge work
 than disabling proportional limits entirely. A single graph whose local limit equals the
