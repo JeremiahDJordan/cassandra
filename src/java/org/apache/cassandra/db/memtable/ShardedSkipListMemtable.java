@@ -123,6 +123,10 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
     @Override
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
+        // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the update is
+        // visible, for the reads that purge the tombstones older than it
+        if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+            updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
         DecoratedKey key = update.partitionKey();
         MemtableShard shard = shards[boundaries.getShardForKey(key)];
         return shard.put(key, update, indexer, opGroup);
@@ -173,15 +177,6 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
         for (MemtableShard shard : shards)
             min =  Long.min(min, shard.minTimestamp());
         return min != EncodingStats.NO_STATS.minTimestamp ? min : NO_MIN_TIMESTAMP;
-    }
-
-    @Override
-    public long getMinLocalDeletionTime()
-    {
-        long min = Long.MAX_VALUE;
-        for (MemtableShard shard : shards)
-            min = Long.min(min, shard.minLocalDeletionTime());
-        return min;
     }
 
     @Override
@@ -350,7 +345,6 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
 
         // The smallest timestamp for all partitions stored in this shard
         private final AtomicLong minTimestamp = new AtomicLong(Long.MAX_VALUE);
-        private final AtomicLong minLocalDeletionTime = new AtomicLong(Long.MAX_VALUE);
 
         private final AtomicLong liveDataSize = new AtomicLong(0);
 
@@ -402,10 +396,6 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
                 }
             }
 
-            // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the update
-            // is visible, for the reads that purge the tombstones older than it
-            if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
-                updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
             BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
             updateMin(minTimestamp, update.stats().minTimestamp);
             liveDataSize.addAndGet(initialSize + updater.dataSize);
@@ -464,11 +454,6 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
         long currentOperations()
         {
             return currentOperations.get();
-        }
-
-        public long minLocalDeletionTime()
-        {
-            return minLocalDeletionTime.get();
         }
 
         public DecoratedKey minPartitionKey()
@@ -539,6 +524,10 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
         @Override
         public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
         {
+            // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the update
+            // is visible, for the reads that purge the tombstones older than it
+            if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+                updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
             DecoratedKey key = update.partitionKey();
             MemtableShard shard = shards[boundaries.getShardForKey(key)];
             synchronized (shard)

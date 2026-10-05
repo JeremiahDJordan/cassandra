@@ -31,7 +31,6 @@ import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.Slices;
@@ -116,6 +115,10 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
     @Override
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
+        // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the update is
+        // visible, for the reads that purge the tombstones older than it
+        if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+            updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
         DecoratedKey key = update.partitionKey();
         AbstractMemtableShard<?, ?> shard = getShards()[boundaries.getShardForKey(key)];
         long colUpdateTimeDelta = shard.put(update, indexer, opGroup);
@@ -150,15 +153,6 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
         for (AbstractMemtableShard<?, ?> shard : getShards())
             min = EncodingStats.mergeMinTimestamp(min, shard.stats);
         return min != EncodingStats.NO_STATS.minTimestamp ? min : NO_MIN_TIMESTAMP;
-    }
-
-    @Override
-    public long getMinLocalDeletionTime()
-    {
-        long min = Long.MAX_VALUE;
-        for (AbstractMemtableShard<?, ?> shard : getShards())
-            min = EncodingStats.mergeMinLocalDeletionTime(min, shard.stats);
-        return min;
     }
 
     @Override
@@ -520,11 +514,6 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
             {
                 // Merge columns before applying the update, because a reader may otherwise miss a column.
                 columns = columns.mergeTo(update.columns());
-                // The stats give the minimum local deletion time, which goes down before the update is visible, for the
-                // reads that purge the tombstones older than it
-                stats = stats.mergeWith(new EncodingStats(LivenessInfo.NO_TIMESTAMP,
-                                                          update.stats().minLocalDeletionTime,
-                                                          EncodingStats.NO_STATS.minTTL));
                 Throwable updateFailure = null;
                 try
                 {

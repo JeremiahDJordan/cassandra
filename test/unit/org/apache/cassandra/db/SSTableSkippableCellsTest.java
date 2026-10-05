@@ -30,7 +30,7 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.Int32Type;
-import org.apache.cassandra.db.memtable.TrieMemtable;
+import org.apache.cassandra.db.memtable.AbstractMemtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BTreeRow;
@@ -140,7 +140,7 @@ public class SSTableSkippableCellsTest extends CQLTester
         // read reads the row again
         Injection hideExpiredData = Injections.newCustom("hide_expired_memtable_data")
                                               .add(InvokePointBuilder.newInvokePoint()
-                                                                     .onClass(TrieMemtable.class)
+                                                                     .onClass(AbstractMemtable.class)
                                                                      .onMethod("getMinLocalDeletionTime")
                                                                      .atEntry())
                                               .add(ActionBuilder.newActionBuilder().actions().doReturn("Long.MAX_VALUE"))

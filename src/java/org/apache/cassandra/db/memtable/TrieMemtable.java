@@ -351,6 +351,10 @@ public class TrieMemtable extends AbstractShardedMemtable
     @Override
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
+        // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the update is
+        // visible, for the reads that purge the tombstones older than it
+        if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+            updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
         DecoratedKey key = update.partitionKey();
         MemtableShard shard = shards[boundaries.getShardForKey(key)];
         long colUpdateTimeDelta = shard.put(update, indexer, opGroup);
@@ -455,15 +459,6 @@ public class TrieMemtable extends AbstractShardedMemtable
         for (MemtableShard shard : shards)
             min =  EncodingStats.mergeMinTimestamp(min, shard.stats);
         return min != EncodingStats.NO_STATS.minTimestamp ? min : NO_MIN_TIMESTAMP;
-    }
-
-    @Override
-    public long getMinLocalDeletionTime()
-    {
-        long min = Long.MAX_VALUE;
-        for (MemtableShard shard : shards)
-            min =  EncodingStats.mergeMinLocalDeletionTime(min, shard.stats);
-        return min;
     }
 
     @Override
@@ -872,9 +867,6 @@ public class TrieMemtable extends AbstractShardedMemtable
             {
                 // Merge columns before applying the update, because a reader may otherwise miss a column.
                 columns = columns.mergeTo(update.columns());
-                // The stats give the minimum local deletion time, which goes down before the update is visible, for the
-                // reads that purge the tombstones older than it
-                stats = stats.mergeWith(update.stats());
 
                 Throwable mergeFailure = null;
                 try
@@ -887,6 +879,11 @@ public class TrieMemtable extends AbstractShardedMemtable
                                                       opGroup,
                                                       updater);
                     partitionCount += partitionsAdded;
+                    // A failed merge leaves the trie unchanged, so the update's effects must not be applied.
+                    updateLiveDataSize(updater.dataSize);
+                    updateMinTimestamp(update.stats().minTimestamp);
+                    updateCurrentOperations(update.operationCount());
+                    stats = stats.mergeWith(update.stats());
                 }
                 catch (Throwable t)
                 {
@@ -895,21 +892,12 @@ public class TrieMemtable extends AbstractShardedMemtable
                 }
                 finally
                 {
-                    try
-                    {
-                        // A failed merge leaves the trie without any of the update's rows and deletions, so the
-                        // indexes must not see it either.
-                        if (mergeFailure == null)
-                            indexer.commit();
-                        else
-                            abortIndexTransaction(indexer, mergeFailure);
-                    }
-                    finally
-                    {
-                        updateMinTimestamp(update.stats().minTimestamp);
-                        updateLiveDataSize(updater.dataSize);
-                        updateCurrentOperations(update.operationCount());
-                    }
+                    // A failed merge leaves the trie without any of the update's rows and deletions, so the indexes
+                    // must not see it either.
+                    if (mergeFailure == null)
+                        indexer.commit();
+                    else
+                        abortIndexTransaction(indexer, mergeFailure);
                 }
                 this.cellDataBufferManager.opOrderGroup = null;
             }
