@@ -22,12 +22,14 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.RangeTombstone;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.memtable.SkipListMemtable;
 import org.apache.cassandra.db.memtable.TrieMemtable;
@@ -51,7 +53,9 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
     private static final String TABLE = "CREATE TABLE %s (pk bigint, ck bigint, s bigint static, v bigint, c set<bigint>, PRIMARY KEY (pk, ck)) WITH ";
     private static final String REVERSED_TABLE = TABLE + "CLUSTERING ORDER BY (ck DESC) AND ";
     /// Rows of this table are written with `ck2` 0 and 1 for each `ck`.
-    private static final String MULTI_COLUMN_TABLE = "CREATE TABLE %s (pk bigint, ck bigint, ck2 bigint, s bigint static, v bigint, c set<bigint>, PRIMARY KEY (pk, ck, ck2)) WITH ";
+    private static final String MULTI_COLUMN_TABLE = "CREATE TABLE %s (pk bigint, ck bigint, ck2 bigint, " +
+                                                     "s bigint static, v bigint, c set<bigint>, " +
+                                                     "PRIMARY KEY (pk, ck, ck2)) WITH ";
 
     /// Pairs of deletion steps. A step is a list of clustering restrictions, applied as a single update (a batch if
     /// there is more than one); an empty restriction deletes the whole partition. Entries made with [#deleteAt] and
@@ -127,13 +131,13 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
     private static final long BETWEEN_TIMESTAMP = 150;
     private static final long[][] DELETION_TIMESTAMPS = { { 100, 200 }, { 200, 100 } };
 
-    /// The statements from the original report, which failed an assertion on the second deletion.
+    /// A range deletion that starts inside an existing range deletion, then rows written under both.
     @Test
     public void testRangeDeletionStartingInsideExistingRange()
     {
         createTable(TABLE + "memtable = 'trie'");
         createIndex("CREATE INDEX ON %s(v) USING 'sai'");
-        assertTrue(getCurrentColumnFamilyStore().getCurrentMemtable() instanceof TrieMemtable);
+        assertTrieMemtable(getCurrentColumnFamilyStore());
 
         execute("DELETE FROM %s USING TIMESTAMP 1 WHERE pk = 1 AND ck > 10 AND ck <= 30");
         execute("DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck >= 20 AND ck <= 40");
@@ -142,22 +146,133 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
         assertRows(execute("SELECT pk, ck, v FROM %s WHERE v >= 0"), row(1L, 35L, 35L));
     }
 
-    /// A row deletion and a newer collection overwrite of the same row in one update, under a newer partition
-    /// deletion, which failed an assertion.
+    /// Two open-ended range deletions of a composite partition key on the default memtable, the second nested in the
+    /// first.
     @Test
-    public void testRowAndComplexDeletionUnderNewerPartitionDeletion()
+    public void testNestedOpenEndedRangeDeletionsOnDefaultMemtable()
+    {
+        createTable("CREATE TABLE %s (pk1 int, pk2 int, ck int, v int, PRIMARY KEY ((pk1, pk2), ck))");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        assertTrieMemtable(getCurrentColumnFamilyStore());
+
+        for (int ck = 0; ck < 5; ++ck)
+            execute("INSERT INTO %s (pk1, pk2, ck, v) VALUES (1, 1, ?, 0)", ck);
+        execute("DELETE FROM %s WHERE pk1 = 1 AND pk2 = 1 AND ck > 1");
+        execute("DELETE FROM %s WHERE pk1 = 1 AND pk2 = 1 AND ck > 2");
+        assertRows(execute("SELECT ck FROM %s WHERE v = 0"), row(0), row(1));
+        flush();
+        assertRows(execute("SELECT ck FROM %s WHERE v = 0"), row(0), row(1));
+    }
+
+    /// A collection write older than a range deletion that covers its row, e.g. a late hint or an out-of-order client
+    /// write: its collection tombstone lands under the existing range deletion.
+    @Test
+    public void testCollectionWriteShadowedByRangeDeletion()
     {
         createTable(TABLE + "memtable = 'trie'");
         createIndex("CREATE INDEX ON %s(v) USING 'sai'");
-        assertTrue(getCurrentColumnFamilyStore().getCurrentMemtable() instanceof TrieMemtable);
+        assertTrieMemtable(getCurrentColumnFamilyStore());
+
+        execute("INSERT INTO %s (pk, ck, v, c) VALUES (1, 5, 5, {5}) USING TIMESTAMP 1");
+        execute("DELETE FROM %s USING TIMESTAMP 20 WHERE pk = 1 AND ck > 10 AND ck <= 30");
+        execute("INSERT INTO %s (pk, ck, v, c) VALUES (1, 20, 20, {20}) USING TIMESTAMP 10");
+        execute("INSERT INTO %s (pk, ck, v, c) VALUES (1, 25, 25, {25}) USING TIMESTAMP 30");
+        assertRows(execute("SELECT ck FROM %s WHERE v >= 0"), row(5L), row(25L));
+        flush();
+        assertRows(execute("SELECT ck FROM %s WHERE v >= 0"), row(5L), row(25L));
+    }
+
+    /// The writes above, replayed from the commit log into an empty memtable, must replay without failures and be
+    /// indexed.
+    @Test
+    public void testReplayOverlappingDeletions() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk1 int, pk2 int, ck int, v int, w int, c set<int>, PRIMARY KEY ((pk1, pk2), ck))");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(w) USING 'legacy_local_table'");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        assertTrieMemtable(cfs);
+        CommitLog.instance.resetUnsafe(true);
+
+        for (int ck = 0; ck < 5; ++ck)
+            execute("INSERT INTO %s (pk1, pk2, ck, v, w, c) VALUES (1, 1, ?, 0, 0, {0}) USING TIMESTAMP 10", ck);
+        execute("DELETE FROM %s USING TIMESTAMP 20 WHERE pk1 = 1 AND pk2 = 1 AND ck > 1");
+        execute("DELETE FROM %s USING TIMESTAMP 30 WHERE pk1 = 1 AND pk2 = 1 AND ck > 2");
+        execute("INSERT INTO %s (pk1, pk2, ck, v, w, c) VALUES (1, 1, 2, 0, 0, {2}) USING TIMESTAMP 15");
+        execute("INSERT INTO %s (pk1, pk2, ck, v, w, c) VALUES (1, 1, 6, 0, 0, {6}) USING TIMESTAMP 40");
+        assertReplayedRows();
+
+        // clearUnsafe() also empties the legacy index table, so after replay its results come from replayed index writes.
+        cfs.clearUnsafe();
+        assertEmpty(execute("SELECT * FROM %s"));
+        assertEquals(1, cfs.indexManager.getAllIndexColumnFamilyStores().size());
+        for (ColumnFamilyStore indexCfs : cfs.indexManager.getAllIndexColumnFamilyStores())
+        {
+            assertTrue(indexCfs.name, indexCfs.getCurrentMemtable().partitionCount() == 0);
+            assertTrue(indexCfs.name, indexCfs.getLiveSSTables().isEmpty());
+        }
+
+        // Replay writes the legacy index table again (and recovery flushes what it replayed).
+        CommitLog.instance.resetUnsafe(false);
+        for (ColumnFamilyStore indexCfs : cfs.indexManager.getAllIndexColumnFamilyStores())
+            assertTrue(indexCfs.name, indexCfs.getCurrentMemtable().partitionCount() > 0 || !indexCfs.getLiveSSTables().isEmpty());
+        assertReplayedRows();
+        flush();
+        assertReplayedRows();
+    }
+
+    private void assertReplayedRows()
+    {
+        assertRows(execute("SELECT ck FROM %s WHERE pk1 = 1 AND pk2 = 1"), row(0), row(1), row(6));
+        assertRows(execute("SELECT ck FROM %s WHERE v = 0"), row(0), row(1), row(6));
+        assertRows(execute("SELECT ck FROM %s WHERE w = 0"), row(0), row(1), row(6));
+    }
+
+    private static void assertTrieMemtable(ColumnFamilyStore cfs)
+    {
+        assertTrue(cfs.getCurrentMemtable() instanceof TrieMemtable);
+    }
+
+    /// A row deletion and a newer collection overwrite of the same row in one update, with no newer deletion over the
+    /// row: the update's row deletion is on the other side of its newer collection tombstone. Partition 1 has an
+    /// existing row and an older partition deletion; partition 2 is empty.
+    @Test
+    public void testRowDeletionWithNewerCollectionOverwriteInOneUpdate()
+    {
+        createTable(TABLE + "memtable = 'trie'");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        assertTrieMemtable(getCurrentColumnFamilyStore());
 
         execute("INSERT INTO %s (pk, ck, v, c) VALUES (1, 1, 1, {1}) USING TIMESTAMP 1");
-        execute("DELETE FROM %s USING TIMESTAMP 20 WHERE pk = 1");
-        execute("BEGIN UNLOGGED BATCH " +
-                "DELETE FROM %1$s USING TIMESTAMP 5 WHERE pk = 1 AND ck = 1; " +
-                "UPDATE %1$s USING TIMESTAMP 10 SET c = {2}, v = 2 WHERE pk = 1 AND ck = 1; " +
-                "APPLY BATCH");
+        execute("DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1");
+        for (long pk = 1; pk <= 2; ++pk)
+            execute("BEGIN UNLOGGED BATCH " +
+                    "DELETE FROM %1$s USING TIMESTAMP 5 WHERE pk = " + pk + " AND ck = 1; " +
+                    "UPDATE %1$s USING TIMESTAMP 10 SET c = {2}, v = 2 WHERE pk = " + pk + " AND ck = 1; " +
+                    "APPLY BATCH");
+        assertRowsIgnoringOrder(execute("SELECT pk, ck, v, c FROM %s WHERE v >= 0"),
+                                row(1L, 1L, 2L, ImmutableSet.of(2L)), row(2L, 1L, 2L, ImmutableSet.of(2L)));
+        flush();
+        assertRowsIgnoringOrder(execute("SELECT pk, ck, v, c FROM %s WHERE v >= 0"),
+                                row(1L, 1L, 2L, ImmutableSet.of(2L)), row(2L, 1L, 2L, ImmutableSet.of(2L)));
+    }
+
+    /// A collection write older than a row deletion of its row, e.g. a hint delivered after the row was deleted: its
+    /// collection tombstone lands under the newer row deletion.
+    @Test
+    public void testCollectionWriteShadowedByRowDeletion()
+    {
+        createTable(TABLE + "memtable = 'trie'");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        assertTrieMemtable(getCurrentColumnFamilyStore());
+
+        execute("INSERT INTO %s (pk, ck, v, c) VALUES (1, 1, 1, {1}) USING TIMESTAMP 1");
+        execute("DELETE FROM %s USING TIMESTAMP 20 WHERE pk = 1 AND ck = 1");
+        execute("INSERT INTO %s (pk, ck, v, c) VALUES (1, 1, 1, {1}) USING TIMESTAMP 10");
+        execute("UPDATE %s USING TIMESTAMP 15 SET c = {5}, v = 5 WHERE pk = 1 AND ck = 1");
         execute("INSERT INTO %s (pk, ck, v) VALUES (1, 2, 3) USING TIMESTAMP 30");
+        assertRows(execute("SELECT pk, ck, v FROM %s WHERE v >= 0"), row(1L, 2L, 3L));
+        flush();
         assertRows(execute("SELECT pk, ck, v FROM %s WHERE v >= 0"), row(1L, 2L, 3L));
     }
 
@@ -190,20 +305,20 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
     @Test
     public void testOverlappingDeletionsWithLegacyIndexOnRegularColumn()
     {
-        testOverlappingDeletions(TABLE, SCENARIOS, "CREATE INDEX ON %s(v)", "v = ?");
+        testOverlappingDeletions(TABLE, SCENARIOS, "CREATE INDEX ON %s(v) USING 'legacy_local_table'", "v = ?");
     }
 
     @Test
     public void testOverlappingDeletionsWithLegacyIndexOnCollection()
     {
-        testOverlappingDeletions(TABLE, SCENARIOS, "CREATE INDEX ON %s(c)", "c CONTAINS ?");
+        testOverlappingDeletions(TABLE, SCENARIOS, "CREATE INDEX ON %s(c) USING 'legacy_local_table'", "c CONTAINS ?");
     }
 
     /// Legacy indexes on primary key columns take part in all updates, including deletions.
     @Test
     public void testOverlappingDeletionsWithLegacyIndexOnClusteringColumn()
     {
-        testOverlappingDeletions(TABLE, SCENARIOS, "CREATE INDEX ON %s(ck)", "ck = ?");
+        testOverlappingDeletions(TABLE, SCENARIOS, "CREATE INDEX ON %s(ck) USING 'legacy_local_table'", "ck = ?");
     }
 
     private void testOverlappingDeletions(String table, List<List<List<String>>> scenarios, String indexDefinition, String indexedPredicate)
@@ -211,7 +326,7 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
         String reference = createTable(table + "memtable = 'skiplist'");
         String indexed = createTable(table + "memtable = 'trie'");
         createIndex(indexDefinition);
-        assertTrue(getColumnFamilyStore(KEYSPACE, indexed).getCurrentMemtable() instanceof TrieMemtable);
+        assertTrieMemtable(getColumnFamilyStore(KEYSPACE, indexed));
 
         applyScenarios(scenarios, reference, indexed);
 
@@ -250,7 +365,7 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
         ColumnFamilyStore legacyCfs = getColumnFamilyStore(KEYSPACE, legacy);
         ColumnFamilyStore trieCfs = getColumnFamilyStore(KEYSPACE, trie);
         assertTrue(legacyCfs.getCurrentMemtable() instanceof SkipListMemtable);
-        assertTrue(trieCfs.getCurrentMemtable() instanceof TrieMemtable);
+        assertTrieMemtable(trieCfs);
         StubIndex legacyStub = (StubIndex) legacyCfs.indexManager.getIndexByName(legacyIndex);
         StubIndex trieStub = (StubIndex) trieCfs.indexManager.getIndexByName(trieIndex);
         legacyStub.reset();
@@ -302,7 +417,8 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
             write(table, "INSERT INTO %s (pk, ck, " + columns + ") VALUES (" + pk + ", " + ck + ", " + valueList + ") USING TIMESTAMP " + timestamp);
         else
             for (long ck2 = 0; ck2 <= 1; ++ck2)
-                write(table, "INSERT INTO %s (pk, ck, ck2, " + columns + ") VALUES (" + pk + ", " + ck + ", " + ck2 + ", " + valueList + ") USING TIMESTAMP " + timestamp);
+                write(table, "INSERT INTO %s (pk, ck, ck2, " + columns + ") VALUES (" + pk + ", " + ck + ", " +
+                             ck2 + ", " + valueList + ") USING TIMESTAMP " + timestamp);
     }
 
     private void applyStep(String table, long pk, List<String> step, long timestamp)

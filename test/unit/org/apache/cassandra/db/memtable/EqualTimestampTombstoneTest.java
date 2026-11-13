@@ -181,6 +181,18 @@ public class EqualTimestampTombstoneTest extends CQLTester
         checkSaiQueries(ASC, ASC_DELETES);
     }
 
+    @Test
+    public void testSaiDescending()
+    {
+        checkSaiQueries(DESC, DESC_DELETES);
+    }
+
+    @Test
+    public void testSaiAscendingMirror()
+    {
+        checkSaiQueries(ASC, ASC_MIRROR_DELETES);
+    }
+
     /// Replay may apply the mutations in a different order than they were written.
     @Test
     public void testCommitLogReplay() throws Throwable
