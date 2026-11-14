@@ -353,7 +353,11 @@ public abstract class CollectionType<T> extends AbstractType<T>
                 sb.append(", ");
             ByteBuffer element = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset);
             offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance);
-            sb.append(elementsType.toJSONString(element, protocolVersion));
+            // a list built by a selector, like [v1, v2], has a null element for a null value
+            if (element == null)
+                sb.append("null");
+            else
+                sb.append(elementsType.toJSONString(element, protocolVersion));
         }
         return sb.append("]").toString();
     }
