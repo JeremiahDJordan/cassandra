@@ -24,12 +24,15 @@ import java.util.Iterator;
 import com.google.common.collect.Iterators;
 import org.junit.Test;
 
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
+import org.apache.cassandra.metrics.TableMetrics;
 
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.QUORUM;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
+import static org.junit.Assert.assertEquals;
 
 public class PagingTest extends TestBaseImpl
 {
@@ -103,5 +106,54 @@ public class PagingTest extends TestBaseImpl
                        row(1, 2, 2),
                        row(1, 1, 1));
         }
+    }
+
+    @Test
+    public void testEachPageIsReadOnce() throws IOException
+    {
+        try (Cluster cluster = init(Cluster.build(1).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck))"));
+            for (int i = 0; i < 3; i++)
+                cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.tbl (pk, ck, v) VALUES (0, ?, ?)"), ConsistencyLevel.ALL, i, i);
+
+            // one page of a single partition read
+            assertReads(cluster, "SELECT * FROM %s.tbl WHERE pk = 0", 10, 1, 0);
+            // two pages of a single partition read, the second one not full
+            assertReads(cluster, "SELECT * FROM %s.tbl WHERE pk = 0", 2, 2, 0);
+            // one page of a range read
+            assertReads(cluster, "SELECT * FROM %s.tbl", 10, 0, 1);
+        }
+    }
+
+    private static void assertReads(Cluster cluster, String query, int pageSize, long expectedReads, long expectedScans)
+    {
+        long readsBefore = coordinatorReads(cluster);
+        long scansBefore = coordinatorScans(cluster);
+
+        assertRows(cluster.coordinator(1).executeWithPaging(withKeyspace(query), ConsistencyLevel.ALL, pageSize),
+                   row(0, 0, 0),
+                   row(0, 1, 1),
+                   row(0, 2, 2));
+
+        assertEquals("Single partition reads of " + query + " with page size " + pageSize,
+                     expectedReads, coordinatorReads(cluster) - readsBefore);
+        assertEquals("Range reads of " + query + " with page size " + pageSize,
+                     expectedScans, coordinatorScans(cluster) - scansBefore);
+    }
+
+    private static long coordinatorReads(Cluster cluster)
+    {
+        return cluster.get(1).callOnInstance(() -> tableMetrics().coordinatorReadLatency.getCount());
+    }
+
+    private static long coordinatorScans(Cluster cluster)
+    {
+        return cluster.get(1).callOnInstance(() -> tableMetrics().coordinatorScanLatency.getCount());
+    }
+
+    private static TableMetrics tableMetrics()
+    {
+        return Keyspace.open(KEYSPACE).getColumnFamilyStore("tbl").metric;
     }
 }
