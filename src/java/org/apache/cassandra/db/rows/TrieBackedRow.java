@@ -148,6 +148,13 @@ public class TrieBackedRow extends AbstractRow
         return builder.build();
     }
 
+    /// Whether the cells of this row are keyed with the column ids of the given version of the table's metadata.
+    public boolean usesColumnIdsOf(TableMetadata metadata)
+    {
+        Columns expected = isStatic() ? metadata.staticColumns() : metadata.regularColumns();
+        return columns == expected || columns.equals(expected);
+    }
+
     /// Returns false if the given object is a level marker with no meaning of its own. Used to drop unproductive
     /// markers that can remain after deletions.
     public static boolean shouldPreserveContentWithoutChildren(Object o)
