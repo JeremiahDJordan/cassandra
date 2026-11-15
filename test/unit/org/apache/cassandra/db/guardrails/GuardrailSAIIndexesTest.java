@@ -240,6 +240,6 @@ public class GuardrailSAIIndexesTest extends GuardrailTester
 
     String getDifferentCreateIndexStatement(String indexName, String column)
     {
-        return String.format("CREATE INDEX %s ON %%s (%s)", indexName, column);
+        return String.format("CREATE INDEX %s ON %%s (%s) USING 'legacy_local_table'", indexName, column);
     }
 }

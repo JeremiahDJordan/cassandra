@@ -67,9 +67,9 @@ public class RowAwareStaticClusteringPrimaryKeyMapTest extends SAITester.Version
     {
         // Create a table with static columns and clustering columns
         createTable("CREATE TABLE %s (pk int, ck int, static_value text static, int_value int, text_value text, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck ASC)");
-        execute("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
-        execute("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
-        execute("CREATE CUSTOM INDEX static_index ON %s(static_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX static_index ON %s(static_value) USING 'StorageAttachedIndex'");
 
         // Insert data with static columns
         // Partition pk=1: static row + multiple regular rows

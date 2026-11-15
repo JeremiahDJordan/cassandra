@@ -82,7 +82,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
     {
         populateTable();
 
-        createIndex("CREATE INDEX ON %s(v)");
+        createIndex("CREATE INDEX ON %s(v) USING 'legacy_local_table'");
 
         // equals (=)
         assertRowsWithoutWarning("SELECT k FROM %s WHERE v = 'Quick fox'", row(1));

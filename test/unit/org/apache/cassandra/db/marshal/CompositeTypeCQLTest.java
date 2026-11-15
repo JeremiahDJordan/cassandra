@@ -168,7 +168,7 @@ public class CompositeTypeCQLTest extends CQLTester
 
             String udt = createType("CREATE TYPE %s (n int)");
             createTable("CREATE TABLE %s(k int PRIMARY KEY, m map<int, frozen<" + udt + ">>)");
-            createIndex("CREATE INDEX ON %s(entries(m))");
+            createIndex("CREATE INDEX ON %s(entries(m)) USING 'legacy_local_table'");
 
             execute("INSERT INTO %s(k, m) VALUES (2, {0: {n: 0}} )");
             execute("INSERT INTO %s(k, m) VALUES (3, {0: {n: 0}, 1: {n: 1}} )");

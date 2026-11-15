@@ -393,16 +393,14 @@ public class SchemaCQLHelperTest extends CQLTester
                                 : "    AND memtable = 'default'\n";
 
         // allow_auto_snapshot and incremental_backups are not present in pre-5.0 compatibility mode
-        String autoSnapshotAndIncrementalBackups = isCompatibilityMode
-                                                   ? ""
-                                                   : "    AND allow_auto_snapshot = true\n" +
-                                                     "    AND incremental_backups = true\n";
+        String autoSnapshot = isCompatibilityMode ? "" : "    AND allow_auto_snapshot = true\n";
+        String incrementalBackups = isCompatibilityMode ? "" : "    AND incremental_backups = true\n";
 
         assertThat(SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), cfs.keyspace.getMetadata()),
                    containsString("AND CLUSTERING ORDER BY (cl1 ASC)\n" +
                             "    AND DROPPED COLUMN RECORD reg1 ascii USING TIMESTAMP " + droppedTimestamp +"\n" +
                             "    AND additional_write_policy = 'ALWAYS'\n" +
-                            autoSnapshotAndIncrementalBackups +
+                            autoSnapshot +
                             "    AND bloom_filter_fp_chance = 1.0\n" +
                             "    AND caching = {'keys': 'ALL', 'rows_per_partition': 'NONE'}\n" +
                             "    AND cdc = false\n" +
@@ -414,6 +412,7 @@ public class SchemaCQLHelperTest extends CQLTester
                             "    AND default_time_to_live = 4\n" +
                             "    AND extensions = {'ext1': 0x76616c31}\n" +
                             "    AND gc_grace_seconds = 5\n" +
+                            incrementalBackups +
                             "    AND max_index_interval = 7\n" +
                             "    AND memtable_flush_period_in_ms = 8\n" +
                             "    AND min_index_interval = 6\n" +

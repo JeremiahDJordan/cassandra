@@ -498,8 +498,8 @@ public class IndexHintsTest extends CQLTester
     public void testLegacyIndexWithAllowFiltering() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int, v3 int)");
-        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1)");
-        String idx2 = createIndex("CREATE INDEX idx2 ON %s(v2)");
+        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1) USING 'legacy_local_table'");
+        String idx2 = createIndex("CREATE INDEX idx2 ON %s(v2) USING 'legacy_local_table'");
 
         String insert = "INSERT INTO %s (k, v1, v2, v3) VALUES (?, ?, ?, ?)";
         Object[] row1 = new Object[]{ 1, 0, 1, 1 };
@@ -567,8 +567,8 @@ public class IndexHintsTest extends CQLTester
     public void testLegacyIndexWithoutAllowFiltering() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int, v3 int)");
-        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1)");
-        String idx2 = createIndex("CREATE INDEX idx2 ON %s(v2)");
+        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1) USING 'legacy_local_table'");
+        String idx2 = createIndex("CREATE INDEX idx2 ON %s(v2) USING 'legacy_local_table'");
 
         String insert = "INSERT INTO %s (k, v1, v2, v3) VALUES (?, ?, ?, ?)";
         Object[] row1 = new Object[]{ 1, 0, 1, 1 };
@@ -783,8 +783,8 @@ public class IndexHintsTest extends CQLTester
     public void testLegacy()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int)");
-        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1)");
-        String idx2 = createIndex("CREATE INDEX idx2 ON %s(v2)");
+        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1) USING 'legacy_local_table'");
+        String idx2 = createIndex("CREATE INDEX idx2 ON %s(v2) USING 'legacy_local_table'");
 
         String insert = "INSERT INTO %s (k, v1, v2) VALUES (?, ?, ?)";
         Object[] row1 = new Object[]{ 1, 0, 0 };
@@ -836,7 +836,7 @@ public class IndexHintsTest extends CQLTester
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int, v3 int)");
         String idx1 = createIndex("CREATE CUSTOM INDEX idx1 ON %s(v1) USING 'StorageAttachedIndex'");
         String idx2 = createIndex("CREATE CUSTOM INDEX idx2 ON %s(v2) USING 'StorageAttachedIndex'");
-        String idx3 = createIndex("CREATE INDEX idx3 ON %s(v3)");
+        String idx3 = createIndex("CREATE INDEX idx3 ON %s(v3) USING 'legacy_local_table'");
 
         String insert = "INSERT INTO %s (k, v1, v2, v3) VALUES (?, ?, ?, ?)";
         Object[] row1 = new Object[]{ 1, 0, 1, 1 };
@@ -956,7 +956,7 @@ public class IndexHintsTest extends CQLTester
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
         String sai = createIndex("CREATE CUSTOM INDEX sai ON %s(v) USING 'StorageAttachedIndex'");
-        String legacy = createIndex("CREATE INDEX legacy ON %s(v)");
+        String legacy = createIndex("CREATE INDEX legacy ON %s(v) USING 'legacy_local_table'");
 
         String insert = "INSERT INTO %s (k, v) VALUES (?, ?)";
         Object[] row1 = new Object[]{ 1, 0 };
@@ -978,7 +978,7 @@ public class IndexHintsTest extends CQLTester
     public void testMultipleIndexesPerColumnAndUnsupportedEqOnAnalyzer()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-        String legacy = createIndex("CREATE INDEX legacy ON %s(v)");
+        String legacy = createIndex("CREATE INDEX legacy ON %s(v) USING 'legacy_local_table'");
         String literal = createIndex("CREATE CUSTOM INDEX literal ON %s(v) USING 'StorageAttachedIndex'");
         String analyzed = createIndex("CREATE CUSTOM INDEX analyzed ON %s(v) USING 'StorageAttachedIndex' " +
                                       "WITH OPTIONS = { 'equals_behaviour_when_analyzed': 'UNSUPPORTED', 'index_analyzer': 'standard' }");
@@ -1071,7 +1071,7 @@ public class IndexHintsTest extends CQLTester
     public void testMultipleIndexesPerColumnAndMatchEqOnAnalyzer()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-        String legacy = createIndex("CREATE INDEX legacy ON %s(v)");
+        String legacy = createIndex("CREATE INDEX legacy ON %s(v) USING 'legacy_local_table'");
         String literal = createIndex("CREATE CUSTOM INDEX literal ON %s(v) USING 'StorageAttachedIndex'");
         String analyzed = createIndex("CREATE CUSTOM INDEX analyzed ON %s(v) USING 'StorageAttachedIndex' " +
                                       "WITH OPTIONS = { 'equals_behaviour_when_analyzed': 'MATCH', 'index_analyzer': 'standard' }");
@@ -1167,7 +1167,7 @@ public class IndexHintsTest extends CQLTester
     public void testMultipleIndexesPerColumnAndContains()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v list<text>)");
-        String legacy = createIndex("CREATE INDEX legacy ON %s(v)");
+        String legacy = createIndex("CREATE INDEX legacy ON %s(v) USING 'legacy_local_table'");
         String literal = createIndex("CREATE CUSTOM INDEX literal ON %s(v) USING 'StorageAttachedIndex'");
         String analyzed = createIndex("CREATE CUSTOM INDEX analyzed ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = { 'index_analyzer': 'standard' }");
 
@@ -1256,7 +1256,7 @@ public class IndexHintsTest extends CQLTester
     public void testDuplicatedHints()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int, v3 int)");
-        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1)");
+        String idx1 = createIndex("CREATE INDEX idx1 ON %s(v1) USING 'legacy_local_table'");
         String idx2 = createIndex("CREATE CUSTOM INDEX idx2 ON %s(v2) USING 'StorageAttachedIndex'");
 
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v1=0 WITH included_indexes={idx1,idx1}").selects(idx1);
@@ -1280,7 +1280,7 @@ public class IndexHintsTest extends CQLTester
     public void testWildcardExcludedIndexes()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v1 int, v2 int, v3 int)");
-        createIndex("CREATE INDEX idx1 ON %s(v1)");
+        createIndex("CREATE INDEX idx1 ON %s(v1) USING 'legacy_local_table'");
         createIndex("CREATE CUSTOM INDEX idx2 ON %s(v2) USING 'StorageAttachedIndex'");
         Object[] row = row(0, 0, 0, 0);
         execute("INSERT INTO %s (k, v1, v2, v3) VALUES (0, 0, 0, 0)");
