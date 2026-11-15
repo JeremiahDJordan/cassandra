@@ -300,6 +300,11 @@ public abstract class MemtableSizeTestBase extends CQLTester
 
         long rowSize = memtable.getEstimatedAverageRowSize();
         double expectedRowSize = (double) memtable.getLiveDataSize() / (partitions * rowsPerPartition);
-        Assert.assertEquals(expectedRowSize, rowSize, (partitions * rowsPerPartition) * 0.05);  // 5% accuracy
+        // 5% of the row size, plus a byte as getEstimatedAverageRowSize() truncates. The legacy trie_stage2 and
+        // trie_stage3 memtables don't count clustering keys in getLiveDataSize() but do in
+        // getEstimatedAverageRowSize(), so they get a looser bound.
+        boolean legacyTrieStage = memtableClass.equals("trie_stage2") || memtableClass.equals("trie_stage3");
+        double tolerance = legacyTrieStage ? (partitions * rowsPerPartition) * 0.05 : expectedRowSize * 0.05 + 1;
+        Assert.assertEquals(expectedRowSize, rowSize, tolerance);
     }
 }
