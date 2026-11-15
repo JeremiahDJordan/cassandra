@@ -104,15 +104,37 @@ public class SerializationHeader
         // but rather on their stats stored in StatsMetadata that are fully accurate.
         EncodingStats.Collector stats = new EncodingStats.Collector();
         RegularAndStaticColumns.Builder columns = RegularAndStaticColumns.builder();
+        Collection<SSTableReader> ordered = orderByDescendingGeneration(sstables);
+        // An sstable keeps the header it was opened or written with, and builds a dropped column from its own header
+        // (see Component.toHeader), so after a schema change even the most recent sstable can have an earlier type
+        // of a column. When merging sstables, the output stores each column under the schema's version of it.
+        boolean merging = ordered.size() > 1;
         // We need to order the SSTables by descending generation to be sure that we use latest column metadata.
-        for (SSTableReader sstable : orderByDescendingGeneration(sstables))
+        for (SSTableReader sstable : ordered)
         {
             stats.updateTimestamp(sstable.getMinTimestamp());
             stats.updateLocalDeletionTime(sstable.getMinLocalDeletionTime());
             stats.updateTTL(sstable.getMinTTL());
-            columns.addAll(sstable.header.columns());
+            for (ColumnMetadata column : sstable.header.columns())
+                columns.add(merging ? schemaVersion(metadata, column) : column);
         }
         return new SerializationHeader(true, metadata, columns.build(), stats.get());
+    }
+
+    /**
+     * The schema's version of {@code column}, a column of an sstable header: the live column or, for a dropped
+     * column, its drop record, which has the type the column was last dropped with. That type can read the data of
+     * every earlier one: a re-add must be compatible with the drop record, and ALTER TYPE only adds or renames
+     * fields. Returns {@code column} itself if the schema's version has another kind or complexity (a primary key
+     * column can have been renamed to the name of a dropped column, and a drop record's complexity can differ from
+     * the sstable's, see {@link Component#toHeader}) or if there is none.
+     */
+    private static ColumnMetadata schemaVersion(TableMetadata metadata, ColumnMetadata column)
+    {
+        ColumnMetadata current = metadata.getColumn(column.name);
+        if (current == null || current.kind != column.kind)
+            current = metadata.getDroppedColumn(column.name.bytes, column.isStatic());
+        return current != null && current.kind == column.kind && current.isComplex() == column.isComplex() ? current : column;
     }
 
     private static Collection<SSTableReader> orderByDescendingGeneration(Collection<SSTableReader> sstables)
