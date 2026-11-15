@@ -19,10 +19,15 @@
 package org.apache.cassandra.cql3.selection;
 
 import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.UUID;
 
 import org.junit.Test;
+
+import com.datastax.driver.core.TupleValue;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnSpecification;
@@ -549,6 +554,48 @@ public class TermSelectionTest extends CQLTester
         assertRows(execute("SELECT (" + type + "){ a: min(v.a) , b: 'min'} FROM %s"),
                    row(userType("a", 3, "b", "min"))
         );
+    }
+
+    @Test
+    public void testCollectionLiteralsOfValueCompatibleElementTypes() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, vi varint, vi2 varint, bi bigint, ts timestamp, tm time, t text)");
+        execute("INSERT INTO %s (k, i, vi, vi2, bi, ts, tm, t) VALUES (0, 7, 10, 7, 9, 1000, '00:00:01', 'x')");
+        BigInteger seven = BigInteger.valueOf(7);
+        BigInteger ten = BigInteger.valueOf(10);
+
+        // the type of the first element is kept if it can read the values of the others, like a varint for an int
+        assertRows(execute("SELECT [vi, i], [[vi], [i]], [bi, ts] FROM %s"),
+                   row(list(ten, seven), list(list(ten), list(seven)), list(9L, 1000L)));
+        assertEquals(Arrays.asList(ten, seven), executeNet("SELECT [vi, i] FROM %s").one().getList(0, BigInteger.class));
+        assertEquals(Arrays.asList(9L, 1000L), executeNet("SELECT [bi, ts] FROM %s").one().getList(0, Long.class));
+        List<TupleValue> tuples = executeNet("SELECT [(vi, t), (i, t)] FROM %s").one().getList(0, TupleValue.class);
+        assertEquals(ten, tuples.get(0).getVarint(0));
+        assertEquals(seven, tuples.get(1).getVarint(0));
+        assertEquals("x", tuples.get(1).getString(1));
+
+        // the elements of a set are sorted and deduplicated as varints
+        assertRows(execute("SELECT {vi, i}, {vi2, i} FROM %s"), row(set(seven, ten), set(seven)));
+        assertEquals(new HashSet<>(Arrays.asList(seven, ten)), executeNet("SELECT {vi, i} FROM %s").one().getSet(0, BigInteger.class));
+        assertEquals(1, executeNet("SELECT {vi2, i} FROM %s").one().getSet(0, BigInteger.class).size());
+
+        String incompatible = "Invalid collection literal: all selectors must have the same CQL type inside collection literals";
+        // a later element's type is only used if it reads and orders the values of the previous elements in the same
+        // way; a varint doesn't order the values of an int as an int does, and a time can read a bigint but not a
+        // timestamp
+        assertInvalidMessage(incompatible, "SELECT [i, vi] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT {i, vi} FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [[i], [vi]] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [(i, t), (vi, t)] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [bi, tm] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [bi, ts, tm] FROM %s");
+        // elements whose types can't read each other's values are still rejected
+        assertInvalidMessage(incompatible, "SELECT [bi, i] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [i, bi] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [i, t] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT {vi, t} FROM %s");
+        // a frozen set of varints doesn't sort its elements as a frozen set of ints does
+        assertInvalidMessage(incompatible, "SELECT [{vi}, {i}] FROM %s");
     }
 
     @Test

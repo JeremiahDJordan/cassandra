@@ -153,15 +153,10 @@ public abstract class Lists
 
     /**
      * Picks the type of the elements of a collection literal, given the type picked from its previous elements and the
-     * type of another element (either of which may be {@code null} if unknown).
-     * <p>
-     * All the elements must have types that can read each other's values, as the literal is serialized with a single
-     * element type: the first element's type is kept unless the other one is wider (a tuple with more components),
-     * and an element whose type is incompatible both ways is rejected.
-     * <p>
-     * The elements of a collection literal are frozen values, and a non-frozen UDT or collection value is serialized in
-     * its frozen form, so the types are compared frozen: a non-frozen column and a frozen column of the same type
-     * can be mixed.
+     * type of another element (either of which may be {@code null} if unknown): the picked type is kept if it can read
+     * the other element's values, like a varint for an int, else the other type is used if it reads and orders the
+     * picked type's values in the same way, like a tuple with more components. Any other element is rejected. The types
+     * are compared frozen, as the elements are serialized in their frozen form.
      */
     static AbstractType<?> selectElementType(AbstractType<?> type, AbstractType<?> otherType)
     {
@@ -173,7 +168,7 @@ public abstract class Lists
 
         AbstractType<?> frozenType = type.freeze();
         AbstractType<?> frozenOtherType = otherType.freeze();
-        if (frozenType.isCompatibleWith(frozenOtherType))
+        if (frozenType.isValueCompatibleWith(frozenOtherType))
             return type;
 
         if (frozenOtherType.isCompatibleWith(frozenType))

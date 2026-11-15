@@ -30,13 +30,13 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.MapType;
-import org.apache.cassandra.db.marshal.NumberType;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.utils.Pair;
 
 public class MapsTest extends CQLTester
 {
-    private final Function<NumberType<?>, AbstractType<?>> identityMapper = integerType -> integerType;
+    private final Function<AbstractType<?>, AbstractType<?>> identityMapper = type -> type;
 
     @Rule
     public ExpectedException thrown = ExpectedException.none();
@@ -44,6 +44,30 @@ public class MapsTest extends CQLTester
     @Test
     public void testGetExactMapTypeIfKnownWithDifferentTypes()
     {
+        thrown.expect(InvalidRequestException.class);
+        thrown.expectMessage("Invalid collection literal: all selectors must have the same CQL type inside collection literals");
+
+        Maps.getExactMapTypeIfKnown(ImmutableList.of(
+            Pair.create(Int32Type.instance, Int32Type.instance),
+            Pair.create(Int32Type.instance, UTF8Type.instance)
+        ), identityMapper);
+    }
+
+    @Test
+    public void testGetExactMapTypeIfKnownWithValueCompatibleTypes()
+    {
+        // a varint can read the values of an int, so the keys and values are read as varints
+        AbstractType<?> expected = MapType.getInstance(IntegerType.instance, IntegerType.instance, false).freeze();
+        Assert.assertEquals(expected, Maps.getExactMapTypeIfKnown(ImmutableList.of(
+            Pair.create(IntegerType.instance, IntegerType.instance),
+            Pair.create(Int32Type.instance, Int32Type.instance)
+        ), identityMapper));
+    }
+
+    @Test
+    public void testGetExactMapTypeIfKnownWithIntBeforeVarint()
+    {
+        // an int can't read the values of a varint, and a varint doesn't order the values of an int in the same way
         thrown.expect(InvalidRequestException.class);
         thrown.expectMessage("Invalid collection literal: all selectors must have the same CQL type inside collection literals");
 
