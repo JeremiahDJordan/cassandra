@@ -74,4 +74,17 @@ public class ReplaceMaskingFunctionTest extends MaskingFunctionTester
         assertInvalidThrowMessage("Type error: 1 cannot be passed as argument 1 of function system.mask_replace of type text",
                                   InvalidRequestException.class, "SELECT mask_replace(v, 1) FROM %s");
     }
+
+    /**
+     * The type of the second argument is taken from the first one. Two tuple literals have equal types that aren't the
+     * same object.
+     */
+    @Test
+    public void testReplaceTupleLiteral() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, t text)");
+        execute("INSERT INTO %s(k, v, t) VALUES (0, 1, 'a')");
+        assertRows(execute("SELECT mask_replace((v, t), (k, t)) FROM %s"), row(tuple(0, "a")));
+        assertRows(execute("SELECT mask_replace((v, t), (v, t)) FROM %s"), row(tuple(1, "a")));
+    }
 }

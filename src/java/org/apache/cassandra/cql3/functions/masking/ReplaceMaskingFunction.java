@@ -73,7 +73,10 @@ public class ReplaceMaskingFunction extends MaskingFunction
                 AbstractType<?> replacedType = argTypes.get(0);
                 AbstractType<?> replacementType = argTypes.get(1);
 
-                assert replacedType == replacementType
+                // The types are equal, but not always the same object: the second parameter takes the type inferred
+                // for the first argument in the first inference pass, and the first argument's type is inferred again
+                // afterwards, which builds a new instance of a type that isn't interned, like a tuple type.
+                assert replacedType.equals(replacementType)
                 : String.format("Both arguments should have the same type, but found %s(%s, %s)",
                                 name, replacedType.asCQL3Type(), replacementType.asCQL3Type());
 
