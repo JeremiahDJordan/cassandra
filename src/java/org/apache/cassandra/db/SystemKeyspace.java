@@ -832,7 +832,11 @@ public final class SystemKeyspace
 
     public static void updateSchemaVersion(UUID version)
     {
-        Nodes.local().update(info -> info.setSchemaVersion(version), false);
+        // Drivers decide that a schema change has reached every node by comparing schema_version in system.local and
+        // system.peers on the node that coordinated it. The new version must be readable from system.local before the
+        // change is acknowledged; otherwise the previous version is reported, matches the previous version of the
+        // other nodes, and the driver considers the schema agreed before they have applied the change.
+        Nodes.local().updateAndAwaitPersistence(info -> info.setSchemaVersion(version));
     }
 
     /**
