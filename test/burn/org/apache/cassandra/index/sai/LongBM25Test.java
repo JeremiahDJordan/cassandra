@@ -18,8 +18,11 @@
 
 package org.apache.cassandra.index.sai;
 
+import java.io.BufferedReader;
 import java.io.IOException;
-import java.net.URISyntaxException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -44,37 +47,27 @@ public class LongBM25Test extends SAITester
 
     private static final List<String> documentLines = new ArrayList<>();
 
+    // Any multi-line English text works as a corpus: documents and queries are built from random lines of it
+    private static final String CORPUS = "tokenization/adventures_of_huckleberry_finn_mark_twain.txt";
+
     static
     {
-        try
+        try (InputStream in = LongBM25Test.class.getClassLoader().getResourceAsStream(CORPUS))
         {
-            var cl = LongBM25Test.class.getClassLoader();
-            var resourceDir = cl.getResource("bm25");
-            if (resourceDir == null)
-                throw new RuntimeException("Could not find resource directory test/resources/bm25/");
+            if (in == null)
+                throw new RuntimeException("Could not find test resource " + CORPUS);
 
-            var dirPath = java.nio.file.Paths.get(resourceDir.toURI());
-            try (var files = java.nio.file.Files.list(dirPath))
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(in, StandardCharsets.UTF_8)))
             {
-                files.forEach(file -> {
-                    try (var lines = java.nio.file.Files.lines(file))
-                    {
-                        lines.map(String::trim)
-                             .filter(line -> !line.isEmpty())
-                             .forEach(documentLines::add);
-                    }
-                    catch (IOException e)
-                    {
-                        throw new RuntimeException("Failed to read file: " + file, e);
-                    }
-                });
+                reader.lines()
+                      .map(String::trim)
+                      .filter(line -> !line.isEmpty())
+                      .forEach(documentLines::add);
             }
             if (documentLines.isEmpty())
-            {
-                throw new RuntimeException("No document lines loaded from test/resources/bm25/");
-            }
+                throw new RuntimeException("No document lines loaded from " + CORPUS);
         }
-        catch (IOException | URISyntaxException e)
+        catch (IOException e)
         {
             throw new RuntimeException("Failed to load test documents", e);
         }
@@ -83,12 +76,17 @@ public class LongBM25Test extends SAITester
     KeySet keysInserted = new KeySet();
     private final int threadCount = 12;
 
+    // Sized for the 1 GB heap of the test-burn JVM: with 4 memtable shards per writer thread and 10M keys, the 12
+    // writers, which flush at random, keep enough memtables and index data in flight that the JVM spends its time in
+    // back-to-back full GCs. One shard per writer thread and 100k keys run in a few minutes.
+    private static final int numKeys = 100_000;
+
     @Before
     public void setup() throws Throwable
     {
         // we don't get loaded until after TM, so we can't affect the very first memtable,
         // but this will affect all subsequent ones
-        TrieMemtable.SHARD_COUNT = 4 * threadCount;
+        TrieMemtable.SHARD_COUNT = threadCount;
     }
 
     @FunctionalInterface
@@ -113,7 +111,7 @@ public class LongBM25Test extends SAITester
         AtomicInteger counter = new AtomicInteger();
         long start = System.currentTimeMillis();
         var fjp = new ForkJoinPool(threadCount);
-        var keys = IntStream.range(0, 10_000_000).boxed().collect(Collectors.toList());
+        var keys = IntStream.range(0, numKeys).boxed().collect(Collectors.toList());
         Collections.shuffle(keys);
         var task = fjp.submit(() -> keys.stream().parallel().forEach(i ->
                                                                      {
