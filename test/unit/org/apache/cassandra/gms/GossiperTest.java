@@ -28,6 +28,7 @@ import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -47,13 +48,18 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
+import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.gms.VersionedValue.VersionedValueFactory;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.SeedProvider;
 import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.CassandraGenerators;
 import org.apache.cassandra.utils.CassandraVersion;
@@ -61,6 +67,7 @@ import org.assertj.core.api.Assertions;
 import org.quicktheories.core.Gen;
 import org.quicktheories.impl.Constraint;
 import static org.apache.cassandra.config.CassandraRelevantProperties.GOSSIP_DISABLE_THREAD_VALIDATION;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SHUTDOWN_ANNOUNCE_DELAY_IN_MS;
 import org.mockito.Mockito;
 
 import static org.apache.cassandra.db.SystemKeyspace.CURRENT_VERSION;
@@ -849,5 +856,41 @@ public class GossiperTest
             Gossiper.instance.endpointStateMap.clear();
         }
 
+    }
+
+    /**
+     * {@link Gossiper#announceShutdown()} (used by a replacing node that gives up because it can't contact any seed)
+     * must send a GOSSIP_SHUTDOWN that the verb's serializer accepts: on the 5.0 messaging versions the payload must be
+     * a {@link GossipShutdown}, or the message fails to serialize and is never delivered.
+     */
+    @Test
+    public void testAnnounceShutdownSendsGossipShutdownPayload() throws Exception
+    {
+        Gossiper.instance.start(0);
+        InetAddressAndPort peer = InetAddressAndPort.getByName("127.0.0.2");
+        Gossiper.instance.liveEndpoints.add(peer);
+        List<Message<?>> sent = new CopyOnWriteArrayList<>();
+        MessagingService.instance().outboundSink.add((message, to) -> {
+            if (message.verb() == Verb.GOSSIP_SHUTDOWN && to.equals(peer))
+                sent.add(message);
+            return false;
+        });
+        try (WithProperties properties = new WithProperties().set(SHUTDOWN_ANNOUNCE_DELAY_IN_MS, 0))
+        {
+            Gossiper.instance.announceShutdown();
+        }
+        finally
+        {
+            MessagingService.instance().outboundSink.clear();
+            Gossiper.instance.liveEndpoints.remove(peer);
+        }
+
+        assertEquals(1, sent.size());
+        Message<?> message = sent.get(0);
+        assertTrue("payload: " + message.payload, message.payload instanceof GossipShutdown);
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            Message.serializer.serialize(message, out, MessagingService.current_version);
+        }
     }
 }

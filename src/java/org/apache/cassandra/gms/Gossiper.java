@@ -2489,7 +2489,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
         logger.info("Announcing shutdown");
         addLocalApplicationState(ApplicationState.STATUS_WITH_PORT, StorageService.instance.valueFactory.shutdown(true));
         addLocalApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.shutdown(true));
-        Message message = Message.out(Verb.GOSSIP_SHUTDOWN, noPayload);
+        Message<GossipShutdown> message = shutdownMessage();
         for (InetAddressAndPort ep : liveEndpoints)
             MessagingService.instance().send(message, ep);
         Uninterruptibles.sleepUninterruptibly(SHUTDOWN_ANNOUNCE_DELAY_IN_MS.getInt(), TimeUnit.MILLISECONDS);
@@ -2865,6 +2865,17 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
     {
         Message<?> message = Message.out(Verb.GOSSIP_SHUTDOWN, noPayload);
         MessagingService.instance().send(message, to);
+    }
+
+    /**
+     * A GOSSIP_SHUTDOWN message carrying this node's endpoint state. The verb's serializer ({@link GossipShutdown#serializer})
+     * casts the payload to {@link GossipShutdown} on 5.0-family messaging versions, so a message with no payload fails to
+     * serialize there and is never delivered. The state is cloned so it can't change between serializedSize and serialize.
+     */
+    private Message<GossipShutdown> shutdownMessage()
+    {
+        EndpointState mystate = endpointStateMap.get(getBroadcastAddressAndPort());
+        return Message.out(Verb.GOSSIP_SHUTDOWN, new GossipShutdown(new EndpointState(mystate)));
     }
 
     public void unsafeSendLocalEndpointStateTo(InetAddressAndPort ep)
