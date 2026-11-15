@@ -2136,7 +2136,8 @@ public class DatabaseDescriptor
 
     public static IFailureDetector newFailureDetector()
     {
-        return newFailureDetector.get();
+        // before any initialization (e.g. a test touching the failure detector without loading the config) use the default
+        return newFailureDetector == null ? createFailureDetector("FailureDetector") : newFailureDetector.get();
     }
 
     public static void setDefaultFailureDetector()

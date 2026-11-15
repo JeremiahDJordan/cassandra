@@ -74,8 +74,11 @@ public class FileSystems
 
     private static Configuration jimfsConfig()
     {
+        // Do not let the file system keep the blocks of deleted files for reuse: by default it caches up to its maximum
+        // size, and a file system that is finished with but still reachable then holds on to all of it.
         return Configuration.unix().toBuilder()
                             .setMaxSize(4L << 30).setBlockSize(512)
+                            .setMaxCacheSize(0)
                             .build();
     }
 

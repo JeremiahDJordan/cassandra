@@ -17,7 +17,13 @@
  */
 package org.apache.cassandra.io.sstable;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.commons.lang3.StringUtils;
@@ -38,6 +44,7 @@ import org.apache.cassandra.utils.Pair;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertSame;
 
 public class DescriptorTest
 {
@@ -130,6 +137,66 @@ public class DescriptorTest
         Descriptor desc2 = new Descriptor(dir.toAbsolute(), "ks", "cf", new SequenceBasedSSTableId(1), DatabaseDescriptor.getSelectedSSTableFormat());
         assertEquals(desc1, desc2);
         assertEquals(desc1.hashCode(), desc2.hashCode());
+    }
+
+    @Test
+    public void testFileForKeepsTheFileOfAComponent()
+    {
+        Descriptor desc = new Descriptor(new File("."), "ks", "cf", new SequenceBasedSSTableId(1), DatabaseDescriptor.getSelectedSSTableFormat());
+        Component[] components = { Components.DATA, Components.STATS, Components.DIGEST, Components.TOC };
+        File[] files = new File[components.length];
+        for (int i = 0; i < components.length; i++)
+        {
+            files[i] = desc.fileFor(components[i]);
+            assertEquals(desc.filenameFor(components[i]), files[i].name());
+        }
+
+        // resolving other components must not change the file of a component that is already resolved
+        for (int i = 0; i < components.length; i++)
+            assertSame(files[i], desc.fileFor(components[i]));
+    }
+
+    @Test
+    public void testConcurrentFileForAgreesOnOneFile() throws Exception
+    {
+        int threads = 8;
+        Component[] components = { Components.DATA, Components.STATS, Components.DIGEST, Components.TOC };
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try
+        {
+            for (int round = 0; round < 200; round++)
+            {
+                Descriptor desc = new Descriptor(new File("."), "ks", "cf", new SequenceBasedSSTableId(round), DatabaseDescriptor.getSelectedSSTableFormat());
+                CyclicBarrier start = new CyclicBarrier(threads);
+                List<Future<File[]>> results = new ArrayList<>();
+                for (int t = 0; t < threads; t++)
+                {
+                    int offset = t;
+                    results.add(executor.submit(() -> {
+                        File[] files = new File[components.length];
+                        start.await();
+                        // every thread starts with a different component, so that they race on the whole cache
+                        for (int i = 0; i < components.length; i++)
+                        {
+                            int c = (i + offset) % components.length;
+                            files[c] = desc.fileFor(components[c]);
+                        }
+                        return files;
+                    }));
+                }
+
+                for (Future<File[]> result : results)
+                {
+                    File[] files = result.get();
+                    for (int i = 0; i < components.length; i++)
+                        assertSame(desc.fileFor(components[i]), files[i]);
+                }
+            }
+        }
+        finally
+        {
+            executor.shutdownNow();
+        }
     }
 
     @Test

@@ -19,6 +19,7 @@ package org.apache.cassandra.gms;
 
 import java.util.function.Predicate;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.utils.FBUtilities;
@@ -34,10 +35,12 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.CUSTOM_FAI
 
 public interface IFailureDetector
 {
+    // The custom class from the system property if set (CNDB); otherwise the failure_detector configured in
+    // cassandra.yaml (FailureDetector by default; the simulator configures its own), as upstream does (CASSANDRA-16930)
     IFailureDetector instance = CUSTOM_FAILURE_DETECTOR_PROPERTY.isPresent()
                                 ? FBUtilities.construct(CUSTOM_FAILURE_DETECTOR_PROPERTY.getString(),
                                                         "Failure Detector")
-                                : new FailureDetector();
+                                : DatabaseDescriptor.newFailureDetector();
 
     public static final Predicate<InetAddressAndPort> isEndpointAlive = instance::isAlive;
     public static final Predicate<Replica> isReplicaAlive = r -> isEndpointAlive.test(r.endpoint());

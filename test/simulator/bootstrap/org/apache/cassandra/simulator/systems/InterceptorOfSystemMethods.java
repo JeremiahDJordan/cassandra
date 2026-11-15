@@ -172,6 +172,17 @@ public interface InterceptorOfSystemMethods
             methods.nemesis(chance);
         }
 
+        /**
+         * Replaces {@link Thread#yield()}. Code that yields is waiting for another thread to make progress, which a
+         * simulated thread can only do once this one is descheduled, so always give the scheduler the chance to run
+         * something else.
+         */
+        public static void yieldThread()
+        {
+            Thread.yield();
+            methods.nemesis(1.0f);
+        }
+
         public static int advanceProbe(int probe)
         {
             return probe + 1;

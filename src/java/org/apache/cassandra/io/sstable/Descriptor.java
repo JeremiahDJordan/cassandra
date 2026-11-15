@@ -19,11 +19,13 @@ package org.apache.cassandra.io.sstable;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.regex.Matcher;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 import java.util.regex.Pattern;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -102,7 +104,17 @@ public class Descriptor
     private final String prefix;
     private final File baseFile;
     private final String baseFileURI;
-    private final ConcurrentMap<Component, File> componentFileMap;
+
+    /**
+     * The files of the components resolved so far, so that a component keeps its file once resolved (STAR-1487).
+     * Each value is a map that is never modified after it is published, and {@link #fileFor(Component)} replaces it
+     * with a compare-and-set. That method is called while holding monitors (e.g. {@code SSTableReader#runWithLock}
+     * and the compaction strategies), so it must stay lock-free: a {@code ConcurrentHashMap} takes a bin lock in
+     * {@code computeIfAbsent}, which is also a point where the simulator can deschedule the calling thread.
+     */
+    private volatile Map<Component, File> componentFiles = Collections.emptyMap();
+    private static final AtomicReferenceFieldUpdater<Descriptor, Map> componentFilesUpdater =
+        AtomicReferenceFieldUpdater.newUpdater(Descriptor.class, Map.class, "componentFiles");
 
     /**
      * A descriptor that assumes CURRENT_VERSION.
@@ -152,8 +164,6 @@ public class Descriptor
         if (!locationURI.endsWith(java.io.File.separator))
             locationURI = locationURI + java.io.File.separatorChar;
         baseFileURI = locationURI + prefix;
-
-        componentFileMap = new ConcurrentHashMap<>();
     }
 
     public File tmpFileFor(Component component)
@@ -184,26 +194,43 @@ public class Descriptor
 
     public File fileFor(Component component)
     {
-        return componentFileMap.computeIfAbsent(component, c -> {
-            // STAR-1892 - CNDB depdends on using Component.getFile here to be able to create a RemotePath if the
-            // URI matches. However, tests that extend CQLTester.InMemory (using the jimfs file system) will fail
-            // with an UnsupportedOperationException. One such test is CQLVectorTest.
-            //
-            // Because Component.getFile uses the file URI to create a new Path object, it will not be wrapped by 
-            // ListenablePath. That leads to an UnsupportedOperationException because ListenablePath implements certain 
-            // methods that are not implemented by jimfs.
-            //
-            // Using the resolve method on the directory to create a new Path object keeps it wrapped by ListenablePath 
-            // and will prevent an UnsupportedOperationException.
-            if (baseFileUri().startsWith("jimfs:"))
-            {
-                return new File(directory.toPath().resolve(filenameFor(component)));
-            }
-            else {
-                return component.getFile(baseFileUri());
-            }
+        Map<Component, File> files = componentFiles;
+        File file = files.get(component);
+        if (file != null)
+            return file;
 
-        });
+        File created = createFileFor(component);
+        while (true)
+        {
+            Map<Component, File> updated = new HashMap<>(files);
+            updated.put(component, created);
+            if (componentFilesUpdater.compareAndSet(this, files, updated))
+                return created;
+
+            // lost a race with another thread; use its file if it resolved the same component
+            files = componentFiles;
+            file = files.get(component);
+            if (file != null)
+                return file;
+        }
+    }
+
+    private File createFileFor(Component component)
+    {
+        // STAR-1892 - CNDB depdends on using Component.getFile here to be able to create a RemotePath if the
+        // URI matches. However, tests that extend CQLTester.InMemory (using the jimfs file system) will fail
+        // with an UnsupportedOperationException. One such test is CQLVectorTest.
+        //
+        // Because Component.getFile uses the file URI to create a new Path object, it will not be wrapped by
+        // ListenablePath. That leads to an UnsupportedOperationException because ListenablePath implements certain
+        // methods that are not implemented by jimfs.
+        //
+        // Using the resolve method on the directory to create a new Path object keeps it wrapped by ListenablePath
+        // and will prevent an UnsupportedOperationException.
+        if (baseFileUri().startsWith("jimfs:"))
+            return new File(directory.toPath().resolve(filenameFor(component)));
+        else
+            return component.getFile(baseFileUri());
     }
 
     public File baseFile()

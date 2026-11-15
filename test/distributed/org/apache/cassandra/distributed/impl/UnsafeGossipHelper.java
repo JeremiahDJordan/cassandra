@@ -268,6 +268,9 @@ public class UnsafeGossipHelper
             Gossiper.runInGossipStageBlocking(() -> {
                 EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(getByAddress(address));
                 VersionedValue status = new VersionedValue.VersionedValueFactory(partitioner).shutdown(true);
+                // set both statuses, as Gossiper.stop() does: EndpointState.getStatus() prefers STATUS_WITH_PORT, and a
+                // GOSSIP_SHUTDOWN carrying this state (Gossiper.unsafeSendShutdown) must report a shutdown status
+                state.addApplicationState(ApplicationState.STATUS_WITH_PORT, status);
                 state.addApplicationState(ApplicationState.STATUS, status);
                 state.forceHighestPossibleVersionUnsafe();
                 StorageService.instance.onChange(getByAddress(address), ApplicationState.STATUS, status);
