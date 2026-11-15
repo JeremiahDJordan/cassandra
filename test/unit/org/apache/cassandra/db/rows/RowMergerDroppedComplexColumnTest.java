@@ -139,17 +139,19 @@ public class RowMergerDroppedComplexColumnTest extends CQLTester
         assertRows(execute("SELECT pk, ck, sv, v FROM %s WHERE pk = 1 AND ck = 1"), expected);
         compactAll();
         assertRows(execute("SELECT pk, ck, sv, v FROM %s"), expected);
+        assertRows(execute("SELECT pk, ck, sv, v FROM %s WHERE pk = 1"), expected);
 
         execute("ALTER TABLE %s ADD sc set<int> static");
         assertRows(execute("SELECT pk, ck, sv, sc, v, s FROM %s"), row(1, 1, 4, set(7, 8), 2, set(3)));
     }
 
     /**
-     * Checks a full scan, a partition read and a single-row read of the table, with columns {@code pk, ck, v}.
+     * Checks full scans, partition reads and a single-row read of the table, with columns {@code pk, ck, v}.
      */
     private void assertReads(Object[] expected) throws Throwable
     {
         assertRows(execute("SELECT * FROM %s"), expected);
+        assertRows(execute("SELECT * FROM %s WHERE pk = 1"), expected);
         assertRows(execute("SELECT pk, ck, v FROM %s WHERE pk = 1"), expected);
         assertRows(execute("SELECT pk, ck, v FROM %s WHERE pk = 1 AND ck = 1"), expected);
     }
