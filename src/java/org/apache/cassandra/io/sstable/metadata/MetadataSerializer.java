@@ -45,10 +45,11 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileInputStreamPlus;
+import org.apache.cassandra.io.util.FileOutputStreamPlus;
 import org.apache.cassandra.schema.CompressionParams;
+import org.apache.cassandra.utils.SyncUtil;
 import org.apache.cassandra.utils.TimeUUID;
 
 import static com.google.common.base.Preconditions.checkNotNull;
@@ -339,10 +340,11 @@ public class MetadataSerializer implements IMetadataSerializer
     private void rewriteWith(Descriptor descriptor, Map<MetadataType, MetadataComponent> currentComponents, @Nullable ICompressor encryptor) throws IOException
     {
         File file = descriptor.tmpFileFor(Components.STATS);
-        try (DataOutputStreamPlus out = file.newOutputStream(File.WriteMode.OVERWRITE))
+        try (FileOutputStreamPlus out = file.newOutputStream(File.WriteMode.OVERWRITE))
         {
             serializeWith(currentComponents, out, descriptor, encryptor);
             out.flush();
+            out.sync();
         }
         catch (IOException e)
         {
@@ -350,6 +352,7 @@ public class MetadataSerializer implements IMetadataSerializer
             throw new FSWriteError(e, file);
         }
         file.move(descriptor.fileFor(Components.STATS));
+        SyncUtil.trySyncDir(descriptor.directory);
     }
 
     public void updateSSTableMetadata(Descriptor descriptor, Map<MetadataType, MetadataComponent> updatedComponents) throws IOException

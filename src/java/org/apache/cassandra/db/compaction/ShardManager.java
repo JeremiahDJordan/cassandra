@@ -35,7 +35,9 @@ import org.apache.cassandra.db.SortedLocalRanges;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.SortingIterator;
 
@@ -134,8 +136,24 @@ public interface ShardManager
         else
             span = rangeSpanned(rdr.getFirst(), rdr.getLast());
 
-        long partitionCount = rdr.estimatedKeys();
+        long partitionCount = partitionCount(rdr);
         return adjustSmallSpans(span, partitionCount);
+    }
+
+    /// The number of partitions in the given sstable. For an [SSTableReader] this is read from its stats metadata,
+    /// which stores the exact count for every sstable format (unlike `estimatedKeys()`, which for the BIG format is
+    /// an index-summary-based estimate that is far too high for sstables with very few partitions).
+    static long partitionCount(CompactionSSTable rdr)
+    {
+        if (rdr instanceof SSTableReader)
+        {
+            EstimatedHistogram partitionSizes = ((SSTableReader) rdr).getEstimatedPartitionSize();
+            if (partitionSizes != null && partitionSizes.count() > 0)
+                return partitionSizes.count();
+        }
+        // Fall back to estimatedKeys() if the histogram is absent or empty, clamped to 1 so rangeSpanned
+        // never computes a zero floor, which would give a zero span and an infinite density.
+        return Math.max(1, rdr.estimatedKeys());
     }
 
     private double adjustSmallSpans(double span, long partitionCount)

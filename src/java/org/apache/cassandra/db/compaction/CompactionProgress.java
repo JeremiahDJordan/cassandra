@@ -58,6 +58,15 @@ public interface CompactionProgress extends TableOperation.Progress
     long inputDiskSize();
 
     /**
+     * The compressed (on-disk) size matching {@link #total()}: the input disk size for compactions (CASSANDRA-21245).
+     */
+    @Override
+    default long totalCompressed()
+    {
+        return inputDiskSize();
+    }
+
+    /**
      * @return The uncompressed size of the input sstables.
      */
     long inputUncompressedSize();

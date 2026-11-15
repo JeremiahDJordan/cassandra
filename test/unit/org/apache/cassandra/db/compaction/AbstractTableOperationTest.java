@@ -50,7 +50,7 @@ public class AbstractTableOperationTest extends AbstractPendingAntiCompactionTes
         UUID tableId = UUID.randomUUID();
         TimeUUID taskId = nextTimeUUID();
         ColumnFamilyStore cfs = MockSchema.newCFS(builder -> builder.id(TableId.fromUUID(tableId)));
-        AbstractTableOperation.OperationProgress task = new AbstractTableOperation.OperationProgress(cfs.metadata(), OperationType.COMPACTION, 0, 1000, taskId, new ArrayList<>());
+        AbstractTableOperation.OperationProgress task = new AbstractTableOperation.OperationProgress(cfs.metadata(), OperationType.COMPACTION, 0, 1000, taskId, new ArrayList<>()).withTotalCompressed(300);
         Assertions.assertThat(task.toString())
                   .isEqualTo("Compaction(%s, 0 / 1000 bytes)@%s(%s, %s)",
                              taskId, tableId, cfs.getKeyspaceName(), cfs.getTableName());

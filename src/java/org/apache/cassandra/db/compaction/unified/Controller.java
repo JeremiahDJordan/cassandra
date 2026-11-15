@@ -1212,7 +1212,8 @@ public abstract class Controller
 
         double maxSstablesPerShardFactor = options.containsKey(MAX_SSTABLES_PER_SHARD_FACTOR_OPTION)
                                        ? Double.parseDouble(options.get(MAX_SSTABLES_PER_SHARD_FACTOR_OPTION))
-                                       : DEFAULT_MAX_SSTABLES_PER_SHARD_FACTOR;
+                                       : validateMaxSstablesPerShardFactor(DEFAULT_MAX_SSTABLES_PER_SHARD_FACTOR,
+                                                                           UCS_MAX_SSTABLES_PER_SHARD_FACTOR.getKey());
 
         return adaptive
                ? AdaptiveController.fromOptions(env,
@@ -1489,15 +1490,11 @@ public abstract class Controller
         {
             try
             {
-                double maxSstablesPerShardFactor = Double.parseDouble(s);
-                if (maxSstablesPerShardFactor < 1)
-                    throw new ConfigurationException(String.format("%s %s must be a float >= 1",
-                                                                   MAX_SSTABLES_PER_SHARD_FACTOR_OPTION,
-                                                                   s));
+                validateMaxSstablesPerShardFactor(Double.parseDouble(s), MAX_SSTABLES_PER_SHARD_FACTOR_OPTION);
             }
             catch (NumberFormatException e)
             {
-                throw new ConfigurationException(String.format(floatParseErr,
+                throw new ConfigurationException(String.format("%s is not a parsable number for %s",
                                                                s,
                                                                MAX_SSTABLES_PER_SHARD_FACTOR_OPTION),
                                                  e);
@@ -1505,6 +1502,24 @@ public abstract class Controller
         }
 
         return adaptive ? AdaptiveController.validateOptions(options) : StaticController.validateOptions(options);
+    }
+
+    /**
+     * Checks a max_sstables_per_shard_factor value: 0 (check disabled) or at least 1.
+     *
+     * @param value the factor to check
+     * @param name the table option or system property the value came from, for the error message
+     * @return value
+     * @throws ConfigurationException when the value is neither 0 nor at least 1, including NaN
+     */
+    static double validateMaxSstablesPerShardFactor(double value, String name)
+    {
+        // Written as a negated comparison so that NaN (which compares false to everything) is rejected too
+        if (!(value == 0 || value >= 1))
+            throw new ConfigurationException(String.format("%s %s must be 0 to disable or a number greater than or equal to 1",
+                                                           name,
+                                                           value));
+        return value;
     }
 
     private static long getSizeWithAlt(Map<String, String> options, String optionHumanReadable, String optionAlt, int altShift, long defaultValue)

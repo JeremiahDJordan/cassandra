@@ -95,6 +95,8 @@ public class EncryptedSequentialWriter extends SequentialWriter
         super(file, true, SequentialWriterOption.newBuilder()
                             .bufferSize(maxBytesInPage(encryptor))
                             .bufferType(BufferType.preferredForCompression())
+                            .trickleFsync(option.trickleFsync())
+                            .trickleFsyncByteInterval(option.trickleFsyncByteInterval())
                             .finishOnClose(option.finishOnClose())
                             .build(), true);
         assert Integer.bitCount(CHUNK_SIZE) == 1

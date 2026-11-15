@@ -193,7 +193,6 @@ public abstract class ResultMessage<T extends ResultMessage<T>> extends Message.
             r.setWarnings(getWarnings());
             r.setCustomPayload(getCustomPayload());
             r.setSource(getSource());
-            r.setStreamId(getStreamId());
             return r;
         }
     }
@@ -254,7 +253,6 @@ public abstract class ResultMessage<T extends ResultMessage<T>> extends Message.
             r.setWarnings(getWarnings());
             r.setCustomPayload(getCustomPayload());
             r.setSource(getSource());
-            r.setStreamId(getStreamId());
             return r;
         }
     }
@@ -352,7 +350,6 @@ public abstract class ResultMessage<T extends ResultMessage<T>> extends Message.
             r.setWarnings(getWarnings());
             r.setCustomPayload(getCustomPayload());
             r.setSource(getSource());
-            r.setStreamId(getStreamId());
             return r;
         }
 
@@ -409,7 +406,6 @@ public abstract class ResultMessage<T extends ResultMessage<T>> extends Message.
             r.setWarnings(getWarnings());
             r.setCustomPayload(getCustomPayload());
             r.setSource(getSource());
-            r.setStreamId(getStreamId());
             return r;
         }
 

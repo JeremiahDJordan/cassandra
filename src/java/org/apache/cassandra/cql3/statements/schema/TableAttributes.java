@@ -26,6 +26,8 @@ import java.util.stream.Collectors;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.functions.types.utils.Bytes;
@@ -33,6 +35,7 @@ import org.apache.cassandra.cql3.statements.PropertyDefinitions;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.schema.AutoRepairParams;
 import org.apache.cassandra.schema.CachingParams;
 import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.CompressionParams;
@@ -43,6 +46,7 @@ import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.schema.TableParams.Option;
 import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
 import org.apache.cassandra.service.reads.repair.ReadRepairStrategy;
+import org.apache.cassandra.utils.CassandraVersion;
 
 import static java.lang.String.format;
 import static org.apache.cassandra.schema.TableParams.Option.*;
@@ -78,6 +82,17 @@ public final class TableAttributes extends PropertyDefinitions
     public void validate(String keyspace)
     {
         validate(validKeywords, obsoleteKeywords);
+
+        if (hasOption(AUTO_REPAIR))
+        {
+            if (!CassandraRelevantProperties.AUTOREPAIR_ENABLE.getBoolean())
+                throw new ConfigurationException("auto_repair option is not supported unless auto-repair is enabled with -Dcassandra.autorepair.enable=true");
+            if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major))
+                throw new ConfigurationException("auto_repair option is not supported while storage_compatibility_mode is "
+                                                 + DatabaseDescriptor.getStorageCompatibilityMode()
+                                                 + "; set storage_compatibility_mode to UPGRADING or NONE");
+        }
+
         build(TableParams.builder(keyspace)).validate();
     }
 
@@ -259,6 +274,9 @@ public final class TableAttributes extends PropertyDefinitions
 
         if (hasOption(READ_REPAIR))
             builder.readRepair(ReadRepairStrategy.fromString(getString(READ_REPAIR)));
+
+        if (hasOption(Option.AUTO_REPAIR))
+            builder.automatedRepair(AutoRepairParams.fromMap(getMap(Option.AUTO_REPAIR)));
 
         return builder.build();
     }

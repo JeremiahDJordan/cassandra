@@ -140,6 +140,7 @@ public class NodeTool
     private static Cli.CliBuilder<NodeToolCmdRunnable> builtinCommands()
     {
         List<Class<? extends NodeToolCmdRunnable>> commands = newArrayList(
+                AutoRepairStatus.class,
                 Assassinate.class,
                 CassHelp.class,
                 CIDRFilteringStats.class,
@@ -181,6 +182,7 @@ public class NodeTool
                 GcStats.class,
                 GetAuditLog.class,
                 GetAuthCacheConfig.class,
+                GetAutoRepairConfig.class,
                 GetBatchlogReplayTrottle.class,
                 GetCIDRGroupsOfIP.class,
                 GetColumnIndexSize.class,
@@ -244,6 +246,7 @@ public class NodeTool
                 Ring.class,
                 Scrub.class,
                 SetAuthCacheConfig.class,
+                SetAutoRepairConfig.class,
                 SetBatchlogReplayThrottle.class,
                 SetCacheCapacity.class,
                 SetCacheKeysToSave.class,
@@ -265,6 +268,7 @@ public class NodeTool
                 SetTraceProbability.class,
                 Sjk.class,
                 Snapshot.class,
+                SSTableRepairedSet.class,
                 Status.class,
                 StatusAutoCompaction.class,
                 StatusBackup.class,

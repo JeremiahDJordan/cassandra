@@ -90,7 +90,7 @@ public class CompactionsCQLTest extends CQLTester
     public void before() throws IOException
     {
         strategy = DatabaseDescriptor.getCorruptedTombstoneStrategy();
-        
+
         CommitLog.instance.resetUnsafe(true);
     }
 
@@ -941,7 +941,9 @@ public class CompactionsCQLTest extends CQLTester
             execute("insert into %s (id, i) values (?,?)", i, i);
             getCurrentColumnFamilyStore().forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
         }
-        AbstractTableOperation holder = holder(OperationType.COMPACTION);
+        // When we have an existing compaction with sstables of total size more than double the available space,
+        // we should not be able to then run a major compaction
+        AbstractTableOperation holder = holder(OperationType.COMPACTION, 2);
         try (NonThrowingCloseable c = CompactionManager.instance.active.onOperationStart(holder))
         {
             getCurrentColumnFamilyStore().forceMajorCompaction();
@@ -952,14 +954,21 @@ public class CompactionsCQLTest extends CQLTester
             // expected
         }
         // don't block compactions if there is a huge validation
-        holder = holder(OperationType.VALIDATION);
+        holder = holder(OperationType.VALIDATION, 2);
+        try (NonThrowingCloseable c = CompactionManager.instance.active.onOperationStart(holder))
+        {
+            getCurrentColumnFamilyStore().forceMajorCompaction();
+        }
+
+        // Should be able to run when the sstables in question are 90% of the total available space
+        holder = holder(OperationType.COMPACTION, 0.9);
         try (NonThrowingCloseable c = CompactionManager.instance.active.onOperationStart(holder))
         {
             getCurrentColumnFamilyStore().forceMajorCompaction();
         }
     }
 
-    private AbstractTableOperation holder(OperationType opType)
+    private AbstractTableOperation holder(OperationType opType, double availableSpaceMultiplier)
     {
         AbstractTableOperation holder = new AbstractTableOperation()
         {
@@ -969,12 +978,16 @@ public class CompactionsCQLTest extends CQLTester
                 for (File f : getCurrentColumnFamilyStore().getDirectories().getCFDirectories())
                     availableSpace += PathUtils.tryGetSpace(f.toPath(), FileStore::getUsableSpace);
 
-                return new OperationProgress(getCurrentColumnFamilyStore().metadata(), 
-                                             opType,                                               
-                                             +0,                                               
-                                             +availableSpace * 2, 
-                                             nextTimeUUID(),                                                                                                                   
-                                             getCurrentColumnFamilyStore().getLiveSSTables());
+                Set<SSTableReader> liveSSTables = getCurrentColumnFamilyStore().getLiveSSTables();
+                long totalDiskUsage = (long)(availableSpace * availableSpaceMultiplier);
+                // Arbitrary compression ratio of 3.4
+                long totalUncompressedSize = (long) ((double) totalDiskUsage * 3.4);
+                return new OperationProgress(getCurrentColumnFamilyStore().metadata(),
+                                             opType,
+                                             +0,
+                                             totalUncompressedSize,
+                                             nextTimeUUID(),
+                                             liveSSTables).withTotalCompressed(totalDiskUsage);
             }
 
             public boolean isGlobal()
@@ -998,6 +1011,8 @@ public class CompactionsCQLTest extends CQLTester
     private void loadTestSStables(ColumnFamilyStore cfs, File ksDir) throws IOException
     {
         Keyspace.open(cfs.getKeyspaceName()).getColumnFamilyStore(cfs.name).truncateBlocking();
+        // truncate deletes the flushed sstables asynchronously; loadNewSSTables() must not find them half-deleted
+        LifecycleTransaction.waitForDeletions();
         for (File cfDir : cfs.getDirectories().getCFDirectories())
         {
             File tableDir = new File(ksDir, cfs.name);

@@ -242,7 +242,7 @@ public final class CompressionParams
         int chunkLength = removeChunkLength(options);
         double minCompressRatio = removeMinCompressRatio(options, strict);
         int maxCompressedLength = calcMaxCompressedLength(chunkLength, minCompressRatio);
-        Class<?> compressorClass = parseCompressorClass(sstableCompressionClass);
+        Class<? extends ICompressor> compressorClass = parseCompressorClass(sstableCompressionClass);
 
         // Reject before creating the compressor: creating an Encryptor may have side effects on the key provider,
         // e.g. generating a key. The general case (any encrypting compressor) is checked by validate(), with the same
@@ -446,7 +446,7 @@ public final class CompressionParams
         return maxCompressedLength;
     }
 
-    private static Class<?> parseCompressorClass(String className) throws ConfigurationException
+    private static Class<? extends ICompressor> parseCompressorClass(String className) throws ConfigurationException
     {
         if (className == null || className.isEmpty())
             return null;
@@ -454,15 +454,17 @@ public final class CompressionParams
         className = expandCompressorName(className);
         try
         {
-            return Class.forName(className);
+            return FBUtilities.classForNameWithoutInitialization(className, "compression", ICompressor.class);
         }
-        catch (Exception e)
+        catch (ConfigurationException e)
         {
-            throw new ConfigurationException("Could not create Compression for type " + className, e);
+            if (e.getCause() instanceof ClassNotFoundException || e.getCause() instanceof NoClassDefFoundError)
+                throw new ConfigurationException("Could not create Compression for type " + className, e);
+            throw e;
         }
     }
 
-    private static ICompressor createCompressor(Class<?> compressorClass, Map<String, String> compressionOptions) throws ConfigurationException
+    private static ICompressor createCompressor(Class<? extends ICompressor> compressorClass, Map<String, String> compressionOptions) throws ConfigurationException
     {
         if (compressorClass == null)
         {

@@ -36,6 +36,7 @@ public class RequestFailureReasonTest
     { 5, "NODE_DOWN" },
     { 6, "INDEX_NOT_AVAILABLE" },
     { 7, "READ_TOO_MANY_INDEXES" },
+    { 12, "TRUNCATE_FAILED" },
     { 500, "UNKNOWN_COLUMN" },
     { 501, "UNKNOWN_TABLE" },
     { 502, "REMOTE_STORAGE_FAILURE" },

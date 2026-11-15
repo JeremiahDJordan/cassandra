@@ -75,7 +75,7 @@ final class ClientsTable extends AbstractVirtualTable
             InetSocketAddress remoteAddress = client.remoteAddress();
 
             result.row(remoteAddress.getAddress(), remoteAddress.getPort())
-                  .column(HOSTNAME, remoteAddress.getHostName())
+                  .column(HOSTNAME, remoteAddress.getHostString())
                   .column(USERNAME, client.username().orElse(null))
                   .column(CONNECTION_STAGE, client.stage().toString().toLowerCase())
                   .column(PROTOCOL_VERSION, client.protocolVersion())

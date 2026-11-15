@@ -94,10 +94,9 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
      * The instances of these FlushItem subclasses are specialized to release resources in the
      * right way for the specific pipeline that produced them.
      */
-    // TODO parameterize with FlushItem subclass
-    interface FlushItemConverter
+    public interface FlushItemConverter<P>
     {
-        FlushItem<?> toFlushItem(Channel channel, Message.Request request, Message.Response response);
+        FlushItem<?> toFlushItem(P param, Channel channel, Message.Request request, Message.Response response);
     }
 
     public Dispatcher(boolean useLegacyFlusher)
@@ -106,18 +105,17 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
     }
 
     @Override
-    public void dispatch(Channel channel, Message.Request request, FlushItemConverter forFlusher, Overload backpressure)
+    public <P> void dispatch(Channel channel, Message.Request request, FlushItemConverter<P> forFlusher, P param, Overload backpressure)
     {
         if (!request.connection().getTracker().isRunning())
         {
             // We can not respond with a custom, transport, or server exceptions since, given current implementation of clients,
             // they will defunct the connection. Without a protocol version bump that introduces an "I am going away message",
             // we have to stick to an existing error code.
-            Message.Response response = ErrorMessage.fromException(new OverloadedException("Server is shutting down"));
-            response.setStreamId(request.getStreamId());
+            Message.Response response = ErrorMessage.fromTransportException(new OverloadedException("Server is shutting down"));
             response.setWarnings(ClientWarn.instance.getWarnings());
             response.attach(request.connection);
-            FlushItem<?> toFlush = forFlusher.toFlushItem(channel, request, response);
+            FlushItem<?> toFlush = forFlusher.toFlushItem(param, channel, request, response);
             flush(toFlush);
             return;
         }
@@ -129,7 +127,7 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         // Importantly, the authExecutor will handle the AUTHENTICATE message which may be CPU intensive.
         ExecutorPlus executor = isAuthQuery ? authExecutor : requestExecutor;
 
-        executor.submit(new RequestProcessor(channel, request, forFlusher, backpressure));
+        executor.submit(new RequestProcessor<>(channel, request, forFlusher, param, backpressure));
         ClientMetrics.instance.markRequestDispatched();
     }
 
@@ -288,20 +286,22 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
      * is the only way we can keep it not wrapped into a callable on SEPExecutor submission path. And we need this
      * functionality for tracking time purposes.
      */
-    public class RequestProcessor implements DebuggableTask.RunnableDebuggableTask
+    public class RequestProcessor<P> implements DebuggableTask.RunnableDebuggableTask
     {
         private final Channel channel;
         private final Message.Request request;
-        private final FlushItemConverter forFlusher;
+        private final FlushItemConverter<P> forFlusher;
+        private final P flusherParam;
         private final Overload backpressure;
 
         private volatile long startTimeNanos;
 
-        public RequestProcessor(Channel channel, Message.Request request, FlushItemConverter forFlusher, Overload backpressure)
+        public RequestProcessor(Channel channel, Message.Request request, FlushItemConverter<P> forFlusher, P flusherParam, Overload backpressure)
         {
             this.channel = channel;
             this.request = request;
             this.forFlusher = forFlusher;
+            this.flusherParam = flusherParam;
             this.backpressure = backpressure;
         }
 
@@ -309,7 +309,7 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         public void run()
         {
             startTimeNanos = MonotonicClock.Global.preciseTime.now();
-            processRequest(channel, request, forFlusher, backpressure, new RequestTime(request.createdAtNanos, startTimeNanos));
+            processRequest(channel, request, forFlusher, flusherParam, backpressure, new RequestTime(request.createdAtNanos, startTimeNanos));
         }
 
         @Override
@@ -353,7 +353,7 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         return requestExecutor.oldestTaskQueueTime() < (DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS) * threshold);
     }
 
-    void processRequest(Channel channel, Message.Request request, FlushItemConverter forFlusher, Overload backpressure, RequestTime requestTime)
+    <P> void processRequest(Channel channel, Message.Request request, FlushItemConverter<P> forFlusher, P param, Overload backpressure, RequestTime requestTime)
     {
         assert request.connection() instanceof ServerConnection;
         ServerConnection connection = (ServerConnection) request.connection();
@@ -364,17 +364,16 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
                     FlushItem<?> toFlush;
                     if (ex == null)
                     {
-                        toFlush = forFlusher.toFlushItem(channel, request, response);
+                        toFlush = forFlusher.toFlushItem(param, channel, request, response);
                         Message.logger.trace("Responding: {}, v={}", response, connection.getVersion());
                     }
                     else
                     {
                         JVMStabilityInspector.inspectThrowable(ex);
                         Predicate<Throwable> handler = ExceptionHandlers.getUnexpectedExceptionHandler(channel, true);
-                        ErrorMessage error = ErrorMessage.fromException(ex, handler);
-                        error.setStreamId(request.getStreamId());
+                        ErrorMessage error = ErrorMessage.fromExceptionNoStreamId(ex, handler);
                         error.setWarnings(ClientWarn.instance.getWarnings());
-                        toFlush = forFlusher.toFlushItem(channel, request, error);
+                        toFlush = forFlusher.toFlushItem(param, channel, request, error);
                     }
                     flush(toFlush);
                 });
@@ -400,7 +399,7 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         if (queueTime > DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS))
         {
             ClientMetrics.instance.markTimedOutBeforeProcessing();
-            return ImmediateFuture.success(ErrorMessage.fromException(new OverloadedException("Query timed out before it could start")));
+            return ImmediateFuture.success(ErrorMessage.fromTransportException(new OverloadedException("Query timed out before it could start")));
         }
 
         if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
@@ -462,7 +461,6 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
 
                     if (result != null)
                     {
-                        result.setStreamId(request.getStreamId());
                         result.setWarnings(ClientWarn.instance.getWarnings());
                         result.attach(connection);
                         connection.applyStateTransition(request.type, result.type);
@@ -502,7 +500,6 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
             {
                 if (result != null)
                 {
-                    result.setStreamId(request.getStreamId());
                     result.setWarnings(ClientWarn.instance.getWarnings());
                     result.attach(connection);
                     connection.applyStateTransition(request.type, result.type);
@@ -546,7 +543,7 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
      * for delivering events to registered clients is dependent on protocol version and the configuration
      * of the pipeline. For v5 and newer connections, the event message is encoded into an Envelope,
      * wrapped in a FlushItem and then delivered via the pipeline's flusher, in a similar way to
-     * a Response returned from {@link #processRequest(Channel, Message.Request, FlushItemConverter, Overload, RequestTime)}.
+     * a Response returned from {@link #processRequest(Channel, Message.Request, FlushItemConverter, Object, Overload, RequestTime)}.
      * It's worth noting that events are not generally fired as a direct response to a client request,
      * so this flush item has a null request attribute. The dispatcher itself is created when the
      * pipeline is first configured during protocol negotiation and is attached to the channel for
@@ -560,9 +557,9 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
                                            final FrameEncoder.PayloadAllocator allocator)
     {
         return eventMessage -> flush(new FlushItem.Framed(channel,
-                                                          eventMessage.encode(version),
+                                                          eventMessage.encode(version, EventMessage.EVENT_MESSAGE_STREAM_ID), // -1 was set in EventMessage previously
                                                           null,
                                                           allocator,
-                                                          f -> f.response.release()));
+                                                          f -> f.responseEnvelope.release()));
     }
 }

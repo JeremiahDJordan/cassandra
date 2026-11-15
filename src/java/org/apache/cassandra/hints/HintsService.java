@@ -488,16 +488,6 @@ public final class HintsService implements HintsServiceMBean
         return catalog.stores().mapToInt(HintsStore::getCorruptedFilesNum).sum();
     }
 
-    /**
-     * Checks hints files total size on disk exceeds the total maximum.
-     * @return true if the max is exceeded
-     */
-    public boolean exceedsMaxHintsSize()
-    {
-        long maxTotalHintsSize = DatabaseDescriptor.getMaxHintsSizePerHost();
-        return maxTotalHintsSize > 0 && getTotalHintsSize() > maxTotalHintsSize;
-    }
-
     HintsCatalog getCatalog()
     {
         return catalog;

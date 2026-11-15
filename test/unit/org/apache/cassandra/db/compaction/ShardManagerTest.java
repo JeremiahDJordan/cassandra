@@ -30,6 +30,8 @@ import org.junit.Assert;
 import org.junit.Before;
 import org.junit.Test;
 
+import com.google.common.collect.ImmutableList;
+
 import org.agrona.collections.IntArrayList;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.DecoratedKey;
@@ -41,7 +43,9 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Splitter;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
+import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.Pair;
 import org.mockito.Mockito;
 
@@ -219,6 +223,68 @@ public class ShardManagerTest
         assertThat(coveringRange.contains(minimumToken)).isTrue();
     }
 
+    @Test
+    public void testRangeSpannedDiskAware()
+    {
+        CompactionRealm realm = Mockito.mock(CompactionRealm.class);
+        when(realm.getPartitioner()).thenReturn(partitioner);
+        when(realm.estimatedPartitionCountInSSTables()).thenReturn(10000L);
+        SortedLocalRanges sortedRanges = SortedLocalRanges.forTestingFull(realm);
+        ShardManager shardManager = new ShardManagerDiskAware(sortedRanges, sortedRanges.split(2));
+
+        // DiskAware inherits the span floor from ShardManagerNoDisks
+        assertEquals(0.02, shardManager.rangeSpanned(mockedTable(0.3, 0.3, Double.NaN, 200)), delta);
+    }
+
+    @Test
+    public void testPartitionCountFromStatsMetadata()
+    {
+        weightedRanges.add(new Splitter.WeightedRange(1.0, new Range<>(minimumToken, minimumToken)));
+        ShardManager shardManager = new ShardManagerNoDisks(localRanges);
+
+        // The stats histogram holds the exact count and wins over estimatedKeys.
+        EstimatedHistogram threePartitions = new EstimatedHistogram();
+        threePartitions.add(100);
+        threePartitions.add(200);
+        threePartitions.add(300);
+        SSTableReader withHistogram = mockedReader(0.3, 0.3, Double.NaN, 500);
+        Mockito.when(withHistogram.getEstimatedPartitionSize()).thenReturn(threePartitions);
+        assertEquals(3, ShardManager.partitionCount(withHistogram));
+        assertEquals(0.0003, shardManager.rangeSpanned(withHistogram), delta);
+
+        // An empty histogram falls back to estimatedKeys.
+        SSTableReader emptyHistogram = mockedReader(0.3, 0.3, Double.NaN, 7);
+        Mockito.when(emptyHistogram.getEstimatedPartitionSize()).thenReturn(new EstimatedHistogram());
+        assertEquals(7, ShardManager.partitionCount(emptyHistogram));
+        assertEquals(0.0007, shardManager.rangeSpanned(emptyHistogram), delta);
+
+        // No histogram and no keys still count as one partition, so the span floor is never zero.
+        SSTableReader noKeys = mockedReader(0.3, 0.3, Double.NaN, 0);
+        assertEquals(1, ShardManager.partitionCount(noKeys));
+        assertEquals(0.0001, shardManager.rangeSpanned(noKeys), delta);
+
+        // Other CompactionSSTable implementations use estimatedKeys.
+        assertEquals(7, ShardManager.partitionCount(mockedTable(0.3, 0.3, Double.NaN, 7)));
+
+        // The floor applies below PER_PARTITION_SPAN_THRESHOLD partitions and the raw span from it.
+        assertEquals(0.0099, shardManager.rangeSpanned(mockedTable(0.3, 0.3 + 1e-6, Double.NaN, ShardManager.PER_PARTITION_SPAN_THRESHOLD - 1)), delta);
+        assertEquals(1e-6, shardManager.rangeSpanned(mockedTable(0.3, 0.3 + 1e-6, Double.NaN, ShardManager.PER_PARTITION_SPAN_THRESHOLD)), delta);
+    }
+
+    @Test
+    public void testSplitSSTablesInShardsEnteringFirstShardOnSecondDisk()
+    {
+        CompactionRealm realm = Mockito.mock(CompactionRealm.class);
+        when(realm.getPartitioner()).thenReturn(partitioner);
+        SortedLocalRanges sortedRanges = SortedLocalRanges.forTestingFull(realm);
+        List<Token> disks = sortedRanges.split(2);
+        ShardManager manager = new ShardManagerDiskAware(sortedRanges, disks);
+        CompactionSSTable table = mockedTable(0.6, 0.65, Double.NaN);
+
+        List<Range<Token>> actual = manager.splitSSTablesInShards(ImmutableList.of(table), 2, (sstables, range) -> range);
+        assertEquals(ImmutableList.of(new Range<>(disks.get(0), tokenAt(0.75))), actual);
+    }
+
     Token tokenAt(double pos)
     {
         return partitioner.split(minimumToken, minimumToken, pos);
@@ -241,6 +307,17 @@ public class ShardManagerTest
         Mockito.when(mock.getLast()).thenReturn(tokenAt(end).minKeyBound());
         Mockito.when(mock.tokenSpaceCoverage()).thenReturn(reportedCoverage);
         Mockito.when(mock.estimatedKeys()).thenReturn(estimatedKeys);
+        return mock;
+    }
+
+    SSTableReader mockedReader(double start, double end, double reportedCoverage, long estimatedKeys)
+    {
+        SSTableReader mock = Mockito.mock(SSTableReader.class);
+        Mockito.when(mock.getFirst()).thenReturn(new BufferDecoratedKey(tokenAt(start), ByteBuffer.allocate(0)));
+        Mockito.when(mock.getLast()).thenReturn(new BufferDecoratedKey(tokenAt(end), ByteBuffer.allocate(0)));
+        Mockito.when(mock.tokenSpaceCoverage()).thenReturn(reportedCoverage);
+        Mockito.when(mock.estimatedKeys()).thenReturn(estimatedKeys);
+        Mockito.when(mock.getEstimatedPartitionSize()).thenReturn(null); // partitionCount falls back to estimatedKeys
         return mock;
     }
 

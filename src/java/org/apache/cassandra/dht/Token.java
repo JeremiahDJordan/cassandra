@@ -196,7 +196,11 @@ public abstract class Token implements RingPosition<Token>, Serializable
      *
      * Used to construct token ranges for sstables.
      */
-    abstract public Token prevValidToken();
+    public Token prevValidToken()
+    {
+        throw new UnsupportedOperationException(String.format("Token type %s does not support token allocation.",
+                                                              getClass().getSimpleName()));
+    }
 
     public Token getToken()
     {

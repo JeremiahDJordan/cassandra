@@ -59,7 +59,6 @@ import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.util.DataIntegrityMetadata;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
-import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -101,8 +100,8 @@ public abstract class SortedTableVerifier<R extends SSTableReaderWithFilter> imp
 
         this.fileAccessLock = new ReentrantReadWriteLock();
         this.dataFile = isOffline
-                        ? sstable.openDataReader(ReadPattern.SEQUENTIAL)
-                        : sstable.openDataReader(CompactionManager.instance.getRateLimiter(), ReadPattern.SEQUENTIAL);
+                        ? sstable.openDataReaderForScan()
+                        : sstable.openDataReaderForScan(CompactionManager.instance.getRateLimiter());
         this.verifyInfo = new VerifyInfo(dataFile, sstable, fileAccessLock.readLock());
         this.options = options;
         this.isOffline = isOffline;
@@ -548,7 +547,7 @@ public abstract class SortedTableVerifier<R extends SSTableReaderWithFilter> imp
                                              dataFile.getFilePointer(),
                                              dataFile.length(),
                                              verificationCompactionId,
-                                             ImmutableSet.of(sstable));
+                                             ImmutableSet.of(sstable)).withTotalCompressed(sstable.onDiskLength());
             }
             catch (Exception e)
             {

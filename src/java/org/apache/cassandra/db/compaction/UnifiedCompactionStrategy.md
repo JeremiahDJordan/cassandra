@@ -680,6 +680,7 @@ UCS accepts these compaction strategy parameters:
   So this setting is useful to prevent the number of SSTables in a shard from growing too large, which can cause
   problems due to the per-sstable overhead. Also these small SSTables may still have overlaps even if under the
   compaction threshold (eg. due to write replicas) and never compacting them wastes storage space.  
+  A value of 0 disables this check.  
   The default value is 10.
 
 All UCS options can also be supplied as system properties, using the prefix `unified_compaction.`, e.g. 

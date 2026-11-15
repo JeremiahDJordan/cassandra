@@ -787,6 +787,11 @@ public class StreamSession
         metrics.countStreamedIn(isEntireSSTable);
     }
 
+    public void countEntireSSTableDigestMismatch()
+    {
+        metrics.countEntireSSTableDigestMismatch();
+    }
+
     /**
      * Finish preparing the session. This method is blocking (memtables are flushed in {@link #addTransferRanges}),
      * so the logic should not execute on the main IO thread (read: netty event loop).
@@ -933,7 +938,7 @@ public class StreamSession
             for (FileStore fs : allWriteableFileStores)
                 newStreamBytesToWritePerFileStore.merge(fs, totalBytesInPerFileStore, Long::sum);
         }
-        Map<FileStore, Long> totalCompactionWriteRemaining = Directories.perFileStore(CompactionManager.instance.active.estimatedRemainingWriteBytes(),
+        Map<FileStore, Long> totalCompactionWriteRemaining = Directories.perFileStore(CompactionManager.instance.active.estimatedRemainingWriteToDiskBytes(),
                                                                                       fileStoreMapper);
         long totalStreamRemaining = StreamManager.instance.getTotalRemainingOngoingBytes();
         long totalBytesStreamRemainingPerFileStore = totalStreamRemaining / Math.max(1, allFileStores.size());

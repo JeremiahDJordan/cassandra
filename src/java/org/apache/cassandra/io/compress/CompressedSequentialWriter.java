@@ -104,10 +104,10 @@ public class CompressedSequentialWriter extends SequentialWriter
                                       MetadataCollector sstableMetadataCollector)
     {
         super(file, SequentialWriterOption.newBuilder()
-                                          .bufferSize(option.bufferSize())
-                                          .bufferType(option.bufferType())
                                           .bufferSize(parameters.chunkLength())
                                           .bufferType(parameters.getSstableCompressor().preferredBufferType())
+                                          .trickleFsync(option.trickleFsync())
+                                          .trickleFsyncByteInterval(option.trickleFsyncByteInterval())
                                           .finishOnClose(option.finishOnClose())
                                           .build());
         this.parameters = parameters;

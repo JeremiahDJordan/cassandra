@@ -114,7 +114,7 @@ max_hints_file_size: 128MiB
 # Disable the option in order to preserve those hints on the disk.
 auto_hints_cleanup_enabled: false
 
-# Enable/disable transfering hints to a peer during decommission. Even when enabled, this does not guarantee
+# Enable/disable transferring hints to a peer during decommission. Even when enabled, this does not guarantee
 # consistency for logged batches, and it may delay decommission when coupled with a strict hinted_handoff_throttle. 
 # Default: true
 # transfer_hints_on_decommission: true
@@ -496,7 +496,7 @@ commit_failure_policy: stop
 #
 # Valid values are either "auto" (omitting the value) or a value greater 0.
 #
-# Note that specifying a too large value will result in long running GCs and possbily
+# Note that specifying a too large value will result in long running GCs and possibly
 # out-of-memory errors. Keep the value at a small fraction of the heap.
 #
 # If you constantly see "prepared statements discarded in the last minute because
@@ -505,7 +505,7 @@ commit_failure_policy: stop
 # i.e. use bind markers for variable parts.
 #
 # Do only change the default value, if you really have more prepared statements than
-# fit in the cache. In most cases it is not neccessary to change this value.
+# fit in the cache. In most cases it is not necessary to change this value.
 # Constantly re-preparing statements is a performance penalty.
 #
 # Default value ("auto") is 1/256th of the heap or 10MiB, whichever is greater
@@ -842,7 +842,7 @@ memtable:
 memtable_allocation_type: offheap_objects
 
 # Limit memory usage for Merkle tree calculations during repairs of a certain
-# table and common token range. Repair commands targetting multiple tables or
+# table and common token range. Repair commands targeting multiple tables or
 # virtual nodes can exceed this limit depending on concurrent_merkle_tree_requests.
 #
 # The default is 1/16th of the available heap. The main tradeoff is that
@@ -945,7 +945,7 @@ memtable_allocation_type: offheap_objects
 # Min unit: ms
 # cdc_free_space_check_interval: 250ms
 
-# A fixed memory pool size in MB for for SSTable index summaries. If left
+# A fixed memory pool size in MB for SSTable index summaries. If left
 # empty, this will default to 5% of the heap size. If the memory usage of
 # all index summaries exceeds this limit, SSTables with low read rates will
 # shrink their index summaries in order to meet this limit.  However, this
@@ -969,6 +969,8 @@ index_summary_resize_interval: 60m
 # impacting read latencies. Almost always a good idea on SSDs; not
 # necessarily on platters.
 trickle_fsync: true
+# The interval is counted in uncompressed bytes, so for compressed SSTables
+# (the default) an fsync fires after fewer bytes than this reach the disk.
 # Min unit: KiB
 trickle_fsync_interval: 10240KiB
 
@@ -1248,7 +1250,7 @@ column_index_cache_size: 2KiB
 
 # Number of simultaneous repair validations to allow. If not set or set to
 # a value less than 1, it defaults to the value of concurrent_compactors.
-# To set a value greeater than concurrent_compactors at startup, the system
+# To set a value greater than concurrent_compactors at startup, the system
 # property cassandra.allow_unlimited_concurrent_validations must be set to
 # true. To dynamically resize to a value > concurrent_compactors on a running
 # node, first call the bypassConcurrentValidatorsLimit method on the
@@ -1295,6 +1297,14 @@ uuid_sstable_identifiers_enabled: true
 # disks balanced, it cannot guarantee it. This feature will be automatically
 # disabled if internode encryption is enabled.
 # stream_entire_sstables: true
+
+# When an entire SSTable is received via zero-copy streaming, validate the Digest.crc32 that was streamed with it
+# against the received Data.db before the SSTable is added to the table. This detects corruption introduced in
+# transit as well as pre-existing corruption on the sending node's disk, neither of which is otherwise noticed by
+# this path, since it writes component bytes to disk without parsing them.
+# If there's no Digest.crc32, this check passes.
+# When unset, the default is not validating Digest.crc32.
+# entire_sstable_stream_digest_validation_enabled: false
 
 # Throttles entire SSTable outbound streaming file transfers on
 # this node to the given total throughput in Mbps.
@@ -1607,6 +1617,35 @@ dynamic_snitch_reset_interval: 600000ms
 # until the pinned host was 20% worse than the fastest.
 dynamic_snitch_badness_threshold: 1.0
 
+# Paxos variant for lightweight transactions (LWTs)
+# Options:
+#   v1
+#          - Legacy Paxos. Expect 4RTs for a write and 3RTs for a read. (default)
+#
+#   v1_without_linearizable_reads_or_rejected_writes
+#          - Legacy Paxos. Expect 4RTs for a write and 2RTs for a read.
+#            With legacy semantics for read/read and rejected write linearizability, i.e. not guaranteed.
+#
+#   v2
+#          - Optimized Paxos. Expect 2RTs for a write, and either 1RT or 2RT for a read. (recommended)
+#
+#   v2_without_linearizable_reads
+#          - Optimized Paxos. Expect 2RTs for a write and 1RT for a read.
+#
+#   v2_without_linearizable_reads_or_rejected_writes
+#          - Optimized Paxos. Expect 2RTs for a write and 1RT for a read.
+#            With legacy semantics for read/read and rejected write linearizability, i.e. not guaranteed.
+#
+# To upgrade from v1:
+#   1. Ensure all nodes are on same Cassandra version 4.1+.
+#   2. Run `nodetool repair --full -pr` on each node.
+#   3. Set paxos_variant: v2 on each node and rolling restart.
+#   Rollback is safe: revert to v1 and rolling restart. No data migration needed.
+#
+# With any v2 variant and `paxos_state_purging: repaired` it is safe to use ANY Commit consistency.
+#
+#paxos_variant: v1
+
 # Configures Java crypto provider. By default, it will use DefaultCryptoProvider
 # which will install Amazon Correto Crypto Provider.
 #
@@ -1675,7 +1714,7 @@ server_encryption_options:
 #  outbound_keystore_password: cassandra
   # Verify peer server certificates
   require_client_auth: false
-  # Set to a valid trustore if require_client_auth is true
+  # Set to a valid truststore if require_client_auth is true
   truststore: conf/.truststore
   #truststore_password: cassandra
   # Verify that the host name in the certificate matches the connected host
@@ -1720,7 +1759,7 @@ client_encryption_options:
   # Verify client certificates
   require_client_auth: false
   # require_endpoint_verification: false
-  # Set trustore and truststore_password if require_client_auth is true
+  # Set truststore and truststore_password if require_client_auth is true
   # truststore: conf/.truststore
   # truststore_password: cassandra
   # More advanced defaults:
@@ -1767,7 +1806,7 @@ user_defined_functions_enabled: false
 
 # Enables encrypting data at-rest (on disk). Different key providers can be plugged in, but the default reads from
 # a JCE-style keystore. A single keystore can hold multiple keys, but the one referenced by
-# the "key_alias" is the only key that will be used for encrypt opertaions; previously used keys
+# the "key_alias" is the only key that will be used for encrypt operations; previously used keys
 # can still (and should!) be in the keystore and will be used on decrypt operations
 # (to handle the case of key rotation).
 #
@@ -1812,7 +1851,7 @@ transparent_data_encryption_options:
 # tombstones seen in memory so we can return them to the coordinator, which
 # will use them to make sure other replicas also know about the deleted rows.
 # With workloads that generate a lot of tombstones, this can cause performance
-# problems and even exaust the server heap.
+# problems and even exhaust the server heap.
 # (http://www.datastax.com/dev/blog/cassandra-anti-patterns-queues-and-queue-like-datasets)
 # Adjust the thresholds here if you understand the dangers and want to
 # scan more tombstones anyway.  These thresholds may also be adjusted at runtime
@@ -1995,6 +2034,13 @@ report_unconfirmed_repaired_data_mismatches: false
 # Materialized views are considered experimental and are not recommended for production use.
 materialized_views_enabled: false
 
+# Specify whether Materialized View mutations are replayed through the write path on streaming, e.g. repair.
+# When enabled, Materialized View data streamed to the destination node will be written into commit log first. When setting to false,
+# the streamed Materialized View data is written into SSTables just the same as normal streaming. The default is true.
+# If this is set to false, streaming will be considerably faster however it's possible that, in extreme situations
+# (losing > quorum # nodes in a replica set), you may have data in your SSTables that never makes it to the Materialized View.
+# materialized_views_on_repair_enabled: true
+
 # Enables creation of transiently replicated keyspaces on this node.
 # Transient replication is experimental and is not recommended for production use.
 transient_replication_enabled: false
@@ -2169,7 +2215,7 @@ drop_compact_storage_enabled: false
 # column_value_size_fail_threshold:
 #
 # Guardrail to warn or fail when encountering larger size of collection data than threshold.
-# At query time this guardrail is applied only to the collection fragment that is being writen, even though in the case
+# At query time this guardrail is applied only to the collection fragment that is being written, even though in the case
 # of non-frozen collections there could be unaccounted parts of the collection on the sstables. This is done this way to
 # prevent read-before-write. The guardrail is also checked at sstable write time to detect large non-frozen collections,
 # although in that case exceeding the fail threshold will only log an error message, without interrupting the operation.
@@ -2180,7 +2226,7 @@ drop_compact_storage_enabled: false
 # collection_size_fail_threshold:
 #
 # Guardrail to warn or fail when encountering more elements in collection than threshold.
-# At query time this guardrail is applied only to the collection fragment that is being writen, even though in the case
+# At query time this guardrail is applied only to the collection fragment that is being written, even though in the case
 # of non-frozen collections there could be unaccounted parts of the collection on the sstables. This is done this way to
 # prevent read-before-write. The guardrail is also checked at sstable write time to detect large non-frozen collections,
 # although in that case exceeding the fail threshold will only log an error message, without interrupting the operation.
@@ -2290,7 +2336,7 @@ drop_compact_storage_enabled: false
 
 # The default secondary index implementation when CREATE INDEX does not specify one via USING.
 # ex. "legacy_local_table" - (default) legacy secondary index, implemented as a hidden table
-# ex. "sai" - "storage-attched" index, implemented via optimized SSTable/Memtable-attached indexes
+# ex. "sai" - "storage-attached" index, implemented via optimized SSTable/Memtable-attached indexes
 #default_secondary_index: legacy_local_table
 
 # Whether a default secondary index implementation is allowed. If this is "false", CREATE INDEX must
@@ -2298,21 +2344,21 @@ drop_compact_storage_enabled: false
 #default_secondary_index_enabled: true
 
 # Startup Checks are executed as part of Cassandra startup process, not all of them
-# are configurable (so you can disable them) but these which are enumerated bellow.
+# are configurable (so you can disable them) but these which are enumerated below.
 # Uncomment the startup checks and configure them appropriately to cover your needs.
 #
 #startup_checks:
 # Verifies correct ownership of attached locations on disk at startup. See CASSANDRA-16879 for more details.
 #  check_filesystem_ownership:
 #    enabled: false
-#    ownership_token: "sometoken" # (overriden by "CassandraOwnershipToken" system property)
-#    ownership_filename: ".cassandra_fs_ownership" # (overriden by "cassandra.fs_ownership_filename")
+#    ownership_token: "sometoken" # (overridden by "CassandraOwnershipToken" system property)
+#    ownership_filename: ".cassandra_fs_ownership" # (overridden by "cassandra.fs_ownership_filename")
 # Prevents a node from starting if snitch's data center differs from previous data center.
 #  check_dc:
-#    enabled: true # (overriden by cassandra.ignore_dc system property)
+#    enabled: true # (overridden by cassandra.ignore_dc system property)
 # Prevents a node from starting if snitch's rack differs from previous rack.
 #  check_rack:
-#    enabled: true # (overriden by cassandra.ignore_rack system property)
+#    enabled: true # (overridden by cassandra.ignore_rack system property)
 # Enable this property to fail startup if the node is down for longer than gc_grace_seconds, to potentially
 # prevent data resurrection on tables with deletes. By default, this will run against all keyspaces and tables
 # except the ones specified on excluded_keyspaces and excluded_tables.
@@ -2322,6 +2368,7 @@ drop_compact_storage_enabled: false
 #    heartbeat_file: /var/lib/cassandra/data/cassandra-heartbeat
 #    excluded_keyspaces: # comma separated list of keyspaces to exclude from the check
 #    excluded_tables: # comma separated list of keyspace.table pairs to exclude from the check
+
 
 # This property indicates with what Cassandra major version the storage format will be compatible with.
 #
@@ -2352,3 +2399,168 @@ storage_compatibility_mode: HCD_1
 
 # Changes defaults considered production safest for HCD users
 # hcd_guardrail_defaults: false
+
+
+# Prevents preparing a repair session or beginning a repair streaming session if pending compactions is over
+# the given value.  Defaults to disabled.
+# reject_repair_compaction_threshold: 1024
+
+# Ratio of disk that must be unused to run repair. It is useful to avoid disks filling up during
+# repair as anti-compaction during repair may contribute to additional space temporarily.
+# For example, setting this to 0.2 means at least 20% of disk must be unused.
+# Set to 0.0 to disable this check. Defaults to 0.0 (disabled) on 5.0 for backward-compatibility.
+# repair_disk_headroom_reject_ratio: 0.0
+
+# Configuration for Auto Repair Scheduler.
+#
+# This feature is disabled by default.
+#
+# NOTE: The auto-repair feature requires enabling the JVM property `cassandra.autorepair.enable=true`.
+#
+# See: https://cassandra.apache.org/doc/latest/cassandra/managing/operating/auto_repair.html for an overview of this
+# feature.
+#
+# auto_repair:
+#   # Enable/Disable the auto-repair scheduler.
+#   # If set to false, the scheduler thread will not be started.
+#   # If set to true, the repair scheduler thread will be created. The thread will
+#   # check for secondary configuration available for each repair type (full, incremental,
+#   # and preview_repaired), and based on that, it will schedule repairs.
+#   enabled: true
+#   repair_type_overrides:
+#     full:
+#       # Enable/Disable full auto-repair
+#       enabled: true
+#       # Minimum duration between repairing the same node again. This is useful for tiny clusters,
+#       # such as clusters with 5 nodes that finish repairs quickly. This means that if the scheduler completes one
+#       # round on all nodes in less than this duration, it will not start a new repair round on a given node until
+#       # this much time has passed since the last repair completed. Consider increasing to a larger value to reduce
+#       # the impact of repairs, however note that one should attempt to run repairs at a smaller interval than
+#       # gc_grace_seconds to avoid potential data resurrection.
+#       min_repair_interval: 24h
+#       token_range_splitter:
+#         # Implementation of IAutoRepairTokenRangeSplitter; responsible for splitting token ranges
+#         # for repair assignments.
+#         #
+#         # Out of the box, Cassandra provides org.apache.cassandra.repair.autorepair.{RepairTokenRangeSplitter,
+#         # FixedTokenRangeSplitter}.
+#         #
+#         # - RepairTokenRangeSplitter (default) attempts to intelligently split ranges based on data size and partition
+#         #   count.
+#         # - FixedTokenRangeSplitter splits into fixed ranges based on the 'number_of_subranges' option.
+#         # class_name: org.apache.cassandra.repair.autorepair.RepairTokenRangeSplitter
+#
+#         # Optional parameters can be specified in the form of:
+#         #   parameters:
+#         #    param_key1: param_value1
+#         parameters:
+#           # The target and maximum amount of compressed bytes that should be included in a repair assignment.
+#           # This scopes the amount of work involved in a repair and includes the data covering the range being
+#           # repaired.
+#           bytes_per_assignment: 50GiB
+#           # The maximum number of bytes to cover in an individual schedule. This serves as
+#           # a mechanism to throttle the work done in each repair cycle. You may reduce this
+#           # value if the impact of repairs is causing too much load on the cluster or increase it
+#           # if writes outpace the amount of data being repaired. Alternatively, adjust the
+#           # min_repair_interval.
+#           # This is set to a large value for full repair to attempt to repair all data per repair schedule.
+#           max_bytes_per_schedule: 100000GiB
+#     incremental:
+#       enabled: false
+#       # Incremental repairs operate over unrepaired data and should finish quickly. Running incremental repair
+#       # frequently keeps the unrepaired set smaller and thus causes repairs to operate over a smaller set of data,
+#       # so a more frequent schedule such as 1h is recommended.
+#       # NOTE: Please consult
+#       # https://cassandra.apache.org/doc/latest/cassandra/managing/operating/auto_repair.html#enabling-ir
+#       # for guidance on enabling incremental repair on an existing cluster.
+#       min_repair_interval: 24h
+#       token_range_splitter:
+#         parameters:
+#           # Configured to attempt repairing 50GiB of compressed data per repair.
+#           # This throttles the amount of incremental repair and anticompaction done per schedule after incremental
+#           # repairs are turned on.
+#           bytes_per_assignment: 50GiB
+#           # Restricts the maximum number of bytes to cover in an individual schedule to the configured
+#           # max_bytes_per_schedule value (defaults to 100GiB for incremental).
+#           # Consider increasing this value if more data is written than this limit within the min_repair_interval.
+#           max_bytes_per_schedule: 100GiB
+#     preview_repaired:
+#       # Performs preview repair over repaired SSTables, useful to detect possible inconsistencies in the repaired
+#       # data set.
+#       enabled: false
+#       min_repair_interval: 24h
+#       token_range_splitter:
+#         parameters:
+#           bytes_per_assignment: 50GiB
+#           max_bytes_per_schedule: 100000GiB
+#   # Time interval between successive checks to see if ongoing repairs are complete or if it is time to schedule
+#   # repairs.
+#   repair_check_interval: 5m
+#   # Minimum duration for the execution of a single repair task. This prevents the scheduler from overwhelming
+#   # the node by scheduling too many repair tasks in a short period of time.
+#   repair_task_min_duration: 5s
+#   # The scheduler needs to adjust its order when nodes leave the ring. Deleted hosts are tracked in metadata
+#   # for a specified duration to ensure they are indeed removed before adjustments are made to the schedule.
+#   history_clear_delete_hosts_buffer_interval: 2h
+#   # By default repair is disabled if there are mixed major versions detected - which would happen
+#   # if a major version upgrade is being performed on the cluster, but a user can enable it using this flag
+#   mixed_major_version_repair_enabled: false
+#   # NOTE: Each of the below settings can be overridden per repair type under repair_type_overrides
+#   global_settings:
+#     # If true, attempts to group tables in the same keyspace into one repair; otherwise, each table is repaired
+#     # individually.
+#     repair_by_keyspace: true
+#     # Number of threads to use for each repair job scheduled by the scheduler. Similar to the -j option in nodetool
+#     # repair.
+#     number_of_repair_threads: 1
+#     # Number of nodes running repair in parallel. If parallel_repair_percentage is set, the larger value is used.
+#     parallel_repair_count: 3
+#     # Percentage of nodes in the cluster running repair in parallel. If parallel_repair_count is set, the larger value
+#     # is used.
+#     parallel_repair_percentage: 3
+#     # Whether to allow a node to take its turn running repair while one or more of its replicas are running repair.
+#     # Defaults to false, as running repairs concurrently on replicas can increase load and also cause anticompaction
+#     # conflicts while running incremental repair.
+#     allow_parallel_replica_repair: false
+#     # An addition to allow_parallel_replica_repair that also blocks repairs when replicas (including this node itself)
+#     # are repairing in any schedule. For example, if a replica is executing full repairs, a value of false will
+#     # prevent starting incremental repairs for this node. Defaults to true and is only evaluated when
+#     # allow_parallel_replica_repair is false.
+#     allow_parallel_replica_repair_across_schedules: true
+#     # Repairs materialized views if true.
+#     materialized_view_repair_enabled: false
+#     # Delay before starting repairs after a node restarts to avoid repairs starting immediately after a restart.
+#     initial_scheduler_delay: 5m
+#     # Timeout for retrying stuck repair sessions.
+#     repair_session_timeout: 3h
+#     # Force immediate repair on new nodes after they join the ring.
+#     force_repair_new_node: false
+#     # Threshold to skip repairing tables with too many SSTables. Defaults to 10,000 SSTables to avoid penalizing good
+#     # tables.
+#     sstable_upper_threshold: 50000
+#     # Maximum time allowed for repairing one table on a given node. If exceeded, the repair proceeds to the
+#     # next table.
+#     table_max_repair_time: 6h
+#     # Avoid running repairs in specific data centers. By default, repairs run in all data centers. Specify data
+#     # centers to exclude in this list. Note that repair sessions will still consider all replicas from excluded
+#     # data centers. Useful if you have keyspaces that are not replicated in certain data centers, and you want to
+#     # not run repair schedule in certain data centers.
+#     ignore_dcs: []
+#     # Repair only the primary ranges owned by a node. Equivalent to the -pr option in nodetool repair. Defaults
+#     # to true. General advice is to keep this true.
+#     repair_primary_token_range_only: true
+#     # Maximum number of retries for a repair session.
+#     repair_max_retries: 3
+#     # Backoff time before retrying a repair session.
+#     repair_retry_backoff: 30s
+#     token_range_splitter:
+#       # Splitter implementation to generate repair assignments. Defaults to RepairTokenRangeSplitter.
+#       class_name: org.apache.cassandra.repair.autorepair.RepairTokenRangeSplitter
+#       parameters:
+#         # Maximum number of partitions to include in a repair assignment. Used to reduce number of partitions
+#         # present in merkle tree leaf nodes to avoid overstreaming.
+#         partitions_per_assignment: 1048576
+#         # Maximum number of tables to include in a repair assignment. This reduces the number of repairs,
+#         # especially in keyspaces with many tables. The splitter avoids batching tables together if they
+#         # exceed other configuration parameters like bytes_per_assignment or partitions_per_assignment.
+#         max_tables_per_assignment: 64

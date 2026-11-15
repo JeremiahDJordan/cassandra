@@ -180,6 +180,8 @@ public class InternalNodeProbe extends NodeProbe
         {
             case "BytesCompacted":
                 return metrics.bytesCompacted;
+            case "CompressedBytesCompacted":
+                return metrics.compressedBytesCompacted;
             case "CompletedTasks":
                 return metrics.completedTasks.getValue();
             case "CompactionsAborted":

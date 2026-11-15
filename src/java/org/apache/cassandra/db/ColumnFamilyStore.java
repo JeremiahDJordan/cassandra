@@ -126,6 +126,7 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.StartupException;
+import org.apache.cassandra.exceptions.TruncateException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.internal.CassandraIndex;
@@ -201,12 +202,14 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.concurrent.Refs;
 import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
+import static java.lang.String.format;
 import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
 import static org.apache.cassandra.config.CassandraRelevantProperties.DISABLED_AUTO_COMPACTION_PROPERTY;
 import static org.apache.cassandra.config.CassandraRelevantProperties.MEMTABLE_RECLAIM_THREADS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.UNSAFE_SYSTEM;
 import static org.apache.cassandra.config.DatabaseDescriptor.getFlushWriters;
 import static org.apache.cassandra.db.commitlog.CommitLogPosition.NONE;
+import static org.apache.cassandra.schema.SchemaConstants.FILENAME_LENGTH;
 import static org.apache.cassandra.utils.Clock.Global.currentTimeMillis;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 import static org.apache.cassandra.utils.FBUtilities.now;
@@ -1757,18 +1760,9 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
     /**
      * Insert/Update the column family for this key.
      * Caller is responsible for acquiring Keyspace.switchLock
-     *
      * @param update to be applied
      * @param context write context for current update
-     * @param updateIndexes whether secondary indexes should be updated.
-     *                      When {@code false} this write is treated as a <em>nested</em> write: it skips the
-     *                      memtable pool's room-wait gate ({@link org.apache.cassandra.utils.memory.MemtableAllocator#awaitRoomToStart})
-     *                      and goes straight to {@link Memtable#putNested} instead of {@link Memtable#put}.
-     *                      Callers that pass {@code false} are already executing inside an enclosing mutation
-     *                      (e.g. a legacy 2i index write initiated from {@code indexer.onInserted()} under the
-     *                      base table's memtable-internal locks) and <strong>must not</strong> block for room,
-     *                      because doing so would deadlock the flush write-barrier (CASSANDRA-21019).
-     *                      As a consequence, a nested write may allocate slightly beyond the gated limit.
+     * @param updateIndexes whether secondary indexes should be updated
      */
     public void apply(PartitionUpdate update, CassandraWriteContext context, boolean updateIndexes)
 
@@ -2072,7 +2066,15 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
         if (!isIndex() || !SecondaryIndexManager.isIndexColumnFamilyStore(this))
             return false;
 
-        truncateBlocking();
+        try
+        {
+            truncateBlocking();
+        }
+        catch (TruncateException e)
+        {
+            logger.warn("Unable to truncate {} to rebuild index after scrub failure", name, e);
+            return false;
+        }
 
         logger.warn("Rebuilding index for {} because of <{}>", name, failure.getMessage());
 
@@ -2479,6 +2481,8 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             throw new IllegalStateException(String.format("can not take ephemeral snapshot (%s) while ttl is specified too", snapshotName));
         }
 
+        validateSnapshotName(snapshotName);
+
         if (rateLimiter == null)
             rateLimiter = DatabaseDescriptor.getSnapshotRateLimiter();
 
@@ -2499,6 +2503,44 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
         }
 
         return createSnapshot(snapshotName, ephemeral, ttl, snapshottedSSTables, creationTime);
+    }
+
+    private void validateSnapshotName(String snapshotName)
+    {
+        if (snapshotName.contains(File.pathSeparator()))
+        {
+            throw new IllegalArgumentException("Snapshot name cannot contain " + File.pathSeparator());
+        }
+
+        if (snapshotName.equals(".") || snapshotName.equals(".."))
+        {
+            throw new IllegalArgumentException("Snapshot name '" + snapshotName + "' is reserved");
+        }
+
+        if (!CassandraRelevantProperties.SNAPSHOT_NAME_VALIDATION.getBoolean())
+            return;
+
+        // the length of valid snapshot name has to be less than or equal to FILENAME_LEGTH - that is 255 -
+        // we are following the max length as it is in SchemaConstants for table name.
+        if (snapshotName.length() > SchemaConstants.FILENAME_LENGTH)
+        {
+            throw new IllegalArgumentException(format("Snapshot name must not be more than %d characters long for " +
+                                                      "resolved snapshot name (got %d characters for \"%s\")",
+                                                      FILENAME_LENGTH, snapshotName.length(), snapshotName));
+        }
+
+        // Allowed characters are a conservative subset of the AWS S3 "Safe characters" set
+        // (https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-keys.html#object-key-guidelines):
+        //   0-9  a-z  A-Z  -  _  .
+        // plus '+', which is not an S3 "Safe character" but can legitimately appear in system
+        // snapshot names via version build metadata (e.g. an upgrade snapshot "<millis>-upgrade-5.0.4+build-...").
+        // The remaining S3-safe characters (! * ' ( )) are intentionally excluded as they are
+        // shell-significant and error-prone in paths, and the path separator '/' is excluded too,
+        // which is what blocks traversal attempts such as "../../mysnapshot"
+        if (!Pattern.compile("[a-zA-Z0-9_.+-]+").matcher(snapshotName).matches())
+        {
+            throw new IllegalArgumentException("Snapshot name contains illegal characters: " + snapshotName);
+        }
     }
 
     protected TableSnapshot createSnapshot(String tag, boolean ephemeral, DurationSpec.IntSecondsBound ttl, Set<SSTableReader> sstables, Instant creationTime) {
@@ -3131,40 +3173,37 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             for (SSTableReader sstable : cfs.getLiveSSTables())
                 now = Math.max(now, sstable.maxDataAge);
         truncatedAt = now;
-
-        Runnable truncateRunnable = new Runnable()
+        Throwable failure = null;
+        try
         {
-            @Override
-            public void run()
-            {
-                log.log("Truncating {}.{} with truncatedAt={}", getKeyspaceName(), getTableName(), truncatedAt);
-                // since truncation can happen at different times on different nodes, we need to make sure
-                // that any repairs are aborted, otherwise we might clear the data on one node and then
-                // stream in data that is actually supposed to have been deleted
-                ActiveRepairService.instance().abort((prs) -> prs.getTableIds().contains(metadata.id),
-                                                   "Stopping parent sessions {} due to truncation of tableId="+metadata.id);
-                data.notifyTruncated(replayAfter, truncatedAt);
+            // run with sstable reloading disabled so that remote storage does not reload sstables we are discarding
+            Boolean[] result = new Boolean[1];
+            storageHandler.runWithReloadingDisabled(() -> {
+                result[0] = runWithCompactionsDisabled(() -> runTruncate(truncatedAt, noSnapshot, replayAfter), OperationType.P0, true, true, AbstractTableOperation.StopTrigger.TRUNCATE);
+            });
+            Boolean succeeded = result[0];
+            // null means compactions couldn't be disabled, not failure of the truncate work itself
+            if (succeeded == null)
+                failure = new TruncateException("Unable to stop in-progress compactions. Please retry when current compaction tasks have completed or overall system load has decreased.");
+            else if (!succeeded)
+                failure = new TruncateException("Truncate failed.");
+        }
+        catch (Throwable t)
+        {
+            failure = t;
+        }
 
-                if (!noSnapshot && isAutoSnapshotEnabled())
-                    snapshot(Keyspace.getTimestampedSnapshotNameWithPrefix(name, SNAPSHOT_TRUNCATE_PREFIX), DatabaseDescriptor.getAutoSnapshotTtl());
+        try
+        {
+            viewManager.build();
+        }
+        catch (Throwable t)
+        {
+            failure = merge(failure, t);
+        }
 
-                discardSSTables(truncatedAt);
+        maybeFail(failure);
 
-                indexManager.truncateAllIndexesBlocking(truncatedAt);
-                viewManager.truncateBlocking(replayAfter, truncatedAt);
-
-                SystemKeyspace.saveTruncationRecord(metadata.id, truncatedAt, replayAfter);
-                logger.trace("cleaning out row cache");
-                invalidateCaches();
-
-            }
-        };
-
-        storageHandler.runWithReloadingDisabled(() -> {
-            runWithCompactionsDisabled(FutureTask.callable(truncateRunnable), OperationType.P0, true, true, AbstractTableOperation.StopTrigger.TRUNCATE);
-        });
-
-        viewManager.build();
         log.log("Truncate of {}.{} is complete", getKeyspaceName(), name);
     }
 
@@ -3174,6 +3213,30 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             return logger::debug;
         else
             return logger::info;
+    }
+
+    private boolean runTruncate(long truncatedAt, boolean noSnapshot, CommitLogPosition replayAfter)
+    {
+        truncateLogger().log("Truncating {}.{} with truncatedAt={}", getKeyspaceName(), getTableName(), truncatedAt);
+        // since truncation can happen at different times on different nodes, we need to make sure
+        // that any repairs are aborted, otherwise we might clear the data on one node and then
+        // stream in data that is actually supposed to have been deleted
+        ActiveRepairService.instance().abort((prs) -> prs.getTableIds().contains(metadata.id),
+                                             "Stopping parent sessions {} due to truncation of tableId=" + metadata.id);
+        data.notifyTruncated(replayAfter, truncatedAt);
+
+        if (!noSnapshot && isAutoSnapshotEnabled())
+            snapshot(Keyspace.getTimestampedSnapshotNameWithPrefix(name, SNAPSHOT_TRUNCATE_PREFIX), DatabaseDescriptor.getAutoSnapshotTtl());
+
+        discardSSTables(truncatedAt);
+
+        indexManager.truncateAllIndexesBlocking(truncatedAt);
+        viewManager.truncateBlocking(replayAfter, truncatedAt);
+
+        SystemKeyspace.saveTruncationRecord(metadata.id, truncatedAt, replayAfter);
+        logger.trace("cleaning out row cache");
+        invalidateCaches();
+        return true;
     }
 
     /**

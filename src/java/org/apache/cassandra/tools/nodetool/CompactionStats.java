@@ -167,6 +167,15 @@ public class CompactionStats extends NodeToolCmd
         else
             tableBuilder.add("data compacted", Long.toString(bytesCompactedCount));
 
+        Object compressedBytesCompacted = probe.getCompactionMetric("CompressedBytesCompacted");
+        long compressedBytesCompactedCount = compressedBytesCompacted instanceof Counter
+                                             ? ((Counter) compressedBytesCompacted).getCount()
+                                             : ((CassandraMetricsRegistry.JmxCounterMBean) compressedBytesCompacted).getCount();
+        if (humanReadable)
+            tableBuilder.add("compressed data compacted", FileUtils.stringifyFileSize(Double.parseDouble(Long.toString(compressedBytesCompactedCount))));
+        else
+            tableBuilder.add("compressed data compacted", Long.toString(compressedBytesCompactedCount));
+
         Object compactionsAborted = probe.getCompactionMetric("CompactionsAborted");
         if (compactionsAborted instanceof Counter)
         {
@@ -228,13 +237,14 @@ public class CompactionStats extends NodeToolCmd
         long remainingBytes = 0;
 
         if (vtableOutput)
-            table.add("keyspace", "table", "task id", "completion ratio", "kind", "progress", "sstables", "total", "unit", "target directory");
+            table.add("keyspace", "table", "task id", "completion ratio", "kind", "progress", "sstables", "total", "total compressed", "unit", "target directory");
         else
             table.add("id", "compaction type", "keyspace", "table", "completed", "total", "unit", "progress");
 
         for (Map<String, String> c : compactions)
         {
             long total = Long.parseLong(c.get(TableOperation.Progress.TOTAL));
+            String totalCompressedValue = c.get(TableOperation.Progress.TOTAL_COMPRESSED);
             long completed = Long.parseLong(c.get(TableOperation.Progress.COMPLETED));
             String taskType = c.get(TableOperation.Progress.OPERATION_TYPE);
             String keyspace = c.get(TableOperation.Progress.KEYSPACE);
@@ -244,12 +254,22 @@ public class CompactionStats extends NodeToolCmd
             String[] tables = c.get(TableOperation.Progress.SSTABLES).split(",");
             String progressStr = toFileSize ? FileUtils.stringifyFileSize(completed) : Long.toString(completed);
             String totalStr = toFileSize ? FileUtils.stringifyFileSize(total) : Long.toString(total);
+            String totalCompressedStr;
+            if (totalCompressedValue != null)
+            {
+                long totalCompressed = Long.parseLong(totalCompressedValue);
+                totalCompressedStr = toFileSize ? FileUtils.stringifyFileSize(totalCompressed) : Long.toString(totalCompressed);
+            }
+            else
+            {
+                totalCompressedStr = "n/a";
+            }
             String percentComplete = total == 0 ? "n/a" : new DecimalFormat("0.00").format((double) completed / total * 100) + '%';
             String id = c.get(TableOperation.Progress.OPERATION_ID);
             if (vtableOutput)
             {
                 String targetDirectory = c.get(TableOperation.Progress.TARGET_DIRECTORY);
-                table.add(keyspace, columnFamily, id, percentComplete, taskType, progressStr, String.valueOf(tables.length), totalStr, unit, targetDirectory);
+                table.add(keyspace, columnFamily, id, percentComplete, taskType, progressStr, String.valueOf(tables.length), totalStr, totalCompressedStr, unit, targetDirectory);
             }
             else
                 table.add(id, taskType, keyspace, columnFamily, progressStr, totalStr, unit, percentComplete);

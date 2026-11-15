@@ -224,6 +224,12 @@ public class Murmur3Partitioner implements IPartitioner
             return new LongToken(token + 1);    // wraparound to MINIMUM if token is MAXIMUM
         }
 
+        @Override
+        public LongToken prevValidToken()
+        {
+            return new LongToken(token - 1);    // wraparound to MAXIMUM if token is MINIMUM
+        }
+
         public LongToken decreaseSlightly()
         {
             return new LongToken(token - 1);
@@ -232,12 +238,6 @@ public class Murmur3Partitioner implements IPartitioner
         public static ByteBuffer keyForToken(long token)
         {
             return keyForToken(new LongToken(token));
-        }
-
-        @Override
-        public Token prevValidToken()
-        {
-            return new LongToken(token - 1);    // wraparound to MAXIMUM if token is MINIMUM
         }
 
         /**

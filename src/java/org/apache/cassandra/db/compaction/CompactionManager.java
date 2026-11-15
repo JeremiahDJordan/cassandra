@@ -908,7 +908,7 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
 
         Set<SSTableReader> fullyContainedSSTables = findSSTablesToAnticompact(sstableIterator, normalizedRanges, sessionID);
 
-        cfs.metric.bytesMutatedAnticompaction.inc(CompactionSSTable.getTotalDataBytes(fullyContainedSSTables));
+        cfs.metric.bytesMutatedAnticompaction.mark(CompactionSSTable.getTotalDataBytes(fullyContainedSSTables));
         cfs.mutateRepaired(fullyContainedSSTables, UNREPAIRED_SSTABLE, sessionID, isTransient);
         // since we're just re-writing the sstable metdata for the fully contained sstables, we don't want
         // them obsoleted when the anti-compaction is complete. So they're removed from the transaction here
@@ -1069,7 +1069,7 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
 
         CompactionTasks tasks = cfStore.getCompactionStrategy().getMaximalTasks(gcBefore, splitOutput, permittedParallelism, operationType);
 
-        if (tasks.isEmpty())
+        if (tasks == null || tasks.isEmpty())
             return Collections.emptyList();
 
         List<Future<?>> futures = new ArrayList<>();
@@ -1127,6 +1127,9 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
                                                                         false,
                                                                         TableOperation.StopTrigger.COMPACTION))
         {
+            if (tasks == null)
+                throw new RuntimeException("Unable to cancel in-progress compactions for " + cfStore.getKeyspaceName() + '.' + cfStore.getTableName() + ". Usually retrying will work.");
+
             if (tasks.isEmpty())
                 return;
 
@@ -1780,7 +1783,7 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
         // repairedAt values for these, we still avoid anti-compacting already repaired sstables, as we currently don't
         // make use of any actual repairedAt value and splitting up sstables just for that is not worth it at this point.
         Set<SSTableReader> unrepairedSSTables = sstables.stream().filter((s) -> !s.isRepaired()).collect(Collectors.toSet());
-        cfs.metric.bytesAnticompacted.inc(CompactionSSTable.getTotalDataBytes(unrepairedSSTables));
+        cfs.metric.bytesAnticompacted.mark(CompactionSSTable.getTotalDataBytes(unrepairedSSTables));
         Collection<Collection<CompactionSSTable>> groupedSSTables = cfs.getCompactionStrategy().groupSSTablesForAntiCompaction(unrepairedSSTables);
 
         // iterate over sstables to check if the full / transient / unrepaired ranges intersect them.
@@ -2024,7 +2027,13 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
             }
         };
 
-        return secondaryIndexExecutor.submitIfRunning(runnable, "index build");
+        Future<?> future = secondaryIndexExecutor.submitIfRunning(runnable, "index build");
+        if (future.isCancelled())
+        {
+            // Let the builder release any resources it reserved during construction.
+            builder.onNotExecuted();
+        }
+        return future;
     }
 
     /**

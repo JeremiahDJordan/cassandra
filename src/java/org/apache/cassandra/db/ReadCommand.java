@@ -967,6 +967,7 @@ public abstract class ReadCommand extends AbstractReadQuery
     /**
      *  A transformation used for simulating slow queries by tests.
      */
+    @VisibleForTesting
     private static class DelayInjector extends Transformation<UnfilteredRowIterator>
     {
         @Override
@@ -1365,7 +1366,11 @@ public abstract class ReadCommand extends AbstractReadQuery
                                                           metadata, nowInSec, columnFilter, rowFilter, limits, indexQueryPlan);
         }
 
-        private @Nullable IndexMetadata deserializeIndexMetadata(DataInputPlus in, int version, TableMetadata metadata) throws IOException
+        /**
+         * @return the index the command was built with, or {@code null} if this node does not know that index yet
+         */
+        @Nullable
+        private IndexMetadata deserializeIndexMetadata(DataInputPlus in, int version, TableMetadata metadata) throws IOException
         {
             try
             {

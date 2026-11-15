@@ -31,6 +31,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.UncheckedInterruptedException;
 
@@ -67,18 +68,22 @@ final class HintsWriteExecutor
     void shutdownBlocking()
     {
         executor.shutdown();
+        boolean terminated;
         try
         {
-            executor.awaitTermination(1, TimeUnit.MINUTES);
+            terminated = executor.awaitTermination(1, TimeUnit.MINUTES);
         }
         catch (InterruptedException e)
         {
             throw new AssertionError(e);
         }
-        finally
-        {
+
+        // every write task shares this buffer, so release it only once no task can be holding it
+        if (terminated)
             FileUtils.clean(writeBuffer);
-        }
+        else
+            logger.warn("Hints write executor did not terminate in one minute, keeping its {} write buffer",
+                        FBUtilities.prettyPrintMemory(WRITE_BUFFER_SIZE));
     }
 
     /**

@@ -653,6 +653,36 @@ public abstract class ControllerTest
         assertThrows(ConfigurationException.class, () -> Controller.validateOptions(options));
     }
 
+    @Test
+    public void testMaxSstablesPerShardFactorValidationMessages()
+    {
+        HashMap<String, String> options = new HashMap<>();
+        options.put(Controller.MAX_SSTABLES_PER_SHARD_FACTOR_OPTION, "1");
+        Controller.validateOptions(options);
+        assertEquals(1.0, Controller.fromOptions(cfs, options).getMaxSstablesPerShardFactor(), epsilon);
+
+        testMaxSstablesPerShardFactorError("0.999", "max_sstables_per_shard_factor 0.999 must be 0 to disable or a number greater than or equal to 1");
+        testMaxSstablesPerShardFactorError("-1", "max_sstables_per_shard_factor -1.0 must be 0 to disable or a number greater than or equal to 1");
+        // NaN compares false to every number, so validation must reject it explicitly
+        testMaxSstablesPerShardFactorError("NaN", "max_sstables_per_shard_factor NaN must be 0 to disable or a number greater than or equal to 1");
+        testMaxSstablesPerShardFactorError("abc", "abc is not a parsable number for max_sstables_per_shard_factor");
+
+        // The system property default goes through the same check, named after the property
+        assertThatThrownBy(() -> Controller.validateMaxSstablesPerShardFactor(0.5, "unified_compaction.max_sstables_per_shard_factor"))
+        .isInstanceOf(ConfigurationException.class)
+        .hasMessageContaining("unified_compaction.max_sstables_per_shard_factor 0.5 must be 0 to disable or a number greater than or equal to 1");
+        assertEquals(0.0, Controller.validateMaxSstablesPerShardFactor(0, "unified_compaction.max_sstables_per_shard_factor"), epsilon);
+    }
+
+    private void testMaxSstablesPerShardFactorError(String input, String message)
+    {
+        Map<String, String> options = new HashMap<>();
+        options.put(Controller.MAX_SSTABLES_PER_SHARD_FACTOR_OPTION, input);
+        assertThatThrownBy(() -> Controller.validateOptions(options))
+        .isInstanceOf(ConfigurationException.class)
+        .hasMessageContaining(message);
+    }
+
     public void testBooleanOption(String name, boolean defaultValue, Predicate<Controller> getter, String... extraSettings)
     {
         Controller controller = Controller.fromOptions(cfs, newOptions(extraSettings));

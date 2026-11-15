@@ -71,7 +71,7 @@ public interface Clock
                 try
                 {
                     outcome = "Using custom clock implementation: " + classname;
-                    clock = (Clock) Class.forName(classname).newInstance();
+                    clock = FBUtilities.construct(classname, "clock", Clock.class);
                 }
                 catch (Throwable t)
                 {

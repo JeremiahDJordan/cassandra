@@ -113,6 +113,8 @@ public abstract class AbstractTableOperation implements TableOperation
          * The total bytes that need to be processed, for example the size of the input files. Depending on the unit it could mean something else, e.g. ranges or keys.
          */
         private final long total;
+        /** Compressed (on-disk) size matching {@link #total}; equals total when unknown (CASSANDRA-21245). */
+        private final long totalCompressed;
         /**
          * The unit for {@link this#completed} and for {@link this#total}.
          */
@@ -144,9 +146,15 @@ public abstract class AbstractTableOperation implements TableOperation
 
         public OperationProgress(TableMetadata metadata, OperationType operationType, long completed, long total, Unit unit, TimeUUID operationId, Collection<? extends SSTableReader> sstables, String targetDirectory)
         {
+            this(metadata, operationType, completed, total, unit, operationId, sstables, targetDirectory, total);
+        }
+
+        public OperationProgress(TableMetadata metadata, OperationType operationType, long completed, long total, Unit unit, TimeUUID operationId, Collection<? extends SSTableReader> sstables, String targetDirectory, long totalCompressed)
+        {
             this.operationType = operationType;
             this.completed = completed;
             this.total = total;
+            this.totalCompressed = totalCompressed;
             this.metadata = metadata;
             this.unit = unit;
             this.operationId = operationId;
@@ -159,7 +167,19 @@ public abstract class AbstractTableOperation implements TableOperation
          */
         public OperationProgress forProgress(long complete, long total)
         {
-            return new OperationProgress(metadata, operationType, complete, total, unit, operationId, sstables, targetDirectory);
+            return forProgress(complete, total, total);
+        }
+
+        /** @return a copy with updated progress, including the compressed total */
+        public OperationProgress forProgress(long complete, long total, long totalCompressed)
+        {
+            return new OperationProgress(metadata, operationType, complete, total, unit, operationId, sstables, targetDirectory, totalCompressed);
+        }
+
+        /** @return a copy with the given compressed (on-disk) total, see {@link #totalCompressed()} */
+        public OperationProgress withTotalCompressed(long totalCompressed)
+        {
+            return new OperationProgress(metadata, operationType, completed, total, unit, operationId, sstables, targetDirectory, totalCompressed);
         }
 
         /**
@@ -208,6 +228,12 @@ public abstract class AbstractTableOperation implements TableOperation
         public long total()
         {
             return total;
+        }
+
+        @Override
+        public long totalCompressed()
+        {
+            return totalCompressed;
         }
 
         @Override

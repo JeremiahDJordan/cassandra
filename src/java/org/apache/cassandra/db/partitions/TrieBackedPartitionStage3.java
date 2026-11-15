@@ -148,7 +148,7 @@ public class TrieBackedPartitionStage3 implements Partition
         public long unsharedHeapSizeExcludingData()
         {
             long heapSize = EMPTY_ROWDATA_SIZE
-                            + BTree.sizeOfStructureOnHeap(columnsBTree)
+                            + BTree.sizeOnHeapOf(columnsBTree)
                             + livenessInfo.unsharedHeapSize();
 
             return BTree.accumulate(columnsBTree, (ColumnData cd, long v) -> v + cd.unsharedHeapSizeExcludingData(), heapSize);

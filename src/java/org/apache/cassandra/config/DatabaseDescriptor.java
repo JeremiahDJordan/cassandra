@@ -60,6 +60,7 @@ import com.google.common.collect.Sets;
 import com.google.common.primitives.Ints;
 import com.google.common.primitives.Longs;
 import com.google.common.util.concurrent.RateLimiter;
+import org.apache.cassandra.repair.autorepair.AutoRepairConfig;
 import org.apache.cassandra.utils.Pair;
 import org.apache.commons.lang3.ArrayUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -470,7 +471,7 @@ public class DatabaseDescriptor
         String loaderClass = CONFIG_LOADER.getString();
         ConfigurationLoader loader = loaderClass == null
                                      ? new YamlConfigurationLoader()
-                                     : FBUtilities.construct(loaderClass, "configuration loading");
+                                     : FBUtilities.construct(loaderClass, "configuration loading", ConfigurationLoader.class);
             config = loader.loadConfig();
         }
 
@@ -1442,8 +1443,9 @@ public class DatabaseDescriptor
         }
         try
         {
-            Class<?> seedProviderClass = Class.forName(conf.seed_provider.class_name);
-            seedProvider = (SeedProvider)seedProviderClass.getConstructor(Map.class).newInstance(conf.seed_provider.parameters);
+            Class<? extends SeedProvider> seedProviderClass =
+                FBUtilities.classForNameWithoutInitialization(conf.seed_provider.class_name, "seed provider", SeedProvider.class);
+            seedProvider = seedProviderClass.getConstructor(Map.class).newInstance(conf.seed_provider.parameters);
         }
         // there are about 5 checked exceptions that could be thrown here.
         catch (Exception e)
@@ -1778,7 +1780,7 @@ public class DatabaseDescriptor
     {
         if (!snitchClassName.contains("."))
             snitchClassName = "org.apache.cassandra.locator." + snitchClassName;
-        IEndpointSnitch snitch = FBUtilities.construct(snitchClassName, "snitch");
+        IEndpointSnitch snitch = FBUtilities.construct(snitchClassName, "snitch", IEndpointSnitch.class);
         return dynamic ? new DynamicEndpointSnitch(snitch) : snitch;
     }
 
@@ -1786,7 +1788,7 @@ public class DatabaseDescriptor
     {
         if (!detectorClassName.contains("."))
             detectorClassName = "org.apache.cassandra.gms." + detectorClassName;
-        IFailureDetector detector = FBUtilities.construct(detectorClassName, "failure detector");
+        IFailureDetector detector = FBUtilities.construct(detectorClassName, "failure detector", IFailureDetector.class);
         return detector;
     }
 
@@ -2725,8 +2727,8 @@ public class DatabaseDescriptor
 
     public static void setCompressedReadAheadBufferSizeInKb(int sizeInKb)
     {
-        if (sizeInKb < 256)
-            throw new IllegalArgumentException("compressed_read_ahead_buffer_size_in_kb must be at least 256KiB");
+        if (sizeInKb < 0 || (sizeInKb > 0 && sizeInKb < 256))
+            throw new IllegalArgumentException("compressed_read_ahead_buffer_size_in_kb must be at least 256KiB (set to 0 to disable)");
 
         conf.compressed_read_ahead_buffer_size = createIntKibibyteBoundAndEnsureItIsValidForByteConversion(sizeInKb, "compressed_read_ahead_buffer_size");
     }
@@ -4266,6 +4268,16 @@ public class DatabaseDescriptor
         return conf.stream_entire_sstables = value;
     }
 
+    public static boolean getEntireSSTableStreamDigestValidationEnabled()
+    {
+        return conf.entire_sstable_stream_digest_validation_enabled;
+    }
+
+    public static void setEntireSSTableStreamDigestValidationEnabled(boolean value)
+    {
+        conf.entire_sstable_stream_digest_validation_enabled = value;
+    }
+
     public static DurationSpec.LongMillisecondsBound getStreamTransferTaskTimeout()
     {
         return conf.stream_transfer_task_timeout;
@@ -4488,6 +4500,16 @@ public class DatabaseDescriptor
     public static void setMaterializedViewsEnabled(boolean enableMaterializedViews)
     {
         conf.materialized_views_enabled = enableMaterializedViews;
+    }
+
+    public static boolean isMaterializedViewsOnRepairEnabled()
+    {
+        return conf.materialized_views_on_repair_enabled;
+    }
+
+    public static void setMaterializedViewsOnRepairEnabled(boolean val)
+    {
+        conf.materialized_views_on_repair_enabled = val;
     }
 
     @Deprecated(since = "CC5") // SASI has been removed altogether, StartupChecks fail if this is true
@@ -5643,5 +5665,24 @@ public class DatabaseDescriptor
         Preconditions.checkArgument(factor > 0.0, "ANN brute force expense factor must be greater than zero");
         Preconditions.checkArgument(factor <= StorageAttachedIndexOptions.MAXIMUM_ANN_BRUTE_FORCE_FACTOR, "ANN brute force expense factor must be at most " + StorageAttachedIndexOptions.MAXIMUM_ANN_BRUTE_FORCE_FACTOR);
         conf.sai_options.ann_brute_force_factor = factor;
+    }
+
+    public static AutoRepairConfig getAutoRepairConfig()
+    {
+        return conf.auto_repair;
+    }
+
+    public static double getRepairDiskHeadroomRejectRatio()
+    {
+        return conf.repair_disk_headroom_reject_ratio;
+    }
+
+    public static void setRepairDiskHeadroomRejectRatio(double value)
+    {
+        if (value < 0.0 || value > 1.0)
+        {
+            throw new IllegalArgumentException("Value must be >= 0 and <= 1 for repair_disk_headroom_reject_ratio");
+        }
+        conf.repair_disk_headroom_reject_ratio = value;
     }
 }

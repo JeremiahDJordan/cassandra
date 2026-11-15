@@ -119,6 +119,7 @@ public class ActiveOperations implements TableOperationObserver
         operations.remove(op);
         TableOperation.Progress progressOnCompleted = op.getProgress();
         CompactionManager.instance.getMetrics().bytesCompacted.inc(progressOnCompleted.total());
+        CompactionManager.instance.getMetrics().compressedBytesCompacted.inc(progressOnCompleted.totalCompressed());
         CompactionManager.instance.getMetrics().totalCompactionsCompleted.mark();
 
         for (CompactionProgressListener listener : listeners)
@@ -139,7 +140,7 @@ public class ActiveOperations implements TableOperationObserver
     /**
      * Get the estimated number of bytes remaining to write per sstable directory
      */
-    public Map<File, Long> estimatedRemainingWriteBytes()
+    public Map<File, Long> estimatedRemainingWriteToDiskBytes()
     {
         synchronized (operations)
         {
@@ -150,7 +151,7 @@ public class ActiveOperations implements TableOperationObserver
                 List<File> directories = compactionInfo.getTargetDirectories();
                 if (directories == null || directories.isEmpty())
                     continue;
-                long remainingWriteBytesPerDataDir = compactionInfo.estimatedRemainingWriteBytes() / directories.size();
+                long remainingWriteBytesPerDataDir = compactionInfo.estimatedRemainingWriteToDiskBytes() / directories.size();
                 for (File directory : directories)
                     writeBytesPerSSTableDir.merge(directory, remainingWriteBytesPerDataDir, Long::sum);
             }

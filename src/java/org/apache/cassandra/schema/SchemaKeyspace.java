@@ -32,6 +32,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.antlr.runtime.RecognitionException;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.ColumnIdentifier;
@@ -154,6 +155,8 @@ public final class SchemaKeyspace
 
     // CC5 schema with memtable as text
     // Used when storage_compatibility_mode is NONE (no downgrade support)
+    // auto_repair column is only included if AUTOREPAIR_ENABLE is true to avoid schema disagreement
+    // with pre-5.0.8 nodes that don't have this column in their system_schema.tables definition
     private static final TableMetadata Tables =
         parse(TABLES,
               "table definitions",
@@ -184,6 +187,7 @@ public final class SchemaKeyspace
               + "additional_write_policy text,"
               + "cdc boolean,"
               + "read_repair text,"
+              + (CassandraRelevantProperties.AUTOREPAIR_ENABLE.getBoolean() ? "auto_repair frozen<map<text, text>>," : "")
               + "PRIMARY KEY ((keyspace_name), table_name))");
 
     private static final TableMetadata Columns =
@@ -275,6 +279,8 @@ public final class SchemaKeyspace
               + "PRIMARY KEY ((keyspace_name), view_name))");
 
     // CC5 schema with memtable as text
+    // auto_repair column is only included if AUTOREPAIR_ENABLE is true to avoid schema disagreement
+    // with pre-5.0.8 nodes that don't have this column in their system_schema.views definition
     private static final TableMetadata Views =
         parse(VIEWS,
               "view definitions",
@@ -309,6 +315,7 @@ public final class SchemaKeyspace
               + "cdc boolean,"
               + "version int,"
               + "read_repair text,"
+              + (CassandraRelevantProperties.AUTOREPAIR_ENABLE.getBoolean() ? "auto_repair frozen<map<text, text>>," : "")
               + "PRIMARY KEY ((keyspace_name), view_name))");
 
     private static final TableMetadata Indexes =
@@ -696,7 +703,12 @@ public final class SchemaKeyspace
         }
     }
 
-    private static void addTableParamsToRowBuilder(TableParams params, Row.SimpleBuilder builder)
+    public static void addTableParamsToRowBuilder(TableParams params, Row.SimpleBuilder builder)
+    {
+        addTableParamsToRowBuilder(params, tablesTableMetadata(), builder);
+    }
+
+    private static void addTableParamsToRowBuilder(TableParams params, TableMetadata schemaTable, Row.SimpleBuilder builder)
     {
         builder.add("bloom_filter_fp_chance", params.bloomFilterFpChance)
                .add("comment", params.comment)
@@ -741,6 +753,17 @@ public final class SchemaKeyspace
         // incremental_backups is enabled, to avoid RTE in pre-4.2 versioned node during upgrades
         if (!params.incrementalBackups)
             builder.add("incremental_backups", false);
+
+        // Only add auto_repair column if:
+        // 1. The column exists in the schema (depends on AUTOREPAIR_ENABLE at class load time)
+        // 2. The scheduler is enabled (which includes AUTOREPAIR_ENABLE check)
+        // to avoid RTE in pre-5.1 versioned node during upgrades
+        if (schemaTable.getColumn(ByteBufferUtil.bytes("auto_repair")) != null
+            && DatabaseDescriptor.getRawConfig() != null
+            && DatabaseDescriptor.getAutoRepairConfig().isAutoRepairSchedulingEnabled())
+        {
+            builder.add("auto_repair", params.autoRepair.asMap());
+        }
     }
 
     private static void addAlterTableToSchemaMutation(TableMetadata oldTable, TableMetadata newTable, Mutation.SimpleBuilder builder)
@@ -951,7 +974,7 @@ public final class SchemaKeyspace
                                               .add("where_clause", view.whereClause.toCQLString())
                                               .add("id", table.id.asUUID());
 
-        addTableParamsToRowBuilder(table.params, rowBuilder);
+        addTableParamsToRowBuilder(table.params, viewsTableMetadata(), rowBuilder);
 
         if (includeColumns)
         {
@@ -1210,6 +1233,12 @@ public final class SchemaKeyspace
         // incremental_backups column was introduced in 4.2
         if (row.has("incremental_backups"))
             builder.incrementalBackups(row.getBoolean("incremental_backups"));
+
+        // auto_repair column was introduced in 5.0.8
+        if (row.has("auto_repair"))
+        {
+            builder.automatedRepair(AutoRepairParams.fromMap(row.getFrozenTextMap("auto_repair")));
+        }
 
         return builder.build();
     }

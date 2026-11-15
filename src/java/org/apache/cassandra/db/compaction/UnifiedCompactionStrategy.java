@@ -1761,7 +1761,10 @@ public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
                                                                                        ShardManager shardManager)
         {
             List<CompactionAggregate.UnifiedAggregate> aggregates = new ArrayList<>();
-            double shardThreshold = fanout * controller.getMaxSstablesPerShardFactor();
+            double maxSstablesPerShardFactor = controller.getMaxSstablesPerShardFactor();
+            if (maxSstablesPerShardFactor == 0)
+                return aggregates; // check disabled
+            double shardThreshold = fanout * maxSstablesPerShardFactor;
             if (sstables.size() > shardThreshold)
             {
                 List<Set<CompactionSSTable>> groups = shardManager.splitSSTablesInShards(sstables,

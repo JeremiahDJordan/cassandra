@@ -245,6 +245,13 @@ public class TrieMemtable extends AbstractShardedMemtable
     }
 
     @Override
+    public boolean limitsConcurrentWritesTo(int maxWriters)
+    {
+        // each shard applies one update at a time under its write lock
+        return boundaries.shardCount() <= maxWriters;
+    }
+
+    @Override
     @VisibleForTesting
     public void overwriteAllData()
     {

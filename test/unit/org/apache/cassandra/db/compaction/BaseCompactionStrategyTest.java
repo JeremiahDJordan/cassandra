@@ -278,6 +278,7 @@ public class BaseCompactionStrategyTest
 
         when(ret.getInterval()).thenReturn(Interval.create(first, last, ret));
         when(ret.estimatedKeys()).thenReturn(ShardManager.PER_PARTITION_SPAN_THRESHOLD * 2);
+        when(ret.getEstimatedPartitionSize()).thenReturn(null); // ShardManager.partitionCount falls back to estimatedKeys
 
         diskIndexMap.put(ret, diskIndex);
         if (diskIndex >= diskIndexes)

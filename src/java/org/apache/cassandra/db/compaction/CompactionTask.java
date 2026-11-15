@@ -72,6 +72,7 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.concurrent.Refs;
@@ -1034,7 +1035,7 @@ public class CompactionTask extends AbstractCompactionTask
                 for (File directory : newCompactionDatadirs)
                     expectedNewWriteSize.put(directory, writeSizePerOutputDatadir);
 
-                Map<File, Long> expectedWriteSize = CompactionManager.instance.active.estimatedRemainingWriteBytes();
+                Map<File, Long> expectedWriteSize = CompactionManager.instance.active.estimatedRemainingWriteToDiskBytes();
 
                 // todo: abort streams if they block compactions
                 if (realm.getDirectories().hasDiskSpaceForCompactionsAndStreams(expectedNewWriteSize, expectedWriteSize))
@@ -1131,6 +1132,10 @@ public class CompactionTask extends AbstractCompactionTask
         {
             if (expiredSSTable instanceof SSTableReader)
             {
+                // Notifying indexers is best-effort: the SSTable is fully expired and is going to be obsoleted regardless.
+                // A read error (e.g. a corrupt-but-expired SSTable, which was previously dropped without ever being read) or
+                // a failure in a custom indexer must not silently leave the SSTable undropped, or every subsequent compaction
+                // would hit the same failure, leaving the expired SSTables permanently stuck.
                 try (ISSTableScanner scanner = ((SSTableReader)expiredSSTable).getScanner())
                 {
                     while (scanner.hasNext())
@@ -1157,21 +1162,40 @@ public class CompactionTask extends AbstractCompactionTask
                                 for (Index.Indexer indexer : indexers)
                                     indexer.begin();
 
-                                while (partition.hasNext())
+                                try
                                 {
-                                    Unfiltered unfiltered = partition.next();
-                                    if (unfiltered instanceof Row)
+                                    Row staticRow = partition.staticRow();
+                                    if (!staticRow.isEmpty())
                                     {
                                         for (Index.Indexer indexer : indexers)
-                                            indexer.removeRow((Row) unfiltered);
+                                            indexer.removeRow(staticRow);
+                                    }
+
+                                    while (partition.hasNext())
+                                    {
+                                        Unfiltered unfiltered = partition.next();
+                                        if (unfiltered instanceof Row)
+                                        {
+                                            for (Index.Indexer indexer : indexers)
+                                                indexer.removeRow((Row) unfiltered);
+                                        }
                                     }
                                 }
-
-                                for (Index.Indexer indexer : indexers)
-                                    indexer.finish();
+                                finally
+                                {
+                                    for (Index.Indexer indexer : indexers)
+                                        indexer.finish();
+                                }
                             }
                         }
                     }
+                }
+                catch (Throwable t)
+                {
+                    JVMStabilityInspector.inspectThrowable(t);
+                    logger.warn("Failed to notify secondary indexes about rows in fully expired SSTable {} during compaction {}; " +
+                                "the SSTable will still be dropped, but index cleanup for it may be incomplete.",
+                                expiredSSTable, transaction.opId(), t);
                 }
             }
         }

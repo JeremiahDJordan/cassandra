@@ -576,7 +576,7 @@ public class BTreeRow extends AbstractRow
                         + clustering.unsharedHeapSize()
                         + primaryKeyLivenessInfo.unsharedHeapSize()
                         + deletion.unsharedHeapSize()
-                        + BTree.sizeOfStructureOnHeap(btree);
+                        + BTree.sizeOnHeapOf(btree);
 
         return accumulate((cd, v) -> v + cd.unsharedHeapSize(), heapSize);
     }
@@ -587,7 +587,7 @@ public class BTreeRow extends AbstractRow
                         + clustering.unsharedHeapSizeExcludingData()
                         + primaryKeyLivenessInfo.unsharedHeapSize()
                         + deletion.unsharedHeapSize()
-                        + BTree.sizeOfStructureOnHeap(btree);
+                        + BTree.sizeOnHeapOf(btree);
 
         return accumulate((cd, v) -> v + cd.unsharedHeapSizeExcludingData(), heapSize);
     }
@@ -677,6 +677,11 @@ public class BTreeRow extends AbstractRow
 
         DeletionTime deletion = rowDeletion.time();
         Object[] tree = mergeRowBTrees(reconcileF, existingBtree, updateBtree, deletion, this.deletion().time());
+        // BTree.update and the reconciler only account the column data (cells and column-tree nodes); the row's
+        // own LivenessInfo/Deletion are not. When they change (e.g. a row tombstone supersedes a live row) the
+        // new objects become memtable-owned and the old ones are released, so account that delta here.
+        reconcileF.onAllocatedOnHeap((livenessInfo.unsharedHeapSize() + rowDeletion.unsharedHeapSize())
+                                     - (this.primaryKeyLivenessInfo().unsharedHeapSize() + this.deletion().unsharedHeapSize()));
         return new BTreeRow(this.clustering, livenessInfo, rowDeletion, tree, minDeletionTime(tree, livenessInfo, deletion));
     }
 
@@ -699,8 +704,15 @@ public class BTreeRow extends AbstractRow
                 else
                 {
                     // The update's deletion shadows part of the existing row. Those cells ARE owned by
-                    // the memtable, so record their removal via retain().
-                    existingBtree = BTree.transformAndFilter(existingBtree, reconciler::retain);
+                    // the memtable, so record their removal via retain(). The retain branch rebuilds the tree
+                    // smaller via BTree.transformAndFilter (node accounting disabled), so report the freed
+                    // structure here, as BTreeRow.Reconciler.merge does on its path.
+                    Object[] retained = BTree.transformAndFilter(existingBtree, reconciler::retain);
+                    if (existingBtree != retained)
+                    {
+                        reconcileF.onAllocatedOnHeap(BTree.sizeOnHeapOf(retained) - BTree.sizeOnHeapOf(existingBtree));
+                        existingBtree = retained;
+                    }
                 }
             }
             return BTree.update(existingBtree, updateBtree, ColumnData.comparator, reconciler);
@@ -781,6 +793,9 @@ public class BTreeRow extends AbstractRow
                     }
                     cells = BTree.update(existingTree, updateTree, existingComplex.column.cellComparator(), (UpdateFunction) reconciler);
                 }
+                // The merged complex column carries maxComplexDeletion in place of the existing column's deletion,
+                // which is counted as owned (BTreeComplexColumn.unsharedHeapSizeExcludingData); account that swap.
+                onAllocatedOnHeap(maxComplexDeletion.unsharedHeapSize() - existingDeletion.unsharedHeapSize());
                 return new BTreeComplexColumn(existingComplex.column, cells, maxComplexDeletion);
             }
         }
@@ -842,8 +857,24 @@ public class BTreeRow extends AbstractRow
                 BTreeComplexColumn existingComplex = (BTreeComplexColumn) existing;
                 if (activeDeletion.supersedes(existingComplex.complexDeletion()))
                 {
-                    Object[] cells = BTree.transformAndFilter(existingComplex.tree(), (ColumnData cd) -> removeShadowed(cd, recordDeletion));
-                    return BTree.isEmpty(cells) ? null : new BTreeComplexColumn(existingComplex.column, cells, DeletionTime.LIVE);
+                    Object[] existingTree = existingComplex.tree();
+                    Object[] cells = BTree.transformAndFilter(existingTree, (ColumnData cd) -> removeShadowed(cd, recordDeletion));
+                    BTreeComplexColumn result = BTree.isEmpty(cells) ? null
+                                                                     : new BTreeComplexColumn(existingComplex.column, cells, DeletionTime.LIVE);
+                    // recordDeletion.delete above releases the shadowed cells only; release the change of the column's
+                    // own structure (cell tree, complex deletion, wrapper), which is counted as owned
+                    // (BTreeComplexColumn.unsharedHeapSizeExcludingData).
+                    if (recordDeletion != ColumnData.noOp)
+                    {
+                        long structureBefore = BTreeComplexColumn.EMPTY_SIZE
+                                               + existingComplex.complexDeletion().unsharedHeapSize()
+                                               + BTree.sizeOnHeapOf(existingTree);
+                        long structureAfter = result == null ? 0 : BTreeComplexColumn.EMPTY_SIZE
+                                                                   + DeletionTime.LIVE.unsharedHeapSize()
+                                                                   + BTree.sizeOnHeapOf(cells);
+                        recordDeletion.onAllocatedOnHeap(structureAfter - structureBefore);
+                    }
+                    return result;
                 }
             }
 

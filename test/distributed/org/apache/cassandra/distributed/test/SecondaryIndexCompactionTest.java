@@ -62,7 +62,7 @@ public class SecondaryIndexCompactionTest extends TestBaseImpl
                 AbstractTableOperation h = new MockHolder(i.getIndexCfs().metadata(), idxSSTables);
                 try (NonThrowingCloseable c = CompactionManager.instance.active.onOperationStart(h))
                 {
-                    CompactionManager.instance.active.estimatedRemainingWriteBytes();
+                    CompactionManager.instance.active.estimatedRemainingWriteToDiskBytes();
                 }
             });
         }
@@ -81,7 +81,7 @@ public class SecondaryIndexCompactionTest extends TestBaseImpl
         @Override
         public OperationProgress getProgress()
         {
-            return new OperationProgress(metadata, OperationType.COMPACTION, 0, 1000, nextTimeUUID(), sstables);
+            return new OperationProgress(metadata, OperationType.COMPACTION, 0, 1000, nextTimeUUID(), sstables).withTotalCompressed(300);
         }
 
         @Override

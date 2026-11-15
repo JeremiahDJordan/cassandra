@@ -100,7 +100,7 @@ public class AuthResponse extends Message.Request
         {
             ClientMetrics.instance.markAuthFailure();
             AuthEvents.instance.notifyAuthFailure(queryState, e);
-            return ErrorMessage.fromException(e);
+            return ErrorMessage.fromTransportException(e);
         }
     }
 }

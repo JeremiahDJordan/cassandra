@@ -106,7 +106,8 @@ public class RepairCoordinator implements Runnable, ProgressEventNotifier, Repai
     private final Function<String, RangesAtEndpoint> getLocalReplicas;
 
     private final List<ProgressListener> listeners = new ArrayList<>();
-    private final AtomicReference<Throwable> firstError = new AtomicReference<>(null);
+    @VisibleForTesting
+    protected final AtomicReference<Throwable> firstError = new AtomicReference<>(null);
     final SharedContext ctx;
     final Scheduler validationScheduler;
 
@@ -229,12 +230,12 @@ public class RepairCoordinator implements Runnable, ProgressEventNotifier, Repai
         complete(null);
     }
 
-    private void fail(String reason)
+    protected void fail(String reason)
     {
         if (reason == null)
         {
             Throwable error = firstError.get();
-            reason = error != null ? error.toString() : "Some repair failed";
+            reason = (error != null && error.getMessage() != null) ? error.getMessage() : "Some repair failed";
         }
         result.setException(new RuntimeException(reason));
 

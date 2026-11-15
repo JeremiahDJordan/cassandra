@@ -33,7 +33,7 @@
     <property name="debuglevel" value="source,lines,vars"/>
 
     <!-- default version and SCM information -->
-    <property name="base.version" value="5.0.7.0"/>
+    <property name="base.version" value="5.0.10.0"/>
     <property name="scm.connection" value="scm:git:ssh://git@github.com:datastax/cassandra.git"/>
     <property name="scm.developerConnection" value="scm:git:ssh://git@github.com:datastax/cassandra.git"/>
     <property name="scm.url" value="scm:git:ssh://git@github.com:datastax/cassandra.git"/>
@@ -1153,7 +1153,7 @@
           <include name="tools/bin/*"/>
           <exclude name="tools/bin/*.in.sh" />
           <include name=".build/**/*.sh"/>
-          <include name="doc/scripts/process-native-protocol-specs-in-docker.sh"/>
+          <include name="doc/scripts/gen-native-protocol-docs.sh"/>
         </tarfileset>
       </tar>
 
@@ -1443,6 +1443,9 @@
       <junit-timeout fork="on" forkmode="@{forkmode}" failureproperty="testfailed" maxmemory="1024m" timeout="@{timeout}" showoutput="@{showoutput}">
         <formatter classname="org.apache.cassandra.CassandraXMLJUnitResultFormatter" extension=".xml" usefile="true"/>
         <formatter classname="org.apache.cassandra.CassandraBriefJUnitResultFormatter" usefile="false"/>
+        <!-- Same as cassandra-env.sh: glibc otherwise creates up to 8 arenas per host core, and the native memory they
+             retain (netty/direct buffer chunks) can push a test JVM past the CI container memory limit -->
+        <env key="MALLOC_ARENA_MAX" value="4"/>
         <jvmarg value="-Dstorage-config=${test.conf}"/>
         <jvmarg value="-Djava.awt.headless=true"/>
         <!-- Cassandra 3.0+ needs <jvmarg line="... ${additionalagent}" /> here! (not value=) -->
@@ -2480,6 +2483,7 @@
   <classpathentry kind="src" output="${test.classes}" path="test/distributed"/>
   <classpathentry kind="src" output="${test.classes}" path="test/simulator/asm"/>
   <classpathentry kind="src" output="${test.classes}" path="test/simulator/main"/>
+  <classpathentry kind="src" output="${test.classes}" path="test/simulator/test"/>
   <classpathentry kind="src" output="${test.classes}" path="test/resources" />
   <classpathentry kind="src" path="tools/stress/src"/>
   <classpathentry kind="src" path="tools/fqltool/src"/>
@@ -2487,8 +2491,8 @@
   <classpathentry kind="src" output="build/test/fqltool-classes" path="tools/fqltool/test/unit" />
   <classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER"/>
   <classpathentry kind="output" path="build/classes/eclipse"/>
+  <classpathentry kind="lib" path="${build.classes.main}"/>
   <classpathentry kind="lib" path="test/conf"/>
-  <classpathentry kind="lib" path="${java.home}/../lib/tools.jar"/>
   ${eclipse-libs-list}
 </classpath>
 ]]>

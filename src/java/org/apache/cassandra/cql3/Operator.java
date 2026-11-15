@@ -132,7 +132,7 @@ public enum Operator
         @Override
         public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
         {
-            CollectionType<?> collectionType = (CollectionType<?>) type;
+            CollectionType<?> collectionType = (CollectionType<?>) type.unwrap();
             return collectionType.contains(leftOperand, rightOperand);
         }
     },
@@ -147,7 +147,7 @@ public enum Operator
         @Override
         public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
         {
-            MapType<?, ?> mapType = (MapType<?, ?>) type;
+            MapType<?, ?> mapType = (MapType<?, ?>) type.unwrap();
             return mapType.containsKey(leftOperand, rightOperand);
         }
     },

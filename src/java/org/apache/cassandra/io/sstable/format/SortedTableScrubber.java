@@ -24,7 +24,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
-import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.concurrent.locks.Lock;
@@ -64,16 +63,12 @@ import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.ConfigurationException;
-import org.apache.cassandra.io.sstable.Component;
-import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.IScrubber;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.SSTableRewriter;
-import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.RandomAccessReader;
-import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ActiveRepairService;
@@ -163,8 +158,8 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
         // partition "ahead" of the data file.)
         boolean isOffline = options.overrideTxnIsOffline ? false : transaction.isOffline();
         this.dataFile = isOffline
-                        ? sstable.openDataReader(ReadPattern.SEQUENTIAL)
-                        : sstable.openDataReader(CompactionManager.instance.getRateLimiter(), ReadPattern.SEQUENTIAL);
+                        ? sstable.openDataReaderForScan()
+                        : sstable.openDataReaderForScan(CompactionManager.instance.getRateLimiter());
 
         this.scrubInfo = new ScrubInfo(dataFile, sstable, fileAccessLock.readLock());
 
@@ -172,23 +167,6 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
             outputHandler.output("Starting scrub with reinsert overflowed TTL option");
         else if (options.overwriteTTLMode != IScrubber.OverwriteTTLMode.NONE)
             outputHandler.output("Starting scrub with option: " + options.overwriteTTLMode);
-    }
-
-    public static void deleteOrphanedComponents(Descriptor descriptor, Set<Component> components)
-    {
-        File dataFile = descriptor.fileFor(Components.DATA);
-        if (components.contains(Components.DATA) && dataFile.length() > 0)
-            // everything appears to be in order... moving on.
-            return;
-
-        // missing the DATA file! all components are orphaned
-        logger.warn("Removing orphans for {}: {}", descriptor, components);
-        for (Component component : components)
-        {
-            File file = descriptor.fileFor(component);
-            if (file.exists())
-                descriptor.fileFor(component).delete();
-        }
     }
 
     @Override
@@ -430,7 +408,7 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
                                              dataFile.length(),
                                              scrubCompactionId,
                                              ImmutableSet.of(sstable),
-                                             File.getPath(sstable.getFilename()).getParent().toString());
+                                             File.getPath(sstable.getFilename()).getParent().toString()).withTotalCompressed(sstable.onDiskLength());
             }
             catch (Exception e)
             {

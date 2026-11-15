@@ -29,6 +29,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.VoidChannelPromise;
@@ -89,8 +90,7 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                     supportedOptions.put(StartupMessage.COMPRESSION, compressions);
                     supportedOptions.put(StartupMessage.PROTOCOL_VERSIONS, ProtocolVersion.supportedVersions());
                     SupportedMessage supported = new SupportedMessage(supportedOptions);
-                    supported.setStreamId(inbound.header.streamId);
-                    outbound = supported.encode(inbound.header.version);
+                    outbound = supported.encode(inbound.header.version, inbound.header.streamId);
                     ctx.writeAndFlush(outbound);
                     break;
 
@@ -129,8 +129,8 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                                 if (null == cause)
                                     cause = new ServerError("Unexpected error establishing connection");
                                 logger.warn("Writing response to STARTUP failed, unable to configure pipeline", cause);
-                                ErrorMessage error = ErrorMessage.fromException(cause);
-                                Envelope response = error.encode(inbound.header.version);
+                                ErrorMessage error = ErrorMessage.fromExceptionNoStreamId(cause);
+                                Envelope response = error.encode(inbound.header.version, inbound.header.streamId);
                                 ChannelPromise closeChannel = AsyncChannelPromise.withListener(ctx, f -> ctx.close());
                                 ctx.writeAndFlush(response, closeChannel);
                                 if (ctx.channel().isOpen())
@@ -149,17 +149,18 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                     }
 
                     ProtocolVersion version = inbound.header.version;
+                    int streamId = inbound.header.streamId;
                     Dispatcher.processInit((ServerConnection) connection, startup).addCallback((response, error) -> {
                         if (error == null)
                         {
-                            Envelope encoded = response.encode(version);
+                            Envelope encoded = response.encode(version, streamId);
                             ctx.writeAndFlush(encoded, promise);
                             logger.debug("Configured pipeline: {}", ctx.pipeline());
                         }
                         else
                         {
-                            ErrorMessage message = ErrorMessage.fromException(new ProtocolException(String.format("Unexpected error %s", error.getMessage())));
-                            Envelope encoded = message.encode(version);
+                            ErrorMessage message = ErrorMessage.fromTransportException(new ProtocolException(String.format("Unexpected error %s", error.getMessage())));
+                            Envelope encoded = message.encode(version, streamId);
                             ctx.writeAndFlush(encoded);
                         }
                     });
@@ -167,11 +168,13 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
 
                 default:
                     ErrorMessage error =
-                        ErrorMessage.fromException(
+                        ErrorMessage.fromTransportException(
                             new ProtocolException(String.format("Unexpected message %s, expecting STARTUP or OPTIONS",
                                                                 inbound.header.type)));
-                    outbound = error.encode(inbound.header.version);
-                    ctx.writeAndFlush(outbound);
+                    outbound = error.encode(inbound.header.version, inbound.header.streamId);
+                    // An unexpected message during initial connection setup leaves the connection in a
+                    // corrupted state; send the error, then close the connection.
+                    ctx.writeAndFlush(outbound).addListener(ChannelFutureListener.CLOSE);
             }
         }
         finally

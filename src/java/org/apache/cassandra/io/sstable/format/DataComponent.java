@@ -29,7 +29,6 @@ import org.apache.cassandra.io.util.ChecksummedSequentialWriter;
 import org.apache.cassandra.io.util.SequentialWriter;
 import org.apache.cassandra.io.util.SequentialWriterOption;
 import org.apache.cassandra.schema.CompressionParams;
-import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ChecksumType;
 
 public class DataComponent
@@ -53,14 +52,14 @@ public class DataComponent
     }
 
     public static SequentialWriter buildWriter(Descriptor descriptor,
-                                               TableMetadata metadata,
+                                               CompressionParams compression,
                                                SequentialWriterOption options,
                                                MetadataCollector metadataCollector,
                                                OperationType operationType)
     {
-        if (metadata.params.compression.isEnabled())
+        if (compression.isEnabled())
         {
-            final CompressionParams compressionParams = buildCompressionParams(metadata, operationType);
+            final CompressionParams compressionParams = buildCompressionParams(compression, descriptor.ksname, operationType);
             return new CompressedSequentialWriter(descriptor.fileFor(Components.DATA),
                                                   descriptor.fileFor(Components.COMPRESSION_INFO),
                                                   descriptor.fileFor(digestComponent),
@@ -84,9 +83,9 @@ public class DataComponent
      *
      * @return {@link CompressionParams}
      */
-    private static CompressionParams buildCompressionParams(TableMetadata metadata, OperationType operationType)
+    private static CompressionParams buildCompressionParams(CompressionParams compression, String keyspace, OperationType operationType)
     {
-        CompressionParams compressionParams = metadata.params.compression;
+        CompressionParams compressionParams = compression;
 
         if (compressionParams.getSstableCompressor() != null)
         {
@@ -96,12 +95,12 @@ public class DataComponent
                 // especially of large tables, can queue up and potentially block writes.
                 // This optimization allows us to fall back to a faster compressor if a particular
                 // compression algorithm indicates we should. See CASSANDRA-15379 for more details.
-                compressionParams = compressionParams.forFlush(metadata.keyspace);
+                compressionParams = compressionParams.forFlush(keyspace);
             }
             else
             {
                 // Allows to plugin custom per-keyspace resolution of compressionParams
-                compressionParams = compressionParams.forCompaction(metadata.keyspace);
+                compressionParams = compressionParams.forCompaction(keyspace);
             }
         }
         return compressionParams;

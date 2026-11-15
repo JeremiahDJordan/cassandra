@@ -26,6 +26,8 @@ import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -94,6 +96,7 @@ import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableStreamRebuildState;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
@@ -126,6 +129,10 @@ public class StorageAttachedIndex implements Index
 
     private static class StorageAttachedIndexBuildingSupport implements IndexBuildingSupport
     {
+        /** Maximum number of blocked sstable names to log when a rebuild is rejected, to keep the message bounded. */
+        private static final int MAX_LOGGED_SSTABLES = 16;
+
+        /** Reserves the stream rebuild status of every returned sstable; the builders created by the caller release it. */
         public NavigableMap<SSTableReader, Set<StorageAttachedIndex>> prepareSSTablesToBuild(StorageAttachedIndexGroup group,
                                                        Set<Index> indexes,
                                                        Collection<SSTableReader> sstablesToRebuild,
@@ -133,6 +140,8 @@ public class StorageAttachedIndex implements Index
         {
             NavigableMap<SSTableReader, Set<StorageAttachedIndex>> sstables = new TreeMap<>(SSTableReader.idComparator);
 
+            // First resolve, without mutating anything, which SSTables each index will rebuild.
+            Map<StorageAttachedIndex, Collection<SSTableReader>> targets = new LinkedHashMap<>();
             indexes.stream()
                    .filter((i) -> i instanceof StorageAttachedIndex)
                    .forEach((i) ->
@@ -150,15 +159,64 @@ public class StorageAttachedIndex implements Index
                                                           .collect(Collectors.toList());
                                 }
 
-                                group.prepareIndexSSTablesForRebuild(ss, sai);
-
-                                ss.forEach((sstable) ->
-                                           {
-                                               Set<StorageAttachedIndex> toBuild = sstables.get(sstable);
-                                               if (toBuild == null) sstables.put(sstable, (toBuild = new HashSet<>()));
-                                               toBuild.add(sai);
-                                           });
+                                targets.put(sai, ss);
                             });
+
+            // Reserve the per-sstable rebuild status for every unique target sstable BEFORE preparing (and possibly
+            // deleting) any index components. A zero-copy stream reserves the same status when its outgoing file is
+            // constructed, so this ensures a rebuild cannot delete/rewrite SAI components underneath an in-flight
+            // stream. The returned builder(s) own these reservations and release them when they finish.
+            Set<SSTableReader> reserved = new LinkedHashSet<>();
+            for (Collection<SSTableReader> ss : targets.values())
+            {
+                for (SSTableReader sstable : ss)
+                {
+                    if (reserved.contains(sstable))
+                        continue;
+                    if (sstable.streamRebuildState().tryBeginRebuild())
+                    {
+                        reserved.add(sstable);
+                    }
+                    else
+                    {
+                        reserved.forEach(s -> s.streamRebuildState().endRebuild());
+
+                        // For debugging, list the SSTables that are blocking this rebuild because they are not in a
+                        // NORMAL state (a zero-copy stream is in flight). Cap the list so the message stays bounded.
+                        String blockedSSTables = targets.values().stream()
+                                                        .flatMap(Collection::stream)
+                                                        .distinct()
+                                                        .filter(s -> s.streamRebuildState().state() != SSTableStreamRebuildState.State.NORMAL)
+                                                        .map(s -> s.descriptor.toString())
+                                                        .limit(MAX_LOGGED_SSTABLES)
+                                                        .collect(Collectors.joining(", "));
+                        throw new RuntimeException(String.format(
+                            "Cannot build SAI index while entire SSTable streaming is in progress. " +
+                            "Blocked sstable(s) (up to %d shown): %s", MAX_LOGGED_SSTABLES, blockedSSTables));
+                    }
+                }
+            }
+
+            // Now it is safe to prepare the index views/components and assemble the build map.
+            try
+            {
+                targets.forEach((sai, ss) ->
+                                {
+                                    group.prepareIndexSSTablesForRebuild(ss, sai);
+
+                                    ss.forEach((sstable) ->
+                                               {
+                                                   Set<StorageAttachedIndex> toBuild = sstables.get(sstable);
+                                                   if (toBuild == null) sstables.put(sstable, (toBuild = new HashSet<>()));
+                                                   toBuild.add(sai);
+                                               });
+                                });
+            }
+            catch (RuntimeException | Error e)
+            {
+                reserved.forEach(s -> s.streamRebuildState().endRebuild());
+                throw e;
+            }
 
             return sstables;
         }
@@ -168,7 +226,8 @@ public class StorageAttachedIndex implements Index
         {
             StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
             NavigableMap<SSTableReader, Set<StorageAttachedIndex>> sstables = prepareSSTablesToBuild(group, indexes, sstablesToRebuild, isFullRebuild);
-            return new StorageAttachedIndexBuilder(group, sstables, isFullRebuild, false);
+            // the builder owns (and releases) the stream rebuild status reserved by prepareSSTablesToBuild
+            return new StorageAttachedIndexBuilder(group, sstables, isFullRebuild, false, true);
         }
 
         @Override
@@ -185,7 +244,9 @@ public class StorageAttachedIndex implements Index
                 SortedMap<SSTableReader, Set<StorageAttachedIndex>> current = new TreeMap<>(Comparator.comparing(sstable -> sstable.descriptor.id));
                 group.forEach(sstable -> current.put(sstable, sstables.get(sstable)));
 
-                builders.add(new StorageAttachedIndexBuilder(indexGroup, current, isFullRebuild, false));
+                // each builder owns (and releases) the stream rebuild status reserved by prepareSSTablesToBuild for
+                // its own subset of the sstables; the groups partition the reserved sstables
+                builders.add(new StorageAttachedIndexBuilder(indexGroup, current, isFullRebuild, false, true));
             }
 
             logger.info("Creating {} parallel index builds over {} total sstables for {}...", builders.size(), sstables.size(), cfs.metadata());

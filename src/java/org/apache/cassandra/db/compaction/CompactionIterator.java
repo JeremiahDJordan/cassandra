@@ -100,6 +100,7 @@ public class CompactionIterator implements UnfilteredPartitionIterator
     private final long nowInSec;
     private final TimeUUID compactionId;
     private final long totalBytes;
+    private final long totalCompressedBytes;
     private volatile long[] bytesReadByLevel;
 
     // Keep targetDirectory for compactions, needed for `nodetool compactionstats`
@@ -133,9 +134,14 @@ public class CompactionIterator implements UnfilteredPartitionIterator
         this.bytesReadByLevel = new long[LeveledGenerations.MAX_LEVEL_COUNT];
 
         long bytes = 0;
+        long compressedBytes = 0;
         for (ISSTableScanner scanner : scanners)
+        {
             bytes += scanner.getLengthInBytes();
+            compressedBytes += scanner.getCompressedLengthInBytes();
+        }
         this.totalBytes = bytes;
+        this.totalCompressedBytes = compressedBytes;
         this.mergedPartitionsHistogram = new long[scanners.size()];
         this.mergedRowsHistogram = new long[scanners.size()];
         // note that we leak `this` from the constructor when calling beginCompaction below, this means we have to get the sstables before
@@ -166,7 +172,7 @@ public class CompactionIterator implements UnfilteredPartitionIterator
             {
                 return progress != null
                        ? progress
-                       : new AbstractTableOperation.OperationProgress(controller.realm.metadata(), type, bytesRead(), totalBytes, compactionId, sstables);
+                       : new AbstractTableOperation.OperationProgress(controller.realm.metadata(), type, bytesRead(), totalBytes, compactionId, sstables).withTotalCompressed(totalCompressedBytes);
             }
 
             @Override

@@ -101,6 +101,7 @@ import org.apache.cassandra.distributed.shared.ThrowingRunnable;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.hints.DTestSerializer;
 import org.apache.cassandra.hints.HintsService;
+import org.apache.cassandra.index.IndexStatusManager;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.io.IVersionedAsymmetricSerializer;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -123,6 +124,7 @@ import org.apache.cassandra.schema.MigrationCoordinator;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspace;
+import org.apache.cassandra.repair.autorepair.AutoRepair;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.CassandraDaemon;
 import org.apache.cassandra.service.ClientState;
@@ -863,7 +865,8 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
     public Future<Void> shutdown(boolean graceful)
     {
         inInstancelogger.info("Shutting down instance {} / {}", config.num(), config.broadcastAddress().getHostString());
-        if (!CassandraRelevantProperties.UNSAFE_SYSTEM.getBoolean())
+        // a drained node has already flushed every keyspace and shut down its flush executors
+        if (!CassandraRelevantProperties.UNSAFE_SYSTEM.getBoolean() && !StorageService.instance.isDrained())
             flush(SchemaKeyspace.metadata().name);
 
         Future<?> future = async((ExecutorService executor) -> {
@@ -927,7 +930,9 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                                 () -> DiagnosticSnapshotService.instance.shutdownAndWait(1L, MINUTES),
                                 () -> shutdownAndWait(Collections.singletonList(ActiveRepairService.repairCommandExecutor())),
                                 () -> ActiveRepairService.instance().shutdownNowAndWait(1L, MINUTES),
-                                () -> SnapshotManager.shutdownAndWait(1L, MINUTES)
+                                () -> AutoRepair.instance.shutdownBlocking(),
+                                () -> SnapshotManager.shutdownAndWait(1L, MINUTES),
+                                () -> IndexStatusManager.instance.shutdownAndWait(1L, MINUTES)
             );
 
             internodeMessagingStarted = false;

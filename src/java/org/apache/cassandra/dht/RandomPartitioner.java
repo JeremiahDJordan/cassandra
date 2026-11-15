@@ -284,13 +284,14 @@ public class RandomPartitioner implements IPartitioner
             BigInteger prev;
             if (token.compareTo(ZERO) == 0)
             {
-                // For ZERO token, return MINIMUM as adjustment
-                // 1. Range semantics: Most range functions expect minimum as an upper bound, not maximum as a lowerbound
-                // 2. Wraparound risks: Functions designed for non-wraparound ranges might not handle maximum on the lower side correctly
-                // Note: this means MAXIMUM.nextValidToken().prevValidToken() != MAXIMUM
+                // For the ZERO token, return MINIMUM as the adjustment, for two reasons:
+                // 1. Range semantics: most range functions expect MINIMUM as an upper bound, not MAXIMUM as a
+                //    lower bound.
+                // 2. Wraparound risks: functions designed for non-wraparound ranges might not handle MAXIMUM on
+                //    the lower side correctly.
                 prev = MINIMUM.token;
             }
-            else if (this.isMinimum())
+            else if (isMinimum())
             {
                 // For MINIMUM, wrap around to MAXIMUM.
                 prev = MAXIMUM;

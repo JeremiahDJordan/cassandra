@@ -20,6 +20,8 @@ package org.apache.cassandra.db.streaming;
 
 import java.io.IOException;
 import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.function.UnaryOperator;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
@@ -37,8 +39,10 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.IOOptions;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
 import org.apache.cassandra.io.sstable.SSTableZeroCopyWriter;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.DataInputPlus;
+import org.apache.cassandra.io.util.DataIntegrityMetadata;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.SequentialWriterOption;
 import org.apache.cassandra.schema.TableId;
@@ -46,6 +50,8 @@ import org.apache.cassandra.streaming.ProgressInfo;
 import org.apache.cassandra.streaming.StreamReceiver;
 import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.messages.StreamMessageHeader;
+import org.apache.cassandra.utils.ChecksumType;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 import static java.lang.String.format;
 import static org.apache.cassandra.utils.FBUtilities.prettyPrintMemory;
@@ -137,6 +143,8 @@ public class CassandraEntireSSTableStreamReader implements IStreamReader
                              prettyPrintMemory(totalSize));
             }
 
+            validateDataDigest(writer.descriptor, manifest);
+
             if (!SKIP_MUTATING_STATS_AFTER_ZCS)
             {
                 UnaryOperator<StatsMetadata> transform = stats -> stats.mutateLevel(header.sstableLevel)
@@ -165,6 +173,60 @@ public class CassandraEntireSSTableStreamReader implements IStreamReader
                     e.addSuppressed(e2);
             }
             throw e;
+        }
+    }
+
+    /**
+     * Validates the received {@code Data.db} against the streamed digest component ({@code Digest.crc32},
+     * {@code Digest.crc32c} or {@code Digest.crc64nvme}).
+     * @throws IOException if a digest was streamed and the received data file does not match it
+     */
+    private void validateDataDigest(Descriptor descriptor, ComponentManifest manifest) throws IOException
+    {
+        if (!DatabaseDescriptor.getEntireSSTableStreamDigestValidationEnabled())
+            return;
+
+        List<Component> components = manifest.components();
+        // The digest may be written with any of the supported checksum types (CNDB-17829); validate against
+        // whichever one was streamed, in the same preference order as SSTableReader#maybeGetDigestValidator.
+        Component digest = null;
+        ChecksumType checksumType = null;
+        if (components.contains(Components.DIGEST))
+        {
+            digest = Components.DIGEST;
+            checksumType = ChecksumType.CRC32;
+        }
+        else if (components.contains(Components.DIGEST_CRC32C))
+        {
+            digest = Components.DIGEST_CRC32C;
+            checksumType = ChecksumType.CRC32C;
+        }
+        else if (components.contains(Components.DIGEST_CRC64NVME))
+        {
+            digest = Components.DIGEST_CRC64NVME;
+            checksumType = ChecksumType.CRC64NVME;
+        }
+
+        if (!components.contains(Components.DATA) || digest == null)
+        {
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES,
+                             "Accepting zero-copy sstable stream from {} without validating CRC due to " +
+                             "missing {} or digest component from streamed components: {}",
+                             session.peer, Components.DATA, components);
+            return;
+        }
+
+        try
+        {
+            new DataIntegrityMetadata.FileDigestValidator(descriptor.fileFor(Components.DATA),
+                                                          descriptor.fileFor(digest),
+                                                          checksumType).validate();
+        }
+        catch (IOException e)
+        {
+            session.countEntireSSTableDigestMismatch();
+            throw new IOException(format("[Stream #%s] Digest mismatch for %s received from %s, aborting stream",
+                                         session.planId(), descriptor, session.peer), e);
         }
     }
 

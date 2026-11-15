@@ -161,13 +161,11 @@ public class ResultMessageTest
         rm.setWarnings(mock(List.class));
         rm.setCustomPayload(mock(Map.class));
         rm.setSource(mock(Envelope.class));
-        rm.setStreamId(123);
         T rm4 = rm3.withOverriddenKeyspace(ks -> ks + "_123");
         assertThat(rm4).isNotSameAs(rm);
         assertThat(rm4.getWarnings()).isSameAs(rm.getWarnings());
         assertThat(rm4.getCustomPayload()).isSameAs(rm.getCustomPayload());
         assertThat(rm4.getSource()).isSameAs(rm.getSource());
-        assertThat(rm4.getStreamId()).isSameAs(rm.getStreamId());
 
         return rm4;
     }

@@ -175,6 +175,7 @@ public interface TableOperation
         String COLUMNFAMILY = "columnfamily";
         String COMPLETED = "completed";
         String TOTAL = "total";
+        String TOTAL_COMPRESSED = "totalCompressed";
         String OPERATION_TYPE = "operationType";
         String UNIT = "unit";
         String OPERATION_ID = "operationId";
@@ -207,6 +208,15 @@ public interface TableOperation
         long total();
 
         /**
+         * @return the compressed (on-disk) size corresponding to {@link #total()}, used to scale remaining-write
+         * estimates for compressed tables (CASSANDRA-21245). Defaults to {@link #total()}.
+         */
+        default long totalCompressed()
+        {
+            return total();
+        }
+
+        /**
          * @return the type of operation, see {@link OperationType}.
          */
         OperationType operationType();
@@ -236,10 +246,15 @@ public interface TableOperation
          * size == output size for a compaction, which is not really true, but should most often provide a worst case
          * remaining write size.
          */
-        default long estimatedRemainingWriteBytes()
+        default long estimatedRemainingWriteToDiskBytes()
         {
+            // total/completed are uncompressed sizes; scale by the effective compression ratio (CASSANDRA-21245)
             if (unit() == Unit.BYTES && operationType().writesData)
-                return total() - completed();
+            {
+                final long total = total();
+                double compressionRatio = total == 0 ? 1 : ((double) totalCompressed() / (double) total);
+                return (long) (compressionRatio * (total - completed()));
+            }
             return 0;
         }
 
@@ -281,6 +296,7 @@ public interface TableOperation
             ret.put(COLUMNFAMILY, table().orElse(null));
             ret.put(COMPLETED, Long.toString(completed()));
             ret.put(TOTAL, Long.toString(total()));
+            ret.put(TOTAL_COMPRESSED, Long.toString(totalCompressed()));
             ret.put(OPERATION_TYPE, operationType().toString());
             ret.put(UNIT, unit().toString());
             ret.put(OPERATION_ID, operationId() == null ? "" : operationId().toString());

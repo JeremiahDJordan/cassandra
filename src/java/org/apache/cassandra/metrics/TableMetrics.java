@@ -334,9 +334,15 @@ public class TableMetrics
     /** number of partitions read creating merkle trees */
     public final TableHistogram partitionsValidated;
     /** number of bytes read while doing anticompaction */
-    public final Counter bytesAnticompacted;
+    public final TableMeter bytesAnticompacted;
     /** number of bytes where the whole sstable was contained in a repairing range so that we only mutated the repair status */
-    public final Counter bytesMutatedAnticompaction;
+    public final TableMeter bytesMutatedAnticompaction;
+    /** number of bytes that were scanned during preview repair */
+    public final TableMeter bytesPreviewed;
+    /** number of desynchronized token ranges that were detected during preview repair */
+    public final TableMeter tokenRangesPreviewedDesynchronized;
+    /** number of desynchronized bytes that were detected during preview repair */
+    public final TableMeter bytesPreviewedDesynchronized;
     /** ratio of how much we anticompact vs how much we could mutate the repair status*/
     public final Gauge<Double> mutatedAnticompactionGauge;
 
@@ -644,7 +650,7 @@ public class TableMetrics
         // MemtableOffHeapSize naming deprecated in 4.0
         memtableOffHeapDataSize = createTableGaugeWithDeprecation("MemtableOffHeapDataSize", "MemtableOffHeapSize",
                                                                   () -> Memtable.getMemoryUsage(cfs.getTracker().getView().getCurrentMemtable()).ownsOffHeap,
-                                                                  new GlobalTableGauge("MemtableOnHeapDataSize"));
+                                                                  new GlobalTableGauge("MemtableOffHeapDataSize"));
 
         memtableLiveDataSize = createTableGauge("MemtableLiveDataSize",
                                                 () -> cfs.getTracker().getView().getCurrentMemtable().getLiveDataSize());
@@ -719,7 +725,7 @@ public class TableMetrics
                 return estimatedPartitions;
             }
         }, null);
-        // This cached guage is used by compaction to calculate a size for single-partition sstables. It does not need
+        // This cached gauge is used by compaction to calculate a size for single-partition sstables. It does not need
         // to be up-to-date, only to give a rough indication of the number of partitions.
         estimatedPartitionCountInSSTablesCached = new CachedGauge<Long>(ESTIMATED_PARTITION_COUNT_CACHE_PERIOD_SECONDS, TimeUnit.SECONDS)
         {
@@ -1093,12 +1099,15 @@ public class TableMetrics
 
         bytesValidated = createTableHistogram("BytesValidated", cfs.getKeyspaceMetrics().bytesValidated, false);
         partitionsValidated = createTableHistogram("PartitionsValidated", cfs.getKeyspaceMetrics().partitionsValidated, false);
-        bytesAnticompacted = createTableCounter("BytesAnticompacted");
-        bytesMutatedAnticompaction = createTableCounter("BytesMutatedAnticompaction");
+        bytesAnticompacted = createTableMeter("BytesAnticompacted", cfs.getKeyspaceMetrics().bytesAnticompacted, true);
+        bytesMutatedAnticompaction = createTableMeter("BytesMutatedAnticompaction", cfs.getKeyspaceMetrics().bytesMutatedAnticompaction, true);
+        bytesPreviewed = createTableMeter("BytesPreviewed", cfs.getKeyspaceMetrics().bytesPreviewed);
+        tokenRangesPreviewedDesynchronized = createTableMeter("TokenRangesPreviewedDesynchronized", cfs.getKeyspaceMetrics().tokenRangesPreviewedDesynchronized);
+        bytesPreviewedDesynchronized = createTableMeter("BytesPreviewedDesynchronized", cfs.getKeyspaceMetrics().bytesPreviewedDesynchronized);
         mutatedAnticompactionGauge = createTableGauge("MutatedAnticompactionGauge", () ->
         {
-            double bytesMutated = bytesMutatedAnticompaction.getCount();
-            double bytesAnticomp = bytesAnticompacted.getCount();
+            double bytesMutated = bytesMutatedAnticompaction.tableOrKeyspaceMeter().getCount();
+            double bytesAnticomp = bytesAnticompacted.tableOrKeyspaceMeter().getCount();
             if (bytesAnticomp + bytesMutated > 0)
                 return bytesMutated / (bytesAnticomp + bytesMutated);
             return 0.0;
@@ -1475,16 +1484,22 @@ public class TableMetrics
 
     protected TableMeter createTableMeter(String name, Meter keyspaceMeter)
     {
-        return createTableMeter(name, name, keyspaceMeter);
+        return createTableMeter(name, keyspaceMeter, false);
     }
 
-    protected TableMeter createTableMeter(String name, String alias, Meter keyspaceMeter)
+    protected TableMeter createTableMeter(String name, Meter keyspaceMeter, boolean globalMeterGaugeCompatible)
+    {
+        return createTableMeter(name, name, keyspaceMeter, globalMeterGaugeCompatible);
+    }
+
+    protected TableMeter createTableMeter(String name, String alias, Meter keyspaceMeter, boolean globalMeterGaugeCompatible)
     {
         Meter globalMeter = null;
         if (EXPORT_GLOBAL_METRICS)
         {
             globalMeter = Metrics.meter(GLOBAL_FACTORY.createMetricName(name),
-                                        GLOBAL_ALIAS_FACTORY.createMetricName(alias));
+                                        GLOBAL_ALIAS_FACTORY.createMetricName(alias),
+                                        globalMeterGaugeCompatible);
         }
 
         Meter tableMeter = null;
@@ -1666,9 +1681,14 @@ public class TableMetrics
 
         public void mark()
         {
+            mark(1L);
+        }
+
+        public void mark(long val)
+        {
             for (Meter meter : all)
             {
-                meter.mark();
+                meter.mark(val);
             }
         }
 

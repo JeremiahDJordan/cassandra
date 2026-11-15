@@ -420,10 +420,10 @@ public final class SingleColumnRelation extends Relation
     {
         ColumnSpecification receiver = columnDef;
 
-        checkFalse(isContainsKey() && !(receiver.type instanceof MapType), "Cannot use CONTAINS KEY on non-map column %s", receiver.name);
-        checkFalse(isContains() && !(receiver.type.isCollection()), "Cannot use CONTAINS on non-collection column %s", receiver.name);
-        checkFalse(isNotContainsKey() && !(receiver.type instanceof MapType), "Cannot use NOT CONTAINS KEY on non-map column %s", receiver.name);
-        checkFalse(isNotContains() && !(receiver.type.isCollection()), "Cannot use NOT CONTAINS on non-collection column %s", receiver.name);
+        checkFalse(isContainsKey() && !(receiver.type.unwrap() instanceof MapType), "Cannot use CONTAINS KEY on non-map column %s", receiver.name);
+        checkFalse(isContains() && !(receiver.type.unwrap().isCollection()), "Cannot use CONTAINS on non-collection column %s", receiver.name);
+        checkFalse(isNotContainsKey() && !(receiver.type.unwrap() instanceof MapType), "Cannot use NOT CONTAINS KEY on non-map column %s", receiver.name);
+        checkFalse(isNotContains() && !(receiver.type.unwrap().isCollection()), "Cannot use NOT CONTAINS on non-collection column %s", receiver.name);
 
         if (mapKey != null)
         {
@@ -439,7 +439,7 @@ public final class SingleColumnRelation extends Relation
                    receiver.name,
                    receiver.type.asCQL3Type());
 
-        if (receiver.type.isCollection())
+        if (receiver.type.unwrap().isCollection())
         {
             // We don't support relations against entire collections (unless they're frozen), like "numbers = {1, 2, 3}"
             checkFalse(receiver.type.isMultiCell() && !isLegalRelationForNonFrozenCollection(),
@@ -461,12 +461,19 @@ public final class SingleColumnRelation extends Relation
             }
         }
 
+        // Only EQ and IN bind markers identify a value the column must equal, so only those are safe to report as
+        // partition-key bind indexes for token-aware routing (see VariableSpecifications#getPartitionKeyBindVariableIndexes).
+        // Every other operator (slices, LIKE, ...) binds a range bound or a pattern, not a value identifying the
+        // restricted column, so we must not hand it the real ColumnMetadata.
+        if (receiver instanceof ColumnMetadata && !isEQ() && !isIN())
+            receiver = new ColumnSpecification(receiver.ksName, receiver.cfName, receiver.name, receiver.type);
+
         return Collections.singletonList(receiver);
     }
 
     private static ColumnSpecification makeCollectionReceiver(ColumnSpecification receiver, boolean forKey)
     {
-        return ((CollectionType<?>) receiver.type).makeCollectionReceiver(receiver, forKey);
+        return ((CollectionType<?>) receiver.type.unwrap()).makeCollectionReceiver(receiver, forKey);
     }
 
     private boolean isLegalRelationForNonFrozenCollection()

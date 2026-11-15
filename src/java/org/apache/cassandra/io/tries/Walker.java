@@ -44,7 +44,7 @@ import org.apache.lucene.util.ArrayUtil;
 public class Walker<CONCRETE extends Walker<CONCRETE>> implements AutoCloseable
 {
     /** Value used to indicate a branch (e.g. lesser/greaterBranch) does not exist. */
-    public static int NONE = -1;
+    public static final int NONE = -1;
 
     protected final Rebufferer source;
     protected final long root;

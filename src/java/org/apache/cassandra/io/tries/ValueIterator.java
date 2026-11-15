@@ -43,7 +43,15 @@ public class ValueIterator<CONCRETE extends ValueIterator<CONCRETE>> extends Bas
     protected ValueIterator(Rebufferer source, long root, boolean collecting, ByteComparable.Version version)
     {
         super(source, root, null, true, version);
-        initializeNoLeftBound(root, 256);
+        try
+        {
+            initializeNoLeftBound(root, 256);
+        }
+        catch (Throwable t)
+        {
+            super.close();
+            throw t;
+        }
     }
 
     protected ValueIterator(Rebufferer source, long root, ByteComparable start, ByteComparable end, LeftBoundTreatment admitPrefix, ByteComparable.Version version)
@@ -67,42 +75,34 @@ public class ValueIterator<CONCRETE extends ValueIterator<CONCRETE>> extends Bas
     {
         super(source, root, end != null ? end.asComparableBytes(version) : null, collecting, version);
 
-        if (start != null)
-            initializeWithLeftBound(root, start.asComparableBytes(byteComparableVersion), admitPrefix, limit != null);
-        else
-            initializeNoLeftBound(root, limit != null ? limit.next() : 256);
-    }
-
-    private void initializeWithLeftBound(long root, ByteSource start, LeftBoundTreatment admitPrefix, boolean atLimit)
-    {
         try
         {
-            descendWith(start.next(), start, atLimit ? limit.next() : 256, null, root, admitPrefix);
+            if (start != null)
+                initializeWithLeftBound(root, start.asComparableBytes(byteComparableVersion), admitPrefix, limit != null);
+            else
+                initializeNoLeftBound(root, limit != null ? limit.next() : 256);
         }
         catch (Throwable t)
         {
             super.close();
             throw t;
         }
+    }
+
+    private void initializeWithLeftBound(long root, ByteSource start, LeftBoundTreatment admitPrefix, boolean atLimit)
+    {
+        descendWith(start.next(), start, atLimit ? limit.next() : 256, null, root, admitPrefix);
     }
 
     private void initializeNoLeftBound(long root, int limitByte)
     {
         stack = new IterationPosition(root, -1, limitByte, null);
 
-        try
-        {
-            go(root);
-            if (hasPayload())
-                next = root;
-            else
-                next = NOT_PREPARED;
-        }
-        catch (Throwable t)
-        {
-            super.close();
-            throw t;
-        }
+        go(root);
+        if (hasPayload())
+            next = root;
+        else
+            next = NOT_PREPARED;
     }
 
     /**

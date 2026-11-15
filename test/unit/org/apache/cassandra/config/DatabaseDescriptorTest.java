@@ -45,8 +45,11 @@ import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.PathUtils;
+import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.security.EncryptionContext;
 import org.apache.cassandra.security.EncryptionContextGenerator;
+import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
+import org.apache.cassandra.utils.ClassLoadingTestSupport;
 import org.assertj.core.api.Assertions;
 import org.mockito.MockedStatic;
 import org.apache.cassandra.io.util.File;
@@ -79,6 +82,25 @@ public class DatabaseDescriptorTest
     public static void setupDatabaseDescriptor()
     {
         DatabaseDescriptor.daemonInitialization();
+    }
+
+    @Test
+    public void testCreateEndpointSnitchWrongTypeRejectedWithoutInitializing()
+    {
+        ClassLoadingTestSupport.assertNotInitialized(ClassLoadingTestNonAssignable.class);
+
+        assertThatThrownBy(() -> DatabaseDescriptor.createEndpointSnitch(false, ClassLoadingTestNonAssignable.class.getName()))
+        .isInstanceOf(ConfigurationException.class)
+        .hasMessageContaining("must extend or implement " + IEndpointSnitch.class.getName());
+
+        assertThat(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class)).isFalse();
+    }
+
+    @Test
+    public void testCreateEndpointSnitchValidClassResolves()
+    {
+        IEndpointSnitch snitch = DatabaseDescriptor.createEndpointSnitch(false, "SimpleSnitch");
+        assertThat(snitch).isNotNull();
     }
 
     // this came as a result of CASSANDRA-995
@@ -1051,6 +1073,30 @@ public class DatabaseDescriptorTest
         finally
         {
             DatabaseDescriptor.daemonInitialization();
+        }
+    }
+
+    @Test
+    public void testSetCompressedReadAheadBufferSizeInKb()
+    {
+        int original = DatabaseDescriptor.getCompressedReadAheadBufferSizeInKB();
+        try
+        {
+            // 0 should be a legal value, and represents disabling read-ahead buffer
+            DatabaseDescriptor.setCompressedReadAheadBufferSizeInKb(0);
+            assertEquals(0, DatabaseDescriptor.getCompressedReadAheadBufferSizeInKB());
+            assertEquals(0, DatabaseDescriptor.getCompressedReadAheadBufferSize());
+
+            Assertions.assertThatThrownBy(() -> DatabaseDescriptor.setCompressedReadAheadBufferSizeInKb(255))
+                      .isInstanceOf(IllegalArgumentException.class)
+                      .hasMessage("compressed_read_ahead_buffer_size_in_kb must be at least 256KiB (set to 0 to disable)");
+
+            DatabaseDescriptor.setCompressedReadAheadBufferSizeInKb(256);
+            assertEquals(256, DatabaseDescriptor.getCompressedReadAheadBufferSizeInKB());
+        }
+        finally
+        {
+            DatabaseDescriptor.setCompressedReadAheadBufferSizeInKb(original);
         }
     }
 }

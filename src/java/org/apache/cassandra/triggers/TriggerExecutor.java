@@ -38,6 +38,7 @@ import org.apache.cassandra.db.IMutation;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.CassandraException;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.TableId;
@@ -259,11 +260,26 @@ public class TriggerExecutor
         }
     }
 
+    public synchronized Class<? extends ITrigger> loadTriggerClass(String triggerClass) throws Exception
+    {
+        // Load without initialization so the type can be verified before the class's static initializer runs.
+        try
+        {
+            return FBUtilities.classForNameWithoutInitialization(triggerClass, "trigger", ITrigger.class, customClassLoader);
+        }
+        catch (ConfigurationException e)
+        {
+            if (e.getCause() instanceof ClassNotFoundException)
+                throw (ClassNotFoundException) e.getCause();
+            throw e;
+        }
+    }
+
     public synchronized ITrigger loadTriggerInstance(String triggerClass) throws Exception
     {
         // double check.
         if (cachedTriggers.get(triggerClass) != null)
             return cachedTriggers.get(triggerClass);
-        return (ITrigger) customClassLoader.loadClass(triggerClass).getConstructor().newInstance();
+        return loadTriggerClass(triggerClass).getConstructor().newInstance();
     }
 }

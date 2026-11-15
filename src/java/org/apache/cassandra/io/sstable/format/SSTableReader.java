@@ -472,6 +472,11 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
                     }
                     catch (CorruptSSTableException ex)
                     {
+                        if (hasAutoRepairSchemaIncompatibility(ex))
+                            logger.error("The SSTable {} contains an auto_repair column that is not recognized. " +
+                                         "This occurs when cassandra.autorepair.enable was previously set to true " +
+                                         "and is now false. Set -Dcassandra.autorepair.enable=true and restart.",
+                                         entry.getKey().baseFile());
                         JVMStabilityInspector.inspectThrowable(ex);
                         logger.error("Corrupt sstable {}; skipping table", entry, ex);
                         return;
@@ -504,6 +509,13 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
         return sstables;
     }
 
+    private static boolean hasAutoRepairSchemaIncompatibility(Throwable t)
+    {
+        for (Throwable cause = t; cause != null; cause = cause.getCause())
+            if (cause.getMessage() != null && cause.getMessage().contains("Unknown column auto_repair during deserialization"))
+                return true;
+        return false;
+    }
 
     protected SSTableReader(Builder<?, ?> builder, Owner owner)
     {
@@ -637,6 +649,14 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
         {
             return task.apply(descriptor);
         }
+    }
+
+    /**
+     * @return the thread-safe, per-descriptor coordination status between SAI index rebuilds and entire-SSTable streaming
+     */
+    public SSTableStreamRebuildState streamRebuildState()
+    {
+        return tidy.global.streamRebuildState;
     }
 
     public void setReplaced()
@@ -1583,6 +1603,12 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
         return dfile.createReaderForScan();
     }
 
+    public RandomAccessReader openDataReaderForScan(RateLimiter limiter)
+    {
+        assert limiter != null;
+        return dfile.createReaderForScan(limiter);
+    }
+
     public void trySkipFileCacheBefore(DecoratedKey key)
     {
         long position = getPosition(key, SSTableReader.Operator.GE);
@@ -1850,6 +1876,8 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
         private WeakReference<ScheduledFuture<?>> readMeterSyncFuture = NULL;
         // shared state managing if the logical sstable has been compacted; this is used in cleanup
         private volatile AbstractLogTransaction.ReaderTidier obsoletion;
+        // Coordination state for SAI index rebuilds and ZCS for this SSTable.
+        final SSTableStreamRebuildState streamRebuildState = new SSTableStreamRebuildState();
 
         GlobalTidy(Descriptor descriptor)
         {

@@ -435,7 +435,8 @@ public abstract class AbstractCommitLogSegmentManager
         advanceAllocatingFrom(last);
 
         // wait for the commit log modifications
-        last.waitForModifications();
+        if (last != null)
+            last.waitForModifications();
 
         // make sure the writes have materialized inside of the memtables by waiting for all outstanding writes
         // to complete
@@ -598,9 +599,10 @@ public abstract class AbstractCommitLogSegmentManager
             throw new UncheckedInterruptedException(e);
         }
 
-        for (CommitLogSegment segment : activeSegments)
-            closeAndDeleteSegmentUnsafe(segment, deleteSegments);
-        activeSegments.clear();
+        // Remove before discard, as archiveAndDiscard does, so a segment is never deleted twice
+        CommitLogSegment segment;
+        while ((segment = activeSegments.poll()) != null)
+            discard(segment, deleteSegments);
 
         size.set(0L);
 
@@ -616,21 +618,6 @@ public abstract class AbstractCommitLogSegmentManager
         if (availableSegment == null && !atSegmentBufferLimit())
         {
             awaitAvailableSegment(allocatingFrom);
-        }
-    }
-
-    /**
-     * Explicitly for use only during resets in unit testing.
-     */
-    private void closeAndDeleteSegmentUnsafe(CommitLogSegment segment, boolean delete)
-    {
-        try
-        {
-            discard(segment, delete);
-        }
-        catch (AssertionError ignored)
-        {
-            // segment file does not exist
         }
     }
 

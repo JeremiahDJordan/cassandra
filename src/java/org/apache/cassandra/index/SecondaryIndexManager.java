@@ -43,6 +43,7 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
@@ -725,7 +726,23 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         List<ListenableFuture<?>> futures = new ArrayList<>(byType.size());
         byType.forEach((buildingSupport, groupedIndexes) ->
                        {
-                           List<SecondaryIndexBuilder> builders = buildingSupport.getParallelIndexBuildTasks(baseCfs, groupedIndexes, sstables, isFullRebuild);
+                           List<SecondaryIndexBuilder> builders;
+                           try
+                           {
+                               builders = buildingSupport.getParallelIndexBuildTasks(baseCfs, groupedIndexes, sstables, isFullRebuild);
+                           }
+                           catch (Throwable t)
+                           {
+                               // Creating the build tasks can fail before anything is submitted (e.g. an SAI rebuild
+                               // rejected because a zero-copy stream holds one of its sstables): mark these indexes
+                               // failed, as a failed build would, so they don't stay counted as building forever.
+                               logAndMarkIndexesFailed(groupedIndexes, t, false);
+                               unbuiltIndexes.addAll(groupedIndexes);
+                               SettableFuture<Object> failed = SettableFuture.create();
+                               failed.setException(t);
+                               futures.add(failed);
+                               return;
+                           }
                            List<ListenableFuture<?>> builderFutures = builders.stream().map(CompactionManager.instance::submitIndexBuild).collect(Collectors.toList());
                            final SettableFuture<Object> build = SettableFuture.create();
                            Futures.addCallback(Futures.allAsList(builderFutures), new FutureCallback<Object>()
@@ -964,6 +981,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         return indexes.get(indexName);
     }
 
+    static Class<? extends Index> loadIndexClass(String className)
+    {
+        return FBUtilities.classForNameWithoutInitialization(className, "Index", Index.class);
+    }
+
     @Nullable
     private Index createInstance(IndexMetadata indexDef)
     {
@@ -980,11 +1002,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 Class<? extends Index> indexClass;
                 try
                 {
-                    indexClass = FBUtilities.classForName(className, "Index");
+                    indexClass = loadIndexClass(className);
                 }
                 catch (ConfigurationException e)
                 {
-                    // ConfigurationException can only be thrown from FBUtilities.classForName(…)
+                    // ConfigurationException can only be thrown from loadIndexClass(…)
                     //  anything from the index constructor will get wrapped in an InvocationTargetException
                     if (INDEX_UNKNOWN_IGNORE.getBoolean())
                     {

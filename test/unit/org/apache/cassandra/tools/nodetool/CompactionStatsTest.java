@@ -126,6 +126,7 @@ public class CompactionStatsTest extends CQLTester
 
         long bytesCompacted = 123;
         long bytesTotal = 123456;
+        long totalCompressedBytes = 112233;
         TimeUUID compactionId = nextTimeUUID();
         List<SSTableReader> sstables = IntStream.range(0, 10)
                                                 .mapToObj(i -> MockSchema.sstable(i, i * 10L, i * 10L + 9, cfs))
@@ -134,7 +135,7 @@ public class CompactionStatsTest extends CQLTester
         {
             public OperationProgress getProgress()
             {
-                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables);
+                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables).withTotalCompressed(totalCompressedBytes);
             }
 
             public boolean isGlobal()
@@ -157,6 +158,7 @@ public class CompactionStatsTest extends CQLTester
             assertThat(stdout).containsPattern("pending tasks\\s+[0-9]*");
             assertThat(stdout).containsPattern("compactions completed\\s+[0-9]*");
             assertThat(stdout).containsPattern("data compacted\\s+[0-9]*");
+            assertThat(stdout).containsPattern("compressed data compacted\\s+[0-9]*");
             assertThat(stdout).containsPattern("compactions aborted\\s+[0-9]*");
             assertThat(stdout).containsPattern("compactions reduced\\s+[0-9]*");
             assertThat(stdout).containsPattern("sstables dropped from compaction\\s+[0-9]*");
@@ -175,6 +177,7 @@ public class CompactionStatsTest extends CQLTester
 
         long bytesCompacted = 123;
         long bytesTotal = 123456;
+        long totalCompressedBytes = 112233;
         TimeUUID compactionId = nextTimeUUID();
         List<SSTableReader> sstables = IntStream.range(0, 10)
                                                 .mapToObj(i -> MockSchema.sstable(i, i * 10L, i * 10L + 9, cfs))
@@ -184,7 +187,7 @@ public class CompactionStatsTest extends CQLTester
         {
             public OperationProgress getProgress()
             {
-                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables, targetDirectory);
+                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables, targetDirectory).withTotalCompressed(totalCompressedBytes);
             }
 
             public boolean isGlobal()
@@ -197,7 +200,7 @@ public class CompactionStatsTest extends CQLTester
         {
             public OperationProgress getProgress()
             {
-                return new OperationProgress(cfs.metadata(), OperationType.CLEANUP, bytesCompacted, bytesTotal, compactionId, sstables);
+                return new OperationProgress(cfs.metadata(), OperationType.CLEANUP, bytesCompacted, bytesTotal, compactionId, sstables).withTotalCompressed(totalCompressedBytes);
             }
 
             public boolean isGlobal()
@@ -210,16 +213,16 @@ public class CompactionStatsTest extends CQLTester
              NonThrowingCloseable c2 = CompactionManager.instance.active.onOperationStart(nonCompactionHolder))
         {
             String stdout = waitForNumberOfPendingTasks(2, "compactionstats", "-V");
-            assertThat(stdout).containsPattern("keyspace\\s+table\\s+task id\\s+completion ratio\\s+kind\\s+progress\\s+sstables\\s+total\\s+unit\\s+target directory");
-            String expectedStatsPattern = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
+            assertThat(stdout).containsPattern("keyspace\\s+table\\s+task id\\s+completion ratio\\s+kind\\s+progress\\s+sstables\\s+total\\s+total compressed\\s+unit\\s+target directory");
+            String expectedStatsPattern = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
                                                         CQLTester.KEYSPACE, currentTable(), compactionId, (double) bytesCompacted / bytesTotal * 100,
-                                                        OperationType.COMPACTION, bytesCompacted, sstables.size(), bytesTotal, AbstractTableOperation.Unit.BYTES,
+                                                        OperationType.COMPACTION, bytesCompacted, sstables.size(), bytesTotal, totalCompressedBytes, AbstractTableOperation.Unit.BYTES,
                                                         targetDirectory);
             assertThat(stdout).containsPattern(expectedStatsPattern);
 
-            String expectedStatsPatternForNonCompaction = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
+            String expectedStatsPatternForNonCompaction = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
                                                                         CQLTester.KEYSPACE, currentTable(), compactionId, (double) bytesCompacted / bytesTotal * 100,
-                                                                        OperationType.COMPACTION, bytesCompacted, sstables.size(), bytesTotal, AbstractTableOperation.Unit.BYTES);
+                                                                        OperationType.COMPACTION, bytesCompacted, sstables.size(), bytesTotal, totalCompressedBytes, AbstractTableOperation.Unit.BYTES);
             assertThat(stdout).containsPattern(expectedStatsPatternForNonCompaction);
         }
         waitForNumberOfPendingTasks(0, "compactionstats", "-V");
@@ -233,6 +236,7 @@ public class CompactionStatsTest extends CQLTester
 
         long bytesCompacted = 123;
         long bytesTotal = 123456;
+        long totalCompressedBytes = 112233;
         TimeUUID compactionId = nextTimeUUID();
         List<SSTableReader> sstables = IntStream.range(0, 10)
                                                 .mapToObj(i -> MockSchema.sstable(i, i * 10L, i * 10L + 9, cfs))
@@ -241,7 +245,7 @@ public class CompactionStatsTest extends CQLTester
         {
             public OperationProgress getProgress()
             {
-                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables);
+                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables).withTotalCompressed(totalCompressedBytes);
             }
 
             public boolean isGlobal()
@@ -270,6 +274,7 @@ public class CompactionStatsTest extends CQLTester
 
         long bytesCompacted = 123;
         long bytesTotal = 123456;
+        long totalCompressedBytes = 112233;
         TimeUUID compactionId = nextTimeUUID();
         List<SSTableReader> sstables = IntStream.range(0, 10)
                                                 .mapToObj(i -> MockSchema.sstable(i, i * 10L, i * 10L + 9, cfs))
@@ -279,7 +284,7 @@ public class CompactionStatsTest extends CQLTester
         {
             public OperationProgress getProgress()
             {
-                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables, targetDirectory);
+                return new OperationProgress(cfs.metadata(), OperationType.COMPACTION, bytesCompacted, bytesTotal, compactionId, sstables, targetDirectory).withTotalCompressed(totalCompressedBytes);
             }
 
             public boolean isGlobal()
@@ -292,7 +297,7 @@ public class CompactionStatsTest extends CQLTester
         {
             public AbstractTableOperation.OperationProgress getProgress()
             {
-                return new AbstractTableOperation.OperationProgress(cfs.metadata(), OperationType.CLEANUP, bytesCompacted, bytesTotal, compactionId, sstables);
+                return new AbstractTableOperation.OperationProgress(cfs.metadata(), OperationType.CLEANUP, bytesCompacted, bytesTotal, compactionId, sstables).withTotalCompressed(totalCompressedBytes);
             }
 
             public boolean isGlobal()
@@ -305,15 +310,15 @@ public class CompactionStatsTest extends CQLTester
              NonThrowingCloseable c2 = CompactionManager.instance.active.onOperationStart(nonCompactionHolder))
         {
             String stdout = waitForNumberOfPendingTasks(2, "compactionstats", "--vtable", "--human-readable");
-            assertThat(stdout).containsPattern("keyspace\\s+table\\s+task id\\s+completion ratio\\s+kind\\s+progress\\s+sstables\\s+total\\s+unit\\s+target directory");
-            String expectedStatsPattern = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
+            assertThat(stdout).containsPattern("keyspace\\s+table\\s+task id\\s+completion ratio\\s+kind\\s+progress\\s+sstables\\s+total\\s+total compressed\\s+unit\\s+target directory");
+            String expectedStatsPattern = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
                                                         CQLTester.KEYSPACE, currentTable(), compactionId, (double) bytesCompacted / bytesTotal * 100,
-                                                        OperationType.COMPACTION, "123 bytes", sstables.size(), "120.56 KiB", AbstractTableOperation.Unit.BYTES,
+                                                        OperationType.COMPACTION, "123 bytes", sstables.size(), "120.56 KiB", "109.6 KiB", AbstractTableOperation.Unit.BYTES,
                                                         targetDirectory);
             assertThat(stdout).containsPattern(expectedStatsPattern);
-            String expectedStatsPatternForNonCompaction = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
+            String expectedStatsPatternForNonCompaction = String.format("%s\\s+%s\\s+%s\\s+%.2f%%\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s\\s+%s",
                                                                         CQLTester.KEYSPACE, currentTable(), compactionId, (double) bytesCompacted / bytesTotal * 100,
-                                                                        OperationType.CLEANUP, "123 bytes", sstables.size(), "120.56 KiB", AbstractTableOperation.Unit.BYTES);
+                                                                        OperationType.CLEANUP, "123 bytes", sstables.size(), "120.56 KiB", "109.6 KiB", AbstractTableOperation.Unit.BYTES);
             assertThat(stdout).containsPattern(expectedStatsPatternForNonCompaction);
         }
         waitForNumberOfPendingTasks(0, "compactionstats", "--vtable", "--human-readable");

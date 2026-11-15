@@ -23,7 +23,7 @@
 #
 ################################
 
-set -x
+[ $DEBUG ] && set -x
 
 WORKSPACE=$1
 
@@ -85,6 +85,10 @@ if [ "$cython" = "yes" ]; then
 else
   export CASS_DRIVER_NO_CYTHON=true
 fi
+
+# Force pip's legacy pkg_resources metadata backend (instead of the importlib.metadata
+# backend that pip defaults to on Python 3.11+). see ubuntu-test.docker
+export _PIP_USE_IMPORTLIB_METADATA=0
 
 pip install --exists-action s -r ${CASSANDRA_DIR}/pylib/requirements.txt
 pip freeze

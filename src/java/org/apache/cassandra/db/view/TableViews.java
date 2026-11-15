@@ -20,6 +20,7 @@ package org.apache.cassandra.db.view;
 import java.util.AbstractCollection;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -124,6 +125,9 @@ public class TableViews extends AbstractCollection<View>
 
     public Iterable<ColumnFamilyStore> allViewsCfs()
     {
+        if (views.isEmpty())
+            return Collections.emptyList();
+
         Keyspace keyspace = Keyspace.open(baseTableMetadata.keyspace);
         return Iterables.transform(views, view -> keyspace.getColumnFamilyStore(view.getDefinition().name()));
     }

@@ -77,6 +77,10 @@ public enum CassandraRelevantProperties
     AUTH_CACHE_WARMING_MAX_RETRIES("cassandra.auth_cache.warming.max_retries"),
     AUTH_CACHE_WARMING_RETRY_INTERVAL_MS("cassandra.auth_cache.warming.retry_interval_ms"),
     AUTOCOMPACTION_ON_STARTUP_ENABLED("cassandra.autocompaction_on_startup_enabled", "true"),
+    /** When true, checks that all nodes are above the minimum supported version before running auto-repair */
+    AUTOREPAIR_CHECK_MIN_VERSION("cassandra.autorepair.check_min_version", "true"),
+    /** When false, completely disables the auto-repair feature including schema changes and JMX registration */
+    AUTOREPAIR_ENABLE("cassandra.autorepair.enable", "false"),
     AUTO_BOOTSTRAP("cassandra.auto_bootstrap"),
     AUTO_REPAIR_FREQUENCY_SECONDS("cassandra.auto_repair_frequency_seconds", convertToString(TimeUnit.MINUTES.toSeconds(5))),
     BATCHLOG_REPLAY_TIMEOUT_IN_MS("cassandra.batchlog.replay_timeout_in_ms"),
@@ -131,6 +135,8 @@ public enum CassandraRelevantProperties
      */
     BOOTSTRAP_SKIP_SCHEMA_CHECK("cassandra.skip_schema_check"),
     BROADCAST_INTERVAL_MS("cassandra.broadcast_interval_ms", "60000"),
+    /** Caps how much of a BTI partition index is preloaded, e.g. "16MiB". 0B disables preloading; negative (default) preloads it all. */
+    BTI_PARTITION_INDEX_PRELOAD_SIZE("cassandra.bti.partition_index_preload_size", "-1B"),
     BTREE_BRANCH_SHIFT("cassandra.btree.branchshift", "5"),
     BTREE_FAN_FACTOR("cassandra.btree.fanfactor"),
     BUFFERPOOL_DISABLE_COMBINED_ALLOCATION("cassandra.bufferpool.disable_combined_allocation"),
@@ -1062,6 +1068,10 @@ public enum CassandraRelevantProperties
     SNAPSHOT_CLEANUP_PERIOD_SECONDS("cassandra.snapshot.ttl_cleanup_period_seconds", "60"),
     /** minimum allowed TTL for snapshots */
     SNAPSHOT_MIN_ALLOWED_TTL_SECONDS("cassandra.snapshot.min_allowed_ttl_seconds", "60"),
+    /**
+     * Validates names of to-be-taken snapshots, defaults to false.
+     */
+    SNAPSHOT_NAME_VALIDATION("cassandra.snapshot.validation", "false"),
     SSL_ENABLE("ssl.enable"),
     SSL_STORAGE_PORT("cassandra.ssl_storage_port"),
     SSTABLE_CHECKSUM_AWS_CRT_DETECTION_ENABLED("cassandra.sstable.checksums.aws_crt_detection_enabled", "true"),

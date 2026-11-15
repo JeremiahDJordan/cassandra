@@ -20,14 +20,19 @@ package org.apache.cassandra.distributed.test.hostreplacement;
 
 import java.io.IOException;
 import java.net.UnknownHostException;
+import java.io.RandomAccessFile;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.TimeoutException;
 
 import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.Constants;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
@@ -49,6 +54,8 @@ import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.assertj.core.api.Assertions;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.BOOTSTRAP_SKIP_SCHEMA_CHECK;
@@ -306,6 +313,87 @@ public class HostReplacementTest extends TestBaseImpl
             epState.addApplicationState(ApplicationState.STATUS_WITH_PORT, newStatus);
             Gossiper.instance.handleMajorStateChange(endpoint, epState);
         };
+    }
+
+    private static final int HEALTHY_PK = 10;
+    private static final int CORRUPT_PK = 11;
+
+    /**
+     * With digest validation enabled, a single corrupted sstable must fail the entire stream session, so neither
+     * the corrupted sstable nor its healthy sibling should land on the replacing node.
+     */
+    @Test
+    public void replaceHostAbortsStreamingWhenDigestValidationCatchesCorruption() throws IOException, TimeoutException
+    {
+        TokenSupplier even = TokenSupplier.evenlyDistributedTokens(2);
+        try (Cluster cluster = Cluster.build(2)
+                                      .withConfig(c -> c.with(Feature.GOSSIP, Feature.NETWORK)
+                                                        .set("entire_sstable_stream_digest_validation_enabled", true)
+                                                        // with BTI, the test default, the sender reads Data.db through the partition
+                                                        // index while planning the stream and so fails on the corruption before the
+                                                        // receiver's digest check can run; BIG does not
+                                                        .set("sstable", Map.of("selected_format", "big")))
+                                      .withTokenSupplier(node -> even.token(node == 3 ? 2 : node))
+                                      .start())
+        {
+            IInvokableInstance node1 = cluster.get(1);
+            IInvokableInstance nodeToRemove = cluster.get(2);
+
+            setupCluster(cluster);
+            writeHealthyAndCorruptSSTables(cluster, node1);
+
+            stopUnchecked(nodeToRemove);
+
+            IInvokableInstance replacingNode = replaceHostAndStart(cluster, nodeToRemove);
+
+            replacingNode.logs().watchFor("Digest mismatch");
+
+            // the whole stream session is aborted on a digest mismatch, so neither sstable should have landed
+            AssertUtils.assertRows(replacingNode.executeInternal("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = " + HEALTHY_PK), EMPTY_ROWS);
+            AssertUtils.assertRows(replacingNode.executeInternal("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = " + CORRUPT_PK), EMPTY_ROWS);
+        }
+    }
+
+    /**
+     * Flushes two separate sstables on {@code node1} for {@code KEYSPACE.tbl}: one containing {@link #HEALTHY_PK}
+     * left untouched, and one containing {@link #CORRUPT_PK} that gets its Data.db corrupted.
+     */
+    static void writeHealthyAndCorruptSSTables(Cluster cluster, IInvokableInstance node1) throws IOException
+    {
+        node1.nodetoolResult("disableautocompaction").asserts().success();
+
+        cluster.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk) VALUES (?)",
+                                       ConsistencyLevel.ALL,
+                                       HEALTHY_PK);
+        node1.flush(KEYSPACE);
+
+        cluster.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk) VALUES (?)",
+                                       ConsistencyLevel.ALL,
+                                       CORRUPT_PK);
+        node1.flush(KEYSPACE);
+
+        corruptSSTable(node1, "tbl");
+    }
+
+    /** Flips a byte in the middle of the Data.db file of the most recently flushed sstable for the given table. */
+    static void corruptSSTable(IInvokableInstance instance, String table) throws IOException
+    {
+        String dataFilePath = instance.callOnInstance(() -> {
+            ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(table);
+            SSTableReader sstable = cfs.getLiveSSTables().stream()
+                                       .max(SSTableReader.maxTimestampAscending)
+                                       .orElseThrow();
+            return sstable.descriptor.fileFor(Components.DATA).absolutePath();
+        });
+
+        try (RandomAccessFile raf = new RandomAccessFile(dataFilePath, "rw"))
+        {
+            long corruptAt = raf.length() / 2;
+            raf.seek(corruptAt);
+            int b = raf.read();
+            raf.seek(corruptAt);
+            raf.write(b ^ 0xFF);
+        }
     }
 
     static void setupCluster(Cluster cluster)
