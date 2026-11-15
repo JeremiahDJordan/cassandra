@@ -68,7 +68,6 @@ import org.apache.cassandra.index.sai.utils.RangeUtil;
 import org.apache.cassandra.index.sai.utils.RowIdWithMeta;
 import org.apache.cassandra.index.sai.utils.RowIdWithScore;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.metrics.LinearFit;
 import org.apache.cassandra.metrics.PairedSlidingWindowReservoir;
 import org.apache.cassandra.metrics.QuickSlidingWindowReservoir;
 import org.apache.cassandra.tracing.Tracing;
@@ -456,11 +455,11 @@ public class V2VectorIndexSearcher extends IndexSearcher
     {
         int rawExpectedNodes = getRawExpectedNodes(rerankK, candidates);
         // update the raw expected value with a linear interpolation based on observed data
-        var observedValues = expectedActualNodesVisited.getSnapshot().values;
+        var observed = expectedActualNodesVisited.getSnapshot();
         int expectedNodes;
-        if (observedValues.length >= 10)
+        if (observed.size() >= 10)
         {
-            var interceptSlope = LinearFit.interceptSlopeFor(observedValues);
+            var interceptSlope = observed.interceptSlope();
             expectedNodes = (int) (interceptSlope.left + interceptSlope.right * rawExpectedNodes);
         }
         else
