@@ -32,6 +32,7 @@ import java.util.function.ToLongFunction;
 
 import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -79,6 +80,8 @@ public class ProxyHandlerConnectionsTest
         timeouts.putIfAbsent(verb, verb.unsafeSetExpiration(expiration));
     }
 
+    private static volatile long originalWriteRpcTimeout = 0;
+
     @BeforeClass
     public static void startup()
     {
@@ -86,6 +89,14 @@ public class ProxyHandlerConnectionsTest
         // call these to initialize everything in case a message is dropped, otherwise we will NPE in the commitlog
         CommitLog.instance.start();
         CompactionManager.instance.getPendingTasks();
+        // testCorruptionOnHandshake waits for a reconnect for each of SETTINGS
+        originalWriteRpcTimeout = ConnectionTest.lowerMinRpcTimeoutForReconnects();
+    }
+
+    @AfterClass
+    public static void restoreTimeouts()
+    {
+        DatabaseDescriptor.setWriteRpcTimeout(originalWriteRpcTimeout);
     }
 
     @After

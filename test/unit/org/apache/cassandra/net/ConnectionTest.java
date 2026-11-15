@@ -120,6 +120,7 @@ public class ConnectionTest
     }
 
     private static volatile long originalRpcTimeout = 0;
+    private static volatile long originalWriteRpcTimeout = 0;
 
     @BeforeClass
     public static void startup()
@@ -130,6 +131,7 @@ public class ConnectionTest
         // in this test class, especially in testMessagePurging and testCloseIfEndpointDown.
         originalRpcTimeout = DatabaseDescriptor.getRpcTimeout(TimeUnit.MILLISECONDS);
         DatabaseDescriptor.setRpcTimeout(5000L);
+        originalWriteRpcTimeout = lowerMinRpcTimeoutForReconnects();
     }
 
     @AfterClass
@@ -137,6 +139,21 @@ public class ConnectionTest
     {
         factory.shutdownNow();
         DatabaseDescriptor.setRpcTimeout(originalRpcTimeout);
+        DatabaseDescriptor.setWriteRpcTimeout(originalWriteRpcTimeout);
+    }
+
+    /**
+     * OutboundConnection retries a failed connection attempt after {@code getMinRpcTimeout() / 2}, and the tests using
+     * {@link #SETTINGS} wait for that once or twice per setting. Lower the write timeout from the 20s of
+     * test/conf/cassandra.yaml to the default 2s, also the expiration of {@link Verb#_TEST_1}, so the retry is 1s.
+     *
+     * @return the previous write timeout in milliseconds, to restore after the class
+     */
+    static long lowerMinRpcTimeoutForReconnects()
+    {
+        long original = DatabaseDescriptor.getWriteRpcTimeout(TimeUnit.MILLISECONDS);
+        DatabaseDescriptor.setWriteRpcTimeout(2000L);
+        return original;
     }
 
     interface SendTest
