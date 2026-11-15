@@ -300,6 +300,13 @@ public abstract class MemtableSizeTestBase extends CQLTester
 
         long rowSize = memtable.getEstimatedAverageRowSize();
         double expectedRowSize = (double) memtable.getLiveDataSize() / (partitions * rowsPerPartition);
-        Assert.assertEquals(expectedRowSize, rowSize, (partitions * rowsPerPartition) * 0.05);  // 5% accuracy
+        // 5% accuracy, relative to the row size (getEstimatedAverageRowSize() truncates to whole bytes, hence the extra
+        // byte). A mismatch between how getLiveDataSize() and getEstimatedAverageRowSize() measure a row biases
+        // Memtable.estimateRowCount, which SAI query planning and the EstimatedRowCount metric use.
+        // The legacy trie_stage2 and trie_stage3 memtables do not count clustering keys (stage3 also not live row
+        // deletions) in getLiveDataSize(), but getEstimatedAverageRowSize() does, so they only get the old bound.
+        boolean legacyTrieStage = memtableClass.equals("trie_stage2") || memtableClass.equals("trie_stage3");
+        double tolerance = legacyTrieStage ? (partitions * rowsPerPartition) * 0.05 : expectedRowSize * 0.05 + 1;
+        Assert.assertEquals(expectedRowSize, rowSize, tolerance);
     }
 }

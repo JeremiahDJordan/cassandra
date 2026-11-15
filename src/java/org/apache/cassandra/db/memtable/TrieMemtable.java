@@ -61,7 +61,10 @@ import org.apache.cassandra.db.partitions.TriePartitionUpdaterLegacyIndex;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellData;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.TrieBackedRow;
 import org.apache.cassandra.db.rows.TrieTombstoneMarker;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
@@ -304,6 +307,38 @@ public class TrieMemtable extends AbstractShardedMemtable
         for (MemtableShard shard : shards)
             total += shard.liveDataSize();
         return total;
+    }
+
+    /// The size of a row measured the way [TriePartitionUpdater] adds to [#getLiveDataSize]: the primary key liveness,
+    /// the deletions and the cells without their paths. Keys (clustering, cell paths) are part of the trie and are not
+    /// counted. Rows are read back as `BTreeRow`s (CNDB-19778), whose [Row#dataSize] also counts the clustering, the
+    /// cell paths and a live row deletion (13 bytes); using it would make [Memtable#estimateRowCount] underestimate.
+    ///
+    /// This matches the updater for live rows, cells and complex deletions. It can be up to 8 bytes high for a row
+    /// whose row marker was removed or emptied by a deletion, because the updater does not account for
+    /// `LivenessInfo.EMPTY` markers symmetrically, so tombstone-dominated memtables are still somewhat underestimated.
+    @Override
+    protected long rowDataSizeForEstimate(Row row)
+    {
+        long size = row.primaryKeyLivenessInfo().dataSize();
+        if (!row.deletion().isLive())
+            size += row.deletion().time().dataSize();
+        for (ColumnData cd : row)
+        {
+            if (cd.column().isSimple())
+            {
+                size += ((Cell<?>) cd).dataSizeWithoutPath();
+            }
+            else
+            {
+                ComplexColumnData complex = (ComplexColumnData) cd;
+                if (!complex.complexDeletion().isLive())
+                    size += complex.complexDeletion().dataSize();
+                for (Cell<?> cell : complex)
+                    size += cell.dataSizeWithoutPath();
+            }
+        }
+        return size;
     }
 
     @Override
