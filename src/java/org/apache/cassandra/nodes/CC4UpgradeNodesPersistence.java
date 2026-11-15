@@ -44,6 +44,9 @@ public class CC4UpgradeNodesPersistence extends NodesPersistence
         if (migrated != null)
         {
             logger.info("Migrating local node metadata from CC4 file-based store (host_id={})", migrated.getHostId());
+            // The CC4 files have no gossip generation. Keep the one in system.local, which saveLocal would otherwise
+            // overwrite with null.
+            migrated.setGossipGeneration(loadGossipGeneration());
             saveLocal(migrated);
             return migrated;
         }

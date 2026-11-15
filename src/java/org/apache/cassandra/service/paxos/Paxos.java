@@ -94,6 +94,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.metrics.CASClientRequestMetrics;
 import org.apache.cassandra.metrics.ClientRequestMetrics;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.service.CASRequest;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.FailureRecordingCallback.AsMap;
@@ -122,7 +123,6 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.PAXOS_MODE
 import static org.apache.cassandra.config.Config.PaxosVariant.v2_without_linearizable_reads_or_rejected_writes;
 import static org.apache.cassandra.db.Keyspace.openAndGetStore;
 import static org.apache.cassandra.exceptions.RequestFailureReason.TIMEOUT;
-import static org.apache.cassandra.gms.ApplicationState.RELEASE_VERSION;
 import static org.apache.cassandra.config.DatabaseDescriptor.*;
 import static org.apache.cassandra.db.ConsistencyLevel.*;
 import static org.apache.cassandra.locator.InetAddressAndPort.Serializer.inetAddressAndPortSerializer;
@@ -1585,18 +1585,8 @@ public class Paxos
 
     static boolean isOldParticipant(Replica replica)
     {
-        String version = Gossiper.instance.getForEndpoint(replica.endpoint(), RELEASE_VERSION);
-        if (version == null)
-            return false;
-
-        try
-        {
-            return new CassandraVersion(version).compareTo(MODERN_PAXOS_RELEASE) < 0;
-        }
-        catch (Throwable t)
-        {
-            return false;
-        }
+        CassandraVersion version = Nodes.getReleaseVersion(replica.endpoint(), null);
+        return version != null && version.compareTo(MODERN_PAXOS_RELEASE) < 0;
     }
 
     public static void evictHungRepairs()

@@ -30,16 +30,21 @@ import com.google.common.collect.Lists;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.CassandraVersion;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class NodesPersistenceTest extends CQLTester
 {
@@ -64,6 +69,7 @@ public class NodesPersistenceTest extends CQLTester
         info.setListenAddressAndPort(InetAddressAndPort.getByNameOverrideDefaults("127.2.3.4", 222));
         info.setClusterName("cluster1");
         info.setCqlVersion(new CassandraVersion("2.3.4"));
+        info.setGossipGeneration(1234);
         info.setBootstrapState(SystemKeyspace.BootstrapState.COMPLETED);
         info.setBroadcastAddressAndPort(InetAddressAndPort.getByNameOverrideDefaults("127.3.4.5", 333));
         info.setNativeProtocolVersion(ProtocolVersion.V5);
@@ -100,6 +106,19 @@ public class NodesPersistenceTest extends CQLTester
         np.deletePeer(info.getPeerAddressAndPort());
         List<PeerInfo> loaded2 = np.loadPeers().collect(Collectors.toList());
         assertThat(loaded2).isEmpty();
+    }
+
+    @Test
+    public void testCheckLocalLoaded() throws Exception
+    {
+        LocalInfo info = new LocalInfo();
+        fillLocalInfoSampleData(info);
+        np.saveLocal(info);
+        Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(SystemKeyspace.LOCAL).forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+
+        // system.local has SSTables, so local information exists that loadLocal didn't return
+        assertThatThrownBy(np::checkLocalLoaded).isInstanceOf(ConfigurationException.class)
+                                                .hasMessage("Found system keyspace files, but they couldn't be loaded!");
     }
 
     @Test

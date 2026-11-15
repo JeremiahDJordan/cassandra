@@ -171,6 +171,31 @@ public class SystemKeyspaceTest
         assertEquals(DatabaseDescriptor.getStoragePort(), row.getInt("listen_port"));
     }
 
+    @Test
+    public void testIncrementAndGetGenerationAfterUpgrade()
+    {
+        // a gossip generation stored by an earlier version, which wrote system.local directly
+        int ahead = (int) (System.currentTimeMillis() / 1000) + 3600;
+        Nodes.getInstance().awaitInflightUpdateCompletion();
+        executeInternal(format("INSERT INTO system.%s (key, gossip_generation) VALUES ('%s', ?)", LOCAL, LOCAL), ahead);
+        Nodes.getInstance().reload();
+
+        assertEquals(ahead + 1, SystemKeyspace.incrementAndGetGeneration());
+        assertEquals(ahead + 2, SystemKeyspace.incrementAndGetGeneration());
+        // stored where earlier versions read it
+        assertEquals(ahead + 2, readGossipGeneration());
+
+        // one behind the clock gives way to the current time
+        Nodes.getInstance().awaitInflightUpdateCompletion();
+        executeInternal(format("INSERT INTO system.%s (key, gossip_generation) VALUES ('%s', ?)", LOCAL, LOCAL), 1000);
+        Nodes.getInstance().reload();
+
+        int now = (int) (System.currentTimeMillis() / 1000);
+        int generation = SystemKeyspace.incrementAndGetGeneration();
+        assertThat(generation).isBetween(now, now + 1);
+        assertEquals(generation, readGossipGeneration());
+    }
+
     private String getOlderVersionString()
     {
         String version = FBUtilities.getReleaseVersionString();
@@ -279,4 +304,8 @@ public class SystemKeyspaceTest
         }
     }
 
+    private int readGossipGeneration()
+    {
+        return executeInternal(format("SELECT gossip_generation FROM system.%s WHERE key='%s'", LOCAL, LOCAL)).one().getInt("gossip_generation");
+    }
 }

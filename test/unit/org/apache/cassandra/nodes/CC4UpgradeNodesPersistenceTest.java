@@ -40,6 +40,7 @@ import com.fasterxml.jackson.core.JsonGenerator;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -108,6 +109,24 @@ public class CC4UpgradeNodesPersistenceTest extends CQLTester
         assertThat(fromSystemTable.getHostId()).isEqualTo(hostId);
         assertThat(fromSystemTable.getDataCenter()).isEqualTo("dc1");
         assertThat(fromSystemTable.getClusterName()).isEqualTo("MigrateCluster");
+    }
+
+    @Test
+    public void testLoadLocalMigratesFromCC4KeepsGossipGeneration() throws Exception
+    {
+        // the CC4 files have no gossip generation; system.local has one. Let the running node's pending saves of its
+        // own local information finish first, as they would write its (unset) generation over this one.
+        Nodes.getInstance().awaitInflightUpdateCompletion();
+        QueryProcessor.executeInternal("INSERT INTO system.local (key, gossip_generation) VALUES ('local', ?)", 1234);
+
+        Map<String, Object> cc4Local = new LinkedHashMap<>();
+        cc4Local.put("host_id", serializeUUID(UUID.randomUUID()));
+        cc4Local.put("cluster_name", "MigrateCluster");
+        writeMsgpack(nodesDir.resolve("local"), cc4Local);
+
+        LocalInfo loaded = persistence.loadLocal();
+        assertThat(loaded.getGossipGeneration()).isEqualTo(1234);
+        assertThat(new NodesPersistence().loadLocal().getGossipGeneration()).isEqualTo(1234);
     }
 
     @Test

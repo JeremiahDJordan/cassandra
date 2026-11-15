@@ -44,11 +44,13 @@ import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.net.NoPayload.noPayload;
 import static org.apache.cassandra.net.Verb.REPLICATION_DONE_REQ;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 public class RemoveTest
@@ -141,6 +143,8 @@ public class RemoveTest
     @Test
     public void testRemoveHostId() throws InterruptedException
     {
+        assertTrue(Nodes.peers().get(removalhost).isExisting());
+
         // start removal in background and send replication confirmations
         final AtomicBoolean success = new AtomicBoolean(false);
         Thread remover = NamedThreadFactory.createAnonymousThread(() ->
@@ -176,5 +180,7 @@ public class RemoveTest
 
         assertTrue(success.get());
         assertTrue(tmd.getSizeOfLeavingEndpoints() == 0);
+        // advertising the removal doesn't bring the removed peer back into Nodes
+        assertFalse(Nodes.peers().get(removalhost).isExisting());
     }
 }
