@@ -175,17 +175,13 @@ public class CompactionDroppedColumnVersionsTest extends CQLTester
     }
 
     /**
-     * A regular column is dropped, and a clustering column is then renamed to its name, which {@code ALTER TABLE}
-     * allows. The sstables that have the dropped column must still compact, with the dropped column among the regular
-     * columns of the output header, and the clustering column kept out of them.
-     * <p>
-     * Only with the sstables kept open: once the rename is done, an sstable that has the dropped column cannot be
-     * opened again, as its header then has the name for both a regular and a clustering column.
+     * A regular column is dropped, and a clustering column is then renamed to its name, which earlier versions of
+     * {@code ALTER TABLE} allowed. The sstables that have the dropped column must still open and compact, with the
+     * dropped column among the regular columns of the output header, and the clustering column kept out of them.
      */
     @Test
     public void testClusteringColumnRenamedToDroppedColumnName() throws Throwable
     {
-        Assume.assumeFalse(reopenSSTables);
         for (AbstractType<?> type : Arrays.asList(Int32Type.instance, UTF8Type.instance))
         {
             createTable("CREATE TABLE %s (pk int, ck int, v int, w int, c " + type.asCQL3Type() +
@@ -199,12 +195,18 @@ public class CompactionDroppedColumnVersionsTest extends CQLTester
             execute("INSERT INTO %s (pk, ck, w) VALUES (3, 1, 30)");
             flush();
             execute("ALTER TABLE %s DROP c");
-            execute("ALTER TABLE %s RENAME ck TO c");
+            SchemaTestUtil.announceTableUpdate(currentTableMetadata().unbuild()
+                                                                     .renamePrimaryKeyColumn(ColumnIdentifier.getInterned("ck", false),
+                                                                                             ColumnIdentifier.getInterned("c", false))
+                                                                     .build());
+            maybeReopenSSTables();
 
             Object[][] expected = { row(1, 1, 1, 10), row(1, 2, 1, 20), row(2, 1, 1, null), row(3, 1, null, 30) };
             assertRowsIgnoringOrder(execute("SELECT pk, c, v, w FROM %s"), expected);
             compactAll();
             assertTypeOfCInAllSSTables(type);
+            assertRowsIgnoringOrder(execute("SELECT pk, c, v, w FROM %s"), expected);
+            maybeReopenSSTables();
             assertRowsIgnoringOrder(execute("SELECT pk, c, v, w FROM %s"), expected);
         }
     }
