@@ -45,6 +45,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.UntypedResultSet.Row;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.marshal.BytesType;
@@ -52,10 +53,12 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.RebufferingInputStream;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.Throwables;
@@ -84,6 +87,7 @@ public class NodesPersistence implements INodesPersistence
                                                            "     broadcast_port, " +
                                                            "     cluster_name, " +
                                                            "     cql_version, " +
+                                                           "     gossip_generation, " +
                                                            "     listen_address, " +
                                                            "     listen_port, " +
                                                            "     native_protocol_version, " +
@@ -94,7 +98,7 @@ public class NodesPersistence implements INodesPersistence
                                                            "     %s) " +
                                                            "VALUES (%s)", LOCAL,
                                                            StringUtils.join(COMMON_COLUMNS, ", "),
-                                                           StringUtils.repeat("?", ", ", 13 + COMMON_COLUMNS.size()));
+                                                           StringUtils.repeat("?", ", ", 14 + COMMON_COLUMNS.size()));
 
     private static final String INSERT_PEER_STMT = format("INSERT INTO system.%s (" +
                                                           "     peer, " +
@@ -138,6 +142,7 @@ public class NodesPersistence implements INodesPersistence
             .setBootstrapState(readBootstrapState(row, "bootstrapped"))
             .setClusterName(row.has("cluster_name") ? row.getString("cluster_name") : null)
             .setCqlVersion(readCassandraVersion(row, "cql_version"))
+            .setGossipGeneration(row.has("gossip_generation") ? row.getInt("gossip_generation") : null)
             .setNativeProtocolVersion(readNativeProtocol(row, "native_protocol_version"))
             .setPartitionerClass(readPartitionerClass(row, "partitioner"))
             .setTruncationRecords(readTruncationRecords(row, "truncated_at"));
@@ -153,6 +158,7 @@ public class NodesPersistence implements INodesPersistence
                                                           serializePort(info.getBroadcastAddressAndPort()),
                                                           info.getClusterName(),
                                                           serializeCassandraVersion(info.getCqlVersion()),
+                                                          info.getGossipGeneration(),
                                                           serializeAddress(info.getListenAddressAndPort()),
                                                           serializePort(info.getListenAddressAndPort()),
                                                           serializeProtocolVersion(info.getNativeProtocolVersion()),
@@ -180,6 +186,13 @@ public class NodesPersistence implements INodesPersistence
         {
             logger.warn("Could not flush peers table because the thread pool has shut down", ex);
         }
+    }
+
+    @Override
+    public void checkLocalLoaded() throws ConfigurationException
+    {
+        if (!Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(LOCAL).getLiveSSTables().isEmpty())
+            throw new ConfigurationException("Found system keyspace files, but they couldn't be loaded!");
     }
 
     @Override
@@ -235,6 +248,15 @@ public class NodesPersistence implements INodesPersistence
         {
             logger.warn("Could not flush peers table because the thread pool has shut down", ex);
         }
+    }
+
+    /** @return the gossip generation stored in {@code system.local}, or {@code null} if there is none */
+    protected Integer loadGossipGeneration()
+    {
+        UntypedResultSet results = QueryProcessor.executeInternal("SELECT gossip_generation FROM system." + LOCAL + " WHERE key = ?", LOCAL);
+        if (results == null || results.isEmpty() || !results.one().has("gossip_generation"))
+            return null;
+        return results.one().getInt("gossip_generation");
     }
 
     private <T extends NodeInfo<T>> T readCommonInfo(T info, Row row)

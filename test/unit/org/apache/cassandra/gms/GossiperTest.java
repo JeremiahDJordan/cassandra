@@ -54,6 +54,7 @@ import org.apache.cassandra.gms.VersionedValue.VersionedValueFactory;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.SeedProvider;
 import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.CassandraGenerators;
 import org.apache.cassandra.utils.CassandraVersion;
@@ -69,6 +70,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -849,5 +851,137 @@ public class GossiperTest
             Gossiper.instance.endpointStateMap.clear();
         }
 
+    }
+
+    @Test
+    public void testShutdownStateIsWiredToNodes() throws UnknownHostException
+    {
+        Util.createInitialRing(ss, partitioner, endpointTokens, keyTokens, hosts, hostIds, 2);
+        try
+        {
+            InetAddressAndPort remoteHostAddress = hosts.get(1);
+            EndpointState initialRemoteState = Gossiper.instance.getEndpointStateForEndpoint(remoteHostAddress);
+
+            UUID schemaAtShutdown = UUID.randomUUID();
+            EndpointState shutdownState = new EndpointState(new HeartBeatState(initialRemoteState.getHeartBeatState().getGeneration()));
+            shutdownState.addApplicationState(ApplicationState.STATUS_WITH_PORT, factory.shutdown(true));
+            shutdownState.addApplicationState(ApplicationState.SCHEMA, factory.schema(schemaAtShutdown));
+            Gossiper.instance.markAsShutdown(remoteHostAddress, shutdownState);
+
+            assertFalse(Gossiper.instance.isAlive(remoteHostAddress));
+            // the state from the shutdown message reaches Nodes...
+            assertEquals(schemaAtShutdown, Nodes.getSchemaVersion(remoteHostAddress, null));
+
+            // ...and so do later changes to it
+            UUID laterSchema = UUID.randomUUID();
+            Gossiper.instance.getEndpointStateForEndpoint(remoteHostAddress).addApplicationState(ApplicationState.SCHEMA, factory.schema(laterSchema));
+            assertEquals(laterSchema, Nodes.getSchemaVersion(remoteHostAddress, null));
+
+            // while the state it replaced no longer updates Nodes
+            initialRemoteState.addApplicationState(ApplicationState.SCHEMA, factory.schema(UUID.randomUUID()));
+            assertEquals(laterSchema, Nodes.getSchemaVersion(remoteHostAddress, null));
+        }
+        finally
+        {
+            // clean up the gossip states
+            Gossiper.instance.endpointStateMap.clear();
+        }
+    }
+
+    @Test
+    public void testShutdownStateOfRemovedEndpointStaysOutOfNodes() throws UnknownHostException
+    {
+        Util.createInitialRing(ss, partitioner, endpointTokens, keyTokens, hosts, hostIds, 2);
+        InetAddressAndPort remoteHostAddress = hosts.get(1);
+        try
+        {
+            EndpointState initialRemoteState = Gossiper.instance.getEndpointStateForEndpoint(remoteHostAddress);
+            assertTrue(Nodes.peers().get(remoteHostAddress).isExisting());
+
+            // what StorageService.removeEndpoint does: keep the gossip state but unwire it, and remove the peer
+            Gossiper.instance.removeEndpoint(remoteHostAddress);
+            SystemKeyspace.removeEndpoint(remoteHostAddress);
+            assertFalse(Nodes.peers().get(remoteHostAddress).isExisting());
+            assertNotNull(Gossiper.instance.getEndpointStateForEndpoint(remoteHostAddress));
+
+            EndpointState shutdownState = new EndpointState(new HeartBeatState(initialRemoteState.getHeartBeatState().getGeneration()));
+            shutdownState.addApplicationState(ApplicationState.STATUS_WITH_PORT, factory.shutdown(true));
+            shutdownState.addApplicationState(ApplicationState.HOST_ID, factory.hostId(hostIds.get(1)));
+            shutdownState.addApplicationState(ApplicationState.SCHEMA, factory.schema(UUID.randomUUID()));
+            Gossiper.instance.markAsShutdown(remoteHostAddress, shutdownState);
+
+            // the shutdown state of a removed endpoint doesn't bring the peer back into Nodes
+            assertFalse(Gossiper.instance.isAlive(remoteHostAddress));
+            assertFalse(Nodes.peers().get(remoteHostAddress).isExisting());
+        }
+        finally
+        {
+            // clean up the gossip states and the quarantine left by removeEndpoint
+            Gossiper.instance.endpointStateMap.clear();
+            Gossiper.instance.unsafeAnnulEndpoint(remoteHostAddress);
+        }
+    }
+
+    @Test
+    public void testTokenRemovedStateOfRemovedEndpointStaysOutOfNodes() throws UnknownHostException
+    {
+        Util.createInitialRing(ss, partitioner, endpointTokens, keyTokens, hosts, hostIds, 2);
+        InetAddressAndPort remoteHostAddress = hosts.get(1);
+        try
+        {
+            assertTrue(Nodes.peers().get(remoteHostAddress).isExisting());
+
+            // what StorageService.removeNode does: excise the endpoint, which keeps the gossip state but unwires it
+            // and removes the peer...
+            Gossiper.instance.removeEndpoint(remoteHostAddress);
+            SystemKeyspace.removeEndpoint(remoteHostAddress);
+            assertFalse(Nodes.peers().get(remoteHostAddress).isExisting());
+
+            // ...then advertise the removal
+            Gossiper.instance.advertiseTokenRemoved(remoteHostAddress, hostIds.get(1));
+
+            // the removed state is gossiped, but doesn't bring the peer back into Nodes, nor its tokens into the ring
+            // that is loaded on restart
+            EndpointState removedState = Gossiper.instance.getEndpointStateForEndpoint(remoteHostAddress);
+            assertEquals(VersionedValue.REMOVED_TOKEN, removedState.getStatus());
+            assertFalse(removedState.hasUpdater());
+            assertFalse(Nodes.peers().get(remoteHostAddress).isExisting());
+            assertFalse(SystemKeyspace.loadTokens().containsKey(remoteHostAddress));
+        }
+        finally
+        {
+            // clean up the gossip states and the quarantine left by removeEndpoint
+            Gossiper.instance.endpointStateMap.clear();
+            Gossiper.instance.unsafeAnnulEndpoint(remoteHostAddress);
+        }
+    }
+
+    @Test
+    public void testTokenRemovedStateOfRingMemberStaysWiredToNodes() throws UnknownHostException
+    {
+        Util.createInitialRing(ss, partitioner, endpointTokens, keyTokens, hosts, hostIds, 2);
+        InetAddressAndPort remoteHostAddress = hosts.get(1);
+        try
+        {
+            // what StorageService.forceRemoveCompletion does: advertise the removal before excising the endpoint
+            Gossiper.instance.advertiseTokenRemoved(remoteHostAddress, hostIds.get(1));
+
+            EndpointState removedState = Gossiper.instance.getEndpointStateForEndpoint(remoteHostAddress);
+            assertEquals(VersionedValue.REMOVED_TOKEN, removedState.getStatus());
+            assertTrue(removedState.hasUpdater());
+            assertTrue(Nodes.peers().get(remoteHostAddress).isExisting());
+
+            // the excise that follows removes the peer
+            Gossiper.instance.removeEndpoint(remoteHostAddress);
+            SystemKeyspace.removeEndpoint(remoteHostAddress);
+            assertFalse(removedState.hasUpdater());
+            assertFalse(Nodes.peers().get(remoteHostAddress).isExisting());
+        }
+        finally
+        {
+            // clean up the gossip states and the quarantine left by removeEndpoint
+            Gossiper.instance.endpointStateMap.clear();
+            Gossiper.instance.unsafeAnnulEndpoint(remoteHostAddress);
+        }
     }
 }

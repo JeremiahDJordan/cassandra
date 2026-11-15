@@ -38,6 +38,15 @@ public interface ILocalInfo extends INodeInfo<LocalInfo>
 
     CassandraVersion getCqlVersion();
 
+    /**
+     * The gossip generation this node last started gossip with, or {@code null} if it isn't known. A restarting node
+     * gossips with a generation above this one (CASSANDRA-3654).
+     */
+    default Integer getGossipGeneration()
+    {
+        return null;
+    }
+
     InetAddressAndPort getListenAddressAndPort();
 
     ProtocolVersion getNativeProtocolVersion();

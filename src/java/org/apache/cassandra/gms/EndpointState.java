@@ -138,6 +138,11 @@ public class EndpointState
         this.updater = null;
     }
 
+    public synchronized boolean hasUpdater()
+    {
+        return updater != null;
+    }
+
     public void update(Set<Map.Entry<ApplicationState, VersionedValue>> entries)
     {
         Consumer<UnaryOperator<NodeInfo<?>>> updater = this.updater;

@@ -948,10 +948,9 @@ public final class SystemKeyspace
      */
     public static void checkHealth() throws ConfigurationException
     {
-        Keyspace keyspace;
         try
         {
-            keyspace = Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+            Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME);
         }
         catch (AssertionError err)
         {
@@ -960,15 +959,11 @@ public final class SystemKeyspace
             ex.initCause(err);
             throw ex;
         }
-        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(LOCAL);
 
         String savedClusterName = Nodes.local().get().getClusterName();
         if (savedClusterName == null) {
-            // this is a brand new node
-            if (!cfs.getLiveSSTables().isEmpty())
-                throw new ConfigurationException("Found system keyspace files, but they couldn't be loaded!");
-
-            // no system files.  this is a new node.
+            // this is a brand new node, unless the persistence holds local information it couldn't load
+            Nodes.local().checkLoaded();
             return;
         }
         if (!DatabaseDescriptor.getClusterName().equals(savedClusterName))
@@ -982,12 +977,10 @@ public final class SystemKeyspace
 
     public static int incrementAndGetGeneration()
     {
-        // gossip generation is specific to Gossip thus it is not handled by Nodes.Local
-        String req = "SELECT gossip_generation FROM system.%s WHERE key='%s'";
-        UntypedResultSet result = executeInternal(format(req, LOCAL, LOCAL));
+        Integer previousGeneration = Nodes.local().get().getGossipGeneration();
 
         int generation;
-        if (result.isEmpty() || !result.one().has("gossip_generation"))
+        if (previousGeneration == null)
         {
             // seconds-since-epoch isn't a foolproof new generation
             // (where foolproof is "guaranteed to be larger than the last one seen at this ip address"),
@@ -997,7 +990,7 @@ public final class SystemKeyspace
         else
         {
             // Other nodes will ignore gossip messages about a node that have a lower generation than previously seen.
-            final int storedGeneration = result.one().getInt("gossip_generation") + 1;
+            final int storedGeneration = previousGeneration + 1;
             final int now = (int) (currentTimeMillis() / 1000);
             if (storedGeneration >= now)
             {
@@ -1011,9 +1004,8 @@ public final class SystemKeyspace
             }
         }
 
-        req = "INSERT INTO system.%s (key, gossip_generation) VALUES ('%s', ?)";
-        executeInternal(format(req, LOCAL, LOCAL), generation);
-        forceBlockingFlush(LOCAL);
+        // persist and sync it before gossip starts with it
+        Nodes.local().update(info -> info.setGossipGeneration(generation), true);
 
         return generation;
     }

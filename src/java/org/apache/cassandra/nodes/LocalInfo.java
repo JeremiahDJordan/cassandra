@@ -40,6 +40,7 @@ public final class LocalInfo extends NodeInfo<LocalInfo> implements ILocalInfo
     private volatile BootstrapState bootstrapState;
     private volatile String clusterName;
     private volatile CassandraVersion cqlVersion;
+    private volatile Integer gossipGeneration;
     private volatile InetAddressAndPort listenAddressAndPort;
     private volatile ProtocolVersion nativeProtocolVersion;
     private volatile Class<? extends IPartitioner> partitionerClass;
@@ -90,6 +91,18 @@ public final class LocalInfo extends NodeInfo<LocalInfo> implements ILocalInfo
     public LocalInfo setCqlVersion(CassandraVersion cqlVersion)
     {
         this.cqlVersion = cqlVersion;
+        return this;
+    }
+
+    @Override
+    public Integer getGossipGeneration()
+    {
+        return gossipGeneration;
+    }
+
+    public LocalInfo setGossipGeneration(Integer gossipGeneration)
+    {
+        this.gossipGeneration = gossipGeneration;
         return this;
     }
 
@@ -181,6 +194,7 @@ public final class LocalInfo extends NodeInfo<LocalInfo> implements ILocalInfo
                && getBootstrapState() == localInfo.getBootstrapState()
                && Objects.equals(getClusterName(), localInfo.getClusterName())
                && Objects.equals(getCqlVersion(), localInfo.getCqlVersion())
+               && Objects.equals(getGossipGeneration(), localInfo.getGossipGeneration())
                && Objects.equals(getListenAddressAndPort(), localInfo.getListenAddressAndPort())
                && Objects.equals(getNativeProtocolVersion(), localInfo.getNativeProtocolVersion())
                && Objects.equals(getPartitionerClass(), localInfo.getPartitionerClass())
@@ -195,6 +209,7 @@ public final class LocalInfo extends NodeInfo<LocalInfo> implements ILocalInfo
                             getBootstrapState(),
                             getClusterName(),
                             getCqlVersion(),
+                            getGossipGeneration(),
                             getListenAddressAndPort(),
                             getNativeProtocolVersion(),
                             getPartitionerClass(),
@@ -210,6 +225,7 @@ public final class LocalInfo extends NodeInfo<LocalInfo> implements ILocalInfo
         .append("bootstrapState", getBootstrapState())
         .append("clusterName", getClusterName())
         .append("cqlVersion", getCqlVersion())
+        .append("gossipGeneration", getGossipGeneration())
         .append("listenAddress", getListenAddressAndPort())
         .append("nativeProtocolVersion", getNativeProtocolVersion())
         .append("partitioner", getPartitionerClass())

@@ -20,6 +20,7 @@ package org.apache.cassandra.nodes;
 
 import java.util.stream.Stream;
 
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 
 public interface INodesPersistence
@@ -74,6 +75,14 @@ public interface INodesPersistence
     void saveLocal(LocalInfo info);
 
     void syncLocal();
+
+    /**
+     * Called at startup, before anything is saved, when {@link #loadLocal()} returned no cluster name. Throws if
+     * local information exists but couldn't be loaded, so that the node doesn't start as a new one.
+     */
+    default void checkLocalLoaded() throws ConfigurationException
+    {
+    }
 
     Stream<PeerInfo> loadPeers();
 

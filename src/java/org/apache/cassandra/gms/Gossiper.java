@@ -739,7 +739,12 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
         if (shutdown == null)
             throw new AssertionError("Remote shutdown sent but missing STATUS_WITH_PORT; " + remoteState);
         remoteState.forceHighestPossibleVersionUnsafe();
-        endpointStateMap.put(endpoint, remoteState);
+        // removeEndpoint() keeps the state of an endpoint that left the ring, but unwires it from Nodes. The shutdown
+        // state of such an endpoint stays unwired, so that it doesn't bring the removed peer back into Nodes.
+        if (epState.hasUpdater())
+            putEndpointState(endpoint, remoteState);
+        else
+            endpointStateMap.put(endpoint, remoteState);
         markDead(endpoint, remoteState);
         FailureDetector.instance.forceConviction(endpoint);
         GossiperDiagnostics.markedAsShutdown(this, endpoint);
@@ -966,7 +971,9 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
         epState.addApplicationState(ApplicationState.STATUS, StorageService.instance.valueFactory.removedNonlocal(hostId, expireTime));
         logger.info("Completing removal of {}", endpoint);
         addExpireTimeForEndpoint(endpoint, expireTime);
-        putEndpointState(endpoint, epState);
+        // A plain put leaves the state's wiring to Nodes as it is: removeNode() has already excised (unwired) the
+        // endpoint, and forceRemoveCompletion() excises it afterwards.
+        endpointStateMap.put(endpoint, epState);
         // ensure at least one gossip round occurs before returning
         Uninterruptibles.sleepUninterruptibly(intervalInMillis * 2, TimeUnit.MILLISECONDS);
     }
