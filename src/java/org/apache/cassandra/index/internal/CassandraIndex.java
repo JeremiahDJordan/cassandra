@@ -41,6 +41,7 @@ import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -665,6 +666,13 @@ public abstract class CassandraIndex implements Index
         indexCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_REMOVED);
         indexCfs.readOrdering.awaitNewBarrier();
         indexCfs.invalidate();
+        // A compaction can start after the interruption above, for instance once the flush completes, and the files
+        // of the sstables it compacts are only removed when it finishes. Now that the index table is invalid, no new
+        // compaction can start: stop the remaining ones and wait for the files to be removed, so that an index created
+        // next with the same name, whose sstables are in the same directory, does not load them.
+        CompactionManager.instance.interruptCompactionForCFs(cfss, (sstable) -> true, true);
+        CompactionManager.instance.waitForCessation(cfss, (sstable) -> true);
+        LifecycleTransaction.waitForDeletions();
     }
 
     private boolean isBuilt()
