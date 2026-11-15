@@ -175,11 +175,12 @@ final class HintsDispatchExecutor
             }
 
             hostId = hostIdSupplier.get();
+            address = HintsEndpointProvider.instance.endpointForHost(hostId);
             logger.info("Transferring all hints to {}: {}", address, hostId);
             if (!transfer(hostId))
             {
                 logger.error("Failed to transfer all hints to {}: {}", address, hostId);
-                throw new RuntimeException("Failed to transfer all hints to " + hostId);
+                throw new RuntimeException("Failed to transfer all hints to " + address + ": " + hostId);
             }
         }
 
@@ -272,7 +273,10 @@ final class HintsDispatchExecutor
             File file = new File(hintsDirectory, descriptor.fileName());
             InputPosition offset = store.getDispatchOffset(descriptor);
 
-            BooleanSupplier shouldAbort = () -> !isAlive.test(descriptor.hostId) || isPaused.get();
+            // Abort when the node we deliver to goes down. On a transfer (decommission) that is the transfer
+            // target, not descriptor.hostId: the node the hints were written for is typically down, which is
+            // why the hints exist, and testing it would abort every transfer of such hints.
+            BooleanSupplier shouldAbort = () -> !isAlive.test(hostId) || isPaused.get();
 
             Optional<Integer> optVersion = HintsEndpointProvider.instance.versionForEndpoint(address);
             if (optVersion.isEmpty())
