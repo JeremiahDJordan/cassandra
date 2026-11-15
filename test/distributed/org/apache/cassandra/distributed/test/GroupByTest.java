@@ -99,6 +99,43 @@ public class GroupByTest extends TestBaseImpl
     }
 
     @Test
+    public void groupByWithLimitAfterRangeTombstone() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(2).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck0 int, ck1 int, PRIMARY KEY (pk, ck0, ck1))"));
+            ICoordinator coordinator = cluster.coordinator(1);
+
+            // a range tombstone on both nodes
+            coordinator.execute(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 2 WHERE pk = 1 AND ck0 > 2"), ConsistencyLevel.ALL);
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (1, 1, 1) USING TIMESTAMP 3"), ConsistencyLevel.ALL);
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (1, 3, 1) USING TIMESTAMP 3"), ConsistencyLevel.ALL);
+
+            // a range tombstone on one node only
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (2, 1, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+            cluster.get(1).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 2 WHERE pk = 2 AND ck0 = 2"));
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (2, 2, 1) USING TIMESTAMP 3"), ConsistencyLevel.ALL);
+
+            for (int pk = 1; pk <= 2; pk++)
+            {
+                int ck0 = pk == 1 ? 3 : 2;
+                for (int pageSize = 1; pageSize <= 4; pageSize++)
+                {
+                    assertRows(coordinator.executeWithPaging(withKeyspace("SELECT pk, ck0, ck1 FROM %s.tbl WHERE pk = ? GROUP BY pk, ck0"),
+                                                             ConsistencyLevel.ALL, pageSize, pk),
+                               row(pk, 1, 1), row(pk, ck0, 1));
+                    assertRows(coordinator.executeWithPaging(withKeyspace("SELECT pk, ck0, ck1 FROM %s.tbl WHERE pk = ? GROUP BY pk, ck0 LIMIT 1"),
+                                                             ConsistencyLevel.ALL, pageSize, pk),
+                               row(pk, 1, 1));
+                }
+                assertRows(coordinator.execute(withKeyspace("SELECT pk, ck0, ck1 FROM %s.tbl WHERE pk = ? GROUP BY pk, ck0 LIMIT 1"),
+                                               ConsistencyLevel.ALL, pk),
+                           row(pk, 1, 1));
+            }
+        }
+    }
+
+    @Test
     public void testGroupByWithAggregatesAndPaging() throws Throwable
     {
         try (Cluster cluster = init(builder().withNodes(2).withConfig((cfg) -> cfg.set("user_defined_functions_enabled", "true")).start()))

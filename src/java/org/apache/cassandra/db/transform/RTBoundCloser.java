@@ -17,6 +17,10 @@
  */
 package org.apache.cassandra.db.transform;
 
+import java.util.function.Function;
+
+import javax.annotation.Nullable;
+
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.ReadExecutionController;
@@ -37,38 +41,87 @@ import org.apache.cassandra.db.rows.*;
  */
 public final class RTBoundCloser extends Transformation<UnfilteredRowIterator>
 {
-    private RTBoundCloser()
+    @Nullable
+    private final LastRowTracker tracker;
+
+    private RTBoundCloser(@Nullable LastRowTracker tracker)
     {
+        this.tracker = tracker;
     }
 
     public static UnfilteredPartitionIterator close(UnfilteredPartitionIterator partitions)
     {
-        return Transformation.apply(partitions, new RTBoundCloser());
+        return Transformation.apply(partitions, new RTBoundCloser(null));
+    }
+
+    /**
+     * Applies {@code limits} to {@code partitions}, and appends an RT bound marker to the resulting row iterators in
+     * case they don't have one. GROUP BY limits read one row past the last one they return; an RT opened right before
+     * that row is closed at it.
+     */
+    public static UnfilteredPartitionIterator close(UnfilteredPartitionIterator partitions,
+                                                    Function<UnfilteredPartitionIterator, UnfilteredPartitionIterator> limits)
+    {
+        LastRowTracker tracker = new LastRowTracker();
+        return Transformation.apply(limits.apply(Transformation.apply(partitions, tracker)), new RTBoundCloser(tracker));
     }
 
     public static UnfilteredRowIterator close(UnfilteredRowIterator partition)
     {
-        RowsTransformation transformation = new RowsTransformation(partition);
+        RowsTransformation transformation = new RowsTransformation(partition, null);
         return Transformation.apply(MoreRows.extend(partition, transformation, partition.columns()), transformation);
     }
 
     @Override
     public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
     {
-        RowsTransformation transformation = new RowsTransformation(partition);
+        RowsTransformation transformation = new RowsTransformation(partition, tracker);
         return Transformation.apply(MoreRows.extend(partition, transformation, partition.columns()), transformation);
+    }
+
+    /**
+     * Tracks the clustering of the last row of the current partition that follows the last RT bound marker, before the
+     * limits are applied.
+     */
+    private final static class LastRowTracker extends Transformation<UnfilteredRowIterator>
+    {
+        private Clustering<?> lastRowClustering;
+
+        @Override
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+            lastRowClustering = null;
+            return Transformation.apply(partition, this);
+        }
+
+        @Override
+        protected Row applyToRow(Row row)
+        {
+            lastRowClustering = row.clustering();
+            return row;
+        }
+
+        @Override
+        protected RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+        {
+            lastRowClustering = null;
+            return marker;
+        }
     }
 
     private final static class RowsTransformation extends Transformation implements MoreRows<UnfilteredRowIterator>
     {
         private final UnfilteredRowIterator partition;
+        @Nullable
+        private final LastRowTracker tracker;
 
         private Clustering<?> lastRowClustering;
         private DeletionTime openMarkerDeletionTime;
 
-        private RowsTransformation(UnfilteredRowIterator partition)
+        private RowsTransformation(UnfilteredRowIterator partition, @Nullable LastRowTracker tracker)
         {
             this.partition = partition;
+            this.tracker = tracker;
         }
 
         @Override
@@ -98,8 +151,12 @@ public final class RTBoundCloser extends Transformation<UnfilteredRowIterator>
              * there *is* an open RT in the stream, but there have been no rows after the opening bound - this must
              * never happen in scenarios where RTBoundCloser is meant to be used; the last encountered clustering
              * should be either a closing bound marker - if the iterator was exhausted fully - or a live row - if
-             * DataLimits stopped it short in the middle of an RT.
+             * DataLimits stopped it short in the middle of an RT. The exception is a row that the limits read but
+             * did not return, which follows the opening bound and so is covered by the RT.
              */
+            if (null == lastRowClustering && null != tracker)
+                lastRowClustering = tracker.lastRowClustering;
+
             if (null == lastRowClustering)
             {
                 String message = String.format("UnfilteredRowIterator for %s has an open RT bound as its last item", partition.metadata());
