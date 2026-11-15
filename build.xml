@@ -1667,6 +1667,28 @@
     </sequential>
   </macrodef>
 
+  <macrodef name="testlist-bigtable">
+    <attribute name="test.file.list"/>
+    <attribute name="test.name" default="${test.name}"/>
+    <sequential>
+      <property name="bigtable_yaml" value="${build.test.dir}/cassandra.bigtable.yaml"/>
+      <concat destfile="${bigtable_yaml}">
+        <fileset file="${test.conf}/cassandra.yaml"/>
+        <fileset file="${test.conf}/bigtable.yaml"/>
+      </concat>
+      <testmacrohelper inputdir="${test.dir}/${test.classlistprefix}" filelist="@{test.file.list}" testname="@{test.name}"
+                       exclude="**/*.java" timeout="${test.timeout}" testtag="bigtable">
+        <jvmarg value="-Dlegacy-sstable-root=${test.data}/legacy-sstables"/>
+        <jvmarg value="-Dinvalid-legacy-sstable-root=${test.data}/invalid-legacy-sstables"/>
+        <jvmarg value="-Dcassandra.ring_delay_ms=1000"/>
+        <jvmarg value="-Dcassandra.tolerate_sstable_size=true"/>
+        <jvmarg value="-Dcassandra.skip_sync=true" />
+        <jvmarg value="-Dcassandra.config=file:///${bigtable_yaml}"/>
+        <jvmarg value="-Dlogback.configurationFile=file://${test.logback.configurationFile}"/>
+      </testmacrohelper>
+    </sequential>
+  </macrodef>
+
     <macrodef name="testlist-nocursor">
         <attribute name="test.file.list"/>
         <attribute name="testlist.offset"/>
