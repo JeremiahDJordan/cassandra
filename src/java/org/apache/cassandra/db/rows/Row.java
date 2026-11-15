@@ -818,8 +818,10 @@ public interface Row extends Unfiltered, Iterable<ColumnData>, IMeasurableMemory
 
             private DeletionTime activeDeletion;
 
-            private final BTreeComplexColumn.Builder complexBuilder;
-            private final List<Iterator<Cell<?>>> complexCells;
+            // Created on first use if none of the columns the merger was created for is complex: the rows can still
+            // hold cells of a dropped complex column that are newer than the drop, which are merged like any other.
+            private BTreeComplexColumn.Builder complexBuilder;
+            private List<Iterator<Cell<?>>> complexCells;
             private final CellReducer cellReducer;
 
             public ColumnDataReducer(int size, boolean hasComplex)
@@ -871,6 +873,11 @@ public interface Row extends Unfiltered, Iterable<ColumnData>, IMeasurableMemory
                 }
                 else
                 {
+                    if (complexBuilder == null)
+                    {
+                        complexBuilder = BTreeComplexColumn.builder();
+                        complexCells = new ArrayList<>(versions.size());
+                    }
                     complexBuilder.newColumn(column);
                     complexCells.clear();
                     DeletionTime complexDeletion = DeletionTime.LIVE;
