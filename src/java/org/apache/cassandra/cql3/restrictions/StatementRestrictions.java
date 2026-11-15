@@ -723,7 +723,10 @@ public class StatementRestrictions
                 filterRestrictionsBuilder.add(nonPrimaryKeyRestrictions);
             }
 
-            if (usesSecondaryIndexing)
+            // An index query can't read a set of partitions given by an IN on the partition key. That doesn't apply
+            // when the partition key restrictions are only part of the row filter of a key range query (a partially
+            // restricted partition key, or a disjunction), e.g. an SAI index serving "pk_component IN (...)".
+            if (usesSecondaryIndexing && !isKeyRange)
                 checkFalse(partitionKeyRestrictions.hasIN(), INDEX_WITH_IN_ON_PK_MESSAGE);
 
             ImmutableList.Builder<StatementRestrictions> children = ImmutableList.builder();
