@@ -39,7 +39,9 @@ import org.apache.cassandra.distributed.api.QueryResult;
 import org.apache.cassandra.distributed.api.QueryResults;
 import org.apache.cassandra.distributed.api.SimpleQueryResult;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.reads.thresholds.CoordinatorWarnings;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.tracing.Tracing;
@@ -142,9 +144,9 @@ public class Coordinator implements ICoordinator
                                                               selectStatement.keyspace());
 
 
-            ResultMessage.Rows initialRows = selectStatement.execute(queryState, initialOptions, requestTime);
+            ResultMessage.Rows initialRows = executePage(selectStatement, queryState, initialOptions, requestTime);
             Iterator<Object[]> iter = new Iterator<Object[]>() {
-                ResultMessage.Rows rows = selectStatement.execute(queryState, initialOptions, requestTime);
+                ResultMessage.Rows rows = executePage(selectStatement, queryState, initialOptions, requestTime);
                 Iterator<Object[]> iter = RowUtil.toIter(rows);
 
                 public boolean hasNext()
@@ -164,7 +166,7 @@ public class Coordinator implements ICoordinator
                                                                    ProtocolVersion.CURRENT,
                                                                    selectStatement.keyspace());
 
-                    rows = selectStatement.execute(queryState, nextOptions, requestTime);
+                    rows = executePage(selectStatement, queryState, nextOptions, requestTime);
                     iter = Iterators.forArray(RowUtil.toObjects(initialRows.result.metadata.names, rows.result.rows));
 
                     return hasNext();
@@ -180,4 +182,34 @@ public class Coordinator implements ICoordinator
         }).call();
     }
 
+    /**
+     * Executes one page of a paged query, handling the replica warnings as {@link CoordinatorHelper} does for an
+     * unpaged query, so that they are recorded in the metrics and abort thresholds apply. The client warnings are
+     * discarded, as the paged result does not return them. The pages after the first are fetched while the result
+     * is iterated, possibly on another thread, so each page sets up and clears the state of the thread executing it.
+     */
+    private static ResultMessage.Rows executePage(SelectStatement statement,
+                                                  QueryState queryState,
+                                                  QueryOptions options,
+                                                  Dispatcher.RequestTime requestTime)
+    {
+        ClientWarn.instance.captureWarnings();
+        CoordinatorWarnings.init();
+        try
+        {
+            ResultMessage.Rows rows = statement.execute(queryState, options, requestTime);
+            CoordinatorWarnings.done();
+            return rows;
+        }
+        catch (Exception | Error e)
+        {
+            CoordinatorWarnings.done();
+            throw e;
+        }
+        finally
+        {
+            CoordinatorWarnings.reset();
+            ClientWarn.instance.resetWarnings();
+        }
+    }
 }

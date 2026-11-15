@@ -24,12 +24,14 @@ import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
 import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Before;
@@ -70,6 +72,7 @@ import org.assertj.core.api.Condition;
 
 import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class TombstoneCountWarningTest extends TestBaseImpl
 {
@@ -202,6 +205,69 @@ public class TombstoneCountWarningTest extends TestBaseImpl
         assertWarnAborts(2, 0, 0);
         testDisabled.accept(driverQueryAll(cql).getExecutionInfo().getWarnings());
         assertWarnAborts(2, 0, 0);
+    }
+
+    @Test
+    public void warnThresholdSinglePartitionWithPaging()
+    {
+        logger.info("[test step : @Test] warnThresholdSinglePartitionWithPaging");
+        warnThresholdWithPaging("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = 1");
+    }
+
+    @Test
+    public void warnThresholdScanWithPaging()
+    {
+        logger.info("[test step : @Test] warnThresholdScanWithPaging");
+        warnThresholdWithPaging("SELECT * FROM " + KEYSPACE + ".tbl");
+    }
+
+    private void warnThresholdWithPaging(String cql)
+    {
+        // with a page size of 1, the first page reads no tombstone and the second page reads TOMBSTONE_WARN + 1
+        CLUSTER.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 0, 0)", ConsistencyLevel.ALL);
+        for (int i = 1; i <= TOMBSTONE_WARN + 1; i++)
+            CLUSTER.coordinator(1).execute("DELETE FROM " + KEYSPACE + ".tbl WHERE pk = 1 AND ck = ?", ConsistencyLevel.ALL, i);
+        CLUSTER.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, ?, 0)", ConsistencyLevel.ALL, TOMBSTONE_WARN + 2);
+
+        enable(true);
+        // the pages after the first are fetched by this thread while iterating
+        Iterator<Object[]> rows = CLUSTER.coordinator(1).executeWithPaging(cql, ConsistencyLevel.ALL, 1);
+        assertThat(Iterators.size(rows)).isEqualTo(2);
+        assertWarnAborts(1, 0, 0);
+    }
+
+    @Test
+    public void failThresholdWithPaging()
+    {
+        logger.info("[test step : @Test] failThresholdWithPaging");
+        String cql = "SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = 1";
+
+        // with a page size of 1, the first page reads no tombstone and the second page reads TOMBSTONE_FAIL + 1
+        CLUSTER.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, 0, 0)", ConsistencyLevel.ALL);
+        for (int i = 1; i <= TOMBSTONE_FAIL + 1; i++)
+            CLUSTER.coordinator(1).execute("DELETE FROM " + KEYSPACE + ".tbl WHERE pk = 1 AND ck = ?", ConsistencyLevel.ALL, i);
+        CLUSTER.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (1, ?, 0)", ConsistencyLevel.ALL, TOMBSTONE_FAIL + 2);
+
+        enable(true);
+        // the second page is fetched by this thread while iterating, and aborts
+        Iterator<Object[]> rows = CLUSTER.coordinator(1).executeWithPaging(cql, ConsistencyLevel.ALL, 1);
+        assertThat(rows.hasNext()).isTrue();
+        assertThat(rows.next()).isEqualTo(new Object[]{ 1, 0, 0 });
+        assertThatThrownBy(rows::hasNext)
+        .hasMessageContaining("nodes scanned over " + (TOMBSTONE_FAIL + 1) + " tombstones and aborted the query " + cql);
+        assertWarnAborts(0, 1, 1);
+
+        // the first page is fetched before executeWithPaging returns, and aborts
+        assertThatThrownBy(() -> CLUSTER.coordinator(1).executeWithPaging(cql + " AND ck > 0", ConsistencyLevel.ALL, 1))
+        .hasMessageContaining("nodes scanned over " + (TOMBSTONE_FAIL + 1) + " tombstones and aborted the query " + cql);
+        assertWarnAborts(0, 2, 1);
+
+        // the aborted pages left no warnings state on the threads that executed them
+        CLUSTER.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (2, 0, 0)", ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute("INSERT INTO " + KEYSPACE + ".tbl (pk, ck, v) VALUES (2, 1, 0)", ConsistencyLevel.ALL);
+        rows = CLUSTER.coordinator(1).executeWithPaging("SELECT * FROM " + KEYSPACE + ".tbl WHERE pk = 2", ConsistencyLevel.ALL, 1);
+        assertThat(Iterators.size(rows)).isEqualTo(2);
+        assertWarnAborts(0, 2, 0);
     }
 
     @Test
