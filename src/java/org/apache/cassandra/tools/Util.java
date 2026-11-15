@@ -19,9 +19,11 @@
 package org.apache.cassandra.tools;
 
 import static java.lang.String.format;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DURATION_IN_MAPS_COMPATIBILITY_MODE;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.ByteBuffer;
 import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
@@ -37,11 +39,14 @@ import java.util.stream.StreamSupport;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.SerializationHeader;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidColumnTypeException;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.schema.TableMetadata;
@@ -49,6 +54,7 @@ import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.streamhist.TombstoneHistogram;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 
@@ -335,23 +341,67 @@ public final class Util
         SerializationHeader.Component header = (SerializationHeader.Component) sstableMetadata.get(MetadataType.HEADER);
 
         IPartitioner partitioner = FBUtilities.newPartitioner(desc);
+        boolean fixTypes = desc.version.hasImplicitlyFrozenTuples();
+        boolean tuplesAreFrozen = hasOnlyFrozenPlainTuples(desc.version);
+        boolean isCounter = header.getRegularColumns().values().stream().anyMatch(AbstractType::isCounter) || header.getStaticColumns().values().stream().anyMatch(AbstractType::isCounter);
 
         TableMetadata.Builder builder = TableMetadata.builder(keyspaceName, tableName).partitioner(partitioner);
         header.getStaticColumns().entrySet().stream()
               .forEach(entry -> {
                   ColumnIdentifier ident = ColumnIdentifier.getInterned(UTF8Type.instance.getString(entry.getKey()), true);
-                  builder.addStaticColumn(ident, entry.getValue());
+                  builder.addStaticColumn(ident, fixHeaderType(fixTypes, tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter));
               });
         header.getRegularColumns().entrySet().stream()
               .forEach(entry -> {
                   ColumnIdentifier ident = ColumnIdentifier.getInterned(UTF8Type.instance.getString(entry.getKey()), true);
-                  builder.addRegularColumn(ident, entry.getValue());
+                  builder.addRegularColumn(ident, fixHeaderType(fixTypes, tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter));
               });
-        builder.addPartitionKeyColumn("PartitionKey", header.getKeyType());
+        builder.addPartitionKeyColumn("PartitionKey", fixHeaderType(fixTypes, tuplesAreFrozen, UTF8Type.instance.decompose("PartitionKey"), header.getKeyType(), true, isCounter));
         for (int i = 0; i < header.getClusteringTypes().size(); i++)
         {
-            builder.addClusteringColumn("clustering" + (i > 0 ? i : ""), header.getClusteringTypes().get(i));
+            String name = "clustering" + (i > 0 ? i : "");
+            builder.addClusteringColumn(name, fixHeaderType(fixTypes, tuplesAreFrozen, UTF8Type.instance.decompose(name), header.getClusteringTypes().get(i), true, isCounter));
         }
         return builder.build();
+    }
+
+    /**
+     * Whether every plain tuple ({@code TupleType}, not a UDT) in the headers of this sstable version is frozen. That
+     * is so for the {@code big} versions before {@code nb}, which only Apache Cassandra writes: it has no multi-cell
+     * tuples, and records frozen tuples without a {@code FrozenType} wrapper. A DataStax node also writes later
+     * versions, in which a multi-cell plain tuple can be the type of a dropped non-frozen UDT column.
+     */
+    @VisibleForTesting
+    static boolean hasOnlyFrozenPlainTuples(Version version)
+    {
+        return version.getSSTableFormat() == SSTableFormat.Type.BIG.info && version.getVersion().compareTo("nb") < 0;
+    }
+
+    /**
+     * Fixes a column type read from an sstable header the way opening the sstable does
+     * ({@link SerializationHeader.Component#toHeader}), as far as that can be done without the schema, and only if
+     * {@code fixTypes}, as a node does. A frozen tuple recorded without a {@code FrozenType} wrapper, as Apache
+     * Cassandra records them, parses as a multi-cell tuple, so its cells would be read as the cells of a complex column.
+     * Such a tuple is frozen if {@code tuplesAreFrozen}, or if it has multi-cell subtypes, which a frozen tuple recorded
+     * that way has, and a dropped non-frozen UDT has not. Otherwise a multi-cell plain tuple is kept, as it can be a
+     * dropped non-frozen UDT: with scalar fields only, the two record the same type. Types that are valid, or that
+     * can't be fixed, are returned unchanged.
+     */
+    @VisibleForTesting
+    static AbstractType<?> fixHeaderType(boolean fixTypes, boolean tuplesAreFrozen, ByteBuffer name, AbstractType<?> type, boolean isPrimaryKeyColumn, boolean isCounter)
+    {
+        if (!fixTypes)
+            return type;
+        try
+        {
+            // isForOfflineTool accepts a multi-cell plain tuple whose subtypes are all frozen
+            type.validateForColumn(name, isPrimaryKeyColumn, isCounter, false, !tuplesAreFrozen, DURATION_IN_MAPS_COMPATIBILITY_MODE.getBoolean());
+            return type;
+        }
+        catch (InvalidColumnTypeException e)
+        {
+            AbstractType<?> fixed = SerializationHeader.Component.tryFix(type, name, isPrimaryKeyColumn, isCounter, false, true);
+            return fixed == null ? type : fixed;
+        }
     }
 }
