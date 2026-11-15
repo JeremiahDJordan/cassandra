@@ -42,6 +42,19 @@ public class UserTypesTest extends CQLTester
     }
 
     @Test
+    public void testFunctionOnNestedLiteralsOfFrozenAndNonFrozenValues() throws Throwable
+    {
+        String type = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v " + type + ", fv frozen<" + type + ">)");
+        execute("INSERT INTO %s (k, v, fv) VALUES (0, {a: 1, b: 2}, {a: 3, b: 4})");
+
+        assertRows(execute("SELECT to_json([[v], [fv]]) FROM %s"),
+                   row("[[{\"a\": 1, \"b\": 2}], [{\"a\": 3, \"b\": 4}]]"));
+        assertRows(execute("SELECT to_json([{v}, {fv}]) FROM %s"),
+                   row("[[{\"a\": 1, \"b\": 2}], [{\"a\": 3, \"b\": 4}]]"));
+    }
+
+    @Test
     public void testInvalidField() throws Throwable
     {
         String myType = createType("CREATE TYPE %s (f int)");

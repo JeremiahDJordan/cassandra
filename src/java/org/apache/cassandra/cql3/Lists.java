@@ -19,6 +19,7 @@ package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -138,7 +139,7 @@ public abstract class Lists
     public static <T> ListType<?> getPreferredCompatibleType(List<T> items,
                                                              java.util.function.Function<T, AbstractType<?>> mapper)
     {
-        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> type = AssignmentTestable.getCompatibleTypeIfKnown(types);
         return type == null ? null : ListType.getInstance(type, false);
     }
