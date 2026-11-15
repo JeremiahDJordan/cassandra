@@ -35,6 +35,7 @@ import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.memtable.TrieMemtable;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.tries.InMemoryTrie;
 import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.dht.AbstractBounds;
@@ -127,7 +128,7 @@ public class TrieMemoryIndex extends MemoryIndex
     }
 
     @Override
-    public long update(DecoratedKey key, Clustering<?> clustering, ByteBuffer oldValue, ByteBuffer newValue)
+    public long update(DecoratedKey key, Clustering<?> clustering, Cell<?> cell)
     {
         throw new UnsupportedOperationException();
     }

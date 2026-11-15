@@ -32,10 +32,14 @@ import javax.annotation.Nullable;
 import com.google.common.annotations.VisibleForTesting;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -74,7 +78,13 @@ public class MemtableIndexManager
 
         long bytes = 0;
 
-        if (index.termType().isNonFrozenCollection())
+        if (indexesVectorCells())
+        {
+            Cell<?> cell = vectorCell(row);
+            if (cell != null)
+                bytes += target.update(key, row.clustering(), cell);
+        }
+        else if (index.termType().isNonFrozenCollection())
         {
             Iterator<ByteBuffer> bufferIterator = index.termType().valuesOf(row, FBUtilities.nowInSeconds());
             if (bufferIterator != null)
@@ -102,13 +112,45 @@ public class MemtableIndexManager
             return index(key, newRow, memtable);
         }
 
+        // A vector that is part of the primary key never changes for a row.
+        if (!indexesVectorCells())
+            return 0;
+
         // Updates should only be able to happen on memtables that were already created and that are still live.
         MemtableIndex target = liveMemtableIndexMap.get(memtable);
         assert target != null : "Memtable for " + memtable.metadata().getTableName() + " not found";
 
-        ByteBuffer oldValue = index.termType().valueOf(key, oldRow, FBUtilities.nowInSeconds());
-        ByteBuffer newValue = index.termType().valueOf(key, newRow, FBUtilities.nowInSeconds());
-        return target.update(key, oldRow.clustering(), oldValue, newValue);
+        Cell<?> cell = vectorCell(newRow);
+        return cell == null ? 0 : target.update(key, newRow.clustering(), cell);
+    }
+
+    /**
+     * @return the cell of the indexed vector column of the row or, if the row has none but a row deletion, a tombstone
+     * at the time of that deletion, which may have shadowed the vector; {@code null} if the row has neither.
+     * <p>
+     * The rows passed to {@link #update} only hold the cells that the write changed. A write of a row that is merged
+     * again after losing the race to publish its partition may have indexed a vector that the other write deleted, and
+     * then change nothing, so the deletion must be applied whenever the index sees it, even if the row has no vector
+     * at that time.
+     */
+    private Cell<?> vectorCell(Row row)
+    {
+        ColumnMetadata column = index.termType().columnMetadata();
+        Cell<?> cell = row.getCell(column);
+        if (cell != null || row.deletion().isLive())
+            return cell;
+
+        DeletionTime deletion = row.deletion().time();
+        return BufferCell.tombstone(column, deletion.markedForDeleteAt(), deletion.localDeletionTime());
+    }
+
+    /**
+     * @return whether this is a vector index on a regular or static column, whose memtable index is updated with the
+     * cells of the column, see {@link VectorMemoryIndex#update}
+     */
+    private boolean indexesVectorCells()
+    {
+        return index.termType().isVector() && !index.termType().columnMetadata().isPrimaryKeyColumn();
     }
 
     public void renewMemtable(Memtable renewed)

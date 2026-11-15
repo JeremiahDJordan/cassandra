@@ -21,6 +21,7 @@ package org.apache.cassandra.index.sai.memory;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
@@ -50,7 +51,11 @@ public abstract class MemoryIndex implements MemtableOrdering
 
     public abstract long add(DecoratedKey key, Clustering<?> clustering, ByteBuffer value);
 
-    public abstract long update(DecoratedKey key, Clustering<?> clustering, ByteBuffer oldValue, ByteBuffer newValue);
+    /**
+     * Indexes the row under the value of the given cell, in place of the value it is indexed under. Only supported by
+     * vector indexes, which index a row under one value.
+     */
+    public abstract long update(DecoratedKey key, Clustering<?> clustering, Cell<?> cell);
 
     public abstract KeyRangeIterator search(QueryContext queryContext, Expression expression, AbstractBounds<PartitionPosition> keyRange);
 

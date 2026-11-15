@@ -21,6 +21,7 @@ package org.apache.cassandra.index.sai.memory;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
@@ -28,6 +29,8 @@ import java.util.List;
 import java.util.NavigableSet;
 import java.util.PriorityQueue;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.Function;
@@ -40,7 +43,11 @@ import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.Cells;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
@@ -58,9 +65,13 @@ import org.apache.cassandra.index.sai.utils.RangeUtil;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CloseableIterator;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.lucene.util.RamUsageEstimator;
 
 import static java.lang.Math.log;
 import static java.lang.Math.max;
@@ -69,6 +80,13 @@ import static java.lang.Math.pow;
 
 public class VectorMemoryIndex extends MemoryIndex
 {
+    // an IndexedCell and its entry in indexedCells (a ConcurrentHashMap node and its slot in the table)
+    private static final long INDEXED_CELL_BYTES = ObjectSizes.measure(new IndexedCell())
+                                                   + RamUsageEstimator.alignObjectSize(RamUsageEstimator.NUM_BYTES_OBJECT_HEADER
+                                                                                       + 3L * RamUsageEstimator.NUM_BYTES_OBJECT_REF
+                                                                                       + Integer.BYTES)
+                                                   + RamUsageEstimator.NUM_BYTES_OBJECT_REF;
+
     private final OnHeapGraph<PrimaryKey> graph;
     private final Memtable memtable;
     private final LongAdder writeCount = new LongAdder();
@@ -77,6 +95,9 @@ public class VectorMemoryIndex extends MemoryIndex
 
     private final NavigableSet<PrimaryKey> primaryKeys = new ConcurrentSkipListSet<>();
 
+    // the cell each row is indexed for, see update()
+    private final ConcurrentMap<PrimaryKey, IndexedCell> indexedCells = new ConcurrentHashMap<>();
+
     public VectorMemoryIndex(StorageAttachedIndex index, Memtable memtable)
     {
         super(index);
@@ -84,6 +105,10 @@ public class VectorMemoryIndex extends MemoryIndex
         this.memtable = memtable;
     }
 
+    /**
+     * Indexes the row under the given vector. Only used for a vector that is part of the primary key, which never
+     * changes for a row; the vector of a regular or static column is indexed by {@link #update}.
+     */
     @Override
     public long add(DecoratedKey key, Clustering<?> clustering, ByteBuffer value)
     {
@@ -104,44 +129,73 @@ public class VectorMemoryIndex extends MemoryIndex
         return bytesUsed;
     }
 
+    /**
+     * Indexes the row under the vector of the given cell, in place of the vector it is indexed under, if the cell
+     * supersedes the cell indexed for that row so far (see {@link Cells#reconcile}); the row is not indexed under any
+     * vector if the cell is a tombstone or has expired.
+     * <p>
+     * The cells of concurrent writes of the same row can arrive in any order, and more than once: a write into an
+     * {@link org.apache.cassandra.db.partitions.AtomicBTreePartition} retries its merge until it is the one that
+     * publishes the partition, and every attempt passes its merged row to the index. Comparing each cell with the
+     * cell indexed for the row so far, under a lock of that row, leaves the row indexed under the vector of its
+     * reconciled cell whatever the order of the calls.
+     *
+     * @param cell the cell of the indexed column of the row
+     */
     @Override
-    public long update(DecoratedKey key, Clustering<?> clustering, ByteBuffer oldValue, ByteBuffer newValue)
+    public long update(DecoratedKey key, Clustering<?> clustering, Cell<?> cell)
     {
-        int oldRemaining = oldValue == null ? 0 : oldValue.remaining();
-        int newRemaining = newValue == null ? 0 : newValue.remaining();
-        if (oldRemaining == 0 && newRemaining == 0)
-            return 0;
-
-        boolean different;
-        if (oldRemaining != newRemaining)
-        {
-            assert oldRemaining == 0 || newRemaining == 0; // one of them is null
-            different = true;
-        }
-        else
-        {
-            different = index.termType().compare(oldValue, newValue) != 0;
-        }
+        PrimaryKey primaryKey = index.hasClustering() ? index.keyFactory().create(key, clustering)
+                                                      : index.keyFactory().create(key);
 
         long bytesUsed = 0;
-        if (different)
+        IndexedCell indexed = indexedCells.get(primaryKey);
+        if (indexed == null)
         {
-            PrimaryKey primaryKey = index.hasClustering() ? index.keyFactory().create(key, clustering)
-                                                          : index.keyFactory().create(key);
+            IndexedCell created = new IndexedCell();
+            indexed = indexedCells.putIfAbsent(primaryKey, created);
+            if (indexed == null)
+            {
+                indexed = created;
+                bytesUsed += INDEXED_CELL_BYTES;
+            }
+        }
 
-            // make the changes in this order, so we don't have a window where the row is not in the index at all
-            if (newRemaining > 0)
-                bytesUsed += graph.add(newValue, primaryKey, OnHeapGraph.InvalidVectorBehavior.FAIL);
-            if (oldRemaining > 0)
-                bytesUsed -= graph.remove(oldValue, primaryKey);
+        synchronized (indexed)
+        {
+            if (!indexed.isSupersededBy(cell, (VectorType<?>) index.termType().indexType()))
+                return bytesUsed;
 
-            // remove primary key if it's no longer indexed
-            if (newRemaining <= 0 && oldRemaining > 0)
-                primaryKeys.remove(primaryKey);
+            ByteBuffer value = cell.isLive(FBUtilities.nowInSeconds()) ? cell.buffer() : null;
+            if (value != null && (value.remaining() == 0 || !index.validateTermSize(key, value, false, null)))
+                value = null;
 
-            // update bounds because only rows with vectors are included in the key bounds,
-            // so if the vector was null before, we won't have included it
-            updateKeyBounds(primaryKey);
+            float[] oldVector = indexed.vector;
+            float[] newVector = null;
+            if (value != null)
+            {
+                if (oldVector != null && Arrays.equals(oldVector, index.termType().decomposeVector(value)))
+                {
+                    newVector = oldVector;
+                }
+                else
+                {
+                    // add the new vector before removing the old one, so we don't have a window where the row is not
+                    // in the index at all
+                    bytesUsed += index(primaryKey, value);
+                    newVector = graph.vectorForKey(primaryKey);
+                }
+            }
+
+            if (oldVector != null && newVector != oldVector)
+            {
+                bytesUsed -= graph.remove(oldVector, primaryKey);
+                // remove primary key if it's no longer indexed
+                if (newVector == null)
+                    primaryKeys.remove(primaryKey);
+            }
+
+            indexed.set(cell, newVector);
         }
         return bytesUsed;
     }
@@ -410,6 +464,46 @@ public class VectorMemoryIndex extends MemoryIndex
         public void close()
         {
             FileUtils.closeQuietly(nodeScores);
+        }
+    }
+
+    /**
+     * What the index knows of the cell a row is indexed for: enough to reconcile it with another cell of that row.
+     * Guarded by its own monitor.
+     */
+    private static final class IndexedCell
+    {
+        private boolean isSet;
+        private long timestamp;
+        private int ttl;
+        private long localDeletionTime;
+        // the vector the row is indexed under, the instance held by the graph for the row, or null if none
+        private float[] vector;
+
+        /**
+         * @return whether {@code cell} wins the reconciliation with the cell this was set from
+         */
+        boolean isSupersededBy(Cell<?> cell, VectorType<?> type)
+        {
+            if (!isSet)
+                return true;
+            if (cell.timestamp() != timestamp)
+                return cell.timestamp() > timestamp;
+
+            // Same timestamp: reconcile as the memtable does, with the vector the row is indexed under as the value.
+            // Only a cell that is not indexed under any vector has a value other than its own here, an empty one.
+            ByteBuffer value = vector == null ? ByteBufferUtil.EMPTY_BYTE_BUFFER : type.decomposeAsFloat(vector);
+            Cell<?> current = new BufferCell(cell.column(), timestamp, ttl, localDeletionTime, value, null);
+            return Cells.reconcile(current, cell) != current;
+        }
+
+        void set(Cell<?> cell, float[] vector)
+        {
+            isSet = true;
+            timestamp = cell.timestamp();
+            ttl = cell.ttl();
+            localDeletionTime = cell.localDeletionTime();
+            this.vector = vector;
         }
     }
 

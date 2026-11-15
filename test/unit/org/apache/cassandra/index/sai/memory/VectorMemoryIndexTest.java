@@ -64,6 +64,8 @@ import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.BootStrapper;
 import org.apache.cassandra.dht.Bounds;
@@ -81,11 +83,14 @@ import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
@@ -238,6 +243,52 @@ public class VectorMemoryIndexTest extends SAITester
                 }
             }
         }
+    }
+
+    /**
+     * The cells of concurrent writes of a row can reach the index in any order, and more than once. The row must be
+     * indexed under the vector of the cell that wins their reconciliation only.
+     */
+    @Test
+    public void testUpdateIndexesVectorOfReconciledCell()
+    {
+        memtableIndex = new VectorMemoryIndex(index, mockMemtable(1));
+        ColumnMetadata column = index.termType().columnMetadata();
+        long nowInSec = FBUtilities.nowInSeconds();
+        ByteBuffer older = randomVector();
+        ByteBuffer newer = randomVector();
+        ByteBuffer other = randomVector();
+        update(0, BufferCell.live(column, 1, randomVector()));
+
+        // the newest cell first, then older ones, then the newest one again
+        update(1, BufferCell.live(column, 20, newer));
+        update(1, BufferCell.live(column, 10, older));
+        update(1, BufferCell.tombstone(column, 15, nowInSec));
+        update(1, BufferCell.live(column, 20, newer));
+        assertIndexedUnder(1, newer);
+
+        // a tombstone wins over a live cell of the same timestamp
+        update(1, BufferCell.tombstone(column, 20, nowInSec));
+        assertIndexedUnder(1, null);
+        update(1, BufferCell.live(column, 20, other));
+        assertIndexedUnder(1, null);
+        update(1, BufferCell.live(column, 21, other));
+        assertIndexedUnder(1, other);
+
+        // of two live cells of the same timestamp, the one with the greater value wins, whatever the order
+        boolean newerIsGreater = ByteBufferUtil.compareUnsigned(newer, older) > 0;
+        ByteBuffer greater = newerIsGreater ? newer : older;
+        ByteBuffer lesser = newerIsGreater ? older : newer;
+        update(2, BufferCell.live(column, 30, greater));
+        update(2, BufferCell.live(column, 30, lesser));
+        assertIndexedUnder(2, greater);
+        update(3, BufferCell.live(column, 30, lesser));
+        update(3, BufferCell.live(column, 30, greater));
+        assertIndexedUnder(3, greater);
+
+        // an expired cell removes the vector
+        update(3, BufferCell.expiring(column, 40, 1, nowInSec - 10, other));
+        assertIndexedUnder(3, null);
     }
 
     @Test
@@ -761,8 +812,43 @@ public class VectorMemoryIndexTest extends SAITester
     private void addRow(int pk, ByteBuffer value)
     {
         DecoratedKey key = makeKey(cfs.metadata(), pk);
-        memtableIndex.add(key, Clustering.EMPTY, value);
+        memtableIndex.update(key, Clustering.EMPTY, BufferCell.live(index.termType().columnMetadata(), 1, value));
         keyMap.put(key, pk);
+    }
+
+    private void update(int pk, Cell<?> cell)
+    {
+        memtableIndex.update(makeKey(cfs.metadata(), pk), Clustering.EMPTY, cell);
+    }
+
+    /**
+     * Checks the vector the row is indexed under, with a search of the graph and a brute force search of the row.
+     */
+    private void assertIndexedUnder(int pk, ByteBuffer vector)
+    {
+        DecoratedKey key = makeKey(cfs.metadata(), pk);
+        Expression expression = generateRandomExpression();
+        float[] queryVector = index.termType().decomposeVector(expression.lower().value.raw);
+        List<Float> expected = vector == null ? List.of()
+                                              : List.of(index.indexWriterConfig().getSimilarityFunction().compare(queryVector, index.termType().decomposeVector(vector)));
+
+        AbstractBounds<PartitionPosition> fullRing = new Range<>(partitioner.getMinimumToken().minKeyBound(), partitioner.getMinimumToken().minKeyBound());
+        AbstractBounds<PartitionPosition> keyOnly = new Bounds<>(key.getToken().minKeyBound(), key.getToken().maxKeyBound());
+        for (AbstractBounds<PartitionPosition> keyRange : List.of(fullRing, keyOnly))
+        {
+            List<Float> scores = new ArrayList<>();
+            QueryContext queryContext = new QueryContext(createRangeRead(100), DatabaseDescriptor.getRangeRpcTimeout(TimeUnit.MILLISECONDS));
+            try (CloseableIterator<PrimaryKeyWithScore> iterator = memtableIndex.orderBy(queryContext, expression, keyRange))
+            {
+                while (iterator.hasNext())
+                {
+                    PrimaryKeyWithScore result = iterator.next();
+                    if (result.primaryKey().partitionKey().equals(key))
+                        scores.add(result.score());
+                }
+            }
+            assertEquals("Scores of row " + pk + " in " + keyRange, expected, scores);
+        }
     }
 
     /**
