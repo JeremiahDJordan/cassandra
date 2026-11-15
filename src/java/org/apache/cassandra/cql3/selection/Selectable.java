@@ -674,6 +674,27 @@ public interface Selectable extends AssignmentTestable
             return Tuples.testTupleAssignment(receiver, selectables);
         }
 
+        /**
+         * A selected value of a non-frozen type is returned in its frozen form, so it is also of the expected type if its
+         * frozen form is.
+         */
+        @Override
+        public void validateType(TableMetadata table, AbstractType<?> type)
+        {
+            if (selectables.size() == 1 && !type.isTuple())
+            {
+                Selectable selectable = selectables.get(0);
+                while (selectable instanceof BetweenParenthesesOrWithTuple && ((BetweenParenthesesOrWithTuple) selectable).selectables.size() == 1)
+                    selectable = ((BetweenParenthesesOrWithTuple) selectable).selectables.get(0);
+                AbstractType<?> elementType = selectable.getExactTypeIfKnown(table.keyspace);
+                if (elementType != null
+                    && elementType.isMultiCell()
+                    && elementType.freeze().testAssignment(type).isAssignable())
+                    return;
+            }
+            Selectable.super.validateType(table, type);
+        }
+
         @Override
         public TestResult testAssignmentToInferredType(String keyspace, ColumnSpecification receiver)
         {

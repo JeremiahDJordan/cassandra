@@ -86,12 +86,20 @@ public class FrozenAndNonFrozenUdtMixTest extends CQLTester
         // A frozen value between parentheses is of that type too.
         assertRows(execute("SELECT [v, (fv)], {v, (fv)}, [l, (fl)] FROM %s WHERE k = 0"),
                    row(list(u12, u34), set(u12, u34), list(list(u12), list(u34))));
-        // A value of another type isn't.
+        // A non-frozen value between parentheses is of the frozen type of the other elements, as it is returned in its
+        // frozen form.
+        assertRows(execute("SELECT [fv, (v)], {fv, (v)}, [fl, (l)], {fs, (s)}, [fm, (m)] FROM %s WHERE k = 0"),
+                   row(list(u34, u12), set(u12, u34), list(list(u34), list(u12)), set(set(u12), set(u34)),
+                       list(map(2, u34), map(1, u12))));
+        assertSameNetResult("SELECT [fv, (v)] FROM %s WHERE k = 1", "SELECT [fv, fv] FROM %s WHERE k = 1");
+        assertSameNetResult("SELECT {fs, (s)} FROM %s WHERE k = 1", "SELECT {fs, fs} FROM %s WHERE k = 1");
+        assertRows(execute("SELECT [fv, ((v))], [fl, ((l))] FROM %s WHERE k = 0"), row(list(u34, u12), list(list(u34), list(u12))));
+        // A value of another type isn't, as the client couldn't decode the result.
         assertInvalidMessage("(k) is not of the expected type", "SELECT [v, (k)] FROM %s WHERE k = 0");
         assertInvalidMessage("(k) is not of the expected type", "SELECT {v, (k)} FROM %s WHERE k = 0");
-        // STAR-561 checks that such an element is of that type, and a non-frozen value isn't of a frozen type. Apache
-        // Cassandra doesn't check it, and accepts this, as it accepts [v, (k)].
-        assertInvalidMessage("(v) is not of the expected type", "SELECT [fv, (v)] FROM %s WHERE k = 0");
+        assertInvalidMessage("(k) is not of the expected type", "SELECT [fv, (k)] FROM %s WHERE k = 0");
+        assertInvalidMessage("(s) is not of the expected type", "SELECT [fl, (s)] FROM %s WHERE k = 0");
+        assertInvalidMessage("(vt) is not of the expected type", "SELECT [fv, (vt)] FROM %s WHERE k = 0");
 
         // A UDT and a tuple of the same shape can be mixed; the element type is that of the first element.
         assertRows(execute("SELECT [v, tp] FROM %s WHERE k = 0"), row(list(u12, userType("a", 5, "b", 6))));
