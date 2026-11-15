@@ -39,21 +39,28 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.notifications.SSTableAddedNotification;
 import org.apache.cassandra.notifications.SSTableListChangedNotification;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
 import org.apache.cassandra.utils.ClassLoadingTestSupport;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMKiller;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.KillerForTests;
@@ -63,6 +70,9 @@ import org.mockito.Mockito;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -107,6 +117,50 @@ public class SecondaryIndexManagerTest extends CQLTester
         String indexName = createIndex("CREATE INDEX ON %s(c)");
 
         assertMarkedAsBuilt(indexName);
+    }
+
+    @Test
+    public void singletonIndexGroupRemainsUsableAfterIndexIsDropped() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+        String indexName = createIndex("CREATE INDEX ON %s(v) USING 'legacy_local_table'");
+        execute("INSERT INTO %s (k, v) VALUES (0, 0)");
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Index index = cfs.indexManager.getIndexByName(indexName);
+        Index.Group group = cfs.indexManager.getIndexGroup(index);
+        assertTrue(group instanceof SingletonIndexGroup);
+        assertTrue(group.containsIndex(index));
+        assertEquals(Collections.singleton(index), group.getIndexes());
+
+        // in-flight index builds, writes, compactions, flushes and reads can still hold the group after the drop
+        dropIndex("DROP INDEX %s." + indexName);
+        assertNull(cfs.indexManager.getIndexGroup(index));
+        assertFalse(group.containsIndex(index));
+        assertTrue(group.getIndexes().isEmpty());
+
+        // index build, write path, compaction and cleanup
+        DecoratedKey key = cfs.decorateKey(ByteBufferUtil.bytes(0));
+        for (IndexTransaction.Type type : IndexTransaction.Type.values())
+        {
+            try (WriteContext ctx = cfs.keyspace.getWriteHandler().createContextForIndexing())
+            {
+                assertNotNull(group.indexerFor(i -> true, key, cfs.metadata().regularAndStaticColumns(),
+                                               FBUtilities.nowInSeconds(), ctx, type, null));
+                assertNull(group.indexerFor(i -> false, key, cfs.metadata().regularAndStaticColumns(),
+                                            FBUtilities.nowInSeconds(), ctx, type, null));
+            }
+        }
+
+        // read path
+        RowFilter rowFilter = Util.cmd(cfs).filterOn("v", Operator.EQ, 0).build().rowFilter();
+        assertNotNull(group.queryPlanFor(rowFilter));
+
+        // sstable writers for flush and compaction: legacy indexes have no flush observer
+        assertNull(group.getFlushObserver(cfs.newSSTableDescriptor(cfs.getDirectories().getDirectoryForNewSSTables()),
+                                          null, cfs.metadata(), 0));
+
+        assertSame(index, ((SingletonIndexGroup) group).getIndex());
     }
 
     @Test

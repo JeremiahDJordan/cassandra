@@ -44,14 +44,23 @@ import org.apache.cassandra.schema.TableMetadata;
 
 /**
  * An {@link Index.Group} containing a single {@link Index}, to which it just delegates the calls.
+ * <p>
+ * The delegate is fixed at construction: {@link #addIndex} and {@link #removeIndex} only change the membership that
+ * {@link SecondaryIndexManager} drops the group by, so callers still holding the group after its index is removed
+ * keep delegating to it.
  */
 public class SingletonIndexGroup implements Index.Group
 {
-    private volatile Index delegate;
+    private final Index delegate;
     private final Set<Index> indexes = Sets.newConcurrentHashSet();
 
-    protected SingletonIndexGroup()
+    protected SingletonIndexGroup(Index delegate)
     {
+        // This class does not work for SAI because the `componentsForNewBuid` method would be incorrect (so more
+        // generally, it does not work for indexes that use dedicated sstable components, which is only SAI). See
+        // comments on `componentsForNewBuid` for more details.
+        Preconditions.checkState(!(delegate instanceof StorageAttachedIndex), "This should not be used with SAI");
+        this.delegate = Preconditions.checkNotNull(delegate);
     }
 
     @Override
@@ -68,12 +77,7 @@ public class SingletonIndexGroup implements Index.Group
     @Override
     public void addIndex(Index index)
     {
-        Preconditions.checkState(delegate == null);
-        // This class does not work for SAI because the `componentsForNewBuid` method would be incorrect (so more
-        // generally, it does not work for indexes that use dedicated sstable components, which is only SAI). See
-        // comments on `componentsForNewBuid` for more details.
-        Preconditions.checkState(!(index instanceof StorageAttachedIndex), "This shoudl not be used with SAI");
-        delegate = index;
+        Preconditions.checkArgument(delegate.equals(index), "Cannot add %s to the singleton group of %s", index, delegate);
         indexes.add(index);
     }
 
@@ -81,14 +85,13 @@ public class SingletonIndexGroup implements Index.Group
     public void removeIndex(Index index)
     {
         Preconditions.checkState(containsIndex(index));
-        delegate = null;
-        indexes.clear();
+        indexes.remove(index);
     }
 
     @Override
     public boolean containsIndex(Index index)
     {
-        return index.equals(delegate);
+        return indexes.contains(index);
     }
 
     @Override
@@ -100,7 +103,6 @@ public class SingletonIndexGroup implements Index.Group
                                     IndexTransaction.Type transactionType,
                                     Memtable memtable)
     {
-        Preconditions.checkNotNull(delegate);
         return indexSelector.test(delegate)
                ? delegate.indexerFor(key, columns, nowInSec, ctx, transactionType, memtable)
                : null;
@@ -109,8 +111,6 @@ public class SingletonIndexGroup implements Index.Group
     @Override
     public Index.QueryPlan queryPlanFor(RowFilter rowFilter)
     {
-        Preconditions.checkNotNull(delegate);
-
         if (rowFilter.indexHints.excludes(delegate))
             return null;
 
@@ -128,7 +128,6 @@ public class SingletonIndexGroup implements Index.Group
     @Override
     public SSTableFlushObserver getFlushObserver(Descriptor descriptor, LifecycleNewTracker tracker, TableMetadata tableMetadata, long keyCount)
     {
-        Preconditions.checkNotNull(delegate);
         return delegate.getFlushObserver(descriptor, tracker);
     }
 
