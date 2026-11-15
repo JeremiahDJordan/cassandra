@@ -62,6 +62,7 @@ import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -232,6 +233,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
         long numberOfRegularColumnExpressions = rowLevelExpressions.size();
         final boolean filterNonStaticColumns = numberOfRegularColumnExpressions > 0;
+        final boolean filterStaticColumns = hasStaticExpression();
 
         return new Transformation<>()
         {
@@ -242,9 +244,19 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             {
                 pk = partition.partitionKey();
 
+                // As for the other rows (see applyToRow), the expressions expect a static row without deleted cells:
+                // otherwise a deleted or expired element of a static collection would be seen as a live element.
+                Row staticRow = partition.staticRow();
+                if (filterStaticColumns && !needsReconciliation())
+                {
+                    staticRow = staticRow.purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
+                    if (staticRow == null)
+                        staticRow = Rows.EMPTY_STATIC_ROW;
+                }
+
                 // Short-circuit all partitions that won't match based on static and partition keys
                 for (Expression e : partitionLevelExpressions)
-                    if (!e.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow(), nowInSec))
+                    if (!e.isSatisfiedBy(metadata, partition.partitionKey(), staticRow, nowInSec))
                     {
                         partition.close();
                         return null;
@@ -801,6 +813,10 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                         {
                             for (Cell<?> cell : complexData)
                             {
+                                // the row isn't purged when the read needs reconciliation (see RowFilter#filter)
+                                if (!cell.isLive(nowInSec))
+                                    continue;
+
                                 if (type.kind == CollectionType.Kind.SET)
                                 {
                                     if (type.nameComparator().compare(cell.path().get(0), value) == 0)
@@ -840,7 +856,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                     MapType<?, ?> mapType = (MapType<?, ?>)column.type.unwrap();
                     if (column.isComplex())
                     {
-                         return row.getCell(column, CellPath.create(value)) != null;
+                        // the row isn't purged when the read needs reconciliation (see RowFilter#filter)
+                        Cell<?> cell = row.getCell(column, CellPath.create(value));
+                        return cell != null && cell.isLive(nowInSec);
                     }
                     else
                     {
@@ -928,8 +946,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             MapType<?, ?> mt = (MapType<?, ?>)column.type;
             if (column.isComplex())
             {
+                // the row isn't purged when the read needs reconciliation (see RowFilter#filter)
                 Cell<?> cell = row.getCell(column, CellPath.create(key));
-                return cell != null && mt.valueComparator().compare(cell.buffer(), value) == 0;
+                return cell != null && cell.isLive(nowInSec) && mt.valueComparator().compare(cell.buffer(), value) == 0;
             }
             else
             {
