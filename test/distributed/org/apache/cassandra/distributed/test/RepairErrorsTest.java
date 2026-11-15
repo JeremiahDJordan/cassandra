@@ -188,12 +188,18 @@ public class RepairErrorsTest extends TestBaseImpl
                                            .withInstanceInitializer(ByteBuddyHelper::installACNoSuchRepairSession)
                                            .start()))
         {
-            cluster.schemaChange("create table "+KEYSPACE+".tbl (id int primary key, x int)");
-            for (int i = 0; i < 10; i++)
-                cluster.coordinator(1).execute("insert into "+KEYSPACE+".tbl (id, x) VALUES (?,?)", ConsistencyLevel.ALL, i, i);
+            // One table per coordinator: after a failed repair, anticompaction can still leave sstables pending on
+            // node 1, and a second repair of the same table would log an unrelated ERROR.
+            for (String table : new String[]{ "tbl1", "tbl2" })
+            {
+                cluster.schemaChange("create table "+KEYSPACE+'.'+table+" (id int primary key, x int)");
+                for (int i = 0; i < 10; i++)
+                    cluster.coordinator(1).execute("insert into "+KEYSPACE+'.'+table+" (id, x) VALUES (?,?)", ConsistencyLevel.ALL, i, i);
+            }
             cluster.forEach(i -> i.flush(KEYSPACE));
             long mark = cluster.get(1).logs().mark();
-            cluster.forEach(i -> i.nodetoolResult("repair", KEYSPACE).asserts().failure());
+            cluster.get(1).nodetoolResult("repair", KEYSPACE, "tbl1").asserts().failure();
+            cluster.get(2).nodetoolResult("repair", KEYSPACE, "tbl2").asserts().failure();
             assertTrue(cluster.get(1).logs().grep(mark, "^ERROR").getResult().isEmpty());
         }
     }
