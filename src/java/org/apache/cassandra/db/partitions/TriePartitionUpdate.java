@@ -255,7 +255,12 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             throw new AssertionError(e);
         }
         // Note: the tombstoneCount here may be an overestimation (some boundaries become covering deletions).
-        return new TriePartitionUpdate(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        TriePartitionUpdate updated = new TriePartitionUpdate(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        // Recompute the stats from the updated data, as BTreePartitionUpdate.withUpdatedTimestamps does: Paxos reads the
+        // ballot that originally proposed an update back from stats().minTimestamp (Commit.isReproposal), so it must
+        // reflect the new timestamps, not those the update was built with.
+        EncodingStats updatedStats = EncodingStats.Collector.collect(updated.staticRow(), updated.rowIterator(), updated.deletionInfo());
+        return new TriePartitionUpdate(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
     }
 
     @Override
