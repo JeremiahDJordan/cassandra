@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3.validation.operations;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -26,6 +27,8 @@ import org.junit.Test;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.serializers.CollectionSerializer;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class SelectSingleColumnRelationTest extends CQLTester
 {
@@ -783,5 +786,45 @@ public class SelectSingleColumnRelationTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE v IN (?, ?) ALLOW FILTERING", 0L, 1L),
                    row(1, 1L),
                    row(3, 1L));
+    }
+
+    @Test
+    public void testInRestrictionsWithNullElementsAndAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, c1 int, c2 int, s int static, v int, w int, PRIMARY KEY (pk, c1, c2))");
+        createIndex("CREATE INDEX ON %s(w) USING 'sai'");
+        execute("INSERT INTO %s (pk, c1, c2, s, v, w) VALUES (1, 1, 1, 1, 1, 0)");
+        execute("INSERT INTO %s (pk, c1, c2, s, v, w) VALUES (2, 2, 2, 2, 2, 0)");
+        execute("INSERT INTO %s (pk, c1, c2, s, v, w) VALUES (3, 3, 3, 3, 3, 1)");
+
+        // a list with a null element bound to a single IN marker
+        ByteBuffer inList = CollectionSerializer.pack(Arrays.asList(null, ByteBufferUtil.bytes(1), ByteBufferUtil.bytes(3)), 3);
+
+        beforeAndAfterFlush(() -> {
+            // A null element matches no row, and the elements after it are still matched
+
+            // regular column
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v IN (null, 1) ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v IN (1, null, 2) ALLOW FILTERING"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v IN (null, null, 3) ALLOW FILTERING"), row(3));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v IN (2, null) ALLOW FILTERING"), row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v IN (?, ?, ?) ALLOW FILTERING", null, 1, 3), row(1), row(3));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v IN ? ALLOW FILTERING", inList), row(1), row(3));
+
+            // static column
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s IN (null, 1) ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE s IN (?, ?, ?) ALLOW FILTERING", 2, null, 3), row(2), row(3));
+
+            // filtered clustering column
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE c2 IN (null, 1) ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE c2 IN (2, null, 3) ALLOW FILTERING"), row(2), row(3));
+            assertRows(execute("SELECT pk FROM %s WHERE pk = 1 AND c2 IN (null, 1) ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((null), (1)) ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((?), (?), (?)) ALLOW FILTERING", 2, null, 3), row(2), row(3));
+
+            // with another restriction served by an index
+            assertRows(execute("SELECT pk FROM %s WHERE v IN (null, 1, 3) AND w = 0 ALLOW FILTERING"), row(1));
+            assertRows(execute("SELECT pk FROM %s WHERE v IN (null, 3) AND w = 1 ALLOW FILTERING"), row(3));
+        });
     }
 }
