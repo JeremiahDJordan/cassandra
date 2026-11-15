@@ -27,7 +27,6 @@ import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.io.util.File;
-import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.tools.ToolRunner.ToolResult;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,8 +45,7 @@ public class SSTableExportLegacyTupleTest extends OfflineToolUtils
     public static Collection<Object[]> versions()
     {
         List<Object[]> versions = new ArrayList<>();
-        // mb and me are left out: they fail reading a complex column (EOFException), as they do on Apache Cassandra
-        for (String version : new String[]{ "ma", "mc", "md", "na", "nb", "oa" })
+        for (String version : new String[]{ "ma", "mb", "mc", "md", "me", "na", "nb", "oa" })
         {
             if (new File("test/data/legacy-sstables/" + version + "/legacy_tables/legacy_" + version + "_tuple").isDirectory())
                 versions.add(new Object[]{ version });
@@ -59,12 +57,7 @@ public class SSTableExportLegacyTupleTest extends OfflineToolUtils
     public void testDumpTupleColumns() throws IOException
     {
         String table = "legacy_" + version + "_tuple";
-        File target = new File("build/test/cassandra/data/legacy_tuple_" + version + '/' + table);
-        if (target.exists())
-            FileUtils.deleteRecursive(target);
-        target.tryCreateDirectories();
-        org.apache.commons.io.FileUtils.copyDirectory(new File("test/data/legacy-sstables/" + version + "/legacy_tables/" + table).toJavaIOFile(),
-                                                      target.toJavaIOFile());
+        File target = copyLegacyTable(version, table, "legacy_tuple_" + version);
         File[] data = target.tryList(file -> file.isFile() && file.name().endsWith("-Data.db"));
         assertThat(data).isNotEmpty();
         for (File sstable : data)

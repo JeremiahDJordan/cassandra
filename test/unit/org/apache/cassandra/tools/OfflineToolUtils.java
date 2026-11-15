@@ -232,6 +232,20 @@ public abstract class OfflineToolUtils
         FileUtils.copyDirectory(new File(srcDir, "legacy_tables").toJavaIOFile(), new File(dataDir, "legacy_sstables").toJavaIOFile());
         return dataDir;
     }
+
+    /**
+     * Copies the directory of a table of the legacy sstables of the specified version to
+     * {@code build/test/cassandra/data/<copyDir>/<table>}, replacing any earlier copy, and returns the copy.
+     */
+    public static File copyLegacyTable(String version, String table, String copyDir) throws IOException
+    {
+        File target = new File("build/test/cassandra/data/" + copyDir + '/' + table);
+        if (target.exists())
+            target.deleteRecursive();
+        FileUtils.copyDirectory(new File("test/data/legacy-sstables/" + version + "/legacy_tables/" + table).toJavaIOFile(),
+                                target.toJavaIOFile());
+        return target;
+    }
     
     protected void assertCorrectEnvPostTest()
     {
