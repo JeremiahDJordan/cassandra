@@ -33,6 +33,7 @@ import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.TypeParser;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
 import static org.junit.Assert.assertEquals;
@@ -561,6 +562,29 @@ public class TermSelectionTest extends CQLTester
         assertInvalidMessage("Cannot infer type for term", "SELECT k, ? FROM %s");
 
         assertInvalidMessage("Cannot infer type for term", "SELECT k, null FROM %s");
+    }
+
+    @Test
+    public void testCollectionLiteralArgumentOfAnotherType() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, j int)");
+        execute("INSERT INTO %s (k, i, j) VALUES (0, 1, 2)");
+
+        assertInvalidMessage("Type error: [i, j] cannot be passed as argument 0 of function system.count of type blob",
+                             "SELECT count([i, j]) FROM %s");
+        assertInvalidMessage("Type error: [1, 2] cannot be passed as argument 0 of function system.count of type blob",
+                             "SELECT count([1, 2]) FROM %s");
+        assertInvalidMessage("Type error: {i: j} cannot be passed as argument 0 of function system.count of type blob",
+                             "SELECT count({i: j}) FROM %s");
+        assertInvalidMessage("Type error: {i, j} cannot be passed as argument 0 of function system.count of type blob",
+                             "SELECT count({i, j}) FROM %s");
+        assertInvalidMessage("Type error: (i, j) cannot be passed as argument 0 of function system.count of type blob",
+                             "SELECT count((i, j)) FROM %s");
+        assertInvalidThrow(InvalidRequestException.class, "SELECT k FROM %s WHERE k = blob_as_int({1: 2})");
+        assertInvalidMessage("Type error: [i, []] cannot be passed as argument 0 of function system.max of type frozen<list<int>>",
+                             "SELECT max([i, []]) FROM %s");
+
+        assertRows(execute("SELECT max([i, j]), max((map<int, int>){i: j}) FROM %s"), row(list(1, 2), map(1, 2)));
     }
 
     private void assertColumnSpec(ColumnSpecification spec, String expectedName, AbstractType<?> expectedType)
