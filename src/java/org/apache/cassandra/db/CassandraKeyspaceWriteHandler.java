@@ -34,6 +34,13 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
 
 public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
 {
+    /**
+     * A switch gives the write a memtable created with the table's current columns, so one is enough. More are only
+     * needed if the table's columns change again in between; after that many the write goes ahead and is rejected
+     * by the memtable.
+     */
+    private static final int MAX_MEMTABLE_SWITCHES_PER_WRITE = 3;
+
     private final Keyspace keyspace;
 
     public CassandraKeyspaceWriteHandler(Keyspace keyspace)
@@ -49,6 +56,19 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
         try
         {
             group = Keyspace.writeOrder.start();
+
+            // A memtable that predates columns of the write cannot store it. This is found out here, before the
+            // commit log append: once the write has a commit log position it cannot go to another memtable.
+            // The new group is after every barrier issued meanwhile, not only the one of the switch. For the final
+            // barrier of Keyspace.stopMutations this is the write that starts right after the check for it in
+            // Keyspace.applyInternal: the drain does not wait for it at that barrier.
+            for (int attempt = 0; attempt < MAX_MEMTABLE_SWITCHES_PER_WRITE && switchOutdatedMemtables(mutation, group); attempt++)
+            {
+                OpOrder.Group outdated = group;
+                group = null;
+                outdated.close();
+                group = Keyspace.writeOrder.start();
+            }
 
             // Let the indexes see the write BEFORE anything is persisted (Index#prepareWrite). This must
             // precede the commit log append: it is the ordering that lets an index treat a replayed
@@ -76,6 +96,26 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
             }
             throw t;
         }
+    }
+
+    /**
+     * Switches the memtables that the write would be applied to and that cannot store it because they predate columns
+     * of the write, see {@link ColumnFamilyStore#switchMemtableIfOutdatedFor}. Per update this looks up the table and
+     * the memtable for the operation group; unless the table's schema has just changed, the memtable then answers
+     * with at most two reference comparisons.
+     *
+     * @return whether the write has to be started again with a new operation group
+     */
+    private boolean switchOutdatedMemtables(Mutation mutation, OpOrder.Group group)
+    {
+        boolean switched = false;
+        for (PartitionUpdate update : mutation.getPartitionUpdates())
+        {
+            ColumnFamilyStore cfs = keyspace.getIfExists(update.metadata().id);
+            if (cfs != null && cfs.switchMemtableIfOutdatedFor(update, group))
+                switched = true;
+        }
+        return switched;
     }
 
     /**
