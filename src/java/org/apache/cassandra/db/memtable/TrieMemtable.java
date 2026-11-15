@@ -198,6 +198,55 @@ public class TrieMemtable extends AbstractShardedMemtable
         return !actualMetadata.regularAndStaticColumns().equals(metadata.get().regularAndStaticColumns());
     }
 
+    /// Cells are keyed with the ids of the columns of this memtable's metadata, so a cell of a column that was added
+    /// to the table later cannot be stored. Such a cell reaches this memtable when its write is built after the
+    /// table's metadata reference is updated and applied before `ColumnFamilyStore.reload` switches the memtable.
+    @Override
+    public boolean predatesColumnsOf(PartitionUpdate update)
+    {
+        // The usual case, at the cost of one comparison: the update is built with the metadata this memtable was
+        // created with.
+        if (update.metadata() == actualMetadata)
+            return false;
+
+        // If the table's metadata has not changed since, a memtable created now would have the same columns.
+        TableMetadata current = metadata.get();
+        if (current == actualMetadata)
+            return false;
+
+        RegularAndStaticColumns columns = update.columns();
+        return predatesAnyOf(columns.statics, current) || predatesAnyOf(columns.regulars, current);
+    }
+
+    /// Whether this memtable has no id for one of the given columns while a memtable created now would take it:
+    ///
+    /// - the table has the column now, so a memtable created now has an id for it. This includes a column that
+    ///   was dropped before this memtable was created and is being added again: `TrieBackedRow.from` would leave its
+    ///   data out here.
+    /// - the table has dropped the column, and this memtable does not know it even as a dropped column (the node got
+    ///   the ADD and the DROP in one schema change): this memtable rejects the cell, a memtable created now leaves
+    ///   it out.
+    ///
+    /// A column that the table never had is not a reason to switch: every memtable rejects it.
+    private boolean predatesAnyOf(Columns columns, TableMetadata current)
+    {
+        for (ColumnMetadata column : columns)
+        {
+            ColumnMetadata own = actualMetadata.getColumn(column.name);
+            if (own != null && own.isStatic() == column.isStatic())
+                continue;
+
+            ColumnMetadata now = current.getColumn(column.name);
+            if (now != null && now.isStatic() == column.isStatic())
+                return true;
+
+            if (actualMetadata.getDroppedColumn(column.name.bytes, column.isStatic()) == null
+                && current.getDroppedColumn(column.name.bytes, column.isStatic()) != null)
+                return true;
+        }
+        return false;
+    }
+
     @Override
     public boolean isClean()
     {
