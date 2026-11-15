@@ -747,7 +747,11 @@ public interface Selectable extends AssignmentTestable
         @Override
         public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            return target(receiver == null ? null : receiver.type).testAssignment(keyspace, receiver);
+            AbstractType<?> type = receiver == null ? null : receiver.type;
+            if (type != null && !(type instanceof ListType) && !type.isVector())
+                return TestResult.NOT_ASSIGNABLE;
+
+            return target(type).testAssignment(keyspace, receiver);
         }
 
         @Override
