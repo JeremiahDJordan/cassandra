@@ -43,6 +43,7 @@ import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -676,11 +677,16 @@ public abstract class CassandraIndex implements Index
         // interrupt in-progress compactions
         Collection<ColumnFamilyStore> cfss = Collections.singleton(indexCfs);
         CompactionManager.instance.interruptCompactionForCFs(cfss, (sstable) -> true, true, TableOperation.StopTrigger.INVALIDATE_INDEX);
-        CompactionManager.instance.waitForCessation(cfss, (sstable) -> true);
+        CompactionManager.instance.waitForCessation(cfss, (sstable) -> true, true, TableOperation.StopTrigger.INVALIDATE_INDEX);
         Keyspace.writeOrder.awaitNewBarrier();
         indexCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_REMOVED);
         indexCfs.readOrdering.awaitNewBarrier();
         indexCfs.invalidate();
+        // stop the compactions started since the first interruption (e.g. after the flush) and wait for their files to
+        // be deleted, so that an index re-created with the same name doesn't load them from the same directory
+        CompactionManager.instance.interruptCompactionForCFs(cfss, (sstable) -> true, true, TableOperation.StopTrigger.INVALIDATE_INDEX);
+        CompactionManager.instance.waitForCessation(cfss, (sstable) -> true, true, TableOperation.StopTrigger.INVALIDATE_INDEX);
+        LifecycleTransaction.waitForDeletions();
     }
 
     private boolean isBuilt()
