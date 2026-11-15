@@ -331,7 +331,7 @@ abstract class LegacyAbstractCompactionStrategy extends AbstractCompactionStrate
 
             SSTableReader reader = (SSTableReader) sstable;
             // what percentage of columns do we expect to compact outside of overlap?
-            if (reader.isEstimationInformative())
+            if (!reader.isEstimationInformative())
             {
                 // we have too few samples to estimate correct percentage
                 return false;
