@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -142,8 +143,8 @@ public abstract class Maps
         AbstractType<?> valueType = null;
         for (Pair<T, T> entry : entries)
         {
-            keyType = selectType(keyType, mapper.apply(entry.left));
-            valueType = selectType(valueType, mapper.apply(entry.right));
+            keyType = Lists.selectElementType(keyType, mapper.apply(entry.left));
+            valueType = Lists.selectElementType(valueType, mapper.apply(entry.right));
         }
 
         if (keyType != null && valueType != null)
@@ -151,30 +152,15 @@ public abstract class Maps
         return null;
     }
 
-    private static <T> AbstractType<?> selectType(AbstractType<?> type, AbstractType<?> otherType)
-    {
-        if (otherType == null)
-            return type;
-
-        if (type != null && !otherType.isCompatibleWith(type))
-        {
-            if (type.isCompatibleWith(otherType))
-                return type;
-
-            throw new InvalidRequestException("Invalid collection literal: all selectors must have the same CQL type inside collection literals");
-        }
-        return otherType;
-    }
-
     public static <T> MapType<?, ?> getPreferredCompatibleType(List<Pair<T, T>> entries,
                                                                java.util.function.Function<T, AbstractType<?>> mapper)
     {
-        Set<AbstractType<?>> keyTypes = entries.stream().map(Pair::left).map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> keyTypes = entries.stream().map(Pair::left).map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> keyType = AssignmentTestable.getCompatibleTypeIfKnown(keyTypes);
         if (keyType == null)
             return null;
 
-        Set<AbstractType<?>> valueTypes = entries.stream().map(Pair::right).map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> valueTypes = entries.stream().map(Pair::right).map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> valueType = AssignmentTestable.getCompatibleTypeIfKnown(valueTypes);
         if (valueType == null)
             return null;

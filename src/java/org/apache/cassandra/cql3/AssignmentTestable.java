@@ -18,10 +18,15 @@
 package org.apache.cassandra.cql3;
 
 import java.util.Collection;
+import java.util.LinkedHashSet;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.schema.SchemaConstants;
 
 public interface AssignmentTestable
 {
@@ -44,7 +49,9 @@ public interface AssignmentTestable
     public AbstractType<?> getCompatibleTypeIfKnown(String keyspace);
 
     /**
-     * @return A data type that can represent all the specified types, or {@code null} if there isn't one.
+     * @return A data type that can represent all the specified types, or {@code null} if there isn't one. If several
+     * types qualify, the first one in the iteration order of {@code types} is returned, so pass an ordered collection
+     * for a deterministic result.
      */
     @Nullable
     public static AbstractType<?> getCompatibleTypeIfKnown(Collection<AbstractType<?>> types)
@@ -53,6 +60,86 @@ public interface AssignmentTestable
                     .filter(type -> types.stream().allMatch(t -> t.testAssignment(type).isAssignable()))
                     .findFirst()
                     .orElse(null);
+    }
+
+    /**
+     * Tests whether this can be assigned to a receiver whose type is the type inferred from this with
+     * {@link #getCompatibleTypeIfKnown}, like the parameter types of a function built by a
+     * {@link org.apache.cassandra.cql3.functions.FunctionFactory}.
+     * <p>
+     * The type inferred for a collection literal has a frozen element type, because a frozen type can't have non-frozen
+     * subtypes, while the type inferred from its elements may be non-frozen, like {@code t} for {@code [v, v]} with
+     * {@code v} a non-frozen UDT. The collection literals override this to test their elements against the latter.
+     */
+    default TestResult testAssignmentToInferredType(String keyspace, ColumnSpecification receiver)
+    {
+        return testAssignment(keyspace, receiver);
+    }
+
+    /**
+     * Tests the elements of a collection literal against the element type of a receiver whose type is the type inferred
+     * from the literal (see {@link #testAssignmentToInferredType}). If the receiver's element type is the frozen form of
+     * the type inferred from the elements, the elements are tested against the latter; an element of another type, like
+     * a tuple next to a UDT, is tested against the receiver's element type. A nested literal is tested in the same way
+     * only against its own inferred type.
+     */
+    static TestResult testAllToInferredType(String keyspace,
+                                            ColumnSpecification elementSpec,
+                                            Collection<? extends AssignmentTestable> elements)
+    {
+        Set<AbstractType<?>> types = elements.stream()
+                                             .filter(Objects::nonNull)
+                                             .map(AssignmentTestable::inferredType)
+                                             .filter(Objects::nonNull)
+                                             .collect(Collectors.toCollection(LinkedHashSet::new));
+        AbstractType<?> type = getCompatibleTypeIfKnown(types);
+        ColumnSpecification inferredSpec = elementSpec;
+        if (type != null && type.isMultiCell() && type.freeze().equals(elementSpec.type))
+            inferredSpec = new ColumnSpecification(elementSpec.ksName, elementSpec.cfName, elementSpec.name, type);
+
+        TestResult res = TestResult.EXACT_MATCH;
+        for (AssignmentTestable element : elements)
+        {
+            if (element == null)
+            {
+                res = TestResult.WEAKLY_ASSIGNABLE;
+                continue;
+            }
+
+            TestResult elementRes = testElementToInferredType(keyspace, element, inferredSpec);
+            if (elementRes == TestResult.NOT_ASSIGNABLE
+                && inferredSpec != elementSpec
+                && !isOfFrozenType(element, elementSpec.type))
+                elementRes = testElementToInferredType(keyspace, element, elementSpec);
+
+            if (elementRes == TestResult.NOT_ASSIGNABLE)
+                return TestResult.NOT_ASSIGNABLE;
+
+            if (elementRes == TestResult.WEAKLY_ASSIGNABLE)
+                res = TestResult.WEAKLY_ASSIGNABLE;
+        }
+        return res;
+    }
+
+    private static TestResult testElementToInferredType(String keyspace,
+                                                        AssignmentTestable element,
+                                                        ColumnSpecification spec)
+    {
+        AbstractType<?> type = inferredType(element);
+        return type != null && type.equals(spec.type)
+               ? element.testAssignmentToInferredType(keyspace, spec)
+               : element.testAssignment(keyspace, spec);
+    }
+
+    private static AbstractType<?> inferredType(AssignmentTestable testable)
+    {
+        return testable.getCompatibleTypeIfKnown(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+    }
+
+    private static boolean isOfFrozenType(AssignmentTestable element, AbstractType<?> frozenType)
+    {
+        AbstractType<?> type = inferredType(element);
+        return type != null && type.freeze().equals(frozenType);
     }
 
     public enum TestResult

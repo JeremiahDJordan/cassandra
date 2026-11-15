@@ -877,7 +877,23 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
         if (receiverType.isValueCompatibleWith(this))
             return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
 
+        if (isNonFrozenUdtAcceptedByTuple(receiverType, this))
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
         return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+    }
+
+    /**
+     * Whether a value of the provided non-frozen UDT type, which is handed on in its frozen form, can be assigned to the
+     * provided frozen tuple receiver. {@link #isValueCompatibleWith} never relates a multi-cell type to a frozen one.
+     */
+    public static boolean isNonFrozenUdtAcceptedByTuple(AbstractType<?> receiverType, AbstractType<?> valueType)
+    {
+        return valueType.isMultiCell()
+               && valueType.isUDT()
+               && receiverType.unwrap().isTuple()
+               && !receiverType.isMultiCell()
+               && receiverType.isValueCompatibleWith(valueType.freeze());
     }
 
     /**
