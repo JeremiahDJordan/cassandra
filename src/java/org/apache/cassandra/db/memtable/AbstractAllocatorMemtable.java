@@ -33,6 +33,7 @@ import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
@@ -159,8 +160,17 @@ public abstract class AbstractAllocatorMemtable extends AbstractMemtableWithComm
     public long getEstimatedAverageRowSize()
     {
         if (estimatedAverageRowSize == null || currentOperations.get() > estimatedAverageRowSize.operations * 1.5)
-            estimatedAverageRowSize = new MemtableAverageRowSize(this);
+            estimatedAverageRowSize = new MemtableAverageRowSize(this, this::rowDataSizeForEstimate);
         return estimatedAverageRowSize.rowSize;
+    }
+
+    /**
+     * The size of a row read from this memtable, measured the same way as {@link #getLiveDataSize()}. Used for
+     * {@link #getEstimatedAverageRowSize()}, so that {@link Memtable#estimateRowCount} is not biased.
+     */
+    protected long rowDataSizeForEstimate(Row row)
+    {
+        return row.dataSize();
     }
 
     @Override
