@@ -30,7 +30,7 @@
 
 # input of ~alphaN, ~betaN, ~rcN package versions need to retain upstream '-alphaN, etc' version for sources
 %define upstream_version %(echo %{version} | sed -r 's/~/-/g')
-%define relname apache-cassandra-%{upstream_version}
+%define relname db-all-%{upstream_version}
 
 Name:          cassandra
 Version:       %{version}
@@ -69,7 +69,7 @@ Cassandra is a distributed (peer-to-peer) system for the management and storage 
 %build
 export LANG=en_US.UTF-8
 export JAVA_TOOL_OPTIONS="-Dfile.encoding=UTF-8"
-ant clean jar -Dversion=%{upstream_version}
+ant clean db-all-jar -Dversion=%{upstream_version}
 
 %install
 %{__rm} -rf %{buildroot}
@@ -126,7 +126,7 @@ cp -p bin/* %{buildroot}/usr/bin/
 cp -p tools/bin/* %{buildroot}/usr/bin/
 
 # copy cassandra jar
-cp build/apache-cassandra-%{upstream_version}.jar %{buildroot}/usr/share/%{username}/
+cp build/db-all-%{upstream_version}.jar %{buildroot}/usr/share/%{username}/
 
 %clean
 %{__rm} -rf %{buildroot}
@@ -190,6 +190,7 @@ Cassandra is a distributed (peer-to-peer) system for the management and storage 
 This package contains extra tools for working with Cassandra clusters.
 
 %files tools
+%attr(755,root,root) %{_bindir}/analyzecompactionlog
 %attr(755,root,root) %{_bindir}/sstabledump
 %attr(755,root,root) %{_bindir}/cassandra-stressd
 %attr(755,root,root) %{_bindir}/compaction-stress

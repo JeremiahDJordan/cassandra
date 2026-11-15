@@ -77,6 +77,7 @@ fi
 
 # re-use when possible the pre-installed virtualenv found in the cassandra-ubuntu-test docker image
 virtualenv-clone ${BUILD_HOME}/${cython_suffix}/python${python_version} ${BUILD_DIR}/venv || virtualenv --python=python${python_version} ${BUILD_DIR}/venv
+source ${BUILD_DIR}/venv/bin/activate
 
 if [ "$cython" = "yes" ]; then
   pip install "Cython>=0.29.15,<3.0"
