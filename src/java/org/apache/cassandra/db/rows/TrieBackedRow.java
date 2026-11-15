@@ -138,14 +138,37 @@ public class TrieBackedRow extends AbstractRow
     private final Deletion deletion;
 
     /// Create a trie-backed version of a row, using the column definitions of the given table metadata.
+    ///
+    /// Data of a column that the table has dropped is not included. Such data can arrive after the drop: in a write
+    /// from a coordinator that did not have the drop yet, in a write from a coordinator that already has a re-add of
+    /// the column that this node has not received yet, or in a commit log replay. Only the table's current columns
+    /// have an id in the trie, so that data cannot be stored.
+    ///
+    /// This is a limitation: the other memtables and sstables keep the data of a dropped column that is newer than the
+    /// drop (see `DeserializationHelper.isDropped`), which is visible again if the column is re-added. A replica with
+    /// a trie memtable acknowledges such a write without that data, cells and complex deletions alike. It stays that
+    /// way because keeping such a cell is worse in this code base: once it is in an sstable, every native-protocol read
+    /// of the partition fails (`IllegalStateException: [c, v] is not a subset of [v]`, a bug from Apache Cassandra)
+    /// until the column is re-added.
     public static TrieBackedRow from(TableMetadata metadata, Row row)
     {
         Builder builder = builder(metadata, row.clustering());
         builder.addPrimaryKeyLivenessInfo(row.primaryKeyLivenessInfo());
         builder.addRowDeletion(row.deletion());
+        boolean hasDroppedColumns = !metadata.droppedColumns.isEmpty(); // keeps the lookup off the common write path
         for (ColumnData cd : row)
+        {
+            if (hasDroppedColumns && isDroppedColumn(builder.columnIds, metadata, cd.column()))
+                continue;
             builder.addColumn(cd);
+        }
         return builder.build();
+    }
+
+    private static boolean isDroppedColumn(Object2IntHashMap<ColumnIdentifier> columnIds, TableMetadata metadata, ColumnMetadata column)
+    {
+        return columnId(columnIds, column) == COLUMN_NOT_PRESENT
+               && metadata.getDroppedColumn(column.name.bytes, column.isStatic()) != null;
     }
 
     /// Returns false if the given object is a level marker with no meaning of its own. Used to drop unproductive
@@ -1461,6 +1484,7 @@ public class TrieBackedRow extends AbstractRow
                 return;
 
             ByteComparable key = columnKey(columnIds, column);
+            Preconditions.checkArgument(key != MISSING_COLUMN_KEY, "Column %s not present in row columns set.", column);
             try
             {
                 mutator.delete(deletionTrie(key, deletion, TrieTombstoneMarker.Kind.COLUMN));
