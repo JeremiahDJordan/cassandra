@@ -162,7 +162,14 @@ public class TrieBackedPartition implements Partition
 
     protected static ContentBuilder build(UnfilteredRowIterator iterator, boolean collectDataSize)
     {
-        ContentBuilder builder = new ContentBuilder(iterator.metadata(), iterator.partitionLevelDeletion(), iterator.isReverseOrder(), collectDataSize);
+        return build(iterator, iterator.metadata(), collectDataSize);
+    }
+
+    /// Build the content of the given iterator, keying cells with the column ids of the given version of the table's
+    /// metadata, which may be another one than the iterator's.
+    protected static ContentBuilder build(UnfilteredRowIterator iterator, TableMetadata metadata, boolean collectDataSize)
+    {
+        ContentBuilder builder = new ContentBuilder(metadata, iterator.partitionLevelDeletion(), iterator.isReverseOrder(), collectDataSize);
 
         builder.addStatic(iterator.staticRow());
 
@@ -237,7 +244,7 @@ public class TrieBackedPartition implements Partition
                                        Row untypedRow)
     {
         TrieBackedRow row;
-        if (untypedRow instanceof TrieBackedRow)
+        if (untypedRow instanceof TrieBackedRow && ((TrieBackedRow) untypedRow).usesColumnIdsOf(metadata))
             row = (TrieBackedRow) untypedRow;
         else
             row = TrieBackedRow.from(metadata, untypedRow);

@@ -165,6 +165,13 @@ public class TrieBackedRow extends AbstractRow
         return builder.build();
     }
 
+    /// Whether the cells of this row are keyed with the column ids of the given version of the table's metadata.
+    public boolean usesColumnIdsOf(TableMetadata metadata)
+    {
+        Columns expected = isStatic() ? metadata.staticColumns() : metadata.regularColumns();
+        return columns == expected || columns.equals(expected);
+    }
+
     private static boolean isDroppedColumn(Object2IntHashMap<ColumnIdentifier> columnIds, TableMetadata metadata, ColumnMetadata column)
     {
         return columnId(columnIds, column) == COLUMN_NOT_PRESENT
