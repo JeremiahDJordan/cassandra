@@ -1065,7 +1065,9 @@ public class CompactionTask extends AbstractCompactionTask
                                            taskId,
                                            realm.getKeyspaceName(),
                                            realm.getTableName(),
-                                           Math.max(1, writeSize / strategy.getMaxSSTableBytes()),
+                                           strategy != null && strategy.getMaxSSTableBytes() > 0
+                                           ? Math.max(1, writeSize / strategy.getMaxSSTableBytes())
+                                           : 1,
                                            writeSize);
                 logger.warn(msg);
                 CompactionManager.instance.incrementAborted();
