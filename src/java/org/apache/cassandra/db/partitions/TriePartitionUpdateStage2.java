@@ -307,7 +307,9 @@ public class TriePartitionUpdateStage2 extends TrieBackedPartitionStage2 impleme
         {
             throw new AssertionError(e);
         }
-        return new TriePartitionUpdateStage2(metadata, partitionKey, columns, stats, rowCountIncludingStatic, dataSize, t, canHaveShadowedData);
+        TriePartitionUpdateStage2 updated = new TriePartitionUpdateStage2(metadata, partitionKey, columns, stats, rowCountIncludingStatic, dataSize, t, canHaveShadowedData);
+        EncodingStats updatedStats = EncodingStats.Collector.collect(updated.staticRow(), updated.rowIterator(), updated.deletionInfo());
+        return new TriePartitionUpdateStage2(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, dataSize, t, canHaveShadowedData);
     }
 
     /**

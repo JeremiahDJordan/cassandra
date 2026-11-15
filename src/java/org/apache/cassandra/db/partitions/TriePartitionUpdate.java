@@ -255,7 +255,10 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             throw new AssertionError(e);
         }
         // Note: the tombstoneCount here may be an overestimation (some boundaries become covering deletions).
-        return new TriePartitionUpdate(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        TriePartitionUpdate updated = new TriePartitionUpdate(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        // Commit.isReproposal reads the ballot back from stats().minTimestamp, so the stats must follow the new timestamps.
+        EncodingStats updatedStats = EncodingStats.Collector.collect(updated.staticRow(), updated.rowIterator(), updated.deletionInfo());
+        return new TriePartitionUpdate(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
     }
 
     @Override
