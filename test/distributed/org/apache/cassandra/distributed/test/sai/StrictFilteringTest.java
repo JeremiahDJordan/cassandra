@@ -322,6 +322,92 @@ public class StrictFilteringTest extends TestBaseImpl
         assertRows(initialRows);
     }
 
+    @Test
+    public void testPagingPartitionRestrictedQueryWithoutClusteringColumns()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.paging_no_clustering (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.paging_no_clustering(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.paging_no_clustering(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        for (int k = 0; k < 4; k++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.paging_no_clustering(k, a, b) VALUES (?, 1, 2)"), ConsistencyLevel.ALL, k);
+
+        // Without strict filtering, the partition-restricted query is a range read of the single partition k = 0.
+        // Paging it must stop at the end of that partition rather than go on with the rest of the ring.
+        String select = withKeyspace("SELECT * FROM %s.paging_no_clustering WHERE k = 0 AND a = 1 AND b = 2 LIMIT 10");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 1, 2));
+    }
+
+    @Test
+    public void testPagingPartitionRestrictedQueryWithPerPartitionLimit()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.paging_per_partition_limit (k int, c int, a int, b int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.paging_per_partition_limit(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.paging_per_partition_limit(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        for (int k = 0; k < 4; k++)
+            for (int c = 0; c < 3; c++)
+                CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.paging_per_partition_limit(k, c, a, b) VALUES (?, ?, 1, 2)"), ConsistencyLevel.ALL, k, c);
+
+        // Without strict filtering, the partition-restricted query is a range read of the single partition k = 0.
+        // Paging it must stop once the per-partition limit is reached rather than go on with the rest of the ring.
+        String select = withKeyspace("SELECT * FROM %s.paging_per_partition_limit WHERE k = 0 AND a = 1 AND b = 2 PER PARTITION LIMIT 1 LIMIT 10");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 0, 1, 2));
+
+        select = withKeyspace("SELECT * FROM %s.paging_per_partition_limit WHERE k = 0 AND a = 1 AND b = 2 PER PARTITION LIMIT 2 LIMIT 10");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 0, 1, 2), row(0, 1, 1, 2));
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 2), row(0, 0, 1, 2), row(0, 1, 1, 2));
+
+        // GROUP BY queries page the same range read through their own pager.
+        select = withKeyspace("SELECT k, c, count(*) FROM %s.paging_per_partition_limit WHERE k = 0 AND a = 1 AND b = 2 GROUP BY k, c PER PARTITION LIMIT 1 LIMIT 10");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 0, 1L));
+    }
+
+    @Test
+    public void testPagingPartitionRestrictedQueryWithStaticColumn()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.paging_static (k int, c int, s int static, v int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.paging_static(s) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.paging_static(v) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.paging_static(k, s) VALUES (0, 5)"), ConsistencyLevel.ALL);
+        for (int c = 0; c < 3; c++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.paging_static(k, c, v) VALUES (0, ?, 1)"), ConsistencyLevel.ALL, c);
+
+        // An expression on a static column and another expression can't be strictly filtered, so the query is a range
+        // read of the single partition k = 0. Paging it must stop once the per-partition limit is reached. As k = 0 is
+        // the only partition, going on with the rest of the ring would return the same rows again.
+        String select = withKeyspace("SELECT k, c FROM %s.paging_static WHERE k = 0 AND s = 5 AND v = 1 PER PARTITION LIMIT 1 LIMIT 10");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 0));
+
+        select = withKeyspace("SELECT k, c FROM %s.paging_static WHERE k = 0 AND s = 5 AND v = 1 PER PARTITION LIMIT 2 LIMIT 10");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 0), row(0, 1));
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 2), row(0, 0), row(0, 1));
+    }
+
+    @Test
+    public void testPagingPartitionRestrictedQueryWithStaticColumnFilter()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.paging_static_filter (k int, c int, s int static, v int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.paging_static_filter(v) USING 'sai'"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        for (int k = 0; k < 3; k++)
+        {
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.paging_static_filter(k, s) VALUES (?, 7)"), ConsistencyLevel.ALL, k);
+            for (int c = 0; c < 3; c++)
+                CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.paging_static_filter(k, c, v) VALUES (?, ?, 1)"), ConsistencyLevel.ALL, k, c);
+        }
+
+        // The same with a filter on the static column instead of an index on it, and other partitions that match.
+        String select = withKeyspace("SELECT k, c, s FROM %s.paging_static_filter WHERE k = 0 AND s = 7 AND v = 1 PER PARTITION LIMIT 2 LIMIT 10 ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 0, 7), row(0, 1, 7));
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 2), row(0, 0, 7), row(0, 1, 7));
+    }
+
     @AfterClass
     public static void shutDownCluster()
     {
