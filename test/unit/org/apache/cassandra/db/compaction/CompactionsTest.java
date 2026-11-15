@@ -20,6 +20,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -29,6 +30,8 @@ import java.util.concurrent.TimeUnit;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Iterables;
+import com.google.common.collect.Sets;
 import org.apache.cassandra.utils.TimeUUID;
 import org.junit.BeforeClass;
 import org.junit.Ignore;
@@ -54,6 +57,7 @@ import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.marshal.ValueAccessors;
 import org.apache.cassandra.db.partitions.FilteredPartition;
 import org.apache.cassandra.db.partitions.Partition;
@@ -82,6 +86,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NonThrowingCloseable;
 import org.apache.cassandra.utils.concurrent.Future;
+import org.apache.cassandra.utils.concurrent.Ref;
 import org.mockito.Mockito;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -201,14 +206,14 @@ public class CompactionsTest
         // disable compaction while flushing
         store.disableAutoCompaction();
 
-        //Populate sstable1 with with keys [0a..29aaaaaaaaaaa] Partitions have to be big enough 
-        //that prevent the size dependent AbstractCompactionStrategy.worthDroppingTombstones to trigger 
-        //a compaction.
-        populate(KEYSPACE1, CF_STANDARD1, 0, 29, "aaaaaaaaaaa",3); //ttl=3s
+        //Populate sstable1 with keys [0a..29a], with 30-character suffixes: with BTI, worthDroppingTombstones estimates
+        //the overlapping keys from the mean partition size, which the histogram rounds up to the next bucket offset;
+        //these partitions are just below one, so the estimate stays close to the real count.
+        populate(KEYSPACE1, CF_STANDARD1, 0, 29, "a".repeat(30), 3); //ttl=3s
         Util.flush(store);
 
         //Populate sstable2 with with keys [0b..29b] (keys do not overlap with SSTable1, but the range is almost fully covered)
-        long timestamp2 = populate(KEYSPACE1, CF_STANDARD1, 0, 29, "bbbbbbbbbbb", 3); //ttl=3s
+        long timestamp2 = populate(KEYSPACE1, CF_STANDARD1, 0, 29, "b".repeat(30), 3); //ttl=3s
         Util.flush(store);
 
         assertEquals(2, store.getLiveSSTables().size());
@@ -260,6 +265,99 @@ public class CompactionsTest
 
         // make sure max timestamp of compacted sstables is recorded properly after compaction.
         assertMaxTimestamp(store, timestamp2);
+    }
+
+    /** A small key range overlap with another sstable does not prevent a single-sstable tombstone compaction. */
+    @Test
+    public void testTombstoneCompactionOfSSTableWithSmallOverlap() throws Exception
+    {
+        Map<String, String> compactionOptions = new HashMap<>();
+        compactionOptions.put("tombstone_compaction_interval", "1");
+        compactionOptions.put("unchecked_tombstone_compaction", "false");
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        store.clearUnsafe();
+        SchemaTestUtil.announceTableUpdate(store.metadata().unbuild().gcGraceSeconds(1).compaction(CompactionParams.stcs(compactionOptions)).build());
+        store.disableAutoCompaction();
+
+        // sstable1: 300 partitions of one live row and nine rows with a TTL. With BIG, more than 256 keys give an index
+        // summary of more than two entries, so the estimate is informative with either sstable format.
+        populate(KEYSPACE1, CF_STANDARD1, 0, 299, 3); //ttl=3s
+        Util.flush(store);
+        SSTableReader sstable1 = Iterables.getOnlyElement(store.getLiveSSTables());
+        long originalSize1 = sstable1.uncompressedLength();
+
+        // sstable2: a live row in two partitions of sstable1 that are next to each other in token order
+        List<DecoratedKey> keys = new ArrayList<>();
+        for (int i = 0; i <= 299; i++)
+            keys.add(Util.dk(Integer.toString(i)));
+        keys.sort(DecoratedKey::compareTo);
+        long timestamp = System.currentTimeMillis();
+        for (DecoratedKey key : keys.subList(150, 152))
+            new RowUpdateBuilder(store.metadata(), timestamp, key.getKey())
+                .clustering("0")
+                .add("val", ByteBufferUtil.EMPTY_BYTE_BUFFER)
+                .build()
+                .applyUnsafe();
+        Util.flush(store);
+        assertEquals(2, store.getLiveSSTables().size());
+        SSTableReader sstable2 = Iterables.getOnlyElement(Sets.difference(store.getLiveSSTables(), Collections.singleton(sstable1)));
+
+        // wait for the TTLs, gc_grace_seconds and tombstone_compaction_interval to pass
+        TimeUnit.SECONDS.sleep(5);
+
+        store.enableAutoCompaction();
+        FBUtilities.waitOnFuture(CompactionManager.instance.submitBackground(store));
+        do
+        {
+            TimeUnit.SECONDS.sleep(1);
+        } while (CompactionManager.instance.getPendingTasks() > 0 || CompactionManager.instance.getActiveCompactions() > 0);
+
+        // sstable1 was compacted on its own, sstable2 was not touched
+        assertEquals(2, store.getLiveSSTables().size());
+        assertFalse("the sstable with a small overlap should have been tombstone-compacted", store.getLiveSSTables().contains(sstable1));
+        assertTrue(store.getLiveSSTables().contains(sstable2));
+        SSTableReader compacted = Iterables.getOnlyElement(Sets.difference(store.getLiveSSTables(), Collections.singleton(sstable2)));
+        assertTrue("should be less than " + originalSize1 + ", but was " + compacted.uncompressedLength(),
+                   compacted.uncompressedLength() < originalSize1);
+    }
+
+    /** The tombstone check doesn't estimate the overlaps of an sstable that was compacted away and released. */
+    @Test
+    public void testTombstoneCheckOfReleasedSSTable() throws Exception
+    {
+        Map<String, String> compactionOptions = new HashMap<>();
+        compactionOptions.put("tombstone_compaction_interval", "1");
+        compactionOptions.put("unchecked_tombstone_compaction", "false");
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore store = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        store.clearUnsafe();
+        SchemaTestUtil.announceTableUpdate(store.metadata().unbuild().gcGraceSeconds(1).compaction(CompactionParams.stcs(compactionOptions)).build());
+        store.disableAutoCompaction();
+
+        populate(KEYSPACE1, CF_STANDARD1, 0, 299, 3); //ttl=3s
+        Util.flush(store);
+        SSTableReader sstable = Iterables.getOnlyElement(store.getLiveSSTables());
+
+        // wait for the TTLs, gc_grace_seconds and tombstone_compaction_interval to pass
+        TimeUnit.SECONDS.sleep(5);
+
+        store.forceMajorCompaction();
+        LifecycleTransaction.waitForDeletions();
+        assertFalse(store.getLiveSSTables().contains(sstable));
+        Ref<SSTableReader> ref = sstable.tryRef();
+        if (ref != null)
+        {
+            ref.release();
+            fail("the compacted sstable is still referenced");
+        }
+
+        long gcBefore = store.gcBefore(FBUtilities.nowInSeconds());
+        assertTrue(sstable.getEstimatedDroppableTombstoneRatio(gcBefore) > 0.2);
+        LegacyAbstractCompactionStrategy strategy = (LegacyAbstractCompactionStrategy) store.getCompactionStrategyContainer().getStrategies(false, null).get(0);
+        assertFalse(strategy.worthDroppingTombstones(sstable, gcBefore));
     }
 
     public static void assertMaxTimestamp(ColumnFamilyStore cfs, long maxTimestampExpected)

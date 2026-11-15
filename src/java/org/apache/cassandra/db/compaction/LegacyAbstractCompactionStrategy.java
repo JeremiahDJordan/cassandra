@@ -36,6 +36,7 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 /**
  * Pluggable compaction strategy determines how SSTables get merged.
@@ -330,25 +331,36 @@ abstract class LegacyAbstractCompactionStrategy extends AbstractCompactionStrate
                 return false; // Correctly estimating percentage requires data that CompactionSSTable does not provide.
 
             SSTableReader reader = (SSTableReader) sstable;
-            // what percentage of columns do we expect to compact outside of overlap?
-            if (reader.isEstimationInformative())
-            {
-                // we have too few samples to estimate correct percentage
+            // the strategy can still list an sstable that was compacted away and released, which can't be read
+            Ref<SSTableReader> ref = reader.tryRef();
+            if (ref == null)
                 return false;
-            }
-            // first, calculate estimated keys that do not overlap
-            long keys = reader.estimatedKeys();
-            Set<Range<Token>> ranges = new HashSet<Range<Token>>(overlaps.size());
-            for (CompactionSSTable overlap : overlaps)
-                ranges.add(new Range<>(overlap.getFirst().getToken(), overlap.getLast().getToken()));
-            long remainingKeys = keys - reader.estimatedKeysForRanges(ranges);
-            // next, calculate what percentage of columns we have within those keys
-            long columns = reader.getEstimatedCellPerPartitionCount().mean() * remainingKeys;
-            double remainingColumnsRatio = ((double) columns) / (reader.getEstimatedCellPerPartitionCount().count() *
-                                                                 reader.getEstimatedCellPerPartitionCount().mean());
+            try
+            {
+                // what percentage of columns do we expect to compact outside of overlap?
+                if (!reader.isEstimationInformative())
+                {
+                    // we have too few samples to estimate correct percentage
+                    return false;
+                }
+                // first, calculate estimated keys that do not overlap
+                long keys = reader.estimatedKeys();
+                Set<Range<Token>> ranges = new HashSet<Range<Token>>(overlaps.size());
+                for (CompactionSSTable overlap : overlaps)
+                    ranges.add(new Range<>(overlap.getFirst().getToken(), overlap.getLast().getToken()));
+                long remainingKeys = keys - reader.estimatedKeysForRanges(ranges);
+                // next, calculate what percentage of columns we have within those keys
+                long columns = reader.getEstimatedCellPerPartitionCount().mean() * remainingKeys;
+                double remainingColumnsRatio = ((double) columns) / (reader.getEstimatedCellPerPartitionCount().count() *
+                                                                     reader.getEstimatedCellPerPartitionCount().mean());
 
-            // return if we still expect to have droppable tombstones in rest of columns
-            return remainingColumnsRatio * droppableRatio > options.getTombstoneThreshold();
+                // return if we still expect to have droppable tombstones in rest of columns
+                return remainingColumnsRatio * droppableRatio > options.getTombstoneThreshold();
+            }
+            finally
+            {
+                ref.release();
+            }
         }
     }
 }
