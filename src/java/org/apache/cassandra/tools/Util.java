@@ -20,6 +20,7 @@ package org.apache.cassandra.tools;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +32,7 @@ import java.util.function.LongFunction;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 
@@ -41,9 +43,12 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidColumnTypeException;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.StatsComponent;
+import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Indexes;
@@ -332,22 +337,28 @@ public final class Util
         SerializationHeader.Component header = statsComponent.serializationHeader();
 
         IPartitioner partitioner = FBUtilities.newPartitioner(desc);
+        boolean isCounter = header.getRegularColumns().values().stream().anyMatch(AbstractType::isCounter) || header.getStaticColumns().values().stream().anyMatch(AbstractType::isCounter);
+        boolean tuplesAreFrozen = hasOnlyFrozenPlainTuples(desc.version);
 
         TableMetadata.Builder builder = TableMetadata.builder(keyspaceName, tableName).partitioner(partitioner);
         header.getStaticColumns().entrySet().stream()
               .forEach(entry -> {
                   ColumnIdentifier ident = ColumnIdentifier.getInterned(UTF8Type.instance.getString(entry.getKey()), true);
-                  builder.addStaticColumn(ident, entry.getValue());
+                  builder.addStaticColumn(ident, fixHeaderType(tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter));
               });
         header.getRegularColumns().entrySet().stream()
               .forEach(entry -> {
                   ColumnIdentifier ident = ColumnIdentifier.getInterned(UTF8Type.instance.getString(entry.getKey()), true);
-                  builder.addRegularColumn(ident, entry.getValue());
+                  builder.addRegularColumn(ident, fixHeaderType(tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter));
               });
-        builder.addPartitionKeyColumn("PartitionKey", header.getKeyType());
+        builder.addPartitionKeyColumn("PartitionKey",
+                                      fixHeaderType(tuplesAreFrozen, UTF8Type.instance.decompose("PartitionKey"),
+                                                    header.getKeyType(), true, isCounter));
         for (int i = 0; i < header.getClusteringTypes().size(); i++)
         {
-            builder.addClusteringColumn("clustering" + (i > 0 ? i : ""), header.getClusteringTypes().get(i));
+            String name = "clustering" + (i > 0 ? i : "");
+            builder.addClusteringColumn(name, fixHeaderType(tuplesAreFrozen, UTF8Type.instance.decompose(name),
+                                                            header.getClusteringTypes().get(i), true, isCounter));
         }
         if (SecondaryIndexManager.isIndexColumnFamily(desc.cfname))
         {
@@ -358,8 +369,41 @@ public final class Util
             builder.indexes(indexes);
             builder.kind(TableMetadata.Kind.INDEX);
         }
-        boolean isCounter = header.getRegularColumns().values().stream().anyMatch(AbstractType::isCounter) || header.getStaticColumns().values().stream().anyMatch(AbstractType::isCounter);
         builder.isCounter(isCounter);
         return builder.build();
+    }
+
+    /**
+     * Whether every plain tuple (not a UDT) in the headers of this sstable version is frozen: the {@code big} versions
+     * before {@code nb} have no multi-cell tuples, and record frozen tuples without a {@code FrozenType} wrapper.
+     */
+    @VisibleForTesting
+    static boolean hasOnlyFrozenPlainTuples(Version version)
+    {
+        return version.format.name().equals(BigFormat.NAME) && version.version.compareTo("nb") < 0;
+    }
+
+    /**
+     * Fixes a column type read from an sstable header as {@link SerializationHeader.Component#toHeader} does, as far as
+     * that can be done without the schema. A frozen tuple recorded without a {@code FrozenType} wrapper parses as a
+     * multi-cell tuple: it is frozen if {@code tuplesAreFrozen} or if it has multi-cell subtypes. Otherwise a multi-cell
+     * plain tuple is kept, as it can be the type of a dropped non-frozen UDT. Other types are returned unchanged if they
+     * are valid or can't be fixed.
+     */
+    @VisibleForTesting
+    static AbstractType<?> fixHeaderType(boolean tuplesAreFrozen, ByteBuffer name, AbstractType<?> type,
+                                         boolean isPrimaryKeyColumn, boolean isCounter)
+    {
+        try
+        {
+            // isForOfflineTool accepts a multi-cell plain tuple whose subtypes are all frozen, unless tuples are frozen
+            type.validateForColumn(name, isPrimaryKeyColumn, isCounter, false, !tuplesAreFrozen);
+            return type;
+        }
+        catch (InvalidColumnTypeException e)
+        {
+            AbstractType<?> fixed = SerializationHeader.Component.tryFix(type, name, isPrimaryKeyColumn, isCounter, false, true);
+            return fixed == null ? type : fixed;
+        }
     }
 }
