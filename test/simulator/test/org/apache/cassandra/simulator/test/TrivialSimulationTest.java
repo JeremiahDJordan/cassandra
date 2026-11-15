@@ -21,7 +21,9 @@ package org.apache.cassandra.simulator.test;
 import java.io.IOException;
 import java.util.EnumMap;
 import java.util.IdentityHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.cassandra.concurrent.ExecutorFactory;
@@ -82,6 +84,35 @@ public class TrivialSimulationTest extends SimulationTestBase
                      }
                  }),
                  () -> {}, DEFAULT_ITERATIONS);
+    }
+
+    @Test
+    public void yieldTest()
+    {
+        // Two tasks each yield until the other has set a flag. Only one simulated thread runs at a time, so whichever
+        // runs first only ever sees the other's flag if yielding lets the scheduler run the other task. The simulated
+        // tasks run in their own class loader, and simulate only logs their failures: the result is passed back in a
+        // system property.
+        String property = "TrivialSimulationTest.yieldTest";
+        System.clearProperty(property);
+        simulate(arr(() -> {
+                     ExecutorPlus executor = ExecutorFactory.Global.executorFactory().pooled("name", 2);
+                     AtomicBoolean spinning = new AtomicBoolean();
+                     AtomicBoolean done = new AtomicBoolean();
+                     executor.submit(() -> {
+                         spinning.set(true);
+                         for (int yields = 0; !done.get() && yields < 1_000_000; yields++)
+                             Thread.yield();
+                         System.setProperty(property, String.valueOf(done.get())); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+                     });
+                     executor.submit(() -> {
+                         for (int yields = 0; !spinning.get() && yields < 1_000_000; yields++)
+                             Thread.yield();
+                         done.set(spinning.get());
+                     });
+                 }),
+                 () -> {});
+        Assert.assertEquals("true", System.getProperty(property)); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
     }
 
     @Test

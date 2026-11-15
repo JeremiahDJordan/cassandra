@@ -55,6 +55,24 @@ public class ClassWithSynchronizedMethods
         }
     }
 
+    /** A synchronized method that a subclass overrides with another synchronized method that calls it. */
+    public static class Base
+    {
+        public synchronized int depth()
+        {
+            return 1;
+        }
+    }
+
+    public static class Derived extends Base
+    {
+        @Override
+        public synchronized int depth()
+        {
+            return super.depth() + 1;
+        }
+    }
+
     public static final List<Execution> executions = new ArrayList<>();
 
     public static synchronized void synchronizedMethodWithParams(int thread, int sequenceNumber)

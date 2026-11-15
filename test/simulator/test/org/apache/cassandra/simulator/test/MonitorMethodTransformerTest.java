@@ -83,6 +83,24 @@ public class MonitorMethodTransformerTest extends SimulationTestBase
                  () -> checkInterleavings());
     }
 
+    @Test
+    public void testSynchronizedMethodCallingSynchronizedSuperMethod()
+    {
+        // The transformer moves the body of a synchronized method to a synthetic method that the original method
+        // delegates to. The delegation must not be virtual, or the method of the superclass would delegate back to
+        // the body of the subclass and recurse until the stack overflows.
+        // The simulated task runs in its own class loader, and simulate only logs its failures: it passes its
+        // result back in a system property.
+        String property = "MonitorMethodTransformerTest.derivedDepth";
+        System.clearProperty(property);
+        simulate(() -> {
+                     int depth = new ClassWithSynchronizedMethods.Derived().depth();
+                     System.setProperty(property, String.valueOf(depth)); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+                 },
+                 () -> {});
+        Assert.assertEquals("2", System.getProperty(property)); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+    }
+
     public static void checkInterleavings()
     {
         List<Integer> seenThreads = new ArrayList<>();

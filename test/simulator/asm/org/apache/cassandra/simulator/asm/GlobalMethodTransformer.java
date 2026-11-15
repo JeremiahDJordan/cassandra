@@ -112,6 +112,13 @@ class GlobalMethodTransformer extends MethodVisitor
             transformer.witness(TransformationKind.LOCK_SUPPORT);
             super.visitMethodInsn(Opcodes.INVOKESTATIC, "org/apache/cassandra/simulator/systems/InterceptorOfSystemMethods$Global", name, descriptor, false);
         }
+        else if (globalMethods && opcode == Opcodes.INVOKESTATIC && owner.equals("java/lang/Thread") && name.equals("yield"))
+        {
+            // a loop that yields until another thread has done something would otherwise spin forever, as the
+            // simulation only runs one thread at a time and has no other reason to switch to the thread waited for
+            transformer.witness(GLOBAL_METHOD);
+            super.visitMethodInsn(Opcodes.INVOKESTATIC, "org/apache/cassandra/simulator/systems/InterceptorOfSystemMethods$Global", "yieldThread", descriptor, false);
+        }
         else if (globalClock && opcode == Opcodes.INVOKESTATIC && name.equals("timestampMicros") && owner.equals("org/apache/cassandra/utils/FBUtilities"))
         {
             transformer.witness(GLOBAL_METHOD);
