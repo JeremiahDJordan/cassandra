@@ -21,10 +21,12 @@ package org.apache.cassandra.tools;
 import java.io.IOException;
 import java.io.PrintStream;
 import java.nio.ByteBuffer;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Set;
 import java.util.Spliterator;
 import java.util.Spliterators;
 import java.util.TreeMap;
@@ -41,20 +43,29 @@ import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidColumnTypeException;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.StatsComponent;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Indexes;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.EstimatedHistogram;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.streamhist.TombstoneHistogram;
 
 import static java.lang.String.format;
@@ -335,7 +346,27 @@ public final class Util
 
         StatsComponent statsComponent = StatsComponent.load(desc, MetadataType.STATS, MetadataType.HEADER);
         SerializationHeader.Component header = statsComponent.serializationHeader();
+        TableMetadata metadata = metadataFromHeader(desc, header, keyspaceName, tableName, false);
 
+        // Cassandra 3.0 writes frozen user types into the serialization header without marking them as frozen, and so
+        // do the "me" sstables written by 3.11.11 in the legacy test data. So in an sstable of a 3.x format, a user type
+        // column that the header gives as non-frozen can be frozen. A node takes the type from its schema, but offline
+        // the data has to tell: these columns are taken as frozen if the first rows that have data for them cannot be
+        // read with the types of the header, but can with all of them frozen. They are decided together: if the sstable
+        // also has a non-frozen user type column, the header's types are kept, unless the sstable reads with all of
+        // them frozen anyway. That is the case of an sstable whose only row sets the non-frozen column to null, which
+        // is then read as an empty frozen value.
+        Set<ColumnIdentifier> userTypeColumns = maybeFrozenUserTypeColumns(desc, metadata);
+        if (userTypeColumns.isEmpty() || readsColumns(desc, metadata, userTypeColumns))
+            return metadata;
+
+        TableMetadata frozen = metadataFromHeader(desc, header, keyspaceName, tableName, true);
+        return readsColumns(desc, frozen, userTypeColumns) ? frozen : metadata;
+    }
+
+    private static TableMetadata metadataFromHeader(Descriptor desc, SerializationHeader.Component header,
+                                                    String keyspaceName, String tableName, boolean freezeUserTypes) throws IOException
+    {
         IPartitioner partitioner = FBUtilities.newPartitioner(desc);
         boolean isCounter = header.getRegularColumns().values().stream().anyMatch(AbstractType::isCounter) || header.getStaticColumns().values().stream().anyMatch(AbstractType::isCounter);
         boolean tuplesAreFrozen = hasOnlyFrozenPlainTuples(desc.version);
@@ -344,12 +375,12 @@ public final class Util
         header.getStaticColumns().entrySet().stream()
               .forEach(entry -> {
                   ColumnIdentifier ident = ColumnIdentifier.getInterned(UTF8Type.instance.getString(entry.getKey()), true);
-                  builder.addStaticColumn(ident, fixHeaderType(tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter));
+                  builder.addStaticColumn(ident, columnType(fixHeaderType(tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter), freezeUserTypes));
               });
         header.getRegularColumns().entrySet().stream()
               .forEach(entry -> {
                   ColumnIdentifier ident = ColumnIdentifier.getInterned(UTF8Type.instance.getString(entry.getKey()), true);
-                  builder.addRegularColumn(ident, fixHeaderType(tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter));
+                  builder.addRegularColumn(ident, columnType(fixHeaderType(tuplesAreFrozen, entry.getKey(), entry.getValue(), false, isCounter), freezeUserTypes));
               });
         builder.addPartitionKeyColumn("PartitionKey", fixHeaderType(tuplesAreFrozen, UTF8Type.instance.decompose("PartitionKey"), header.getKeyType(), true, isCounter));
         for (int i = 0; i < header.getClusteringTypes().size(); i++)
@@ -368,6 +399,88 @@ public final class Util
         }
         builder.isCounter(isCounter);
         return builder.build();
+    }
+
+    private static AbstractType<?> columnType(AbstractType<?> type, boolean freezeUserTypes)
+    {
+        return freezeUserTypes && type.isUDT() && type.isMultiCell() ? type.freeze() : type;
+    }
+
+    /**
+     * Returns the columns of a non-frozen user type, if the sstable is of a format written by Cassandra 3.x.
+     */
+    private static Set<ColumnIdentifier> maybeFrozenUserTypeColumns(Descriptor desc, TableMetadata metadata)
+    {
+        Set<ColumnIdentifier> columns = new HashSet<>();
+        if (!desc.version.format.name().equals(BigFormat.NAME) || desc.version.version.compareTo("na") >= 0)
+            return columns;
+
+        for (ColumnMetadata column : metadata.regularAndStaticColumns())
+        {
+            if (column.type.isUDT() && column.type.isMultiCell())
+                columns.add(column.name);
+        }
+        return columns;
+    }
+
+    /**
+     * How many rows with data for the columns in question {@link #readsColumns} reads at most. Reading a value with the
+     * wrong type does not always fail on the row it is in, but usually does on one of the next unfiltereds.
+     */
+    private static final int TRIAL_ROWS_WITH_DATA = 100;
+
+    /**
+     * Whether the sstable can be read with the specified metadata up to {@link #TRIAL_ROWS_WITH_DATA} rows that have
+     * data for one of the specified columns and the unfiltered that follows them, or up to its end.
+     */
+    private static boolean readsColumns(Descriptor desc, TableMetadata metadata, Set<ColumnIdentifier> columns)
+    {
+        SSTableReader sstable = null;
+        try
+        {
+            sstable = SSTableReader.openNoValidation(null, desc, TableMetadataRef.forOfflineTools(metadata));
+            int rowsWithData = 0;
+            try (ISSTableScanner scanner = sstable.getScanner())
+            {
+                // hasNext() reads the next partition or unfiltered, so it is called before the count is checked
+                while (scanner.hasNext() && rowsWithData < TRIAL_ROWS_WITH_DATA)
+                {
+                    try (UnfilteredRowIterator partition = scanner.next())
+                    {
+                        if (hasDataFor(partition.staticRow(), columns))
+                            rowsWithData++;
+
+                        while (partition.hasNext() && rowsWithData < TRIAL_ROWS_WITH_DATA)
+                        {
+                            Unfiltered unfiltered = partition.next();
+                            if (unfiltered.isRow() && hasDataFor((Row) unfiltered, columns))
+                                rowsWithData++;
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        catch (Throwable t)
+        {
+            JVMStabilityInspector.inspectThrowable(t);
+            return false;
+        }
+        finally
+        {
+            if (sstable != null)
+                sstable.selfRef().release();
+        }
+    }
+
+    private static boolean hasDataFor(Row row, Set<ColumnIdentifier> columns)
+    {
+        for (ColumnData data : row)
+        {
+            if (columns.contains(data.column().name))
+                return true;
+        }
+        return false;
     }
 
     /**
