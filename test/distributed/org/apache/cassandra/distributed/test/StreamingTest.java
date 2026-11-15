@@ -21,12 +21,14 @@ package org.apache.cassandra.distributed.test;
 import java.io.Serializable;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
@@ -144,9 +146,19 @@ public class StreamingTest extends TestBaseImpl
 
             // disable sstable compression so the uncompressed stream path is exercised
             String compression = uncompressed ? " AND compression = {'enabled': 'false'}" : "";
-            int schemaCoordinator = sourceVersion <= targetVersion ? 1 : 2;
-            cluster.schemaChange("CREATE KEYSPACE " + keyspace + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2};", false, cluster.get(schemaCoordinator));
-            cluster.schemaChange(String.format("CREATE TABLE %s.cf (k text, c1 text, c2 text, PRIMARY KEY (k)) WITH compaction = {'class': 'LeveledCompactionStrategy', 'enabled': 'true'}%s", keyspace, compression), false, cluster.get(schemaCoordinator));
+            // Schema is neither pushed nor pulled between nodes whose messaging versions differ
+            // (MigrationCoordinator#shouldPushSchemaTo and #shouldPullFromEndpoint, as in Apache). The in-JVM
+            // cluster starts out reporting each peer at the lower of the two versions, so a schema change
+            // coordinated by the lower-version node is pushed only until a messaging handshake from the other
+            // node records that node's real version (InboundConnectionInitiator). After that, cluster.schemaChange()
+            // can never reach schema agreement. Create the schema on each node locally instead, with a fixed
+            // table id so that both nodes know the streamed table by the same id.
+            String tableId = UUID.nameUUIDFromBytes(keyspace.getBytes(StandardCharsets.UTF_8)).toString();
+            for (int node = 1; node <= cluster.size(); node++)
+            {
+                cluster.get(node).schemaChangeInternal("CREATE KEYSPACE IF NOT EXISTS " + keyspace + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2};");
+                cluster.get(node).schemaChangeInternal(String.format("CREATE TABLE IF NOT EXISTS %s.cf (k text, c1 text, c2 text, PRIMARY KEY (k)) WITH ID = %s AND compaction = {'class': 'LeveledCompactionStrategy', 'enabled': 'true'}%s", keyspace, tableId, compression));
+            }
 
             for (int i = 0 ; i < rowCount ; ++i)
                 cluster.get(1).executeInternal(String.format("INSERT INTO %s.cf (k, c1, c2) VALUES (?, 'value1', 'value2');", keyspace), Integer.toString(i));
