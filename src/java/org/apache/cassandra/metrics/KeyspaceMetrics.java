@@ -218,6 +218,8 @@ public class KeyspaceMetrics
     public final Meter tooManySSTableIndexesReadWarnings;
     public final Meter tooManySSTableIndexesReadAborts;
 
+    public final LatencyMetrics viewSSTableIntervalTree;
+
     public final ImmutableMap<SSTableFormat<?, ?>, ImmutableMap<String, Gauge<? extends Number>>> formatSpecificGauges;
 
     public final Meter bytesAnticompacted;
@@ -358,6 +360,9 @@ public class KeyspaceMetrics
         outOfRangeTokenReads = createKeyspaceCounter("ReadOutOfRangeToken");
         outOfRangeTokenWrites = createKeyspaceCounter("WriteOutOfRangeToken");
         outOfRangeTokenPaxosRequests = createKeyspaceCounter("PaxosOutOfRangeToken");
+
+        viewSSTableIntervalTree = createLatencyMetrics("ViewSSTableIntervalTree");
+
         bytesAnticompacted =  createKeyspaceMeter("BytesAnticompacted");
         bytesMutatedAnticompaction = createKeyspaceMeter("BytesMutatedAnticompaction");
         bytesPreviewed = createKeyspaceMeter("BytesPreviewed");
