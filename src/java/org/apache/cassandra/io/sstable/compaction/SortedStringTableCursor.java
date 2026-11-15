@@ -43,6 +43,7 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.vint.VIntCoding;
 
@@ -56,6 +57,7 @@ public class SortedStringTableCursor implements SSTableCursor
     private final SSTableReader sstable;
     private final DeserializationHelper helper;
     private final SerializationHeader header;
+    private final boolean skipStaticRows;
 
     private DecoratedKey partitionKey;
     private ClusteringPrefix<?> clusteringKey;
@@ -103,7 +105,15 @@ public class SortedStringTableCursor implements SSTableCursor
         {
             this.dataFile = dataFile;
             this.header = sstable.header;
-            this.helper = new DeserializationHelper(sstable.metadata(), sstable.descriptor.version.correspondingMessagingVersion(), DeserializationHelper.Flag.LOCAL);
+            TableMetadata metadata = sstable.metadata();
+            this.helper = new DeserializationHelper(metadata,
+                                                    sstable.descriptor.version.correspondingMessagingVersion(),
+                                                    DeserializationHelper.Flag.LOCAL);
+            // When the table has no static column any more, the static rows are skipped, with any cell newer than
+            // the drop. Iterator compaction writes none either: it reads them, but the merge returns an empty static
+            // row (UnfilteredRowIterators.mergeStaticRows). This is decided once for the sstable, where the
+            // iterators read the schema for each partition.
+            this.skipStaticRows = header.hasStatic() && header.isForSSTable() && metadata.staticColumns().isEmpty();
             this.sstable = sstable;
             this.activeRangeDeletion = DeletionTime.LIVE;
             this.regularColumns = toArray(header.columns(false));
@@ -248,6 +258,12 @@ public class SortedStringTableCursor implements SSTableCursor
             if (!header.hasStatic())
                 throw new IOException(String.format("Static row encountered in partition %s on table without static columns",
                                                     partitionKey.toString()));
+
+            if (skipStaticRows)
+            {
+                UnfilteredSerializer.serializer.skipRowBody(dataFile);
+                return false;
+            }
 
             clusteringKey = Clustering.STATIC_CLUSTERING;
         }

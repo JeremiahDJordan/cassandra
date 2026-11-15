@@ -46,6 +46,7 @@ import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.ColumnData;
@@ -456,23 +457,25 @@ public final class JsonTransformer
 
                 cellType = cell.column().cellValueType();
             }
-            else if (type.isUDT() && type.isMultiCell()) // non-frozen udt
+            else if (type instanceof TupleType && type.isMultiCell()) // non-frozen udt, or a dropped one
             {
-                UserType ut = (UserType) type;
+                // A dropped non-frozen udt has a multi-cell tuple type, which has no field names: write the positions.
+                TupleType tt = (TupleType) type;
                 json.writeFieldName("path");
                 arrayIndenter.setCompact(true);
                 json.writeStartArray();
                 for (int i = 0; i < cell.path().size(); i++)
                 {
-                    Short fieldPosition = ut.nameComparator().compose(cell.path().get(i));
-                    json.writeString(ut.fieldNameAsString(fieldPosition));
+                    Short fieldPosition = tt.nameComparator().compose(cell.path().get(i));
+                    json.writeString(type.isUDT() ? ((UserType) type).fieldNameAsString(fieldPosition)
+                                                  : fieldPosition.toString());
                 }
                 json.writeEndArray();
                 arrayIndenter.setCompact(false);
 
                 // cellType of udt
-                Short fieldPosition = ((UserType) type).nameComparator().compose(cell.path().get(0));
-                cellType = ((UserType) type).fieldType(fieldPosition);
+                Short fieldPosition = tt.nameComparator().compose(cell.path().get(0));
+                cellType = tt.type(fieldPosition);
             }
             else
             {
