@@ -197,7 +197,8 @@ public class TrieMemtable extends AbstractShardedMemtable
             return true;
         if (reason != ColumnFamilyStore.FlushReason.SCHEMA_CHANGE)
             return false;
-        // If the columns definition changes, we need to flush as we would need to remap column indexes.
+        // Cells are keyed with the ids of this memtable's columns, so it has to be switched if the columns change
+        // (super.shouldSwitch already switches for every schema change).
         return !actualMetadata.regularAndStaticColumns().equals(metadata.get().regularAndStaticColumns());
     }
 
@@ -773,8 +774,9 @@ public class TrieMemtable extends AbstractShardedMemtable
 
         public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
         {
-            // If the update is not TriePartitionUpdate, convert it to one before taking the lock.
-            DeletionAwareTrie<Object, TrieTombstoneMarker> mergableTrie = TriePartitionUpdate.asMergableTrie(update);
+            // If the update is not TriePartitionUpdate, convert it to one before taking the lock. The cells are keyed
+            // with the column ids of this memtable's metadata, which the update may not have been built with.
+            DeletionAwareTrie<Object, TrieTombstoneMarker> mergableTrie = TriePartitionUpdate.asMergableTrie(update, metadata);
 
             boolean locked = writeLock.tryLock();
             if (locked)

@@ -205,6 +205,31 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
     }
 
     /**
+     * Convert the given update (with unknown implementation type) to its trie representation, including the partition
+     * key prefix, for merging into a trie whose cells are keyed with the column ids of the given table metadata, i.e.
+     * the destination memtable's.
+     * <p>
+     * Column ids are positions in one version of the table's columns. The update may have been built with another
+     * version than the destination's (a write in flight during a schema change is decoded before, and applied after,
+     * the memtable switch, or the other way round), so its columns are resolved by name against the destination's.
+     */
+    public static DeletionAwareTrie<Object, TrieTombstoneMarker> asMergableTrie(PartitionUpdate update, TableMetadata destination)
+    {
+        if (update instanceof TriePartitionUpdate && hasSameColumns(update.metadata(), destination))
+            return ((TriePartitionUpdate) update).trie.prefixedBy(update.partitionKey());
+
+        try (UnfilteredRowIterator iterator = update.unfilteredIterator())
+        {
+            return build(iterator, destination, false).trie().prefixedBy(update.partitionKey());
+        }
+    }
+
+    private static boolean hasSameColumns(TableMetadata a, TableMetadata b)
+    {
+        return a == b || a.regularAndStaticColumns().equals(b.regularAndStaticColumns());
+    }
+
+    /**
      * Return the given update's trie representation without the partition prefix. Used for testing.
      */
     public static DeletionAwareTrie<Object, TrieTombstoneMarker> asMergableTrieWithoutPartitionPrefix(PartitionUpdate update)
