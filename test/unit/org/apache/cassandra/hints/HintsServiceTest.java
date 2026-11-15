@@ -18,7 +18,9 @@
 package org.apache.cassandra.hints;
 
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -93,10 +95,14 @@ public class HintsServiceTest
         System.clearProperty(SKIP_REWRITING_HINTS_ON_HOST_LEFT.getKey());
     }
 
+    private final List<InetAddressAndPort> members = new ArrayList<>();
+
     @After
     public void cleanup()
     {
         MockMessagingService.cleanup();
+        members.forEach(StorageService.instance.getTokenMetadata()::removeEndpoint);
+        members.clear();
     }
 
     @Before
@@ -364,6 +370,39 @@ public class HintsServiceTest
         {
             return endpoint -> !endpoint.equals(excluded);
         }
+    }
+
+    @Test
+    public void testTransferHintsForDownHost() throws Exception
+    {
+        // only the transfer target is alive, the host the hints were written for is down
+        UUID target = StorageService.instance.getLocalHostUUID();
+        UUID downHost = addMember("127.0.0.2");
+        HintsService.instance.shutdownBlocking();
+        HintsService.instance = new HintsService(target::equals);
+        HintsService.instance.startDispatch();
+
+        MockMessagingSpy spy = MockMessagingService.when(verb(HINT_REQ))
+                                                   .respond(Message.internalResponse(HINT_RSP, NoPayload.noPayload));
+        HintsStore store = writeAndFlushHints(downHost, 100);
+        assertTrue(store.hasFiles());
+
+        // the transfer must not be aborted because the host the hints are for is down
+        HintsService.instance.transferHints(() -> target).get(30, TimeUnit.SECONDS);
+
+        spy.interceptMessageOut(100).get(30, TimeUnit.SECONDS);
+        assertFalse(store.hasFiles());
+    }
+
+    private UUID addMember(String address) throws UnknownHostException
+    {
+        InetAddressAndPort endpoint = InetAddressAndPort.getByName(address);
+        UUID hostId = UUID.randomUUID();
+        TokenMetadata tokenMetadata = StorageService.instance.getTokenMetadata();
+        tokenMetadata.updateHostId(hostId, endpoint);
+        tokenMetadata.updateNormalToken(DatabaseDescriptor.getPartitioner().getRandomToken(), endpoint);
+        members.add(endpoint);
+        return hostId;
     }
 
     private MockMessagingSpy sendHintsAndResponses(int noOfHints, int noOfResponses)
