@@ -104,15 +104,32 @@ public class SerializationHeader
         // but rather on their stats stored in StatsMetadata that are fully accurate.
         EncodingStats.Collector stats = new EncodingStats.Collector();
         RegularAndStaticColumns.Builder columns = RegularAndStaticColumns.builder();
+        Collection<SSTableReader> ordered = orderByDescendingGeneration(sstables);
+        // Even the most recent sstable's header can have an earlier type of a column (see Component.toHeader), so a
+        // merge stores each column under the schema's version of it.
+        boolean merging = ordered.size() > 1;
         // We need to order the SSTables by descending generation to be sure that we use latest column metadata.
-        for (SSTableReader sstable : orderByDescendingGeneration(sstables))
+        for (SSTableReader sstable : ordered)
         {
             stats.updateTimestamp(sstable.getMinTimestamp());
             stats.updateLocalDeletionTime(sstable.getMinLocalDeletionTime());
             stats.updateTTL(sstable.getMinTTL());
-            columns.addAll(sstable.header.columns());
+            for (ColumnMetadata column : sstable.header.columns())
+                columns.add(merging ? schemaVersion(metadata, column) : column);
         }
         return new SerializationHeader(true, metadata, columns.build(), stats.get());
+    }
+
+    /**
+     * The schema's version of an sstable header column: the live column or its drop record, whose type can read every
+     * earlier one. {@code column} itself if there is none or it differs in kind or complexity.
+     */
+    private static ColumnMetadata schemaVersion(TableMetadata metadata, ColumnMetadata column)
+    {
+        ColumnMetadata current = metadata.getColumn(column.name);
+        if (current == null || current.kind != column.kind)
+            current = metadata.getDroppedColumn(column.name.bytes, column.isStatic());
+        return current != null && current.kind == column.kind && current.isComplex() == column.isComplex() ? current : column;
     }
 
     private static Collection<SSTableReader> orderByDescendingGeneration(Collection<SSTableReader> sstables)

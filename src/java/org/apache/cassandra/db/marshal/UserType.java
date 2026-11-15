@@ -211,21 +211,6 @@ public class UserType extends TupleType implements SchemaElement
         return TupleType.buildValue(components);
     }
 
-    public <V> void validateCell(Cell<V> cell) throws MarshalException
-    {
-        if (isMultiCell)
-        {
-            ByteBuffer path = cell.path().get(0);
-            nameComparator().validate(path);
-            Short fieldPosition = nameComparator().getSerializer().deserialize(path);
-            fieldType(fieldPosition).validate(cell.value(), cell.accessor());
-        }
-        else
-        {
-            validate(cell.value(), cell.accessor());
-        }
-    }
-
     @Override
     public Term fromJSONObject(Object parsed) throws MarshalException
     {

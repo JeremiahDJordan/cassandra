@@ -31,6 +31,7 @@ import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.cql3.Tuples;
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.serializers.CollectionSerializer;
@@ -121,6 +122,28 @@ public class TupleType extends MultiCellCapableType<ByteBuffer>
     public boolean isTuple()
     {
         return true;
+    }
+
+    /**
+     * Validates a cell of a column of this type. For a multi-cell type, the cell path holds the field index and the
+     * cell value is that field's value. Besides non-frozen UDTs, a multi-cell tuple is the type of a dropped non-frozen
+     * UDT column, as dropped columns do not keep the field names.
+     */
+    public <V> void validateCell(Cell<V> cell) throws MarshalException
+    {
+        if (isMultiCell)
+        {
+            ByteBuffer path = cell.path().get(0);
+            nameComparator().validate(path);
+            short fieldPosition = nameComparator().getSerializer().deserialize(path);
+            if (fieldPosition < 0 || fieldPosition >= size())
+                throw new MarshalException(String.format("Field position %d is out of range for %s", fieldPosition, asCQL3Type()));
+            type(fieldPosition).validate(cell.value(), cell.accessor());
+        }
+        else
+        {
+            validate(cell.value(), cell.accessor());
+        }
     }
 
     public <VL, VR> int compareCustom(VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
