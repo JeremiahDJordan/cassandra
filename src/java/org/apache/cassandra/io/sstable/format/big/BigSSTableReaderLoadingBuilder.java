@@ -151,8 +151,10 @@ public class BigSSTableReaderLoadingBuilder extends SortedTableReaderLoadingBuil
             if (builder.getFilter() == null)
             {
                 builder.setFilter(FilterFactory.AlwaysPresent);
-                logger.warn("Could not recreate or deserialize existing bloom filter, continuing with a pass-through " +
-                            "bloom filter but this will significantly impact reads performance");
+                // offline opens (standalone tools) never load the filter, so a pass-through filter is expected there
+                if (filterNeeded)
+                    logger.warn("Could not recreate or deserialize existing bloom filter, continuing with a pass-through " +
+                                "bloom filter but this will significantly impact reads performance");
             }
             else if (rebuildFilter)
             {
