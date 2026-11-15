@@ -290,7 +290,10 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             sb.append(": ");
             ByteBuffer vv = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset);
             offset += CollectionSerializer.sizeOfValue(vv, ByteBufferAccessor.instance);
-            sb.append(values.toJSONString(vv, protocolVersion));
+            if (vv == null)
+                sb.append("null");
+            else
+                sb.append(values.toJSONString(vv, protocolVersion));
         }
         return sb.append("}").toString();
     }
