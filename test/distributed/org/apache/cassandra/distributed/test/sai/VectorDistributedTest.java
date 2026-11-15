@@ -44,6 +44,8 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
+import org.apache.cassandra.distributed.api.QueryResult;
+import org.apache.cassandra.distributed.api.Row;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
@@ -51,6 +53,8 @@ import org.apache.cassandra.index.sai.utils.Glove;
 
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
+import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -230,6 +234,27 @@ public class VectorDistributedTest extends TestBaseImpl
             int key = SAITester.getRandom().nextIntBetween(0, vectorCount - 1);
             float[] queryVector = randomVector();
             searchByKeyWithLimit(key, queryVector, vectors);
+        }
+    }
+
+    @Test
+    public void testPagingWithoutSelectingOrderingColumn()
+    {
+        cluster.schemaChange(formatQuery(String.format(CREATE_TABLE, 2)));
+        cluster.schemaChange(formatQuery(String.format(CREATE_INDEX, "val")));
+        SAIUtil.waitForIndexQueryable(cluster, KEYSPACE);
+
+        for (int pk = 0; pk < 4; pk++)
+            cluster.coordinator(1).execute(formatQuery("INSERT INTO %s (pk, val) VALUES (?, [" + pk + ".0, 1.0])"), ConsistencyLevel.ALL, pk);
+
+        // val is added to the selection for ordering only, so it is not returned
+        String query = formatQuery("SELECT pk FROM %s ORDER BY val ANN OF [0.0, 1.0] LIMIT 3");
+        assertRows(cluster.coordinator(1).execute(query, ConsistencyLevel.ONE), row(0), row(1), row(2));
+        for (int pageSize : new int[]{ 1, 3, 10 })
+        {
+            QueryResult result = cluster.coordinator(1).executeWithPagingWithResult(query, ConsistencyLevel.ONE, pageSize);
+            assertThat(result.names()).containsExactly("pk");
+            assertRows(result.map(Row::toObjectArray), row(0), row(1), row(2));
         }
     }
 

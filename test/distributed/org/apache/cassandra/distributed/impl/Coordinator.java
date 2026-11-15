@@ -165,7 +165,7 @@ public class Coordinator implements ICoordinator
                                                                    selectStatement.keyspace());
 
                     rows = selectStatement.execute(queryState, nextOptions, requestTime);
-                    iter = Iterators.forArray(RowUtil.toObjects(initialRows.result.metadata.names, rows.result.rows));
+                    iter = Iterators.forArray(RowUtil.toObjects(initialRows.result.metadata.requestNames(), rows.result.rows));
 
                     return hasNext();
                 }
@@ -176,7 +176,7 @@ public class Coordinator implements ICoordinator
                 }
             };
 
-            return QueryResults.fromObjectArrayIterator(RowUtil.getColumnNames(initialRows.result.metadata.names), iter);
+            return QueryResults.fromObjectArrayIterator(RowUtil.getColumnNames(initialRows.result.metadata.requestNames()), iter);
         }).call();
     }
 
