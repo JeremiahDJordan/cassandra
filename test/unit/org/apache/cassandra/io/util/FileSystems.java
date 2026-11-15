@@ -74,8 +74,10 @@ public class FileSystems
 
     private static Configuration jimfsConfig()
     {
+        // no cache of deleted files' blocks: a finished but still reachable file system would hold up to its max size
         return Configuration.unix().toBuilder()
                             .setMaxSize(4L << 30).setBlockSize(512)
+                            .setMaxCacheSize(0)
                             .build();
     }
 

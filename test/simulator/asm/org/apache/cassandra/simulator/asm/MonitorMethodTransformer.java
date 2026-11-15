@@ -121,11 +121,10 @@ class MonitorMethodTransformer extends MethodNode
             }
         }
 
-        int invokeCode;
-        if (isInstanceMethod && (access & Opcodes.ACC_PRIVATE) != 0) invokeCode = Opcodes.INVOKESPECIAL;
-        else if (isInstanceMethod) invokeCode = Opcodes.INVOKEVIRTUAL;
-        else invokeCode = Opcodes.INVOKESTATIC;
-        return invokeCode;
+        // The synthetic method we delegate to is the one declared by this class, so invoke it non-virtually: with
+        // INVOKEVIRTUAL, a synchronized override calling its synchronized super method would recurse into its own
+        // $unsync method.
+        return isInstanceMethod ? Opcodes.INVOKESPECIAL : Opcodes.INVOKESTATIC;
     }
 
     void pushRef()

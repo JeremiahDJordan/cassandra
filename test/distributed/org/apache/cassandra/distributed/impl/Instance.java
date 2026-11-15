@@ -60,6 +60,7 @@ import org.apache.cassandra.concurrent.ExecutorFactory;
 import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.concurrent.ExecutorPlus;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.concurrent.ScheduledThreadPoolExecutorPlus;
 import org.apache.cassandra.concurrent.SharedExecutorPool;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.CassandraRelevantProperties;
@@ -966,6 +967,10 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
 
             // ScheduledExecutors shuts down after MessagingService, as MessagingService may issue tasks to it.
             error = parallelRun(error, executor, () -> ScheduledExecutors.shutdownNowAndWait(1L, MINUTES));
+
+            // Nodes persists the local and peers information on its own executor, which the gossip stage and the
+            // scheduled tasks submit to: stop it after them.
+            error = parallelRun(error, executor, () -> Nodes.getInstance().shutdownAndWait(1L, MINUTES));
             
             error = parallelRun(error, executor, this::stopJmx);
 
@@ -1199,6 +1204,11 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
     private static void waitForDeletions(long timeout, TimeUnit unit) throws InterruptedException, ExecutionException, TimeoutException
     {
         if (ScheduledExecutors.nonPeriodicTasks.isShutdown())
+            return;
+        // Under the simulator the executors are simulated (its executor factory replaces ScheduledThreadPoolExecutorPlus),
+        // tasks run only when the simulation schedules them and its file system is in memory, so a timed wait here
+        // can expire even though nothing is stuck. Only wait on a real executor.
+        if (!(ScheduledExecutors.nonPeriodicTasks instanceof ScheduledThreadPoolExecutorPlus))
             return;
         Future<?> barrier = ScheduledExecutors.nonPeriodicTasks.schedule(Runnables.doNothing(), 0, TimeUnit.MILLISECONDS);
         try

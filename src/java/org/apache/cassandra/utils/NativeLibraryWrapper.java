@@ -24,7 +24,7 @@ import com.sun.jna.Pointer;
  * An interface to implement for using OS specific native methods.
  * @see INativeLibrary
  */
-@Shared
+@Shared(inner = Shared.Recursive.INTERFACES) // also share the nested NativeError exception
 // Implementors are advised to NOT use JNA's convenient LastErrorException because it relies
 // on checking errno(), which is not reliable.  Linux man page explains,
 //       The value in errno is significant only when the return value of

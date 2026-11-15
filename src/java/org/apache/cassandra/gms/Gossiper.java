@@ -2889,8 +2889,7 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
 
     public void unsafeSendShutdown(InetAddressAndPort to)
     {
-        Message<?> message = Message.out(Verb.GOSSIP_SHUTDOWN, noPayload);
-        MessagingService.instance().send(message, to);
+        MessagingService.instance().send(shutdownMessage(), to);
     }
 
     /**

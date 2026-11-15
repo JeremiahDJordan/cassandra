@@ -67,9 +67,10 @@
     </target>
 
     <target name="resolver-init" depends="init,_resolver_download" unless="resolver-ant-tasks.initialized" description="Initialize Resolver ANT Tasks">
+        <!-- the simulator jars are built (simulator-jars), not resolved, and the simulator tests need them -->
         <delete>
             <fileset dir="${build.dir.lib}" includes="**/*"/>
-            <fileset dir="${test.lib}" includes="**/*"/>
+            <fileset dir="${test.lib}" includes="**/*" excludes="jars/simulator-asm.jar,jars/simulator-bootstrap.jar"/>
         </delete>
 
         <typedef uri="antlib:org.apache.maven.resolver.ant" resource="org/apache/maven/resolver/ant/antlib.xml" classpathref="resolver-ant-tasks.classpath" />

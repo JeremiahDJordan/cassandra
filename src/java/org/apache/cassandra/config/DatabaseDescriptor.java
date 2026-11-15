@@ -2138,7 +2138,8 @@ public class DatabaseDescriptor
 
     public static IFailureDetector newFailureDetector()
     {
-        return newFailureDetector.get();
+        // the config may not be loaded yet
+        return newFailureDetector == null ? createFailureDetector("FailureDetector") : newFailureDetector.get();
     }
 
     public static void setDefaultFailureDetector()

@@ -1198,9 +1198,12 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
             if (isolated.contains(s))
                 return false;
 
+            // The AWS CRT, which ChecksumType initializes, registers a JVM shutdown hook that would keep an instance
+            // class loader reachable until the JVM exits; shared, it is loaded once, as in a node.
             return shared.contains(s) ||
                    InstanceClassLoader.getDefaultLoadSharedFilter().test(s) ||
-                   s.startsWith("org.jboss.byteman");
+                   s.startsWith("org.jboss.byteman") ||
+                   s.startsWith("software.amazon.awssdk.crt.");
         };
     }
 

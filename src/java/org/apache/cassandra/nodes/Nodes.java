@@ -24,6 +24,8 @@ import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
@@ -42,6 +44,7 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.NODES_DISABLE_PERSISTING_TO_SYSTEM_KEYSPACE;
@@ -261,6 +264,16 @@ public class Nodes
     {
         local.awaitInflightUpdateCompletion();
         peers.awaitInflightUpdateCompletion();
+    }
+
+    /**
+     * Stops the persistence executor after it runs the submitted updates. Only used by tests that stop an in-JVM
+     * instance, so that its thread doesn't keep the instance's class loader reachable.
+     */
+    @VisibleForTesting
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+        ExecutorUtils.shutdownAndWait(timeout, unit, updateExecutor);
     }
 
     private Runnable wrapPersistenceTask(String name, Runnable task)
