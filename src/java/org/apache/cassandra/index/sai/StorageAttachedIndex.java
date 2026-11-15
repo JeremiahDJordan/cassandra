@@ -887,7 +887,8 @@ public class StorageAttachedIndex implements Index
         StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
         assert indexGroup != null : "Index group does not exist for table " + baseCfs.keyspace + '.' + baseCfs.name;
 
-        List<SSTableReader> nonIndexed = findNonIndexedSSTables(baseCfs, indexGroup, validation);
+        // Wait for SSTables being added without this index's components (streamed or imported), so they are selected
+        List<SSTableReader> nonIndexed = baseCfs.indexManager.selectSSTablesForInitialBuild(() -> findNonIndexedSSTables(baseCfs, indexGroup, validation));
 
         if (nonIndexed.isEmpty())
             return ImmediateFuture.success(null);
