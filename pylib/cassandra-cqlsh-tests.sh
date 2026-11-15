@@ -76,8 +76,12 @@ else
   cython_suffix="no-cython"
 fi
 
-# re-use when possible the pre-installed virtualenv found in the cassandra-ubuntu-test docker image
-virtualenv-clone ${BUILD_HOME}/${cython_suffix}/python${python_version} ${BUILD_DIR}/venv || virtualenv --python=python${python_version} ${BUILD_DIR}/venv
+# re-use when possible a pre-installed virtualenv: ${BUILD_HOME}/<cython|no-cython>/python<version> in the
+# DataStax CI image, ${BUILD_HOME}/env<version> in the in-tree cassandra-ubuntu-test docker image
+virtualenv-clone ${BUILD_HOME}/${cython_suffix}/python${python_version} ${BUILD_DIR}/venv \
+  || virtualenv-clone ${BUILD_HOME}/env${python_version} ${BUILD_DIR}/venv \
+  || virtualenv --python=python${python_version} ${BUILD_DIR}/venv
+source ${BUILD_DIR}/venv/bin/activate
 
 if [ "$cython" = "yes" ]; then
   pip install "Cython>=0.29.15,<3.0"
@@ -90,7 +94,9 @@ fi
 # backend that pip defaults to on Python 3.11+). see ubuntu-test.docker
 export _PIP_USE_IMPORTLIB_METADATA=0
 
-pip install --exists-action s -r ${CASSANDRA_DIR}/pylib/requirements.txt
+# 'w' (wipe): the in-tree image's prebuilt venvs have src/cassandra-driver without its .git (see ubuntu-test.docker),
+# and for a directory that is not a git clone pip prompts instead of applying 's' (switch)
+pip install --exists-action w -r ${CASSANDRA_DIR}/pylib/requirements.txt
 pip freeze
 
 if [ "$cython" = "yes" ]; then
