@@ -24,10 +24,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.v1.LongArray;
 import org.apache.cassandra.index.sai.disk.v1.MetadataSource;
 import org.apache.cassandra.index.sai.disk.v1.MetadataWriter;
@@ -37,7 +39,10 @@ import org.apache.cassandra.index.sai.disk.v2.sortedterms.SortedTermsMeta;
 import org.apache.cassandra.index.sai.disk.v2.sortedterms.SortedTermsReader;
 import org.apache.cassandra.index.sai.disk.v2.sortedterms.SortedTermsWriter;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
+import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.test.microbench.index.sai.v1.AbstractOnDiskBench;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
@@ -66,6 +71,7 @@ import org.openjdk.jmh.annotations.Param;
 import org.openjdk.jmh.annotations.Scope;
 import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
+import org.openjdk.jmh.annotations.TearDown;
 import org.openjdk.jmh.annotations.Warmup;
 import org.openjdk.jmh.infra.Blackhole;
 
@@ -112,27 +118,44 @@ public class SortedTermsBench extends AbstractOnDiskBench
 
     byte[][] bcIntBytes = new byte[NUM_ROWS][];
 
+    /**
+     * The sorted terms are a per-sstable component group of their own sstable, separate from the superclass's: a second
+     * per-sstable group of the same sstable would get the same file names, and overwrite its group metadata.
+     */
+    private File sortedTermsDirectory;
+    private IndexDescriptor sortedTermsDescriptor;
+
     @Setup(Level.Trial)
     public void perTrialSetup2() throws IOException
     {
-        IndexComponents.ForWrite components = indexDescriptor.newPerSSTableComponentsForWrite();
-        try (MetadataWriter metadataWriter = new MetadataWriter(components);
-             NumericValuesWriter blockFPWriter = new NumericValuesWriter(components.addOrGet(IndexComponentType.PRIMARY_KEY_BLOCK_OFFSETS),
-                                                                         metadataWriter, true);
-             SortedTermsWriter writer = new SortedTermsWriter(components.addOrGet(IndexComponentType.PRIMARY_KEY_BLOCKS),
-                                                              metadataWriter,
-                                                              blockFPWriter,
-                                                              components.addOrGet(IndexComponentType.PRIMARY_KEY_TRIE)))
+        sortedTermsDirectory = new File(Files.createTempDirectory("jmh_sorted_terms"));
+        sortedTermsDescriptor = IndexDescriptor.empty(new Descriptor(sortedTermsDirectory,
+                                                                     metadata.keyspace,
+                                                                     metadata.name,
+                                                                     Util.newUUIDGen().get()));
+        IndexComponents.ForWrite components = sortedTermsDescriptor.newPerSSTableComponentsForWrite();
+        try (MetadataWriter metadataWriter = new MetadataWriter(components))
         {
-            for (int x = 0; x < NUM_ROWS; x++)
+            // not closed here: the SortedTermsWriter owns, and closes, it
+            NumericValuesWriter blockFPWriter = new NumericValuesWriter(components.addOrGet(IndexComponentType.PRIMARY_KEY_BLOCK_OFFSETS),
+                                                                        metadataWriter, true);
+            try (SortedTermsWriter writer = new SortedTermsWriter(components.addOrGet(IndexComponentType.PRIMARY_KEY_BLOCKS),
+                                                                  metadataWriter,
+                                                                  blockFPWriter,
+                                                                  components.addOrGet(IndexComponentType.PRIMARY_KEY_TRIE)))
             {
-                ByteBuffer buffer = Int32Type.instance.decompose(x);
-                ByteSource byteSource = Int32Type.instance.asComparableBytes(buffer, TypeUtil.BYTE_COMPARABLE_VERSION);
-                byte[] bytes = ByteSourceInverse.readBytes(byteSource);
-                bcIntBytes[x] = bytes;
-                writer.add(ByteComparable.preencoded(TypeUtil.BYTE_COMPARABLE_VERSION, bytes));
+                for (int x = 0; x < NUM_ROWS; x++)
+                {
+                    ByteBuffer buffer = Int32Type.instance.decompose(x);
+                    ByteSource byteSource = Int32Type.instance.asComparableBytes(buffer, TypeUtil.BYTE_COMPARABLE_VERSION);
+                    byte[] bytes = ByteSourceInverse.readBytes(byteSource);
+                    bcIntBytes[x] = bytes;
+                    writer.add(ByteComparable.preencoded(TypeUtil.BYTE_COMPARABLE_VERSION, bytes));
+                }
             }
         }
+        // SAI component groups are immutable: only a completed group replaces the index descriptor's (empty) one
+        components.markComplete();
 
         // create the lucene index
         luceneDir = Files.createTempDirectory("jmh_lucene_test");
@@ -167,7 +190,7 @@ public class SortedTermsBench extends AbstractOnDiskBench
         rowIds = new int[NUM_ROWS];
         tokenValues = new long[NUM_ROWS];
 
-        IndexComponents.ForRead components = indexDescriptor.perSSTableComponents();
+        IndexComponents.ForRead components = sortedTermsDescriptor.perSSTableComponents();
         MetadataSource metadataSource = MetadataSource.loadMetadata(components);
         IndexComponent.ForRead blocksComponent = components.get(IndexComponentType.PRIMARY_KEY_BLOCKS);
         IndexComponent.ForRead blockOffsetsComponent = components.get(IndexComponentType.PRIMARY_KEY_BLOCK_OFFSETS);
@@ -183,6 +206,14 @@ public class SortedTermsBench extends AbstractOnDiskBench
         LeafReaderContext context = luceneReader.leaves().get(0);
 
         columnASortedDocValues = context.reader().getSortedDocValues("columnA");
+    }
+
+    @TearDown(Level.Trial)
+    public void perTrialTearDown2() throws IOException
+    {
+        directory.close();
+        FileUtils.deleteRecursive(new File(luceneDir));
+        FileUtils.deleteRecursive(sortedTermsDirectory);
     }
 
     @Override

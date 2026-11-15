@@ -68,10 +68,14 @@ public abstract class BaseCompactionBench extends CQLTester
     @Param( {"DEFAULT"} )
     DataBuilderHelper dataBuilder;
 
-    @Param( {"1", "2", "4"} )
+    // Not varied by default: the only subclass, CompactionBreakdownBench, scans and merges on the benchmark thread,
+    // which the number of compactors does not affect. Use -p compactors=1,2,4 for a benchmark that it does affect.
+    @Param( {"1"} )
     int compactors;
 
-    @Param( {"1", "2", "4"} )
+    // The size of each sstable, in units of 100k rows. Every trial writes sstableCount * size * 100k rows in its
+    // setup, so only the smallest size runs by default; use -p size=1,2,4 to measure how the results scale.
+    @Param( {"1"} )
     int size;
 
     @Param( {"2"} )
@@ -101,7 +105,9 @@ public abstract class BaseCompactionBench extends CQLTester
         if (size < 1)
             throw new IllegalArgumentException();
 
-        prepareServer();
+        // JMH runs this superclass @Setup before the subclasses' own: initialize DatabaseDescriptor here
+        // (prepareServer() alone needs it already initialized), as CQLTester.setUpClass() does for unit tests
+        setUpClass();
 
         String keyspaceName = createKeyspace("CREATE KEYSPACE %s with replication = " +
                 "{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }" +
@@ -151,7 +157,7 @@ public abstract class BaseCompactionBench extends CQLTester
         }
     }
 
-    // overridden by CompactionBenchmark
+    // subclasses can override this to benchmark another compaction strategy
     public String compactionClass()
     {
         return SizeTieredCompactionStrategy.class.getSimpleName();

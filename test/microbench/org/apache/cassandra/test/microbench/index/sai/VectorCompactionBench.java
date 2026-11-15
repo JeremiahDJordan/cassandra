@@ -29,6 +29,7 @@ import java.util.stream.IntStream;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.index.sai.SAITester;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
@@ -107,6 +108,11 @@ public class VectorCompactionBench extends SAITester
     @TearDown(Level.Trial)
     public void teardown() throws IOException, ExecutionException, InterruptedException
     {
+        // The last compaction's obsolete sstables and transaction log are deleted asynchronously on
+        // nonPeriodicTasks; deleting the directories under them fails with NoSuchFileException. Wait before
+        // shutting the commit log down: the deletions write to system.sstable_activity, and a write that
+        // needs a new segment after the shutdown waits forever.
+        LifecycleTransaction.waitForDeletions();
         CommitLog.instance.shutdownBlocking();
         CQLTester.cleanup();
     }

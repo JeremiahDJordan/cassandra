@@ -33,9 +33,11 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.auth.AuthTestUtils;
 import org.apache.cassandra.auth.AuthenticatedUser;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CIDR;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.exceptions.UnauthorizedException;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.openjdk.jmh.annotations.Benchmark;
 import org.openjdk.jmh.annotations.BenchmarkMode;
 import org.openjdk.jmh.annotations.Fork;
@@ -71,6 +73,9 @@ public class CIDRAuthorizerBench extends CQLTester
     @Setup(Level.Trial)
     public void setup() throws IOException
     {
+        // DataStax only creates the CIDR auth tables (cidr_groups, cidr_permissions) from storage compatibility
+        // mode CC5 on (AuthKeyspace.tableNames()); the test default is HCD_1
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.NONE);
         CQLTester.setUpClass();
         CQLTester.requireAuthentication();
 

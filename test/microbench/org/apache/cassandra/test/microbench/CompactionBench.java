@@ -22,22 +22,29 @@ package org.apache.cassandra.test.microbench;
 import java.io.IOException;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ExecutionException;
+import java.util.concurrent.*;
 
-import org.openjdk.jmh.annotations.*;
-
+import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
 import org.apache.cassandra.db.compaction.CompactionStrategyFactory;
-import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
+import org.openjdk.jmh.annotations.*;
 
-public class CompactionBench extends BaseCompactionBench
+@BenchmarkMode(Mode.AverageTime)
+@OutputTimeUnit(TimeUnit.MILLISECONDS)
+@Warmup(iterations = 25, time = 1, timeUnit = TimeUnit.SECONDS)
+@Measurement(iterations = 5, time = 2, timeUnit = TimeUnit.SECONDS)
+@Fork(value = 1)
+@Threads(1)
+@State(Scope.Benchmark)
+public class CompactionBench extends CQLTester
 {
+    // compare compaction with and without cursors (DataStax STAR-782)
     @Param({"false", "true"})
     boolean cursors;
 
@@ -50,11 +57,12 @@ public class CompactionBench extends BaseCompactionBench
     List<Descriptor> liveFiles;
 
     @Setup(Level.Trial)
-    public void setup0() throws Throwable
+    public void setup() throws Throwable
     {
         CQLTester.setUpClass();
         keyspace = createKeyspace("CREATE KEYSPACE %s with replication = { 'class' : 'SimpleStrategy', 'replication_factor' : 1 } and durable_writes = false");
-        table = createTable(keyspace, "CREATE TABLE %s ( userid bigint, picid bigint, commentid bigint, PRIMARY KEY(userid, picid))");
+        table = createTable(keyspace, "CREATE TABLE %s ( userid bigint, picid bigint, commentid bigint, PRIMARY KEY(userid, picid))" +
+                                      " WITH compaction = { 'class' : '" + compactionClass() + "' }");
         execute("use "+keyspace+";");
         writeStatement = "INSERT INTO "+table+"(userid,picid,commentid)VALUES(?,?,?)";
         readStatement = "SELECT * from "+table+" limit 100";
@@ -125,15 +133,14 @@ public class CompactionBench extends BaseCompactionBench
     }
 
     @Benchmark
-    public void compactSSTables() throws Throwable
+    public void compactTest() throws Throwable
     {
         cfs.forceMajorCompaction();
     }
 
-    @Override
     public String compactionClass()
     {
-        return cursors ? "SizeTieredCompactionStrategy" : "org.apache.cassandra.test.microbench.CompactionBenchmark$CursorDisabledStrategy";
+        return cursors ? SizeTieredCompactionStrategy.class.getName() : CursorDisabledStrategy.class.getName();
     }
 
     public static class CursorDisabledStrategy extends SizeTieredCompactionStrategy
@@ -143,6 +150,7 @@ public class CompactionBench extends BaseCompactionBench
             super(factory, options);
         }
 
+        @Override
         public boolean supportsCursorCompaction()
         {
             return false;
