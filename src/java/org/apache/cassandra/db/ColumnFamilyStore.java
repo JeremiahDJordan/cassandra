@@ -3336,7 +3336,8 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
                 // interrupt in-progress compactions
                 CompactionManager.instance.interruptCompactionForCFs(toInterruptFor, sstablesPredicate, interruptValidation, trigger);
 
-                CompactionManager.instance.waitForCessation(toInterruptFor, sstablesPredicate);
+                // keep interrupting until done, as operations holding matching sstables may start new tasks meanwhile
+                CompactionManager.instance.waitForCessation(toInterruptFor, sstablesPredicate, interruptValidation, trigger);
 
                 // doublecheck that we finished, instead of timing out
                 if (!allCompactionsFinished(toInterruptFor, sstablesPredicate))

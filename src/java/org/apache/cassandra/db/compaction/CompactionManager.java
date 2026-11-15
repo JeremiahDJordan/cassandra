@@ -41,6 +41,7 @@ import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import javax.management.openmbean.OpenDataException;
 import javax.management.openmbean.TabularData;
 
@@ -2686,15 +2687,37 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
 
     public void waitForCessation(Iterable<ColumnFamilyStore> cfss, Predicate<SSTableReader> sstablePredicate)
     {
+        waitForCessation(cfss, sstablePredicate, false, null);
+    }
+
+    /**
+     * Waits for operations involving sstables matching the predicate to finish, as above, but also keeps cancelling
+     * and interrupting matching tasks and operations that appear while waiting. Some operations keep their sstables
+     * marked compacting and only create the tasks that process them later (e.g. {@code parallelAllSSTableOperation}
+     * creates one task per sstable when it is executed), so they are not visible to the initial cancellation done by
+     * {@link ColumnFamilyStore#runWithCompactionsDisabled} and would otherwise run to completion while we wait.
+     *
+     * @param trigger the cause for interrupting compactions; if null, new operations are not interrupted
+     */
+    public void waitForCessation(Iterable<ColumnFamilyStore> cfss,
+                                 Predicate<SSTableReader> sstablePredicate,
+                                 boolean interruptValidation,
+                                 @Nullable TableOperation.StopTrigger trigger)
+    {
         long start = nanoTime();
         long delay = TimeUnit.SECONDS.toNanos(CESSATION_WAIT_SECONDS);
 
         while (nanoTime() - start < delay)
         {
-            if (CompactionManager.instance.isCompacting(cfss, sstablePredicate))
-                Uninterruptibles.sleepUninterruptibly(1, TimeUnit.MILLISECONDS);
-            else
+            if (!CompactionManager.instance.isCompacting(cfss, sstablePredicate))
                 break;
+
+            if (trigger != null)
+            {
+                active.cancelScheduledTasksAffecting(cfss, sstablePredicate, trigger);
+                interruptCompactionForCFs(cfss, sstablePredicate, interruptValidation, trigger);
+            }
+            Uninterruptibles.sleepUninterruptibly(1, TimeUnit.MILLISECONDS);
         }
     }
 
