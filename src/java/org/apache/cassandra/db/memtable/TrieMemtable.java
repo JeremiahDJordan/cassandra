@@ -84,6 +84,7 @@ import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.metrics.TrieMemtableMetricsView;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.DroppedColumn;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -152,7 +153,7 @@ public class TrieMemtable extends AbstractShardedMemtable
     {
         super(commitLogLowerBound, metadataRef, owner, shardCountOption);
         this.metrics = TrieMemtableMetricsView.getOrCreate(metadataRef.keyspace, metadataRef.name);
-        this.actualMetadata = metadataRef.get();
+        this.actualMetadata = withDroppedColumns(metadataRef.get());
         this.shards = generatePartitionShards(boundaries.shardCount(), actualMetadata, metrics, owner.readOrdering());
         this.mergedTrie = makeMergedTrie(shards);
         logger.trace("Created memtable with {} shards", this.shards.length);
@@ -181,6 +182,28 @@ public class TrieMemtable extends AbstractShardedMemtable
         return DeletionAwareTrie.mergeDistinct(tries);
     }
 
+    /// The given metadata with the dropped columns that are not columns of the table any more put back as columns, so
+    /// that late writes of cells newer than the drop have a column id in this memtable. Reads and flushes filter the
+    /// dropped columns' data by drop time using the table's current metadata.
+    static TableMetadata withDroppedColumns(TableMetadata metadata)
+    {
+        if (metadata.droppedColumns.isEmpty())
+            return metadata;
+
+        TableMetadata.Builder builder = null;
+        for (DroppedColumn dropped : metadata.droppedColumns.values())
+        {
+            // re-added, or the name is now used by another column
+            if (metadata.getColumn(dropped.column.name) != null)
+                continue;
+            if (builder == null)
+                builder = metadata.unbuild();
+            ColumnMetadata column = dropped.column;
+            builder.addColumn(new ColumnMetadata(column.ksName, column.cfName, column.name, column.type, ColumnMetadata.NO_POSITION, column.kind, null, false));
+        }
+        return builder == null ? metadata : builder.build();
+    }
+
     @Override
     public TableMetadata metadata()
     {
@@ -195,7 +218,7 @@ public class TrieMemtable extends AbstractShardedMemtable
         if (reason != ColumnFamilyStore.FlushReason.SCHEMA_CHANGE)
             return false;
         // If the columns definition changes, we need to flush as we would need to remap column indexes.
-        return !actualMetadata.regularAndStaticColumns().equals(metadata.get().regularAndStaticColumns());
+        return !actualMetadata.regularAndStaticColumns().equals(withDroppedColumns(metadata.get()).regularAndStaticColumns());
     }
 
     @Override
