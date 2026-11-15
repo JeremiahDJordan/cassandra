@@ -307,7 +307,12 @@ public class TriePartitionUpdateStage2 extends TrieBackedPartitionStage2 impleme
         {
             throw new AssertionError(e);
         }
-        return new TriePartitionUpdateStage2(metadata, partitionKey, columns, stats, rowCountIncludingStatic, dataSize, t, canHaveShadowedData);
+        TriePartitionUpdateStage2 updated = new TriePartitionUpdateStage2(metadata, partitionKey, columns, stats, rowCountIncludingStatic, dataSize, t, canHaveShadowedData);
+        // Recompute the stats from the updated data, as BTreePartitionUpdate.withUpdatedTimestamps does: Paxos reads the
+        // ballot that originally proposed an update back from stats().minTimestamp (Commit.isReproposal), so it must
+        // reflect the new timestamps, not those the update was built with.
+        EncodingStats updatedStats = EncodingStats.Collector.collect(updated.staticRow(), updated.rowIterator(), updated.deletionInfo());
+        return new TriePartitionUpdateStage2(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, dataSize, t, canHaveShadowedData);
     }
 
     /**
