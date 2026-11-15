@@ -64,7 +64,9 @@ import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 import static org.apache.cassandra.net.Verb.PAXOS2_COMMIT_AND_PREPARE_REQ;
 import static org.apache.cassandra.net.Verb.PAXOS2_PREPARE_REFRESH_REQ;
+import static org.apache.cassandra.net.Verb.PAXOS2_PREPARE_REQ;
 import static org.apache.cassandra.net.Verb.PAXOS2_PROPOSE_REQ;
+import static org.apache.cassandra.net.Verb.PAXOS2_REPAIR_REQ;
 import static org.apache.cassandra.net.Verb.PAXOS_COMMIT_REQ;
 import static org.apache.cassandra.net.Verb.PAXOS_PROPOSE_REQ;
 
@@ -279,6 +281,33 @@ public class MutatorVetoTest extends CASTestBase
     }
 
 
+    /**
+     * Runs a PaxosRepair for {@code pk} on {@code node} with {@code excluded} kept out of the repair's
+     * consensus quorum; returns "OK", or the failure cause prefixed with "FAILURE: ".
+     * <p>
+     * The repair's query round and its prepares resolve on the first quorum (2 of the 3 replicas) to
+     * answer. When the only replica holding the commit ({@code commitOnlyOn}'s holder) is the one left
+     * out, that quorum sees nothing but the proposal its members accepted and never saw committed, and
+     * the repair completes it as an in-progress proposal ({@code REPAIR_IN_PROGRESS}) rather than
+     * refreshing the commit ({@code REFRESH_COMMITTED}). Both are correct paxos; which one runs depends
+     * on response order. Dropping the repair's query and prepare messages to a replica that missed the
+     * commit pins the quorum to one that includes the holder, so the refresh path is always taken.
+     * Commits are not filtered: the refresh still reaches {@code excluded}.
+     */
+    private static String repairOnNode(int node, int excluded, String tableName, int pk)
+    {
+        IMessageFilters.Filter excludeFromQuorum =
+            cluster.filters().verbs(PAXOS2_REPAIR_REQ.id, PAXOS2_PREPARE_REQ.id).from(node).to(excluded).drop();
+        try
+        {
+            return repairOnNode(node, tableName, pk);
+        }
+        finally
+        {
+            excludeFromQuorum.off();
+        }
+    }
+
     /** Runs a PaxosRepair for {@code pk} on {@code node}; returns "OK", or the failure cause prefixed with "FAILURE: ". */
     private static String repairOnNode(int node, String tableName, int pk)
     {
@@ -355,7 +384,7 @@ public class MutatorVetoTest extends CASTestBase
         // Vetoed refresh: the repair fails, the announce is paired with UNCONFIRMED
         resetMutator(2);
         armRefreshVeto(2, true);
-        String vetoedResult = repairOnNode(2, tableName, pk);
+        String vetoedResult = repairOnNode(2, 1, tableName, pk);
         Assert.assertTrue("the vetoed repair attempt must fail with the veto; got " + vetoedResult
                           + "; announces=" + announces(2) + " terminals=" + terminals(2),
                           vetoedResult.contains("dtest mutator veto"));
@@ -373,7 +402,7 @@ public class MutatorVetoTest extends CASTestBase
                    .messagesMatching((from, to, message) -> dropped.incrementAndGet() <= 3).drop();
         try
         {
-            Assert.assertEquals("the retried repair must complete", "OK", repairOnNode(2, tableName, pk));
+            Assert.assertEquals("the retried repair must complete", "OK", repairOnNode(2, 1, tableName, pk));
         }
         finally
         {
@@ -425,7 +454,7 @@ public class MutatorVetoTest extends CASTestBase
         }
 
         resetMutator(2);
-        Assert.assertEquals("the repair must complete", "OK", repairOnNode(2, tableName, pk));
+        Assert.assertEquals("the repair must complete", "OK", repairOnNode(2, 1, tableName, pk));
         List<String> terminals = awaitTerminals(2, 1);
         Assert.assertTrue("the poison-path refresh must deliver an APPLIED terminal: " + terminals,
                           terminals.contains("REFRESH_COMMITTED:APPLIED"));
@@ -466,7 +495,7 @@ public class MutatorVetoTest extends CASTestBase
             // pending {4}: without this, {1, 2, 3} can answer first and the round is completed as
             // an in-progress repair instead. Excluding {1} from the prepare forces {2, 3, 4}.
             IMessageFilters.Filter excludeNodeOne =
-                cluster.filters().verbs(org.apache.cassandra.net.Verb.PAXOS2_PREPARE_REQ.id).from(3).to(1).drop();
+                cluster.filters().verbs(PAXOS2_PREPARE_REQ.id).from(3).to(1).drop();
             try
             {
                 cluster.coordinator(3)
