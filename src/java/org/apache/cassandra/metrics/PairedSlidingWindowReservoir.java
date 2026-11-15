@@ -18,41 +18,46 @@
 
 package org.apache.cassandra.metrics;
 
+import java.util.Arrays;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Preconditions;
+
+import org.apache.cassandra.utils.Pair;
+
 /**
  * A Reservoir-like class that tracks the last N paired measurements.
  */
 public class PairedSlidingWindowReservoir
 {
-    private final IntIntPair[] measurements;
+    private final int windowSize;
     private long count;
+    // Readers take the published snapshot without the lock, so update() replaces it instead of changing its array.
+    private volatile PairedSnapshot snapshot = new PairedSnapshot(new IntIntPair[0]);
 
     public PairedSlidingWindowReservoir(int size)
     {
-        this.measurements = new IntIntPair[size];
+        Preconditions.checkArgument(size > 0, "Window size must be positive, got %s", size);
+        this.windowSize = size;
         this.count = 0L;
     }
 
     public int size()
     {
-        if (this.count >= this.measurements.length)
-            return this.measurements.length;
-
-        synchronized (this)
-        {
-            return (int) Math.min(this.count, this.measurements.length);
-        }
+        return this.snapshot.size();
     }
 
     public synchronized void update(int value1, int value2)
     {
-        this.measurements[(int) (this.count++ % this.measurements.length)] = new IntIntPair(value1, value2);
+        var values = Arrays.copyOf(this.snapshot.values, (int) Math.min(this.count + 1, this.windowSize));
+        values[(int) (this.count % this.windowSize)] = new IntIntPair(value1, value2);
+        this.snapshot = new PairedSnapshot(values);
+        this.count++;
     }
 
     public PairedSnapshot getSnapshot()
     {
-        var values = new IntIntPair[this.size()];
-        System.arraycopy(this.measurements, 0, values, 0, values.length);
-        return new PairedSnapshot(values);
+        return this.snapshot;
     }
 
     /**
@@ -79,11 +84,35 @@ public class PairedSlidingWindowReservoir
 
     public static class PairedSnapshot
     {
-        public final IntIntPair[] values;
+        private final IntIntPair[] values;
+        private final Pair<Double, Double> interceptSlope;
 
-        public PairedSnapshot(IntIntPair[] values)
+        private PairedSnapshot(IntIntPair[] values)
         {
             this.values = values;
+            this.interceptSlope = LinearFit.interceptSlopeFor(values);
+        }
+
+        public int size()
+        {
+            return values.length;
+        }
+
+        /**
+         * A copy of the pairs, in slot order.
+         */
+        @VisibleForTesting
+        public IntIntPair[] values()
+        {
+            return values.clone();
+        }
+
+        /**
+         * The intercept and slope of the best linear fit to the pairs, see {@link LinearFit#interceptSlopeFor}.
+         */
+        public Pair<Double, Double> interceptSlope()
+        {
+            return interceptSlope;
         }
     }
 }
