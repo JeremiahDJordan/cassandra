@@ -839,6 +839,19 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
         return subTypes().stream().anyMatch(AbstractType::referencesDuration);
     }
 
+    /**
+     * Whether a column of this type has a duration where values are sorted: anywhere in a primary key column, or in the
+     * keys or elements of a non-frozen map or set.
+     */
+    public boolean hasSortedDuration(boolean isPrimaryKeyColumn)
+    {
+        if (isPrimaryKeyColumn)
+            return referencesDuration();
+        return isMultiCell()
+               && this instanceof MultiCellCapableType
+               && ((MultiCellCapableType<?>) this).nameComparator().referencesDuration();
+    }
+
     public final boolean referencesCounter()
     {
         return isCounter() || subTypes().stream().anyMatch(AbstractType::referencesCounter);
@@ -881,11 +894,27 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
      * @param isCounterTable     whether the table the {@code columnName} is part of is a counter table.
      * @throws InvalidColumnTypeException if this type is not a valid column type for {@code columnName}.
      */
+    public final void validateForColumn(ByteBuffer columnName,
+                                        boolean isPrimaryKeyColumn,
+                                        boolean isCounterTable,
+                                        boolean isDroppedColumn,
+                                        boolean isForOfflineTool)
+    {
+        validateForColumn(columnName, isPrimaryKeyColumn, isCounterTable, isDroppedColumn, isForOfflineTool, false);
+    }
+
+    /**
+     * @param allowSortedDuration whether to accept a duration where values are sorted, see {@link #hasSortedDuration}.
+     *                            New columns must not have one (CNDB-9753), but existing schemas and sstables can, like
+     *                            a duration nested in a set element or a map key. Durations compare by their serialized
+     *                            bytes, so such columns are readable.
+     */
     public void validateForColumn(ByteBuffer columnName,
                                   boolean isPrimaryKeyColumn,
                                   boolean isCounterTable,
                                   boolean isDroppedColumn,
-                                  boolean isForOfflineTool)
+                                  boolean isForOfflineTool,
+                                  boolean allowSortedDuration)
     {
         if (isPrimaryKeyColumn)
         {
@@ -899,7 +928,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
             // We don't allow durations in anything sorted (primary key here, or in the "name-comparator" part of
             // collections below). This isn't really a technical limitation, but duration sorts in a somewhat random
             // way, so CASSANDRA-11873 decided to reject them when sorting was involved.
-            if (referencesDuration())
+            if (!allowSortedDuration && referencesDuration())
                 throw columnException(columnName,
                                       "duration types are not supported within PRIMARY KEY columns");
 
@@ -935,7 +964,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
                 {
                     AbstractType<?> nameComparator = ((MultiCellCapableType<?>) this).nameComparator();
                     // As mentioned above, CASSANDRA-11873 decided to reject durations when sorting was involved.
-                    if (nameComparator.referencesDuration())
+                    if (!allowSortedDuration && nameComparator.referencesDuration())
                     {
                         // Trying to profile a more precise error message
                         String what = this instanceof MapType
