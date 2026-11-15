@@ -134,8 +134,6 @@ public class ColumnFamilyStoreTest
                                            true,
                                            TableOperation.StopTrigger.UNIT_TESTS);
         });
-        task1.start();
-
         Thread task2 = new Thread(() -> {
             cfs.runWithCompactionsDisabled(() -> {
                                                task2StaredtLatch.countDown();
@@ -145,14 +143,26 @@ public class ColumnFamilyStoreTest
                                            true,
                                            TableOperation.StopTrigger.UNIT_TESTS);
         });
-        task2.start();
 
-        // Check that task1 started but task2 is waiting
-        assertTrue(task1StaredtLatch.await(30, TimeUnit.SECONDS));
-        assertEquals(1, task2StaredtLatch.getCount());
+        try
+        {
+            // Start task2 only once task1 holds the lock; started together, task2 can take it first
+            task1.start();
+            assertTrue(task1StaredtLatch.await(30, TimeUnit.SECONDS));
+            task2.start();
 
-        // Allow task1 to complete and check task2 completed next
-        task1FinishLatch.countDown();
+            // Check that task2 is parked waiting for the lock and has not run
+            Util.spinAssertEquals(Thread.State.WAITING, task2::getState, 30);
+            assertEquals(1, task2StaredtLatch.getCount());
+        }
+        finally
+        {
+            // Allow task1 to complete even if an assertion failed: it holds the lock that every later test's
+            // truncateCFS() needs, so leaving it blocked hangs the rest of the class
+            task1FinishLatch.countDown();
+        }
+
+        // Check task2 completed next
         assertTrue(task2StaredtLatch.await(30, TimeUnit.SECONDS));
 
         task1.join();
