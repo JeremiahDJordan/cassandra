@@ -43,7 +43,9 @@ import org.openjdk.jmh.annotations.Setup;
 import org.openjdk.jmh.annotations.State;
 import org.openjdk.jmh.annotations.Warmup;
 
-@Fork(1)
+// 1000000 terms with 1 row per partition need ~1.2GiB of live heap, more than the 1GiB that the jmh ant macro gives
+// the forks by default (see .build/build-bench.xml)
+@Fork(value = 1, jvmArgsAppend = "-Xmx2G")
 @Warmup(iterations = 5, time = 3)
 @Measurement(iterations = 10, time = 3)
 @OutputTimeUnit(TimeUnit.MICROSECONDS)

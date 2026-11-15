@@ -163,13 +163,17 @@ public abstract class AbstractOnDiskBench
         final int[] postings = IntStream.range(0, rows).map(this::toPosting).toArray();
         final IntArrayPostingList postingList = new IntArrayPostingList(postings);
 
-        try (PostingsWriter writer = new PostingsWriter(indexDescriptor.newPerIndexComponentsForWrite(indexContext)))
+        IndexComponents.ForWrite components = indexDescriptor.newPerIndexComponentsForWrite(indexContext);
+        long summaryPosition;
+        try (PostingsWriter writer = new PostingsWriter(components))
         {
-            long summaryPosition = writer.write(postingList);
+            summaryPosition = writer.write(postingList);
             writer.complete();
-
-            return summaryPosition;
         }
+        // SAI component groups are immutable: a new group only replaces the index descriptor's (empty) one once
+        // marked complete, so without this perIndexComponents(indexContext) has no POSTING_LISTS
+        components.markComplete();
+        return summaryPosition;
     }
 
     protected final PostingsReader openPostingsReader() throws IOException
