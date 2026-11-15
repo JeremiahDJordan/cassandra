@@ -55,7 +55,9 @@ import org.openjdk.jmh.infra.Blackhole;
 @OutputTimeUnit(TimeUnit.MILLISECONDS)
 @Warmup(iterations = 3, time = 3, timeUnit = TimeUnit.SECONDS)
 @Measurement(iterations = 5, time = 5, timeUnit = TimeUnit.SECONDS)
-@Fork(value = 1)
+// 128000 vectors of dimension 1536 are ~750MiB of float data held for the whole trial, too close to the 1GiB that the jmh
+// ant macro gives the forks by default (see .build/build-bench.xml)
+@Fork(value = 1, jvmArgsAppend = "-Xmx2G")
 @Threads(1)
 @State(Scope.Benchmark)
 public class OnDiskVectorValuesBench extends SAITester

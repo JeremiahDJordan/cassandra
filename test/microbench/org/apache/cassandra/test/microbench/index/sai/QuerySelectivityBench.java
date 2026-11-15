@@ -99,6 +99,9 @@ public class QuerySelectivityBench extends CQLTester
         CQLTester.prepareServer();
         beforeTest();
         DatabaseDescriptor.setAutoSnapshot(false);
+        // test/conf/cassandra.yaml enables read size thresholds (a 4MiB coordinator failure threshold), which rangeQuery's
+        // up to 5000 rows of ~1KB exceed; they are disabled by default
+        DatabaseDescriptor.setReadThresholdsEnabled(false);
 
         // create the schema
         String table = createTable("CREATE TABLE %s (k int, c1 int, c2 blob, v int, p blob, PRIMARY KEY (k, c1, c2))");
