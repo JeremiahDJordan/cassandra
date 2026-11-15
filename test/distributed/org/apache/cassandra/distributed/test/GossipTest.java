@@ -53,6 +53,8 @@ import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.IClusterVersionProvider;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.Message;
+import org.apache.cassandra.nodes.IPeerInfo;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.service.PendingRangeCalculatorService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.StreamPlan;
@@ -71,7 +73,11 @@ import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.api.TokenSupplier.evenlyDistributedTokens;
 import static org.apache.cassandra.distributed.impl.DistributedTestSnitch.toCassandraInetAddressAndPort;
+import static org.apache.cassandra.distributed.shared.ClusterUtils.assertRingIs;
+import static org.apache.cassandra.distributed.shared.ClusterUtils.awaitRingJoin;
+import static org.apache.cassandra.distributed.shared.ClusterUtils.awaitRingStatus;
 import static org.apache.cassandra.distributed.shared.ClusterUtils.runAndWaitForLogs;
+import static org.apache.cassandra.distributed.shared.ClusterUtils.stopUnchecked;
 import static org.apache.cassandra.distributed.shared.NetworkTopology.singleDcNetworkTopology;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
@@ -530,6 +536,41 @@ public class GossipTest extends TestBaseImpl
         }
     }
 
+    @Test
+    public void removedNodeStaysOutOfRemovalCoordinatorPeers() throws Exception
+    {
+        try (Cluster cluster = Cluster.build(3)
+                                      .withConfig(c -> c.with(GOSSIP, NETWORK))
+                                      .start())
+        {
+            IInvokableInstance coordinator = cluster.get(1);
+            IInvokableInstance peer = cluster.get(2);
+            IInvokableInstance removed = cluster.get(3);
+            String removedHostId = removed.callOnInstance(() -> StorageService.instance.getLocalHostId());
+
+            stopUnchecked(removed);
+            awaitRingStatus(coordinator, removed, "Down");
+            coordinator.nodetoolResult("removenode", removedHostId).asserts().success();
+
+            // the removal coordinator excises the removed node, and advertising its removal doesn't bring it back
+            assertRingIs(coordinator, coordinator, peer);
+            assertNotAPeer(coordinator, removed);
+
+            // nor does it come back when the coordinator restarts and loads the ring from its persisted peers; the
+            // other peer is down too, so that it can't tell the coordinator about the removal again
+            stopUnchecked(peer);
+            stopUnchecked(coordinator);
+            coordinator.startup();
+            assertRingIs(coordinator, coordinator, peer);
+            assertNotAPeer(coordinator, removed);
+
+            peer.startup();
+            awaitRingJoin(coordinator, peer);
+            assertRingIs(coordinator, coordinator, peer);
+            assertNotAPeer(coordinator, removed);
+        }
+    }
+
     private static String getLocalToken(IInvokableInstance node)
     {
         Collection<String> tokens = ClusterUtils.getLocalTokens(node);
@@ -562,6 +603,22 @@ public class GossipTest extends TestBaseImpl
                                        movingAddress),
                          hasPending, expectPending);
         }
+    }
+
+    private static void assertNotAPeer(IInvokableInstance inst, IInvokableInstance removed)
+    {
+        InetSocketAddress removedAddress = removed.broadcastAddress();
+        inst.acceptsOnInstance((InetSocketAddress address) -> {
+            InetAddressAndPort endpoint = toCassandraInetAddressAndPort(address);
+            IPeerInfo peerInfo = Nodes.peers().get(endpoint);
+            assertTrue("Removed peer " + endpoint + " exists in Nodes: " + peerInfo,
+                       peerInfo == null || !peerInfo.isExisting());
+            assertFalse("Removed peer " + endpoint + " is a member of the token metadata",
+                        StorageService.instance.getTokenMetadata().isMember(endpoint));
+        }).accept(removedAddress);
+        Object[][] rows = inst.executeInternal("SELECT host_id FROM system.peers_v2 WHERE peer = ? AND peer_port = ?",
+                                               removedAddress.getAddress(), removedAddress.getPort());
+        assertEquals("Removed peer " + removedAddress + " is in system.peers_v2", 0, rows.length);
     }
 
     static void populate(Cluster cluster)

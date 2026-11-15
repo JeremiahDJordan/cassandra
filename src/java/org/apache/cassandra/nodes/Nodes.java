@@ -39,6 +39,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.ExecutorFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.FBUtilities;
@@ -486,6 +487,14 @@ public class Nodes
         public ILocalInfo get()
         {
             return internalMap.get(localInfoKey);
+        }
+
+        /**
+         * @see INodesPersistence#checkLocalLoaded()
+         */
+        public void checkLoaded() throws ConfigurationException
+        {
+            nodesPersistence.checkLocalLoaded();
         }
 
         private void save(LocalInfo previousInfo, LocalInfo newInfo, boolean blocking, boolean force)

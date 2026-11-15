@@ -43,7 +43,6 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.exceptions.UnavailableException;
-import org.apache.cassandra.gms.IGossiper;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -53,6 +52,7 @@ import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.RequestCallbackWithFailure;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.repair.SharedContext;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableId;
@@ -726,9 +726,9 @@ public class PaxosRepair extends AbstractPaxosRepair
         return (version.major == 4 && version.minor > 0) || version.major > 4;
     }
 
-    static boolean validatePeerCompatibility(IGossiper gossiper, Replica peer)
+    static boolean validatePeerCompatibility(Replica peer)
     {
-        CassandraVersion version = gossiper.getReleaseVersion(peer.endpoint());
+        CassandraVersion version = Nodes.getReleaseVersion(peer.endpoint(), null);
         boolean result = validateVersionCompatibility(version);
         if (!result)
             logger.info("PaxosRepair isn't supported by {} on version {}", peer, version);
@@ -738,7 +738,7 @@ public class PaxosRepair extends AbstractPaxosRepair
     static boolean validatePeerCompatibility(SharedContext ctx, TableMetadata table, Range<Token> range)
     {
         Participants participants = Participants.get(table, range.right, ConsistencyLevel.SERIAL, r -> ctx.failureDetector().isAlive(r.endpoint()));
-        return Iterables.all(participants.all, r -> validatePeerCompatibility(ctx.gossiper(), r));
+        return Iterables.all(participants.all, PaxosRepair::validatePeerCompatibility);
     }
 
     public static boolean validatePeerCompatibility(SharedContext ctx, TableMetadata table, Collection<Range<Token>> ranges)

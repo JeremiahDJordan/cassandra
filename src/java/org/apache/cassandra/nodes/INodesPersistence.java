@@ -20,6 +20,7 @@ package org.apache.cassandra.nodes;
 
 import java.util.stream.Stream;
 
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 
 public interface INodesPersistence
@@ -74,6 +75,20 @@ public interface INodesPersistence
     void saveLocal(LocalInfo info);
 
     void syncLocal();
+
+    /**
+     * Called once at startup, from {@code SystemKeyspace.checkHealth()}, when the local information that
+     * {@link #loadLocal()} returned has no cluster name, which normally means a new node. It runs before
+     * {@code SystemKeyspace.persistLocalMetadata()} saves anything.
+     * <p>
+     * Throws if this persistence holds local information that it couldn't load, so that the node doesn't start as a
+     * new one. The default does nothing, so the node starts as a new one.
+     *
+     * @throws ConfigurationException if local information exists but couldn't be loaded
+     */
+    default void checkLocalLoaded() throws ConfigurationException
+    {
+    }
 
     Stream<PeerInfo> loadPeers();
 
