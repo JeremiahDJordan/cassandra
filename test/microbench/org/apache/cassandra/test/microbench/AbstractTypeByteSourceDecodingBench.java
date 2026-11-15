@@ -68,7 +68,8 @@ public class AbstractTypeByteSourceDecodingBench
     @Param({"UTF8Type", "BytesType", "IntegerType", "DecimalType"})
     private String abstractTypeName;
 
-    @Param({"LEGACY", "OSS41", "OSS50"})
+    // No LEGACY: it is not a revertible format (IntegerType, CompositeType, etc. reject decoding it)
+    @Param({"OSS41", "OSS50"})
     private static ByteComparable.Version version = ByteComparable.Version.OSS50;
 
     private AbstractType abstractType;
