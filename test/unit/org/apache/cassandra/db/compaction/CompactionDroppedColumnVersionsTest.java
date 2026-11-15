@@ -734,7 +734,7 @@ public class CompactionDroppedColumnVersionsTest extends CQLTester
         assertEquals(count, cfs.getLiveSSTables().size());
     }
 
-    private static AbstractType<?> typeOfC(SSTableReader sstable)
+    static AbstractType<?> typeOfC(SSTableReader sstable)
     {
         for (ColumnMetadata column : sstable.header.columns())
         {
