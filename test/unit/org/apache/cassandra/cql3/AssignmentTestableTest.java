@@ -19,18 +19,37 @@
 package org.apache.cassandra.cql3;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.SetType;
+import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.marshal.VectorType;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Pair;
+
+import static org.apache.cassandra.config.CassandraRelevantProperties.VECTOR_FLOAT_ONLY;
 
 public class AssignmentTestableTest
 {
+    @BeforeClass
+    public static void setupClass()
+    {
+        VECTOR_FLOAT_ONLY.setBoolean(false);
+    }
+
     @Test
     public void testGetPreferredCompatibleType()
     {
@@ -49,6 +68,44 @@ public class AssignmentTestableTest
         testGetPreferredCompatibleType(LongType.instance, LongType.instance, LongType.instance);
         testGetPreferredCompatibleType(null, Int32Type.instance, LongType.instance); // not assignable
         testGetPreferredCompatibleType(null, LongType.instance, Int32Type.instance); // not assignable
+    }
+
+    /**
+     * When the element types are all compatible with each other, the type of the first element is preferred, whatever
+     * the hash codes of the types.
+     */
+    @Test
+    public void testGetPreferredCompatibleTypeOfMutuallyCompatibleTypes()
+    {
+        UserType udt = new UserType("ks", ByteBufferUtil.bytes("t"), Collections.singletonList(FieldIdentifier.forUnquoted("a")),
+                                    Collections.singletonList(Int32Type.instance), true);
+        AbstractType<?> type1 = ListType.getInstance(udt, false);
+        AbstractType<?> type2 = ListType.getInstance(udt.freeze(), false);
+        List<AbstractType<?>> types12 = Arrays.asList(type1, type2);
+        List<AbstractType<?>> types21 = Arrays.asList(type2, type1);
+        Assert.assertEquals(type1, AssignmentTestable.getCompatibleTypeIfKnown(types12));
+        Assert.assertEquals(type2, AssignmentTestable.getCompatibleTypeIfKnown(types21));
+
+        Assert.assertEquals(ListType.getInstance(type1, false), Lists.getPreferredCompatibleType(types12, t -> t));
+        Assert.assertEquals(ListType.getInstance(type2, false), Lists.getPreferredCompatibleType(types21, t -> t));
+        Assert.assertEquals(SetType.getInstance(type1, false), Sets.getPreferredCompatibleType(types12, t -> t));
+        Assert.assertEquals(SetType.getInstance(type2, false), Sets.getPreferredCompatibleType(types21, t -> t));
+        Assert.assertEquals(MapType.getInstance(type1, type2, false),
+                            Maps.getPreferredCompatibleType(Arrays.asList(Pair.create(type1, type2), Pair.create(type2, type1)), t -> t));
+        Assert.assertEquals(MapType.getInstance(type2, type1, false),
+                            Maps.getPreferredCompatibleType(Arrays.asList(Pair.create(type2, type1), Pair.create(type1, type2)), t -> t));
+
+        // frozen user types of several hash codes and a tuple of the same shape
+        AbstractType<?> tuple = new TupleType(Collections.singletonList(Int32Type.instance));
+        for (int i = 0; i < 10; i++)
+        {
+            AbstractType<?> frozenUdt = new UserType("ks", ByteBufferUtil.bytes("t" + i), Collections.singletonList(FieldIdentifier.forUnquoted("a")),
+                                                     Collections.singletonList(Int32Type.instance), false);
+            List<AbstractType<?>> udtFirst = Arrays.asList(frozenUdt, tuple);
+            List<AbstractType<?>> tupleFirst = Arrays.asList(tuple, frozenUdt);
+            Assert.assertEquals(VectorType.getInstance(frozenUdt, 2), Vectors.getPreferredCompatibleType(udtFirst, t -> t));
+            Assert.assertEquals(VectorType.getInstance(tuple, 2), Vectors.getPreferredCompatibleType(tupleFirst, t -> t));
+        }
     }
 
     public void testGetPreferredCompatibleType(AbstractType<?> type, AbstractType<?>... types)

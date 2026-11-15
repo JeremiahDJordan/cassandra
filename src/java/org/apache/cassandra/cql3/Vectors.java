@@ -20,6 +20,7 @@ package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
@@ -86,7 +87,7 @@ public class Vectors
     public static <T> VectorType<?> getPreferredCompatibleType(List<T> items,
                                                                java.util.function.Function<T, AbstractType<?>> mapper)
     {
-        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> type = AssignmentTestable.getCompatibleTypeIfKnown(types);
         return type == null ? null : VectorType.getInstance(type, items.size());
     }
