@@ -87,6 +87,12 @@ otherwise the node does not start ("Invalid yaml. Please remove properties [...]
     - `commitlog_sync_batch_window_in_ms`, `commitlog_periodic_queue_size`, `concurrent_replicates` and
       `native_transport_max_negotiable_protocol_version`, removed in 5.0.
 Behaviour that differs from HCD 1.2:
+    - Speculative retry measures the table's sampled read latency from when the coordinator started processing the
+      request, as Apache Cassandra 5.0 does (CASSANDRA-19534). HCD 1.2 measured it from when the replica reads were
+      sent (CNDB-8423). The difference is the coordinator's own work before it sends the reads, so it is usually
+      small. Read repair after a digest mismatch uses the same deadline: when the first replica round trip was
+      already as slow as the sampled latency, the additional repair read is sent right away instead of after
+      another wait, so read repair can send more additional reads while replicas are slow.
     - Compressed and encrypted SSTable writers honour `trickle_fsync` (CASSANDRA-21487), which is `true` in the
       default cassandra.yaml: SSTable writes of compressed or encrypted tables (flush, compaction, streaming that
       doesn't stream entire SSTables) fdatasync the data file, and the partition and row index files when indexes are
