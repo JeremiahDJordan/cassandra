@@ -846,10 +846,14 @@ public class LegacySSTableTest
         {
             for (String legacyVersion : legacyVersions)
             {
+                // re-add the columns with the types createTables gave them
+                boolean allFrozen = legacyVersion.startsWith("m");
                 alterTableAddColumn(legacyVersion, "val frozen<tuple<set<int>,set<text>>>");
-                alterTableAddColumn(legacyVersion, "val2 tuple<set<int>,set<text>>");
+                alterTableAddColumn(legacyVersion, allFrozen ? "val2 frozen<tuple<set<int>,set<text>>>"
+                                                             : "val2 tuple<set<int>,set<text>>");
                 alterTableAddColumn(legacyVersion, String.format("val3 frozen<legacy_%s_tuple_udt>", legacyVersion));
-                alterTableAddColumn(legacyVersion, String.format("val4 legacy_%s_tuple_udt", legacyVersion));
+                alterTableAddColumn(legacyVersion, String.format(allFrozen ? "val4 frozen<legacy_%s_tuple_udt>"
+                                                                           : "val4 legacy_%s_tuple_udt", legacyVersion));
             }
         }
     }
