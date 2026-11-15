@@ -297,9 +297,22 @@ public class InboundConnectionInitiator
         public void handlerAdded(ChannelHandlerContext ctx) throws Exception
         {
             handshakeTimeout = ctx.executor().schedule(() -> {
-                logger.error("Timeout handshaking with {} (on {})", SocketFactory.addressId(initiate.from, (InetSocketAddress) ctx.channel().remoteAddress()), settings.bindAddress);
+                // closed, but not yet removed from the pipeline, which cancels this timeout
+                if (!ctx.channel().isActive())
+                    return;
+                if (initiate == null)
+                    logger.error("Timeout handshaking with {} (on {}): no handshake initiation message received", ctx.channel().remoteAddress(), settings.bindAddress);
+                else
+                    logger.error("Timeout handshaking with {} (on {})", SocketFactory.addressId(initiate.from, (InetSocketAddress) ctx.channel().remoteAddress()), settings.bindAddress);
                 failHandshake(ctx);
             }, HandshakeProtocol.TIMEOUT_MILLIS, MILLISECONDS);
+        }
+
+        @Override
+        protected void handlerRemoved0(ChannelHandlerContext ctx)
+        {
+            if (handshakeTimeout != null)
+                handshakeTimeout.cancel(true);
         }
 
         @Override
