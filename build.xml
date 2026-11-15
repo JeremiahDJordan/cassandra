@@ -1004,6 +1004,14 @@
     </target>
 
     <!--
+        The db-all-jar target copies the main jar to its db-all name, the name the deb and rpm packages install.
+        The artifacts target makes the same copy.
+    -->
+    <target name="db-all-jar" depends="jar" description="Assemble DSE DB JAR files, and copy the main jar to its db-all name">
+      <copy file="${build.dir}/${final.name}.jar" tofile="${build.dir}/${new.artifact.name}.jar"/>
+    </target>
+
+    <!--
         The javadoc-jar target makes cassandra-javadoc.jar output required for publishing to Maven central repository.
     -->
     <target name="javadoc-jar" depends="javadoc" unless="no-javadoc" description="Assemble DSE DB JavaDoc JAR file">
