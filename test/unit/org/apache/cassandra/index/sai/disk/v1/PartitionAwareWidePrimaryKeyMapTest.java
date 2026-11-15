@@ -60,8 +60,8 @@ public class PartitionAwareWidePrimaryKeyMapTest extends SAITester
 
         // Create a wide table (with clustering column), and two SAI indexes to ensure primary key components exist
         createTable("CREATE TABLE %s (pk int, ck int, int_value int, text_value text, PRIMARY KEY (pk, ck))");
-        execute("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
-        execute("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
 
         // Insert rows with multiple clustering values per partition to create wide partitions
         // Partition 1: multiple rows

@@ -22,8 +22,10 @@ import org.junit.Test;
 import java.nio.ByteBuffer;
 
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.index.internal.CassandraIndex;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class SelectMultiColumnRelationTest extends CQLTester
@@ -2060,7 +2062,10 @@ public class SelectMultiColumnRelationTest extends CQLTester
                    row(1, "0", 0, 1, 3),
                    row(1, "1", 1, 3, 5));
 
-        assertInvalidMessage("PRIMARY KEY column \"c2\" cannot be restricted as preceding column \"c1\" is not restricted",
+        // with SAI, the default index in test-latest, the clustering IN is left to filtering
+        assertInvalidMessage(DatabaseDescriptor.getDefaultSecondaryIndex().equals(CassandraIndex.NAME)
+                             ? "PRIMARY KEY column \"c2\" cannot be restricted as preceding column \"c1\" is not restricted"
+                             : StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT * FROM %s WHERE (c2, c3) IN ((?, ?), (?, ?))", 1, 0, 2, 0);
 
         assertInvalidMessage("Multicolumn IN filters are not supported",

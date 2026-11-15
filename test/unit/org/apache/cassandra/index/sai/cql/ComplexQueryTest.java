@@ -274,7 +274,7 @@ public class ComplexQueryTest extends SAITester
     public void indexNotSupportingDisjunctionTest()
     {
         createTable("CREATE TABLE %s (pk int, a int, PRIMARY KEY(pk))");
-        createIndex("CREATE INDEX ON %s(a)");
+        createIndex("CREATE INDEX ON %s(a) USING 'legacy_local_table'");
 
         execute("INSERT INTO %s (pk, a) VALUES (?, ?)", 1, 1);
         execute("INSERT INTO %s (pk, a) VALUES (?, ?)", 2, 2);

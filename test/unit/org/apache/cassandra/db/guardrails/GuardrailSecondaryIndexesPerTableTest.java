@@ -30,6 +30,9 @@ public class GuardrailSecondaryIndexesPerTableTest extends ThresholdTester
 {
     private static final int INDEXES_PER_TABLE_WARN_THRESHOLD = 1;
     private static final int INDEXES_PER_TABLE_FAIL_THRESHOLD = 3;
+    // secondary_indexes_per_table counts legacy indexes only (SAI has its own guardrails); an explicit USING keeps the
+    // test valid with default_secondary_index: sai.
+    private static final String USING_LEGACY = " USING 'legacy_local_table'";
 
     public GuardrailSecondaryIndexesPerTableTest()
     {
@@ -88,12 +91,12 @@ public class GuardrailSecondaryIndexesPerTableTest extends ThresholdTester
 
     private void assertCreateIndexSucceeds(String column, String indexName) throws Throwable
     {
-        assertMaxThresholdValid(format("CREATE INDEX %s ON %s.%s(%s)", indexName, keyspace(), currentTable(), column));
+        assertMaxThresholdValid(format("CREATE INDEX %s ON %s.%s(%s)" + USING_LEGACY, indexName, keyspace(), currentTable(), column));
     }
 
     private void assertCreateIndexWarns(String column, String indexName) throws Throwable
     {
-        assertThresholdWarns(format("CREATE INDEX %s ON %%s(%s)", indexName, column),
+        assertThresholdWarns(format("CREATE INDEX %s ON %%s(%s)" + USING_LEGACY, indexName, column),
                              format("Creating secondary index %son table %s, current number of indexes %s exceeds warning threshold of %s.",
                                     (Strings.isNullOrEmpty(indexName) ? "" : indexName + " "),
                                     currentTable(),
@@ -104,7 +107,7 @@ public class GuardrailSecondaryIndexesPerTableTest extends ThresholdTester
 
     private void assertCreateIndexFails(String column, String indexName) throws Throwable
     {
-        assertThresholdFails(format("CREATE INDEX %s ON %%s(%s)", indexName, column),
+        assertThresholdFails(format("CREATE INDEX %s ON %%s(%s)" + USING_LEGACY, indexName, column),
                              format("aborting the creation of secondary index %son table %s",
                                     Strings.isNullOrEmpty(indexName) ? "" : indexName + " ", currentTable())
         );

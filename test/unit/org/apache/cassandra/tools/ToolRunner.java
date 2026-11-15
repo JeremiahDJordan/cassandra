@@ -56,8 +56,12 @@ public class ToolRunner
 {
     protected static final Logger logger = LoggerFactory.getLogger(ToolRunner.class);
 
+    // SnakeYAML logs every duplicate config key it accepts to stderr through java.util.logging, and test configs such as
+    // test-latest's are built by concatenating yaml files that override earlier keys.
     public static final ImmutableList<String> DEFAULT_CLEANERS = ImmutableList.of("(?im)^picked up.*\\R",
-                                                                                   "(?im)^.*`USE <keyspace>` with prepared statements is.*\\R");
+                                                                                   "(?im)^.*`USE <keyspace>` with prepared statements is.*\\R",
+                                                                                   "(?m)^.* org\\.yaml\\.snakeyaml\\.internal\\.Logger warn\\R",
+                                                                                   "(?m)^WARNING: duplicate keys found : .*\\R");
     private static final ImmutableList<String> STDOUT_CLEANERS = ImmutableList.of("^DEBUG .*\\R");
 
     public static int runClassAsTool(String clazz, String... args)

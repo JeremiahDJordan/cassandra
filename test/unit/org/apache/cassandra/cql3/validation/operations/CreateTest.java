@@ -685,7 +685,9 @@ public class CreateTest extends CQLTester
             testMapMemtableConfig("", null, MemtableParams.DEFAULT.factory(), defaultClass);
             testMapMemtableConfig("SkipListMemtable", "skiplist", MemtableParams.get("skiplist").factory(), SkipListMemtable.class);
             testMapMemtableConfig("TrieMemtable","trie", MemtableParams.get("trie").factory(), TrieMemtable.class);
-            testMapMemtableConfig("TrieMemtableStage1", "trie", MemtableParams.get("trie").factory(), TrieMemtable.class);
+            testMapMemtableConfig("TrieMemtableStage1", "trie_stage1", MemtableParams.get("trie_stage1").factory(), TrieMemtableStage1.class);
+            testMapMemtableConfig("TrieMemtableStage2", "trie_stage2", MemtableParams.get("trie_stage2").factory(), TrieMemtableStage2.class);
+            testMapMemtableConfig("TrieMemtableStage3", "trie_stage3", MemtableParams.get("trie_stage3").factory(), TrieMemtableStage3.class);
             testMapMemtableConfig("PersistentMemoryMemtable", "persistent_memory", MemtableParams.get("persistent_memory").factory(), PersistentMemoryMemtable.class);
         }
 

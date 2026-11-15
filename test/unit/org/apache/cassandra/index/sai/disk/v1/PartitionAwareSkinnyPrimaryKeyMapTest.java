@@ -58,8 +58,8 @@ public class PartitionAwareSkinnyPrimaryKeyMapTest extends SAITester
         SAIUtil.setCurrentVersion(Version.AA);
 
         createTable("CREATE TABLE %s (pk int PRIMARY KEY, int_value int, text_value text)");
-        execute("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
-        execute("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
 
         // Insert a few rows to have first/middle/last and token gaps
         execute("INSERT INTO %s (pk, int_value, text_value) VALUES (?, ?, ?)", 1, 10, "a");

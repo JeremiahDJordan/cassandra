@@ -262,7 +262,7 @@ public class SecondaryIndexManagerTest extends CQLTester
     public void remoteReloadOnSSTableAddMarksTheIndexAsBuilt()
     {
         createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
-        String indexName = createIndex("CREATE INDEX ON %s(c)");
+        String indexName = createIndex("CREATE INDEX ON %s(c) USING 'legacy_local_table'");
 
         assertMarkedAsBuilt(indexName);
 

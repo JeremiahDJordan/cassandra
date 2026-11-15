@@ -52,7 +52,8 @@ public class AllIndexImplementationsTest extends CQLTester
     {
         List<Object[]> parameters = new LinkedList<>();
         parameters.add(new Object[]{ "none", null, null });
-        parameters.add(new Object[]{ "legacy", CassandraIndex.class, "CREATE INDEX ON %%s(%s)" });
+        // explicit USING, as default_secondary_index is sai in test-latest
+        parameters.add(new Object[]{ "legacy", CassandraIndex.class, "CREATE INDEX ON %%s(%s) USING '" + CassandraIndex.NAME + "'" });
         parameters.add(new Object[]{ "SAI", StorageAttachedIndex.class, "CREATE CUSTOM INDEX ON %%s(%s) USING 'StorageAttachedIndex'" });
         return parameters;
     }
