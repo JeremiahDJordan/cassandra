@@ -95,6 +95,18 @@ public class MemtableWriteDuringSchemaChangeTest extends CQLTester
     }
 
     @Test
+    public void testWriteBuiltBeforeADropAndAppliedAfter() throws Throwable
+    {
+        TableMetadata before = createTable();
+        execute("ALTER TABLE %s DROP b");
+        write(before, true, true);
+
+        assertRows(execute("SELECT pk, ck, d FROM %s"), row(0, 1, 4));
+        flush();
+        assertRows(execute("SELECT pk, ck, d FROM %s"), row(0, 1, 4));
+    }
+
+    @Test
     public void testWriteBuiltAfterAnAddAndAppliedBeforeTheMemtableSwitch() throws Throwable
     {
         TableMetadata before = createTable();
