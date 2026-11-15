@@ -797,8 +797,10 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
 
             private DeletionTime activeDeletion;
 
-            private final ComplexColumnData.Builder complexBuilder;
-            private final List<Iterator<Cell<?>>> complexCells;
+            // Created on first use when none of the columns the merger is created for is complex: the merged rows
+            // can still contain a complex column that has been dropped, if some of its cells are newer than the drop.
+            private ComplexColumnData.Builder complexBuilder;
+            private List<Iterator<Cell<?>>> complexCells;
             private final CellReducer cellReducer;
 
             public ColumnDataReducer(int size, boolean hasComplex)
@@ -851,6 +853,11 @@ public interface Row extends Unfiltered, Iterable<ColumnData>
                 }
                 else
                 {
+                    if (complexBuilder == null)
+                    {
+                        complexBuilder = ComplexColumnData.builder();
+                        complexCells = new ArrayList<>(versions.size());
+                    }
                     complexBuilder.newColumn(column);
                     complexCells.clear();
                     DeletionTime complexDeletion = DeletionTime.LIVE;
