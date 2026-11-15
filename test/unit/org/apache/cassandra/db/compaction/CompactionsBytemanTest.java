@@ -26,6 +26,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
+import com.google.common.collect.Iterables;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -35,9 +36,12 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
@@ -140,6 +144,44 @@ public class CompactionsBytemanTest extends CQLTester
         createPossiblyExpiredSSTable(cfs, false);
         createPossiblyExpiredSSTable(cfs, false);
         cfs.forceMajorCompaction(false);
+        dropTable("DROP TABLE %s");
+    }
+
+    /*
+    Always return false for hasDiskSpaceForCompactionsAndStreams. A garbage collection task has no compaction strategy,
+    so it must still fail with the "Not enough space" error rather than a NullPointerException.
+     */
+    @Test
+    @BMRules(rules = { @BMRule(name = "No disk space for garbage collection test",
+    targetClass = "Directories",
+    targetMethod = "hasDiskSpaceForCompactionsAndStreams",
+    action = "return false;") } )
+    public void testNotEnoughSpaceErrorWithoutCompactionStrategy() throws Throwable
+    {
+        createLowGCGraceTable();
+        final ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        createPossiblyExpiredSSTable(cfs, false);
+        SSTableReader sstable = Iterables.getOnlyElement(cfs.getLiveSSTables());
+        long abortedBefore = CompactionManager.instance.getMetrics().compactionsAborted.getCount();
+
+        try (LifecycleTransaction txn = cfs.getTracker().tryModify(sstable, OperationType.GARBAGE_COLLECT))
+        {
+            AbstractCompactionTask task = CompactionTask.forGarbageCollection(cfs,
+                                                                              txn,
+                                                                              FBUtilities.nowInSeconds(),
+                                                                              CompactionParams.TombstoneOption.ROW);
+            task.execute(CompactionManager.instance.active);
+            fail("Expected the garbage collection to fail for lack of disk space");
+        }
+        catch (RuntimeException e)
+        {
+            assertEquals(RuntimeException.class, e.getClass());
+            assertTrue(e.getMessage(), e.getMessage().startsWith("Not enough space for compaction"));
+            assertTrue(e.getMessage(), e.getMessage().contains("estimated sstables = 1,"));
+        }
+
+        assertEquals(abortedBefore + 1, CompactionManager.instance.getMetrics().compactionsAborted.getCount());
+        assertEquals(Collections.singleton(sstable), cfs.getLiveSSTables());
         dropTable("DROP TABLE %s");
     }
 
