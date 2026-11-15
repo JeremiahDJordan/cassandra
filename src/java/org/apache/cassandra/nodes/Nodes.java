@@ -480,6 +480,19 @@ public class Nodes
         }
 
         /**
+         * Updates local node information like {@link #update(UnaryOperator)}, then waits until the update has been
+         * written by the {@link INodesPersistence}, so that reads of the persisted information (for example CQL queries
+         * on {@code system.local}) see it. Unlike a {@code blocking} update, this does not sync (flush) the persisted
+         * information, so the update is not necessarily durable when this method returns.
+         */
+        public ILocalInfo updateAndAwaitPersistence(UnaryOperator<LocalInfo> update)
+        {
+            ILocalInfo updated = update(update, false, false);
+            awaitInflightUpdateCompletion();
+            return updated;
+        }
+
+        /**
          * Returns information about the local node (if present).
          * Note that you should never try to manually cast the returned object to a mutable instnace and modify it.
          */
