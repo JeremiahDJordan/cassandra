@@ -32,25 +32,23 @@ public class PairedSlidingWindowReservoir
         this.count = 0L;
     }
 
-    public int size()
+    // All access to measurements and count is synchronized. A reader must not see a count that covers a slot whose
+    // pair has not been stored yet, or getSnapshot() returns an array with a null element (NPE in LinearFit). The
+    // window is small (V2VectorIndexSearcher uses 20 pairs), so copying it under the lock is cheap.
+    public synchronized int size()
     {
-        if (this.count >= this.measurements.length)
-            return this.measurements.length;
-
-        synchronized (this)
-        {
-            return (int) Math.min(this.count, this.measurements.length);
-        }
+        return (int) Math.min(this.count, this.measurements.length);
     }
 
     public synchronized void update(int value1, int value2)
     {
-        this.measurements[(int) (this.count++ % this.measurements.length)] = new IntIntPair(value1, value2);
+        this.measurements[(int) (this.count % this.measurements.length)] = new IntIntPair(value1, value2);
+        this.count++;
     }
 
-    public PairedSnapshot getSnapshot()
+    public synchronized PairedSnapshot getSnapshot()
     {
-        var values = new IntIntPair[this.size()];
+        var values = new IntIntPair[size()];
         System.arraycopy(this.measurements, 0, values, 0, values.length);
         return new PairedSnapshot(values);
     }
