@@ -102,32 +102,43 @@ public class GeoDistanceAccuracyTest extends VectorTester
     @Test
     public void haversineBenchmark()
     {
-        // Run 1 million iterations
-        int iterations = 1000000;
-        double strictHaversineDuration = 0;
-        double sloppyHaversineDuration = 0;
-        for (int i = 0; i < iterations; i++)
+        // Run 1 million iterations of each, timed in rounds. Timing each call on its own mostly measures
+        // System.nanoTime(), and one preemption on a busy host can then decide the result, so compare the fastest
+        // round of each algorithm instead.
+        int rounds = 100;
+        int roundSize = 10000;
+        float[] coordinates = new float[roundSize * 4];
+        long bestStrictNanos = Long.MAX_VALUE;
+        long bestSloppyNanos = Long.MAX_VALUE;
+        double sink = 0; // consume the results so the JIT cannot drop the calls
+        for (int round = 0; round < rounds; round++)
         {
-            float searchLat = SAITester.getRandom().nextFloatBetween(-90, 90);
-            float searchLon = SAITester.getRandom().nextFloatBetween(-180, 180);
-            float pointLat = SAITester.getRandom().nextFloatBetween(-90, 90);
-            float pointLon = SAITester.getRandom().nextFloatBetween(-180, 180);
+            for (int i = 0; i < coordinates.length; i += 4)
+            {
+                coordinates[i] = SAITester.getRandom().nextFloatBetween(-90, 90); // search latitude
+                coordinates[i + 1] = SAITester.getRandom().nextFloatBetween(-180, 180); // search longitude
+                coordinates[i + 2] = SAITester.getRandom().nextFloatBetween(-90, 90); // point latitude
+                coordinates[i + 3] = SAITester.getRandom().nextFloatBetween(-180, 180); // point longitude
+            }
 
             // Get the haversine distance using a strict algorithm
-            var nowStrict = System.nanoTime();
-            GeoDistanceAccuracyTest.strictHaversineDistance(searchLat, searchLon, pointLat, pointLon);
-            strictHaversineDuration += System.nanoTime() - nowStrict;
+            long nowStrict = System.nanoTime();
+            for (int i = 0; i < coordinates.length; i += 4)
+                sink += GeoDistanceAccuracyTest.strictHaversineDistance(coordinates[i], coordinates[i + 1], coordinates[i + 2], coordinates[i + 3]);
+            bestStrictNanos = Math.min(bestStrictNanos, System.nanoTime() - nowStrict);
 
             // Calculate the sloppy distance (the one used in the code)
-            var nowSloppy = System.nanoTime();
-            SloppyMath.haversinMeters(searchLat, searchLon, pointLat, pointLon);
-            sloppyHaversineDuration += System.nanoTime() - nowSloppy;
+            long nowSloppy = System.nanoTime();
+            for (int i = 0; i < coordinates.length; i += 4)
+                sink += SloppyMath.haversinMeters(coordinates[i], coordinates[i + 1], coordinates[i + 2], coordinates[i + 3]);
+            bestSloppyNanos = Math.min(bestSloppyNanos, System.nanoTime() - nowSloppy);
         }
 
-        double strictHaversineAverage = strictHaversineDuration / iterations;
-        double sloppyHaversineAverage = sloppyHaversineDuration / iterations;
-        logger.info("Average duration for strict haversine: " + strictHaversineAverage);
-        logger.info("Average duration for sloppy haversine: " + sloppyHaversineAverage);
+        double strictHaversineAverage = (double) bestStrictNanos / roundSize;
+        double sloppyHaversineAverage = (double) bestSloppyNanos / roundSize;
+        logger.info("Average duration for strict haversine (fastest round): " + strictHaversineAverage);
+        logger.info("Average duration for sloppy haversine (fastest round): " + sloppyHaversineAverage);
+        logger.debug("Sum of distances: {}", sink);
         assertTrue("Sloppy haversine distance should be at least as fast as strict haversine distance.",
                    sloppyHaversineAverage <= strictHaversineAverage);
     }
