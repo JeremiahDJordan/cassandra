@@ -1233,6 +1233,32 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
     }
 
     /**
+     * Switches the memtable that a write started with the given operation group would be applied to, if it predates
+     * columns of the update (see {@link Memtable#predatesColumnsOf}), as {@link #reload} is about to do. Must be called
+     * before the commit log append: a write with a commit log position has to go to the memtable that owns it.
+     *
+     * @return true if the write has to be started again with a new operation group, which is after the switch's barrier
+     */
+    public boolean switchMemtableIfOutdatedFor(PartitionUpdate update, OpOrder.Group opGroup)
+    {
+        if (data.getView().liveMemtables.isEmpty())
+            return false;
+
+        Memtable memtable = data.getMemtableFor(opGroup, null);
+        if (!memtable.predatesColumnsOf(update))
+            return false;
+
+        // If the memtable has been switched already, this only waits for that switch to have issued its barrier.
+        // Unlike switchMemtableIfCurrent, nothing waits for the flushes.
+        synchronized (data)
+        {
+            if (data.getView().getCurrentMemtable() == memtable)
+                switchMemtable(FlushReason.SCHEMA_CHANGE);
+        }
+        return true;
+    }
+
+    /**
      * Switches the memtable iff the live memtable is the one provided
      *
      * @param memtable

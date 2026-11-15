@@ -509,6 +509,16 @@ public interface Memtable extends Comparable<Memtable>, UnfilteredSource, CellSo
      */
     boolean accepts(OpOrder.Group opGroup, CommitLogPosition commitLogPosition);
 
+    /**
+     * Whether this memtable cannot take the given update while a memtable created now could, because the update has
+     * columns that were added to the table (or added and dropped again) after this memtable was created. Called for
+     * every write, see {@code ColumnFamilyStore.switchMemtableIfOutdatedFor}.
+     */
+    default boolean predatesColumnsOf(PartitionUpdate update)
+    {
+        return false;
+    }
+
     /** Approximate commit log lower bound, <= getCommitLogLowerBound, used as a time stamp for ordering */
     CommitLogPosition getApproximateCommitLogLowerBound();
 

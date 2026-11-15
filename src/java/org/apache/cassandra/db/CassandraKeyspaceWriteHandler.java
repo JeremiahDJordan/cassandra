@@ -34,6 +34,9 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
 
 public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
 {
+    // More than one switch is needed only if the table's columns change again; after that many the memtable rejects the write.
+    private static final int MAX_MEMTABLE_SWITCHES_PER_WRITE = 3;
+
     private final Keyspace keyspace;
 
     public CassandraKeyspaceWriteHandler(Keyspace keyspace)
@@ -49,6 +52,15 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
         try
         {
             group = Keyspace.writeOrder.start();
+
+            // A memtable that predates columns of the write cannot store it; see ColumnFamilyStore#switchMemtableIfOutdatedFor.
+            for (int attempt = 0; attempt < MAX_MEMTABLE_SWITCHES_PER_WRITE && switchOutdatedMemtables(mutation, group); attempt++)
+            {
+                OpOrder.Group outdated = group;
+                group = null;
+                outdated.close();
+                group = Keyspace.writeOrder.start();
+            }
 
             // Let the indexes see the write BEFORE anything is persisted (Index#prepareWrite). This must
             // precede the commit log append: it is the ordering that lets an index treat a replayed
@@ -76,6 +88,23 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
             }
             throw t;
         }
+    }
+
+    /**
+     * Switches the memtables of the write that predate its columns, see {@link ColumnFamilyStore#switchMemtableIfOutdatedFor}.
+     *
+     * @return whether the write has to be started again with a new operation group
+     */
+    private boolean switchOutdatedMemtables(Mutation mutation, OpOrder.Group group)
+    {
+        boolean switched = false;
+        for (PartitionUpdate update : mutation.getPartitionUpdates())
+        {
+            ColumnFamilyStore cfs = keyspace.getIfExists(update.metadata().id);
+            if (cfs != null && cfs.switchMemtableIfOutdatedFor(update, group))
+                switched = true;
+        }
+        return switched;
     }
 
     /**
