@@ -1432,6 +1432,7 @@ public class UnifiedCompactionStrategyTest extends BaseCompactionStrategyTest
         when(controller.getReservedThreads()).thenReturn(Integer.MAX_VALUE);
         when(controller.getReservationsType()).thenReturn(Reservations.Type.PER_LEVEL);
         when(controller.getIgnoreOverlapsInExpirationCheck()).thenReturn(false);
+        when(controller.getExpiredSSTableCheckFrequency()).thenReturn(Long.MIN_VALUE); // check expiration on every pick
         when(controller.overlapInclusionMethod()).thenReturn(Overlaps.InclusionMethod.SINGLE);
         when(controller.parallelizeOutputShards()).thenReturn(parallelizeOutputShards);
         when(controller.random()).thenCallRealMethod();
@@ -1491,6 +1492,7 @@ public class UnifiedCompactionStrategyTest extends BaseCompactionStrategyTest
         when(controller.maxCompactionSpaceBytes()).thenReturn(Long.MAX_VALUE);
         when(controller.maxThroughput()).thenReturn(Double.MAX_VALUE);
         when(controller.getIgnoreOverlapsInExpirationCheck()).thenReturn(false);
+        when(controller.getExpiredSSTableCheckFrequency()).thenReturn(Long.MIN_VALUE); // check expiration on every pick
         when(controller.overlapInclusionMethod()).thenReturn(Overlaps.InclusionMethod.SINGLE);
         when(controller.parallelizeOutputShards()).thenReturn(parallelizeOutputShards);
         when(controller.maxSSTablesToCompact()).thenReturn(1000);
