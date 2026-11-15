@@ -53,10 +53,23 @@ public class VectorSiftSmallTest extends VectorTester.Versioned
 {
     private static final String DATASET = "siftsmall"; // change to "sift" for larger dataset. requires manual download
 
+    // Recall bounds for testCompaction. With only 100 queries, recall@1 moves in steps of 0.01, so it is asserted as
+    // the number of queries that may miss their exact nearest neighbour. A healthy index misses a few of them, and
+    // how many varies from run to run because the graphs are built concurrently. Over 310 measured runs covering
+    // every on-disk version, a checkpoint missed at most 3 before compaction, at most 4 after a compaction, and at
+    // most 5 with NVQ (CI saw 6 once). NVQ always returns the second neighbour of queries 16 and 68, which is within
+    // 0.1% of the nearest one's squared distance. The bounds leave a margin of one to three misses over that. For
+    // scale, the PQ refinement bug fixed by CNDB-19259 caused 27 to 55 misses after refinement.
+    // Recall@100 is measured on 10,000 neighbours and is stable: it was never below 0.995 in these runs.
+    private static final int MAX_MISSES_AT_1_BEFORE_COMPACTION = 4;
+    private static final int MAX_MISSES_AT_1_AFTER_COMPACTION = 5;
+    private static final int MAX_MISSES_AT_1_AFTER_COMPACTION_NVQ = 8;
+    private static final double MIN_RECALL_AT_100 = 0.99;
+
     // The full version matrix takes longer than the test fork timeout on slow CI hosts, so the
     // suite is sharded by version: this class covers ED and later, older versions are covered by
     // VectorSiftSmallEbEcTest and VectorSiftSmallLegacyTest.
-    @Parameterized.Parameters(name = "{0} {1}")
+    @Parameterized.Parameters(name = "version={0} enableNVQ={1} enableFused={2}")
     public static Collection<Object[]> data()
     {
         return data(v -> v.onOrAfter(Version.ED));
@@ -222,30 +235,19 @@ public class VectorSiftSmallTest extends VectorTester.Versioned
             insertVectors(baseVectors.subList(i * vectorsPerSegment, (i + 1) * vectorsPerSegment), i * vectorsPerSegment);
             flush();
         }
-        for (int topK : List.of(1, 100))
-        {
-            double recall = testRecall(topK, queryVectors, groundTruth);
-            assertTrue("Pre-compaction recall is " + recall, recall > 0.975);
-        }
+        assertCompactionRecall("Pre-compaction", MAX_MISSES_AT_1_BEFORE_COMPACTION, queryVectors, groundTruth);
 
-        // When NVQ is enabled, we expect worse recall
-        float postCompactionRecall = JVectorVersionUtil.ENABLE_NVQ ? 0.9499f : 0.975f;
+        // When NVQ is enabled, reranking is less precise and more near-ties are lost
+        int maxMissesAt1 = JVectorVersionUtil.ENABLE_NVQ ? MAX_MISSES_AT_1_AFTER_COMPACTION_NVQ
+                                                         : MAX_MISSES_AT_1_AFTER_COMPACTION;
 
         // Take the CassandraOnHeapGraph code path.
         compact();
-        for (int topK : List.of(1, 100))
-        {
-            var recall = testRecall(topK, queryVectors, groundTruth);
-            assertTrue("Post-compaction recall is " + recall, recall > postCompactionRecall);
-        }
+        assertCompactionRecall("Post-compaction (CassandraOnHeapGraph)", maxMissesAt1, queryVectors, groundTruth);
 
         // Compact again to take the CompactionGraph code path.
         compact();
-        for (int topK : List.of(1, 100))
-        {
-            var recall = testRecall(topK, queryVectors, groundTruth);
-            assertTrue("Post-compaction recall is " + recall, recall > postCompactionRecall);
-        }
+        assertCompactionRecall("Post-compaction (CompactionGraph)", maxMissesAt1, queryVectors, groundTruth);
 
         // Force the PQ training size so that the CompactionGraph refine path runs halfway through the build
         int savedTrainingSize = CompactionGraph.PQ_TRAINING_SIZE;
@@ -258,11 +260,25 @@ public class VectorSiftSmallTest extends VectorTester.Versioned
         {
             CompactionGraph.PQ_TRAINING_SIZE = savedTrainingSize;
         }
-        for (int topK : List.of(1, 100))
-        {
-            var recall = testRecall(topK, queryVectors, groundTruth);
-            assertTrue("Post-refinement recall is " + recall, recall > postCompactionRecall);
-        }
+        assertCompactionRecall("Post-refinement", maxMissesAt1, queryVectors, groundTruth);
+    }
+
+    /**
+     * Asserts recall@1 (at most {@code maxMissesAt1} of the queries may miss their nearest neighbour) and recall@100
+     * for {@link #testCompaction}. See the bounds at the top of the class for how they were chosen.
+     */
+    private void assertCompactionRecall(String stage, int maxMissesAt1,
+                                        List<float[]> queryVectors, List<List<Integer>> groundTruth)
+    {
+        double recallAt1 = testRecall(1, queryVectors, groundTruth);
+        long missesAt1 = Math.round((1 - recallAt1) * queryVectors.size());
+        assertTrue(String.format("%s recall@1 is %s: %d of %d queries missed their nearest neighbour, at most %d may",
+                                 stage, recallAt1, missesAt1, queryVectors.size(), maxMissesAt1),
+                   missesAt1 <= maxMissesAt1);
+
+        double recallAt100 = testRecall(100, queryVectors, groundTruth);
+        assertTrue(String.format("%s recall@100 is %s, expected at least %s", stage, recallAt100, MIN_RECALL_AT_100),
+                   recallAt100 >= MIN_RECALL_AT_100);
     }
 
     // exercise the path where we use the PQ from the first segment (constructed on-heap)
