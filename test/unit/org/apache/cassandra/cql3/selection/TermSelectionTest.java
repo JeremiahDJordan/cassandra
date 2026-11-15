@@ -47,6 +47,7 @@ import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 
 public class TermSelectionTest extends CQLTester
 {
@@ -630,6 +631,67 @@ public class TermSelectionTest extends CQLTester
         assertInvalidMessage(incompatible, "SELECT {vi, t} FROM %s");
         // a frozen set of varints doesn't sort its elements as a frozen set of ints does
         assertInvalidMessage(incompatible, "SELECT [{vi}, {i}] FROM %s");
+    }
+
+    @Test
+    public void testCollectionLiteralElementTypes() throws Throwable
+    {
+        String type = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, j int, bi bigint, vi varint, t text, " +
+                    "v " + type + ", fv frozen<" + type + ">, l list<int>, fl frozen<list<int>>, tp tuple<int, int>)");
+        execute("INSERT INTO %s (k, i, j, bi, vi, t, v, fv, l, fl, tp) " +
+                "VALUES (0, 7, 8, 9, 10, 'x', {a: 1, b: 2}, {a: 3, b: 4}, [1], [2], (5, 6))");
+
+        // elements that are not of the element type of the collection, between parentheses or not
+        String incompatible = "Invalid collection literal: all selectors must have the same CQL type inside collection literals";
+        assertInvalidMessage("(i) is not of the expected type: " + type, "SELECT [v, (i)] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [v, i] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [i, t] FROM %s");
+        assertInvalidMessage("(t) is not of the expected type: int", "SELECT [i, (t)] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [i, bi] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [i, writetime(i)] FROM %s");
+        assertInvalidMessage("(v) is not of the expected type: list<int>", "SELECT [l, (v)] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [[i], [t]] FROM %s");
+        assertInvalidMessage("(t) is not of the expected type: int", "SELECT {i, (t)} FROM %s");
+        assertInvalidMessage("(i) is not of the expected type: " + type, "SELECT {v, (i)} FROM %s");
+        assertInvalidMessage("{i: t} is not of the expected type: frozen<map<int, int>>",
+                             "SELECT [(map<int, int>){i: j}, {i: t}] FROM %s");
+        assertInvalidMessage("{t: j} is not of the expected type: frozen<map<int, int>>",
+                             "SELECT [(map<int, int>){i: j}, {t: j}] FROM %s");
+        assertInvalidMessage("{a: t} is not of the expected type: " + type, "SELECT [v, {a: t}] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [tp, (i, t)] FROM %s");
+        assertInvalidMessage("(1, t) is not of the expected type: tuple<int, int>", "SELECT [tp, (1, t)] FROM %s");
+
+        // elements of the element type of the collection, or whose values are values of it
+        Object v = userType("a", 1, "b", 2);
+        Object fv = userType("a", 3, "b", 4);
+        assertRows(execute("SELECT [fv, (fv)] FROM %s"), row(list(fv, fv)));
+        assertRows(execute("SELECT [(int) 1, i] FROM %s"), row(list(1, 7)));
+        assertRows(execute("SELECT [i, (j)] FROM %s"), row(list(7, 8)));
+        assertRows(execute("SELECT [i, 1, null] FROM %s"), row(list(7, 1, null)));
+        assertRows(execute("SELECT [vi, i] FROM %s"), row(list(BigInteger.valueOf(10), BigInteger.valueOf(7))));
+        assertRows(execute("SELECT {i, (j)} FROM %s"), row(set(7, 8)));
+        assertRows(execute("SELECT [l, fl] FROM %s"), row(list(list(1), list(2))));
+        assertRows(execute("SELECT [fl, l] FROM %s"), row(list(list(2), list(1))));
+        assertRows(execute("SELECT [[i], [(j)]] FROM %s"), row(list(list(7), list(8))));
+        assertRows(execute("SELECT [(map<int, int>){i: j}, {j: (i)}] FROM %s"), row(list(map(7, 8), map(8, 7))));
+        assertRows(execute("SELECT [tp, (i, j)] FROM %s"), row(list(tuple(5, 6), tuple(7, 8))));
+        assertRows(execute("SELECT [fv, {a: i, b: 1}] FROM %s"), row(list(fv, userType("a", 7, "b", 1))));
+        assertRows(execute("SELECT [v, fv] FROM %s"), row(list(v, fv)));
+        assertRows(execute("SELECT [fv, v] FROM %s"), row(list(fv, v)));
+        assertRows(execute("SELECT [v, (v)] FROM %s"), row(list(v, v)));
+        assertRows(execute("SELECT [fv, (v)] FROM %s"), row(list(fv, v)));
+        assertRows(execute("SELECT [v, tp] FROM %s"), row(list(v, userType("a", 5, "b", 6))));
+        assertRows(execute("SELECT [[v], [fv]] FROM %s"), row(list(list(v), list(fv))));
+        assertRows(execute("SELECT [[fv], [v]] FROM %s"), row(list(list(fv), list(v))));
+        assertRows(execute("SELECT to_json([v, (fv)]) FROM %s"), row("[{\"a\": 1, \"b\": 2}, {\"a\": 3, \"b\": 4}]"));
+
+        // the client decodes the values
+        for (String literal : new String[]{ "[fv, (fv)]", "[(int) 1, i]", "[i, (j)]", "[i, 1, null]", "[vi, i]", "{i, (j)}",
+                                            "[l, fl]", "[fl, l]", "[[i], [(j)]]", "[(map<int, int>){i: j}, {j: (i)}]",
+                                            "[tp, (i, j)]", "[fv, {a: i, b: 1}]", "[v, fv]", "[fv, v]", "[v, (v)]",
+                                            "[fv, (v)]", "[v, tp]", "[[v], [fv]]", "[[fv], [v]]" })
+            assertNotNull(literal, executeNet("SELECT " + literal + " FROM %s").one().getObject(0));
     }
 
     private ByteBuffer selectedValue(String query) throws Throwable
