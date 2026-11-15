@@ -19,12 +19,10 @@
 package org.apache.cassandra.db.marshal;
 
 import java.io.IOException;
-import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Modifier;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
@@ -40,11 +38,8 @@ import java.util.Map;
 import java.util.Set;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
-import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-import java.util.stream.Stream;
-import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
 import com.google.common.base.Charsets;
@@ -63,11 +58,7 @@ import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import net.minidev.json.JSONArray;
 import net.minidev.json.JSONObject;
-import net.minidev.json.parser.JSONParser;
-import net.minidev.json.parser.ParseException;
-import net.openhft.chronicle.core.util.ThrowingFunction;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.AssignmentTestable;
@@ -123,7 +114,6 @@ import org.reflections.scanners.Scanners;
 import org.reflections.util.ConfigurationBuilder;
 
 import static org.apache.cassandra.db.marshal.AbstractType.ComparisonType.CUSTOM;
-import static org.apache.cassandra.utils.AbstractTypeGenerators.DSE_CUSTOM_TYPES;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.TypeKind.COMPOSITE;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.TypeKind.COUNTER;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.TypeKind.DYNAMIC_COMPOSITE;
@@ -158,6 +148,15 @@ public class AbstractTypeTest
 
     static
     {
+        configureTypeGenerators();
+    }
+
+    /**
+     * The type generators must be set up the same way wherever type pairs are compared, so that every comparison walks
+     * the same pairs; {@link AbstractTypeMigrationTest} uses this too.
+     */
+    static void configureTypeGenerators()
+    {
         CassandraRelevantProperties.VECTOR_FLOAT_ONLY.setBoolean(false);
 
         // make sure blob is always the same
@@ -188,28 +187,14 @@ public class AbstractTypeTest
     // withUpdatedUserType/expandUserTypes/referencesDuration - types that recursive check types
 
     private static TypesCompatibility currentTypesCompatibility;
-    private static LoadedTypesCompatibility cassandra40TypesCompatibility;
-    private static LoadedTypesCompatibility cassandra41TypesCompatibility;
-    private static LoadedTypesCompatibility cassandra50TypesCompatibility;
-    private static LoadedTypesCompatibility dse68cndbTypesCompatibility;
-    private static LoadedTypesCompatibility legacyCC40TypesCompatibility;
-    private static LoadedTypesCompatibility cc40TypesCompatibility;
-    private static LoadedTypesCompatibility cc50TypesCompatibility;
 
     private final static String CASSANDRA_VERSION = "cc-5.0";
     private final static Path BASE_OUTPUT_PATH = Paths.get("test", "data", "types-compatibility");
 
     @BeforeClass
-    public static void beforeClass() throws IOException
+    public static void beforeClass()
     {
         DatabaseDescriptor.daemonInitialization();
-        cassandra40TypesCompatibility = new LoadedTypesCompatibility(compatibilityFile(CassandraVersion.CASSANDRA_4_0.toMajorMinorString()), Set.of());
-        cassandra41TypesCompatibility = new LoadedTypesCompatibility(compatibilityFile(CassandraVersion.CASSANDRA_4_1.toMajorMinorString()), Set.of());
-        cassandra50TypesCompatibility = new LoadedTypesCompatibility(compatibilityFile(CassandraVersion.CASSANDRA_5_0.toMajorMinorString()), Set.of());
-        dse68cndbTypesCompatibility = new LoadedTypesCompatibility(compatibilityFile("dse-6.8-cndb"), ImmutableSet.of());
-        legacyCC40TypesCompatibility = new LoadedTypesCompatibility(compatibilityFile("legacy-cc-4.0"), ImmutableSet.of());
-        cc40TypesCompatibility = new LoadedTypesCompatibility(compatibilityFile("cc-4.0"), ImmutableSet.of());
-        cc50TypesCompatibility = new LoadedTypesCompatibility(compatibilityFile("cc-5.0"), ImmutableSet.of());
         currentTypesCompatibility = new CurrentTypesCompatibility();
     }
 
@@ -834,174 +819,6 @@ public class AbstractTypeTest
     }
 
     @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCassandra40ToCurrent()
-    {
-        cassandra40TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(currentTypesCompatibility, cassandra40TypesCompatibility, true);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCassandra41ToCurrent()
-    {
-        cassandra41TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(currentTypesCompatibility, cassandra41TypesCompatibility, true);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCassandra50ToCurrent()
-    {
-        cassandra50TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(currentTypesCompatibility, cassandra50TypesCompatibility, true);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromDse68CndbToCurrent()
-    {
-        dse68cndbTypesCompatibility.assertLoaded();
-        testBackwardCompatibility(currentTypesCompatibility, dse68cndbTypesCompatibility, false);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromLegacyCC40ToCurrent()
-    {
-        legacyCC40TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(currentTypesCompatibility, legacyCC40TypesCompatibility, false);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCC40ToCurrent()
-    {
-        cc40TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(currentTypesCompatibility, cc40TypesCompatibility, false);
-    }
-
-    @Test
-    public void testMigrationFromCC50ToCurrent()
-    {
-        cc50TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(currentTypesCompatibility, cc50TypesCompatibility, true);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCurrentToCassandra40()
-    {
-        cassandra40TypesCompatibility.assertLoaded();
-        Set<Class<? extends AbstractType>> skippedTypes = Sets.union(DSE_CUSTOM_TYPES, Set.of(LegacyTimeUUIDType.class, VectorType.class));
-        testBackwardCompatibility(cassandra40TypesCompatibility, currentTypesCompatibility,
-                                  c -> !skippedTypes.contains(c),
-                                  t -> !skippedTypes.contains(t.getClass()),
-                                  true);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCurrentToCassandra41()
-    {
-        cassandra41TypesCompatibility.assertLoaded();
-        Set<Class<? extends AbstractType>> skippedTypes = Sets.union(DSE_CUSTOM_TYPES, Set.of(LegacyTimeUUIDType.class, VectorType.class));
-        testBackwardCompatibility(cassandra41TypesCompatibility, currentTypesCompatibility,
-                                  c -> !skippedTypes.contains(c),
-                                  t -> !skippedTypes.contains(t.getClass()),
-                                  true);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCurrentToCassandra50()
-    {
-        cassandra50TypesCompatibility.assertLoaded();
-        Set<Class<? extends AbstractType>> skippedTypes = DSE_CUSTOM_TYPES;
-        testBackwardCompatibility(cassandra50TypesCompatibility, currentTypesCompatibility,
-                                  c -> !skippedTypes.contains(c),
-                                  t -> !skippedTypes.contains(t.getClass()),
-                                  true);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCurrentToDse68Cndb()
-    {
-        dse68cndbTypesCompatibility.assertLoaded();
-        Set<Class<? extends AbstractType>> skippedTypes = Set.of(LegacyTimeUUIDType.class, VectorType.class);
-        testBackwardCompatibility(dse68cndbTypesCompatibility, currentTypesCompatibility,
-                                  c -> !skippedTypes.contains(c),
-                                  t -> !skippedTypes.contains(t.getClass()),
-                                  false);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCurrentToLegacyCC40()
-    {
-        legacyCC40TypesCompatibility.assertLoaded();
-        Set<Class<? extends AbstractType>> skippedTypes = Set.of(LegacyTimeUUIDType.class, VectorType.class);
-        testBackwardCompatibility(legacyCC40TypesCompatibility, currentTypesCompatibility,
-                                  c -> !skippedTypes.contains(c),
-                                  t -> !skippedTypes.contains(t.getClass()),
-                                  false);
-    }
-
-    @Test
-    @Ignore("To be discussed")
-    public void testMigrationFromCurrentToCC40()
-    {
-        cc40TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(cc40TypesCompatibility, currentTypesCompatibility,
-                                  t -> t != LegacyTimeUUIDType.class,
-                                  t -> t != LegacyTimeUUIDType.instance,
-                                  false);
-    }
-
-    @Test
-    public void testMigrationFromCurrentToCC50()
-    {
-        cc50TypesCompatibility.assertLoaded();
-        testBackwardCompatibility(cc50TypesCompatibility, currentTypesCompatibility, true);
-    }
-
-    private static void testBackwardCompatibility(TypesCompatibility upgradeTo, TypesCompatibility upgradeFrom, boolean serializationCompatibleWithSupported)
-    {
-        testBackwardCompatibility(upgradeTo, upgradeFrom, t -> true, t -> true, serializationCompatibleWithSupported);
-    }
-
-    public static void testBackwardCompatibility(TypesCompatibility upgradeTo, TypesCompatibility upgradeFrom, Predicate<Class<? extends AbstractType>> classFilter, Predicate<AbstractType<?>> typeFilter, boolean serializationCompatibleWithSupported)
-    {
-        SoftAssertions assertions = new SoftAssertionsWithLimit(100);
-
-        assertions.assertThat(upgradeTo.knownTypes().stream().filter(classFilter).collect(Collectors.toSet()))
-                  .containsAll(upgradeFrom.knownTypes().stream().filter(classFilter).collect(Collectors.toSet()));
-        assertions.assertThat(upgradeTo.primitiveTypes().stream().filter(typeFilter).collect(Collectors.toSet()))
-                  .containsAll(upgradeFrom.primitiveTypes().stream().filter(typeFilter).collect(Collectors.toSet()));
-
-        // for compatibility, we ensure that this version can read values of all the types the previous version can write
-        assertions.assertThat(upgradeTo.multiCellSupportingTypesForReading()).containsAll(upgradeFrom.multiCellSupportingTypes());
-
-
-        forEachTypesPair(true, (l, r) -> {
-            if (l.equals(r))
-                return;
-            if (typeFilter.test(l) && typeFilter.test(r))
-            {
-                if (upgradeFrom.expectCompatibleWith(l, r))
-                    assertions.assertThat(upgradeTo.expectCompatibleWith(l, r)).describedAs(isCompatibleWithDesc(l, r)).isTrue();
-                if (serializationCompatibleWithSupported && upgradeFrom.expectSerializationCompatibleWith(l, r))
-                    assertions.assertThat(upgradeTo.expectSerializationCompatibleWith(l, r)).describedAs(isSerializationCompatibleWithDesc(l, r)).isTrue();
-                if (upgradeFrom.expectValueCompatibleWith(l, r))
-                    assertions.assertThat(upgradeTo.expectValueCompatibleWith(l, r)).describedAs(isValueCompatibleWithDesc(l, r)).isTrue();
-            }
-        });
-
-        assertions.assertAll();
-    }
-
-    @Test
     public void testImplementedCompatibility()
     {
         SoftAssertions assertions = new SoftAssertionsWithLimit(100);
@@ -1018,12 +835,12 @@ public class AbstractTypeTest
         assertions.assertAll();
     }
 
-    private static Path compatibilityFile(CassandraVersion version)
+    static Path compatibilityFile(CassandraVersion version)
     {
         return BASE_OUTPUT_PATH.resolve(String.format("%s.%s.json.gz", version.major, version.minor));
     }
 
-    private static Path compatibilityFile(String version)
+    static Path compatibilityFile(String version)
     {
         return BASE_OUTPUT_PATH.resolve(String.format("%s.json.gz", version));
     }
@@ -1368,17 +1185,17 @@ public class AbstractTypeTest
         };
     }
 
-    private static Description isCompatibleWithDesc(AbstractType<?> left, AbstractType<?> right)
+    static Description isCompatibleWithDesc(AbstractType<?> left, AbstractType<?> right)
     {
         return typeRelDesc("isCompatibleWith", left, right);
     }
 
-    private static Description isValueCompatibleWithDesc(AbstractType<?> left, AbstractType<?> right)
+    static Description isValueCompatibleWithDesc(AbstractType<?> left, AbstractType<?> right)
     {
         return typeRelDesc("isValueCompatibleWith", left, right);
     }
 
-    private static Description isSerializationCompatibleWithDesc(AbstractType<?> left, AbstractType<?> right)
+    static Description isSerializationCompatibleWithDesc(AbstractType<?> left, AbstractType<?> right)
     {
         return typeRelDesc("isSerializationCompatibleWith", left, right);
     }
@@ -1515,154 +1332,7 @@ public class AbstractTypeTest
         }
     }
 
-    private final static class LoadedTypesCompatibility extends TypesCompatibility
-    {
-        private final Multimap<AbstractType<?>, AbstractType<?>> valueCompatibleWith;
-        private final Multimap<AbstractType<?>, AbstractType<?>> serializationCompatibleWith;
-        private final Multimap<AbstractType<?>, AbstractType<?>> compatibleWith;
-        private final Set<Class<? extends AbstractType>> unsupportedTypes;
-        private final Set<Class<? extends AbstractType>> knownTypes;
-        private final Set<Class<? extends AbstractType>> multiCellSupportingTypes;
-        private final Set<Class<? extends AbstractType>> multiCellSupportingTypesForReading;
-        private final Set<AbstractType<?>> primitiveTypes;
-        private final SoftAssertions loadAssertions = new SoftAssertionsWithLimit(100);
-        private final Set<String> excludedTypes;
-
-        private <T> Function<Object, Stream<T>> safeParse(ThrowingFunction<String, T, Exception> consumer)
-        {
-            return obj -> {
-                String typeName = (String) obj;
-                if (refersExcludedType(typeName))
-                    return Stream.empty();
-                try
-        {
-                    return Stream.of(consumer.apply(typeName));
-                }
-                catch (InterruptedException ex)
-                {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException(ex);
-                }
-                catch (Exception th)
-                {
-                    loadAssertions.fail("Failed to parse type: " + typeName, th);
-                }
-                return Stream.empty();
-            };
-        }
-
-        private boolean refersExcludedType(String typeName)
-        {
-            for (String unsupportedType : excludedTypes)
-                if (typeName.contains(unsupportedType))
-                    return true;
-            return false;
-        }
-
-        private Set<Class<? extends AbstractType>> getTypesArray(Object json)
-        {
-            return ((JSONArray) json).stream()
-                                     .map(String.class::cast)
-                                     .flatMap(safeParse(((ThrowingFunction<String, Class<? extends AbstractType>, Exception>) className -> (Class<? extends AbstractType>) Class.forName(className))))
-                                     .collect(Collectors.toUnmodifiableSet());
-        }
-
-        private Multimap<AbstractType<?>, AbstractType<?>> getTypesCompatibilityMultimap(Object json)
-        {
-            Multimap<AbstractType<?>, AbstractType<?>> map = Multimaps.newListMultimap(new HashMap<>(), ArrayList::new);
-            ((JSONObject) json).forEach((l, collection) -> safeParse(TypeParser::parse).apply(l).forEach(left -> {
-                ((JSONArray) collection).forEach(r -> {
-                    safeParse(TypeParser::parse).apply(r).forEach(right -> map.put(left, right));
-                });
-            }));
-            return map;
-        }
-
-        private LoadedTypesCompatibility(Path path, Set<String> excludedTypes) throws IOException
-        {
-            super(path.getFileName().toString());
-
-            this.excludedTypes = ImmutableSet.copyOf(excludedTypes);
-            logger.info("Loading types compatibility from {} skipping {} as unsupported", path.toAbsolutePath(), excludedTypes);
-            try (GZIPInputStream in = new GZIPInputStream(Files.newInputStream(path)))
-            {
-                JSONObject json = (JSONObject) new JSONParser().parse(new InputStreamReader(in, Charsets.UTF_8));
-                knownTypes = getTypesArray(json.get(KNOWN_TYPES_KEY));
-                multiCellSupportingTypes = getTypesArray(json.get(MULTICELL_TYPES_KEY));
-                multiCellSupportingTypesForReading = getTypesArray(json.get(MULTICELL_TYPES_FOR_READING_KEY));
-                unsupportedTypes = getTypesArray(json.get(UNSUPPORTED_TYPES_KEY));
-                primitiveTypes = ((JSONArray) json.get(PRIMITIVE_TYPES_KEY)).stream().flatMap(safeParse(TypeParser::parse)).collect(Collectors.toSet());
-                compatibleWith = getTypesCompatibilityMultimap(json.get(COMPATIBLE_TYPES_KEY));
-                serializationCompatibleWith = getTypesCompatibilityMultimap(json.get(SERIALIZATION_COMPATIBLE_TYPES_KEY));
-                valueCompatibleWith = getTypesCompatibilityMultimap(json.get(VALUE_COMPATIBLE_TYPES_KEY));
-            }
-            catch (ParseException | NoSuchFileException e)
-            {
-                throw new IOException(path.toAbsolutePath().toString(), e);
-            }
-
-            logger.info("Loaded types compatibility from {}: knownTypes: {}, multiCellSupportingTypes: {}, " +
-                        "multiCellSupportingTypesForReading: {}, unsupportedTypes: {}, primitiveTypes: {}, " +
-                        "compatibleWith: {}, serializationCompatibleWith: {}, valueCompatibleWith: {}",
-                        path.getFileName(), knownTypes.size(), multiCellSupportingTypes.size(),
-                        multiCellSupportingTypesForReading.size(), unsupportedTypes.size(), primitiveTypes.size(),
-                        compatibleWith.size(), serializationCompatibleWith.size(), valueCompatibleWith.size());
-        }
-
-        public void assertLoaded()
-        {
-            loadAssertions.assertAll();
-        }
-        @Override
-        public boolean expectCompatibleWith(AbstractType left, AbstractType right)
-        {
-            return compatibleWith.containsEntry(left, right);
-        }
-
-        @Override
-        public boolean expectValueCompatibleWith(AbstractType left, AbstractType right)
-        {
-            return valueCompatibleWith.containsEntry(left, right);
-        }
-
-        @Override
-        public boolean expectSerializationCompatibleWith(AbstractType left, AbstractType right)
-        {
-            return serializationCompatibleWith.containsEntry(left, right);
-        }
-
-        @Override
-        public Set<Class<? extends AbstractType>> knownTypes()
-        {
-            return knownTypes;
-        }
-
-        @Override
-        public Set<AbstractType<?>> primitiveTypes()
-        {
-            return primitiveTypes;
-        }
-
-        @Override
-        public Set<Class<? extends AbstractType>> multiCellSupportingTypes()
-        {
-            return multiCellSupportingTypes;
-        }
-
-        @Override
-        public Set<Class<? extends AbstractType>> multiCellSupportingTypesForReading()
-        {
-            return multiCellSupportingTypesForReading;
-        }
-
-        @Override
-        public Set<Class<? extends AbstractType>> unsupportedTypes()
-        {
-            return unsupportedTypes;
-        }
-    }
-
-    private static class CurrentTypesCompatibility extends TypesCompatibility
+    static class CurrentTypesCompatibility extends TypesCompatibility
     {
         protected final Multimap<AbstractType<?>, AbstractType<?>> primitiveValueCompatibleWith = HashMultimap.create();
         protected final Multimap<AbstractType<?>, AbstractType<?>> primitiveSerializationCompatibleWith = HashMultimap.create();
@@ -1674,7 +1344,7 @@ public class AbstractTypeTest
         protected final Set<Class<? extends AbstractType>> multiCellSupportingTypes;
         protected final Set<Class<? extends AbstractType>> multiCellSupportingTypesForReading;
 
-        private CurrentTypesCompatibility()
+        CurrentTypesCompatibility()
         {
             super("current");
             primitiveValueCompatibleWith.put(BytesType.instance, AsciiType.instance);
