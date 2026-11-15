@@ -89,8 +89,8 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     private final LongAdder overwriteCount = new LongAdder();
     private final LongAdder removedCount = new LongAdder();
 
-    private PrimaryKey minimumKey;
-    private PrimaryKey maximumKey;
+    // (minimum, maximum) of the indexed keys, replaced as a whole by updateKeyBounds(); null until a key is indexed
+    private volatile KeyBounds keyBounds;
 
     private final NavigableSet<PrimaryKey> primaryKeys = new ConcurrentSkipListSet<>();
 
@@ -183,15 +183,11 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
         throw new UnsupportedOperationException("Vector index does not support multi-value updates");
     }
 
-    private void updateKeyBounds(PrimaryKey primaryKey) {
-        if (minimumKey == null)
-            minimumKey = primaryKey;
-        else if (primaryKey.compareTo(minimumKey) < 0)
-            minimumKey = primaryKey;
-        if (maximumKey == null)
-            maximumKey = primaryKey;
-        else if (primaryKey.compareTo(maximumKey) > 0)
-            maximumKey = primaryKey;
+    // writers call this concurrently, and a lost update would make orderResultsBy() drop keys of this memtable
+    private synchronized void updateKeyBounds(PrimaryKey primaryKey)
+    {
+        KeyBounds bounds = keyBounds;
+        keyBounds = bounds == null ? new KeyBounds(primaryKey, primaryKey) : bounds.withUpdated(primaryKey);
     }
 
     @Override
@@ -213,7 +209,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
 
         if (keyQueue.size() == 0)
             return KeyRangeIterator.empty();
-        return new ReorderingKeyRangeIterator(keyQueue.build(Comparator.naturalOrder()), keyQueue.size());
+        return new ReorderingKeyRangeIterator(keyBounds, keyQueue.build(Comparator.naturalOrder()), keyQueue.size());
     }
 
     @Override
@@ -298,8 +294,8 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     @Override
     public CloseableIterator<PrimaryKeyWithSortKey> orderResultsBy(QueryContext context, List<PrimaryKey> keys, Orderer orderer, int limit)
     {
-        if (minimumKey == null)
-            // This case implies maximumKey is empty too.
+        KeyBounds bounds = keyBounds;
+        if (bounds == null)
             return CloseableIterator.emptyIterator();
 
         assert orderer.isANN() : "Only ANN is supported for vector search, received " + orderer;
@@ -307,7 +303,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
         var keysInGraph = new HashSet<PrimaryKey>();
         var relevantOrdinals = new IntHashSet();
 
-        var keysInRange = PrimaryKeyListUtil.getKeysInRange(keys, minimumKey, maximumKey);
+        var keysInRange = PrimaryKeyListUtil.getKeysInRange(keys, bounds.minimum, bounds.maximum);
         boolean isStatic = indexContext.getDefinition().isStatic();
 
         keysInRange.forEach(k ->
@@ -546,9 +542,9 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     {
         private final SortingIterator<PrimaryKey> keyQueue;
 
-        ReorderingKeyRangeIterator(SortingIterator<PrimaryKey> keyQueue, int expectedSize)
+        ReorderingKeyRangeIterator(KeyBounds bounds, SortingIterator<PrimaryKey> keyQueue, int expectedSize)
         {
-            super(minimumKey, maximumKey, expectedSize);
+            super(bounds.minimum, bounds.maximum, expectedSize);
             this.keyQueue = keyQueue;
         }
 
@@ -615,5 +611,26 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     public void cleanup()
     {
         graph.cleanup();
+    }
+
+    private static final class KeyBounds
+    {
+        final PrimaryKey minimum;
+        final PrimaryKey maximum;
+
+        KeyBounds(PrimaryKey minimum, PrimaryKey maximum)
+        {
+            this.minimum = minimum;
+            this.maximum = maximum;
+        }
+
+        KeyBounds withUpdated(PrimaryKey key)
+        {
+            PrimaryKey newMin = minimum.compareTo(key) > 0 ? key : minimum;
+            PrimaryKey newMax = maximum.compareTo(key) < 0 ? key : maximum;
+
+            // Avoid allocation if nothing changed
+            return newMin == minimum && newMax == maximum ? this : new KeyBounds(newMin, newMax);
+        }
     }
 }
