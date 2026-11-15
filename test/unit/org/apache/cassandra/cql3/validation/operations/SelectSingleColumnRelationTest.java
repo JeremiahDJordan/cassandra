@@ -24,8 +24,10 @@ import java.util.List;
 import org.junit.Test;
 
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.index.internal.CassandraIndex;
 
 public class SelectSingleColumnRelationTest extends CQLTester
 {
@@ -354,11 +356,20 @@ public class SelectSingleColumnRelationTest extends CQLTester
 
         assertRows(execute("SELECT v1 FROM %s WHERE time = 1"), row("B"), row("E"));
 
-        // Checks that IN restrictions are not used for index queries
-        assertInvalidMessage("PRIMARY KEY column \"time\" cannot be restricted as preceding column \"author\" is not restricted",
-                            "SELECT v1 FROM %s WHERE time IN (1, 2)");
-        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
-                             "SELECT v1 FROM %s WHERE id2 IN (0, 2)");
+        if (DatabaseDescriptor.getDefaultSecondaryIndex().equals(CassandraIndex.NAME))
+        {
+            // Checks that IN restrictions are not used for legacy index queries
+            assertInvalidMessage("PRIMARY KEY column \"time\" cannot be restricted as preceding column \"author\" is not restricted",
+                                 "SELECT v1 FROM %s WHERE time IN (1, 2)");
+            assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                                 "SELECT v1 FROM %s WHERE id2 IN (0, 2)");
+        }
+        else
+        {
+            // DataStax's SAI supports IN restrictions (default_secondary_index: sai, e.g. test-latest)
+            assertRows(execute("SELECT v1 FROM %s WHERE time IN (1, 2)"), row("B"), row("C"), row("E"));
+            assertRows(execute("SELECT v1 FROM %s WHERE id2 IN (0, 2)"), row("A"), row("B"), row("D"));
+        }
         assertRows(execute("SELECT v1 FROM %s WHERE id2 = 0 and time IN (1, 2) ALLOW FILTERING"),
                    row("B"));
 
