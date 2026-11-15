@@ -63,8 +63,8 @@ public class RowAwareWidePrimaryKeyMapTest extends SAITester.Versioned.RowAware
     public void setup() throws Throwable
     {
         createTable("CREATE TABLE %s (pk int, ck int, int_value int, text_value text, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck ASC)");
-        execute("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
-        execute("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX int_index ON %s(int_value) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex'");
 
         // Insert multiple rows per partition to exercise clustering ordering
         // Partition pk=1

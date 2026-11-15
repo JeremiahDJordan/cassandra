@@ -77,7 +77,7 @@ public class CoordinatorReadSizeMetricsTest
         // Uses the legacy (CassandraIndex) implementation which is compatible with any partitioner,
         // including the ByteOrderedPartitioner used by the default unit-test configuration.
         session.execute(String.format(
-        "CREATE INDEX IF NOT EXISTS ON %s.%s (v);",
+        "CREATE INDEX IF NOT EXISTS ON %s.%s (v) USING 'legacy_local_table';",
         KEYSPACE, TABLE));
 
         waitForIndexQueryable();

@@ -303,16 +303,21 @@ public class LuceneAnalyzerTest extends SAITester
                     "USING 'org.apache.cassandra.index.sai.StorageAttachedIndex' " +
                     "WITH OPTIONS = { 'index_analyzer': 'standard' }");
 
-        assertThatThrownBy(() -> createIndex("CREATE CUSTOM INDEX ON %s(val) WITH OPTIONS = { 'ascii': true }"
-        )).isInstanceOf(InvalidRequestException.class);
+        // The column already has an analyzed index, so another analyzed index on it is a duplicate
+        assertThatThrownBy(() -> createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' " +
+                                             "WITH OPTIONS = { 'ascii': true }"
+        )).isInstanceOf(InvalidRequestException.class)
+          .hasMessageContaining("Cannot create duplicate storage-attached index on column: val");
 
-        assertThatThrownBy(() -> createIndex("CREATE CUSTOM INDEX ON %s(val) " +
-                                             "WITH OPTIONS = { 'case_sesnsitive': false }"
-        )).isInstanceOf(InvalidRequestException.class);
+        assertThatThrownBy(() -> createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' " +
+                                             "WITH OPTIONS = { 'case_sensitive': false }"
+        )).isInstanceOf(InvalidRequestException.class)
+          .hasMessageContaining("Cannot create duplicate storage-attached index on column: val");
 
-        assertThatThrownBy(() -> createIndex("CREATE CUSTOM INDEX ON %s(val) " +
+        assertThatThrownBy(() -> createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' " +
                                              "WITH OPTIONS = { 'normalize': true }"
-        )).isInstanceOf(InvalidRequestException.class);
+        )).isInstanceOf(InvalidRequestException.class)
+          .hasMessageContaining("Cannot create duplicate storage-attached index on column: val");
     }
 
     @Test

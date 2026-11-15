@@ -1086,13 +1086,11 @@ public class  DescribeStatementTest extends CQLTester
                                 : "    AND memtable = 'default'\n";
 
         // allow_auto_snapshot and incremental_backups are not present in pre-5.0 compatibility mode
-        String autoSnapshotAndIncrementalBackups = isCompatibilityMode
-                                                   ? ""
-                                                   : "    AND allow_auto_snapshot = true\n" +
-                                                     "    AND incremental_backups = true\n";
+        String autoSnapshot = isCompatibilityMode ? "" : "    AND allow_auto_snapshot = true\n";
+        String incrementalBackups = isCompatibilityMode ? "" : "    AND incremental_backups = true\n";
 
         return "additional_write_policy = '99p'\n" +
-               autoSnapshotAndIncrementalBackups +
+               autoSnapshot +
                "    AND bloom_filter_fp_chance = 0.01\n" +
                "    AND caching = {'keys': 'ALL', 'rows_per_partition': 'NONE'}\n" +
                "    AND cdc = false\n" +
@@ -1104,6 +1102,7 @@ public class  DescribeStatementTest extends CQLTester
                "    AND default_time_to_live = 0\n" +
                "    AND extensions = {}\n" +
                "    AND gc_grace_seconds = 864000\n" +
+               incrementalBackups +
                "    AND max_index_interval = 2048\n" +
                "    AND memtable_flush_period_in_ms = 0\n" +
                "    AND min_index_interval = 128\n" +
@@ -1126,13 +1125,11 @@ public class  DescribeStatementTest extends CQLTester
                                 : "    AND memtable = 'default'\n";
 
         // allow_auto_snapshot and incremental_backups are not present in pre-5.0 compatibility mode
-        String autoSnapshotAndIncrementalBackups = isCompatibilityMode
-                                                   ? ""
-                                                   : "    AND allow_auto_snapshot = true\n" +
-                                                     "    AND incremental_backups = true\n";
+        String autoSnapshot = isCompatibilityMode ? "" : "    AND allow_auto_snapshot = true\n";
+        String incrementalBackups = isCompatibilityMode ? "" : "    AND incremental_backups = true\n";
 
         return "additional_write_policy = '99p'\n" +
-               autoSnapshotAndIncrementalBackups +
+               autoSnapshot +
                "    AND bloom_filter_fp_chance = 0.01\n" +
                "    AND caching = {'keys': 'ALL', 'rows_per_partition': 'NONE'}\n" +
                "    AND cdc = false\n" +
@@ -1143,6 +1140,7 @@ public class  DescribeStatementTest extends CQLTester
                "    AND crc_check_chance = 1.0\n" +
                "    AND extensions = {}\n" +
                "    AND gc_grace_seconds = 864000\n" +
+               incrementalBackups +
                "    AND max_index_interval = 2048\n" +
                "    AND memtable_flush_period_in_ms = 0\n" +
                "    AND min_index_interval = 128\n" +
