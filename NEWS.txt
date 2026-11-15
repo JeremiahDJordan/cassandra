@@ -80,6 +80,10 @@ Upgrading
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
       return the same value as the address column. This avoids the risk of client connections overwhelming
       DNS. (CASSANDRA-21539)
+    - A single-column IN restriction used with ALLOW FILTERING, on an indexed column or not, with an unset bind marker,
+      such as v IN (?, ?) with a marker left unbound by a driver using native protocol v4 or later, is now rejected
+      with "Invalid unset value for column v", as EQ and IN on primary key columns already are. It used to match
+      the rows whose value of the column is empty. Bind every marker of such a restriction. (CASSANDRA-XXXXX)
     - Do not set the UnifiedCompactionStrategy table option max_sstables_per_shard_factor until every node runs
       5.0.10 or later. Earlier versions do not recognize the option. When one of them coordinates a schema change
       that validates the whole table definition, such as ALTER TABLE ... ADD, it rejects the change for any table
