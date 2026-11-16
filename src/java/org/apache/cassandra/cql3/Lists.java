@@ -19,6 +19,7 @@ package org.apache.cassandra.cql3;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -130,35 +131,62 @@ public abstract class Lists
                                                           java.util.function.Function<T, AbstractType<?>> mapper)
     {
         AbstractType<?> type = getElementType(items, mapper);
-        return type != null ? ListType.getInstance(type, false) : null;
+        return type != null ? ListType.getInstance(type.freeze(), false) : null;
     }
 
-    protected static <T> AbstractType<?> getElementType(List<T> items,
-                                                        java.util.function.Function<T, AbstractType<?>> mapper)
+    /**
+     * Returns the element type of a list or set literal from its items, if it can be known. Unlike the element type of
+     * {@link #getExactListTypeIfKnown}, it isn't frozen: it is the type of the elements, which may be a non-frozen UDT
+     * or collection.
+     *
+     * @param items the items mapped to the elements
+     * @param mapper the mapper used to retrieve the element types from the items
+     * @return the element type from the items if it can be known or <code>null</code>
+     */
+    public static <T> AbstractType<?> getElementType(List<T> items,
+                                                     java.util.function.Function<T, AbstractType<?>> mapper)
     {
         AbstractType<?> type = null;
         for (T item : items)
-        {
-            AbstractType<?> itemType = mapper.apply(item);
-            if (itemType == null)
-                continue;
-
-            if (type != null && !itemType.isCompatibleWith(type))
-            {
-                if (type.isCompatibleWith(itemType))
-                    continue;
-
-                throw new InvalidRequestException("Invalid collection literal: all selectors must have the same CQL type inside collection literals");
-            }
-            type = itemType;
-        }
+            type = selectElementType(type, mapper.apply(item));
         return type;
+    }
+
+    /**
+     * Picks the type of the elements of a collection literal, given the type picked from its previous elements and the
+     * type of another element (either of which may be {@code null} if unknown).
+     * <p>
+     * All the elements must have types that can read each other's values, as the literal is serialized with a single
+     * element type: the first element's type is kept unless the other one is wider (a tuple with more components),
+     * and an element whose type is incompatible both ways is rejected.
+     * <p>
+     * The elements of a collection literal are frozen values, and a non-frozen UDT or collection value is serialized in
+     * its frozen form, so the types are compared frozen: a non-frozen column and a frozen column of the same type
+     * can be mixed.
+     */
+    static AbstractType<?> selectElementType(AbstractType<?> type, AbstractType<?> otherType)
+    {
+        if (otherType == null)
+            return type;
+
+        if (type == null)
+            return otherType;
+
+        AbstractType<?> frozenType = type.freeze();
+        AbstractType<?> frozenOtherType = otherType.freeze();
+        if (frozenType.isCompatibleWith(frozenOtherType))
+            return type;
+
+        if (frozenOtherType.isCompatibleWith(frozenType))
+            return otherType;
+
+        throw new InvalidRequestException("Invalid collection literal: all selectors must have the same CQL type inside collection literals");
     }
 
     public static <T> ListType<?> getPreferredCompatibleType(List<T> items,
                                                              java.util.function.Function<T, AbstractType<?>> mapper)
     {
-        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> type = AssignmentTestable.getCompatibleTypeIfKnown(types);
         return type == null ? null : ListType.getInstance(type.freeze(), false);
     }

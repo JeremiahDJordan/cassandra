@@ -107,6 +107,26 @@ public interface Selectable extends AssignmentTestable
     }
 
     /**
+     * Returns the type that the elements of a list or set literal are expected to be of.
+     * <p>
+     * When the type of the literal is known from its elements, its element type is frozen, because a frozen collection
+     * type can't have non-frozen subtypes, while the elements may be of a non-frozen UDT or collection type, like
+     * {@code v} in {@code [v, (v)]}. An element of unknown type, like {@code (v)}, is then expected to be of the type of
+     * the other elements, as in Apache Cassandra.
+     *
+     * @param table the table schema
+     * @param selectables the elements of the literal
+     * @param collectionElementType the element type of the literal's collection type
+     */
+    private static AbstractType<?> elementType(TableMetadata table,
+                                               List<Selectable> selectables,
+                                               AbstractType<?> collectionElementType)
+    {
+        AbstractType<?> type = Lists.getElementType(selectables, s -> s.getExactTypeIfKnown(table.keyspace));
+        return type != null && type.freeze().equals(collectionElementType) ? type : collectionElementType;
+    }
+
+    /**
      * Checks if any processing is performed on the selected columns, {@code false} otherwise.
      * @return {@code true} if any processing is performed on the selected columns, {@code false} otherwise.
      */
@@ -663,6 +683,29 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public TestResult testAssignmentToInferredType(String keyspace, ColumnSpecification receiver)
+        {
+            if (selectables.size() == 1 && !receiver.type.isTuple())
+                return selectables.get(0).testAssignmentToInferredType(keyspace, receiver);
+
+            // The component types of a tuple type are frozen, in Apache Cassandra too, so this tests the components as
+            // Tuples.testTupleAssignment does, only letting collection literals among them test their own elements.
+            if (!Tuples.checkIfTupleType(receiver.type))
+                return TestResult.NOT_ASSIGNABLE;
+
+            if (selectables.size() > Tuples.getTupleType(receiver.type).size())
+                return TestResult.NOT_ASSIGNABLE;
+
+            for (int i = 0; i < selectables.size(); i++)
+            {
+                ColumnSpecification componentSpec = Tuples.componentSpecOf(receiver, i);
+                if (!selectables.get(i).testAssignmentToInferredType(keyspace, componentSpec).isAssignable())
+                    return TestResult.NOT_ASSIGNABLE;
+            }
+            return TestResult.WEAKLY_ASSIGNABLE;
+        }
+
+        @Override
         public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
                                           List<ColumnMetadata> defs,
@@ -804,6 +847,12 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public TestResult testAssignmentToInferredType(String keyspace, ColumnSpecification receiver)
+        {
+            return target(receiver == null ? null : receiver.type).testAssignmentToInferredType(keyspace, receiver);
+        }
+
+        @Override
         public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
                                           List<ColumnMetadata> defs,
@@ -876,6 +925,15 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public TestResult testAssignmentToInferredType(String keyspace, ColumnSpecification receiver)
+        {
+            if (!(receiver.type instanceof ListType) || selectables.isEmpty())
+                return testAssignment(keyspace, receiver);
+
+            return AssignmentTestable.testAllToInferredType(keyspace, Lists.valueSpecOf(receiver), selectables);
+        }
+
+        @Override
         public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
                                           List<ColumnMetadata> defs,
@@ -890,11 +948,10 @@ public interface Selectable extends AssignmentTestable
                                          this);
             }
 
-            ListType<?> listType = (ListType<?>) type;
-
+            AbstractType<?> elementType = elementType(cfm, selectables, ((ListType<?>) type).getElementsType());
             List<AbstractType<?>> expectedTypes = new ArrayList<>(selectables.size());
             for (int i = 0, m = selectables.size(); i < m; i++)
-                expectedTypes.add(listType.getElementsType());
+                expectedTypes.add(elementType);
 
             SelectorFactories factories = createFactoriesAndCollectColumnDefinitions(selectables,
                                                                                      expectedTypes,
@@ -928,6 +985,12 @@ public interface Selectable extends AssignmentTestable
         public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
             return Vectors.testVectorAssignment(receiver, selectables);
+        }
+
+        @Override
+        public TestResult testAssignmentToInferredType(String keyspace, ColumnSpecification receiver)
+        {
+            return testAssignment(keyspace, receiver);
         }
 
         @Override
@@ -996,6 +1059,15 @@ public interface Selectable extends AssignmentTestable
         }
 
         @Override
+        public TestResult testAssignmentToInferredType(String keyspace, ColumnSpecification receiver)
+        {
+            if (!(receiver.type instanceof SetType) || selectables.isEmpty())
+                return testAssignment(keyspace, receiver);
+
+            return AssignmentTestable.testAllToInferredType(keyspace, Sets.valueSpecOf(receiver), selectables);
+        }
+
+        @Override
         public Factory newSelectorFactory(TableMetadata cfm,
                                           AbstractType<?> expectedType,
                                           List<ColumnMetadata> defs,
@@ -1020,9 +1092,10 @@ public interface Selectable extends AssignmentTestable
             if (setType.getElementsType() == DurationType.instance)
                 throw invalidRequest("Durations are not allowed inside sets: %s", setType.asCQL3Type());
 
+            AbstractType<?> elementType = elementType(cfm, selectables, setType.getElementsType());
             List<AbstractType<?>> expectedTypes = new ArrayList<>(selectables.size());
             for (int i = 0, m = selectables.size(); i < m; i++)
-                expectedTypes.add(setType.getElementsType());
+                expectedTypes.add(elementType);
 
             SelectorFactories factories = createFactoriesAndCollectColumnDefinitions(selectables,
                                                                                      expectedTypes,
