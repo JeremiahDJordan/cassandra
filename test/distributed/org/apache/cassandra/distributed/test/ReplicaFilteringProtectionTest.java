@@ -119,6 +119,44 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
         }
     }
 
+    /**
+     * Replica filtering protection splits the partitions of single-partition queries into pages of at most the query's
+     * row limit (the page size or the LIMIT). The per-partition limit must still apply to the whole partition, not to
+     * each page.
+     */
+    @Test
+    public void testPerPartitionLimitAcrossPages()
+    {
+        String table = createRangeTombstoneTable("ppl_across_pages");
+
+        // Matches at c = 0 to 3 on both replicas, which disagree on a non-filtered value, so the digests mismatch
+        for (int c = 0; c < 4; c++)
+        {
+            write(1, "INSERT INTO %s (k, c, v) VALUES (0, " + c + ", 1) USING TIMESTAMP 1", table);
+            write(2, "INSERT INTO %s (k, c, v) VALUES (0, " + c + ", 1) USING TIMESTAMP 1", table);
+        }
+        cluster.schemaChange("ALTER TABLE " + table + " ADD x int");
+        write(2, "UPDATE %s USING TIMESTAMP 2 SET x = 1 WHERE k = 0 AND c = 0", table);
+
+        for (int pageSize : new int[]{ 1, 2, 3, 4 })
+        {
+            assertRows(cluster.coordinator(1).executeWithPaging("SELECT c FROM " + table + " WHERE k = 0 AND v = 1 PER PARTITION LIMIT 1 ALLOW FILTERING", ALL, pageSize),
+                       row(0));
+            assertRows(cluster.coordinator(1).executeWithPaging("SELECT c FROM " + table + " WHERE k = 0 AND v = 1 PER PARTITION LIMIT 2 ALLOW FILTERING", ALL, pageSize),
+                       row(0), row(1));
+            assertRows(cluster.coordinator(1).executeWithPaging("SELECT c FROM " + table + " WHERE k = 0 AND v = 1 ALLOW FILTERING", ALL, pageSize),
+                       row(0), row(1), row(2), row(3));
+            assertRows(cluster.coordinator(1).executeWithPaging("SELECT c FROM " + table + " WHERE k = 0 AND v = 1 PER PARTITION LIMIT 1 LIMIT 2 ALLOW FILTERING", ALL, pageSize),
+                       row(0));
+        }
+
+        // Without paging, a LIMIT above the per-partition limit splits the partition the same way
+        assertRows(cluster.coordinator(1).execute("SELECT c FROM " + table + " WHERE k = 0 AND v = 1 PER PARTITION LIMIT 1 LIMIT 2 ALLOW FILTERING", ALL),
+                   row(0));
+        assertRows(cluster.coordinator(1).execute("SELECT c FROM " + table + " WHERE k = 0 AND v = 1 PER PARTITION LIMIT 2 LIMIT 3 ALLOW FILTERING", ALL),
+                   row(0), row(1));
+    }
+
     @Test
     public void testRangeTombstoneAcrossPages()
     {
