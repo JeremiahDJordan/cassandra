@@ -831,6 +831,28 @@ public class VectorUpdateDeleteTest extends VectorTester
     }
 
     @Test
+    public void testVectorIndexWithAllOrdinalsDeletedAndSomeViaColumnDeletion()
+    {
+        createTable(KEYSPACE, "CREATE TABLE %s (pk int, a int, str_val text, val vector<float, 3>, PRIMARY KEY(pk, a))");
+        createIndex("CREATE CUSTOM INDEX ON %s(str_val) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+        disableCompaction(KEYSPACE);
+
+        execute("INSERT INTO %s (pk, a, str_val, val) VALUES (1, 1, 'A', [1.0, 2.0, 3.0])");
+        execute("INSERT INTO %s (pk, a, str_val, val) VALUES (2, 1, 'A', [1.0, 2.0, 4.0])");
+        execute("INSERT INTO %s (pk, a, str_val, val) VALUES (3, 1, 'A', [1.0, 2.0, 5.0])");
+
+        execute("DELETE FROM %s WHERE pk = 1");
+        execute("DELETE val FROM %s WHERE pk = 2 AND a = 1");
+        execute("DELETE val FROM %s WHERE pk = 3 AND a = 1");
+        flush();
+
+        assertRows(execute("SELECT PK FROM %s WHERE str_val = 'A' ORDER BY val ann of [1.0, 2.0, 3.0] LIMIT 1"));
+        // a partition restriction that selects a part of the segment looks up the ordinals of its row ids too
+        assertRows(execute("SELECT PK FROM %s WHERE pk = 2 ORDER BY val ann of [1.0, 2.0, 3.0] LIMIT 1"));
+    }
+
+    @Test
     public void ensureCompressedVectorsCanFlush()
     {
         createTable("CREATE TABLE %s (pk int, val vector<float, 4>, PRIMARY KEY(pk))");
