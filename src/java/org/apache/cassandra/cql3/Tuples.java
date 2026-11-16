@@ -20,6 +20,7 @@ package org.apache.cassandra.cql3;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
@@ -272,7 +273,11 @@ public class Tuples
                 // type.split(bytes)
                 List<List<ByteBuffer>> elements = new ArrayList<>(l.size());
                 for (T element : l)
-                    elements.add(Arrays.asList(tupleType.split(ByteBufferAccessor.instance, type.getElementsType().decompose(element))));
+                {
+                    // a null element is handled as a tuple whose elements are all null
+                    elements.add(element == null ? Collections.nCopies(tupleType.size(), null)
+                                                 : Arrays.asList(tupleType.split(ByteBufferAccessor.instance, type.getElementsType().decompose(element))));
+                }
                 return new InValue(elements);
             }
             catch (MarshalException e)
