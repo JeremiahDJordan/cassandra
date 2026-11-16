@@ -22,6 +22,7 @@ import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -128,13 +129,13 @@ public abstract class Sets
                                                         java.util.function.Function<T, AbstractType<?>> mapper)
     {
         AbstractType<?> type = Lists.getElementType(items, mapper);
-        return type != null ? SetType.getInstance(type, false) : null;
+        return type != null ? SetType.getInstance(type.freeze(), false) : null;
     }
 
     public static <T> SetType<?> getPreferredCompatibleType(List<T> items,
                                                             java.util.function.Function<T, AbstractType<?>> mapper)
     {
-        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> types = items.stream().map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> type = AssignmentTestable.getCompatibleTypeIfKnown(types);
         return type == null ? null : SetType.getInstance(type.freeze(), false);
     }

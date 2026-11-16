@@ -74,6 +74,15 @@ public interface FunctionParameter
     }
 
     /**
+     * @return whether the type of this parameter is the type of another argument of the function call when that type
+     * is known, rather than the type inferred from the argument of this parameter (see {@link #sameAs})
+     */
+    default boolean prefersTypeOfOtherArgument()
+    {
+        return false;
+    }
+
+    /**
      * @param wrapped the wrapped parameter
      * @return a function parameter definition that accepts the specified wrapped parameter, considering it optional as
      * defined by {@link #isOptional()}.
@@ -102,6 +111,12 @@ public interface FunctionParameter
             public boolean isOptional()
             {
                 return true;
+            }
+
+            @Override
+            public boolean prefersTypeOfOtherArgument()
+            {
+                return wrapped.prefersTypeOfOtherArgument();
             }
 
             @Override
@@ -237,6 +252,12 @@ public interface FunctionParameter
             public void validateType(FunctionFactory factory, AssignmentTestable arg, AbstractType<?> argType)
             {
                 parameter.validateType(factory, arg, argType);
+            }
+
+            @Override
+            public boolean prefersTypeOfOtherArgument()
+            {
+                return preferOther;
             }
 
             @Override
