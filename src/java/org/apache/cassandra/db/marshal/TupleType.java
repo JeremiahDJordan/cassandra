@@ -34,7 +34,6 @@ import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
-import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.TupleSerializer;
 import org.apache.cassandra.serializers.TypeSerializer;
@@ -463,16 +462,15 @@ public class TupleType extends MultiCellCapableType<ByteBuffer>
     @Override
     public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
-        ByteBuffer duplicated = buffer.duplicate();
-        int offset = 0;
+        ByteBuffer[] buffers = split(ByteBufferAccessor.instance, buffer);
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < subTypes.size(); i++)
         {
             if (i > 0)
                 sb.append(", ");
 
-            ByteBuffer value = CollectionSerializer.readValue(duplicated, ByteBufferAccessor.instance, offset);
-            offset += CollectionSerializer.sizeOfValue(value, ByteBufferAccessor.instance);
+            // the value can have fewer components than the type, the missing ones are null
+            ByteBuffer value = (i >= buffers.length) ? null : buffers[i];
             if (value == null)
                 sb.append("null");
             else
