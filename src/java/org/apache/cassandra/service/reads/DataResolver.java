@@ -270,11 +270,13 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         //      before it counts against the limit. If this "pre-count" filter causes a short read, additional rows
         //      will be fetched from the first-phase iterator.
 
+        UnaryOperator<PartitionIterator> filter = preCountFilterForReplicaFilteringProtection();
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(replicaPlan().keyspace(),
                                                                              command,
                                                                              replicaPlan().consistencyLevel(),
                                                                              requestTime,
                                                                              replicas,
+                                                                             filter,
                                                                              DatabaseDescriptor.getCachedReplicaRowsWarnThreshold(),
                                                                              DatabaseDescriptor.getCachedReplicaRowsFailThreshold());
 
@@ -288,7 +290,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         ResolveContext secondPhaseContext = new ResolveContext(replicas, true);
         PartitionIterator completedPartitions = resolveWithReadRepair(secondPhaseContext,
                                                                       i -> rfp.queryProtectedPartitions(firstPhasePartitions, i),
-                                                                      preCountFilterForReplicaFilteringProtection(),
+                                                                      filter,
                                                                       repairedDataTracker);
 
         // Ensure that the RFP instance has a chance to record metrics when the iterator closes.
