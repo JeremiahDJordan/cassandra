@@ -26,6 +26,7 @@ import org.junit.Test;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 
 public class SelectSingleColumnRelationTest extends CQLTester
 {
@@ -1325,4 +1326,36 @@ public class SelectSingleColumnRelationTest extends CQLTester
         );
     }
 
+    @Test
+    public void testFilteredInRestrictionWithNullElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (p1 int, p2 int, c1 int, c2 int, s int static, u int, v int, PRIMARY KEY ((p1, p2), c1, c2))");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (p1, p2, c1, c2, s, u, v) VALUES (1, 1, 1, 1, 1, 1, 1)");
+
+        beforeAndAfterFlush(() -> {
+            // a filtered IN, on a partition key component, a clustering column, a static column, a regular column
+            // and an indexed column, ignores a null element, which matches nothing
+            for (String column : new String[]{ "p1", "c2", "s", "u", "v" })
+            {
+                String select = "SELECT * FROM %s WHERE " + column;
+                assertRows(execute(select + " IN (1, null) ALLOW FILTERING"), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN (null, 1) ALLOW FILTERING"), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN (?, ?) ALLOW FILTERING", 1, null), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN ? ALLOW FILTERING", list(1, null)), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN (null, null) ALLOW FILTERING"));
+                assertRows(execute(select + " IN (1, 2) ALLOW FILTERING"), row(1, 1, 1, 1, 1, 1, 1));
+            }
+
+            // the index serves IN without ALLOW FILTERING
+            assertRows(execute("SELECT * FROM %s WHERE v IN (1, null)"), row(1, 1, 1, 1, 1, 1, 1));
+            assertRows(execute("SELECT * FROM %s WHERE v IN (?, ?)", null, 1), row(1, 1, 1, 1, 1, 1, 1));
+
+            // where IN selects the clustering, a null element is rejected
+            assertInvalidThrowMessage("Invalid null value in condition for column c1", InvalidRequestException.class,
+                                      "SELECT * FROM %s WHERE c1 IN (1, null) ALLOW FILTERING");
+            assertInvalidThrowMessage("Invalid null value in condition for column c1", InvalidRequestException.class,
+                                      "SELECT * FROM %s WHERE p1 = 1 AND p2 = 1 AND c1 IN (1, null)");
+        });
+    }
 }
