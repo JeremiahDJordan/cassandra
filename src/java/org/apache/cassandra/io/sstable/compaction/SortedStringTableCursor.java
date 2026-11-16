@@ -441,6 +441,14 @@ public class SortedStringTableCursor implements SSTableCursor
         return currentType;
     }
 
+    /**
+     * Whether this cursor skips the static rows of the sstable, because the table has no static column any more.
+     */
+    public boolean skipsStaticRows()
+    {
+        return skipStaticRows;
+    }
+
     public DecoratedKey partitionKey()
     {
         return partitionKey;

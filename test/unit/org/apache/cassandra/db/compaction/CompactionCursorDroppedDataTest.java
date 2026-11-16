@@ -28,6 +28,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
+import org.apache.cassandra.io.sstable.compaction.SortedStringTableCursor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.ALLOW_CURSOR_COMPACTION;
@@ -129,6 +130,88 @@ public class CompactionCursorDroppedDataTest extends CQLTester
         assertEquals(2, byIterators.partitions);
         assertEquals(2, byIterators.rows);
         assertEquals(byIterators, compactWithLastStaticColumnDropped(true));
+    }
+
+    /**
+     * As {@link #testLastStaticColumnWithCellNewerThanDrop}, with all the data newer than the drop: the cursor skips
+     * the static rows, which leaves partition 3 empty, although it leaves out no cell of a dropped column.
+     */
+    @Test
+    public void testLastStaticColumnWithAllDataNewerThanDrop() throws Throwable
+    {
+        Output byIterators = compactWithLastStaticColumnDroppedBeforeData(false);
+        assertEquals(2, byIterators.partitions);
+        assertEquals(2, byIterators.rows);
+        assertEquals(byIterators, compactWithLastStaticColumnDroppedBeforeData(true));
+    }
+
+    private Output compactWithLastStaticColumnDroppedBeforeData(boolean useCursors) throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, s int static, PRIMARY KEY (pk, ck))");
+        disableCompaction();
+        execute("UPDATE %s USING TIMESTAMP 200 SET s = 1 WHERE pk = 1");
+        execute("UPDATE %s USING TIMESTAMP 200 SET v = 1 WHERE pk = 1 AND ck = 1");
+        flush();
+        execute("UPDATE %s USING TIMESTAMP 200 SET s = 2 WHERE pk = 2");
+        execute("UPDATE %s USING TIMESTAMP 200 SET v = 2 WHERE pk = 2 AND ck = 1");
+        execute("UPDATE %s USING TIMESTAMP 200 SET s = 3 WHERE pk = 3");
+        flush();
+        execute("ALTER TABLE %s DROP s USING TIMESTAMP 100");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            assertFalse(sstable.header.hasColumnDroppedAtOrAfter(cfs.metadata(), sstable.getMinTimestamp()));
+            assertTrue(mayLeaveEmptyData(sstable));
+        }
+        Output output = compactWithoutTombstones(useCursors);
+        assertRows(execute("SELECT pk, ck, v FROM %s"), row(1, 1, 1), row(2, 1, 2));
+        return output;
+    }
+
+    /**
+     * Only an sstable that has data of a dropped column at or before the drop, or static rows of a table that has no
+     * static column any more, is read through a cursor that skips the empty data that leaving them out can leave.
+     * A column dropped before the data was written, or dropped and re-added before the data was written, does not
+     * make any difference to the others.
+     */
+    @Test
+    public void testSkippingEmptyDataOnlyForSSTablesWithDataOfDroppedColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, c set<int>, d int, PRIMARY KEY (pk, ck))");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        execute("ALTER TABLE %s DROP d USING TIMESTAMP 100");
+        execute("UPDATE %s USING TIMESTAMP 200 SET v = 1, c = c + {1} WHERE pk = 1 AND ck = 1");
+        flush();
+        SSTableReader afterDrop = Iterables.getOnlyElement(cfs.getLiveSSTables());
+        assertFalse(mayLeaveEmptyData(afterDrop));
+
+        execute("UPDATE %s USING TIMESTAMP 300 SET c = c + {2} WHERE pk = 2 AND ck = 1");
+        execute("UPDATE %s USING TIMESTAMP 300 SET c = c + {3} WHERE pk = 3 AND ck = 1");
+        flush();
+        execute("ALTER TABLE %s DROP c USING TIMESTAMP 400");
+        execute("ALTER TABLE %s ADD c set<int>");
+        execute("UPDATE %s USING TIMESTAMP 600 SET c = c + {4} WHERE pk = 3 AND ck = 1");
+        execute("UPDATE %s USING TIMESTAMP 600 SET c = c + {5} WHERE pk = 4 AND ck = 1");
+        flush();
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            // only the sstable written after c was re-added has no data at or before a drop
+            boolean afterReAdd = sstable.getMinTimestamp() == 600;
+            assertEquals(sstable.toString(), !afterReAdd, mayLeaveEmptyData(sstable));
+        }
+
+        Output byCursors = compactWithoutTombstones(true);
+        assertEquals(3, byCursors.partitions);
+        assertRowsIgnoringOrder(execute("SELECT pk, ck, v, c FROM %s"), row(1, 1, 1, null), row(3, 1, null, set(4)), row(4, 1, null, set(5)));
+    }
+
+    private static boolean mayLeaveEmptyData(SSTableReader sstable)
+    {
+        try (SortedStringTableCursor cursor = new SortedStringTableCursor(sstable))
+        {
+            return CompactionCursor.mayLeaveEmptyData(sstable, cursor, sstable.metadata());
+        }
     }
 
     /**

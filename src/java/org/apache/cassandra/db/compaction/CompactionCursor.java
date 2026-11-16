@@ -19,12 +19,11 @@
 package org.apache.cassandra.db.compaction;
 
 import java.io.IOException;
-import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collection;
-import java.util.Set;
 import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Iterables;
 import com.google.common.util.concurrent.RateLimiter;
 
@@ -112,18 +111,24 @@ public class CompactionCursor implements SSTableCursorMerger.MergeListener, Auto
 
     /**
      * The sstable cursor leaves out the data of a dropped column that is not newer than the drop (see
-     * DeserializationHelper.isDropped), which can leave a complex column, a row or a partition with no content. They
-     * are skipped, as the iterators skip them: the merger must not compare the versions of a column that has no data,
-     * and the writer must not get an empty partition.
+     * DeserializationHelper.isDropped), and the static rows of a table that has no static column any more, which can
+     * leave a complex column, a row or a partition with no content. They are skipped, as the iterators skip them: the
+     * merger must not compare the versions of a column that has no data, and the writer must not get an empty
+     * partition. Only an sstable whose header names a column dropped at or after its minimum timestamp can have such
+     * data.
      */
     private SSTableCursor makeSSTableCursor(SSTableReader reader, Range<Token> tokenRange, RateLimiter limiter)
     {
-        SSTableCursor cursor = new SortedStringTableCursor(reader, tokenRange, limiter);
-        // read after the cursor is created: drop records are never removed, so this sees every drop the cursor applies
-        Set<ByteBuffer> dropped = metadata().droppedColumns.keySet();
-        return Iterables.any(reader.header.columns(), c -> dropped.contains(c.name.bytes))
-               ? new SkipEmptyDataCursor(cursor)
-               : cursor;
+        SortedStringTableCursor cursor = new SortedStringTableCursor(reader, tokenRange, limiter);
+        // read after the cursor is created: drop records are never removed and a later drop has a later time, so this
+        // sees every drop the cursor applies
+        return mayLeaveEmptyData(reader, cursor, metadata()) ? new SkipEmptyDataCursor(cursor) : cursor;
+    }
+
+    @VisibleForTesting
+    static boolean mayLeaveEmptyData(SSTableReader reader, SortedStringTableCursor cursor, TableMetadata metadata)
+    {
+        return cursor.skipsStaticRows() || reader.header.hasColumnDroppedAtOrAfter(metadata, reader.getMinTimestamp());
     }
 
     public SSTableCursor.Type copyOne(SSTableDataSink writer) throws IOException

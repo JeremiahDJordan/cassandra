@@ -162,6 +162,17 @@ public class SerializationHeader
     }
 
     /**
+     * Whether a column of this header has a drop record in {@code metadata} with a drop time at or after
+     * {@code timestamp}, so that data at or after {@code timestamp} can be data of a dropped column that the drop
+     * removes.
+     */
+    public boolean hasColumnDroppedAtOrAfter(TableMetadata metadata, long timestamp)
+    {
+        DropTimes times = dropTimes(metadata);
+        return times != null && times.latest >= timestamp;
+    }
+
+    /**
      * Whether a column of this header that {@code filter} does not fetch, although it fetches all columns, has a drop
      * record in {@code metadata} with a drop time before {@code timestamp}, so that data at or before
      * {@code timestamp} can have cells of it that are newer than the drop.
@@ -205,6 +216,7 @@ public class SerializationHeader
         final ColumnMetadata[] columns;
         final long[] droppedTimes;
         final long earliest;
+        final long latest;
 
         DropTimes(TableMetadata metadata, RegularAndStaticColumns columns)
         {
@@ -220,12 +232,15 @@ public class SerializationHeader
             this.columns = withDrop.toArray(new ColumnMetadata[0]);
             this.droppedTimes = new long[this.columns.length];
             long earliest = Long.MAX_VALUE;
+            long latest = Long.MIN_VALUE;
             for (int i = 0; i < this.columns.length; i++)
             {
                 droppedTimes[i] = metadata.droppedColumns.get(this.columns[i].name.bytes).droppedTime;
                 earliest = Math.min(earliest, droppedTimes[i]);
+                latest = Math.max(latest, droppedTimes[i]);
             }
             this.earliest = earliest;
+            this.latest = latest;
         }
     }
 
