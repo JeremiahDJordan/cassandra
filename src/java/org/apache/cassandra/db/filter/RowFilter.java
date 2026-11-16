@@ -72,6 +72,7 @@ import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.InvalidPatternException;
@@ -267,6 +268,7 @@ public class RowFilter
         FilterElement rowLevelOperation = root.rowLevelTree();
 
         final boolean filterNonStaticColumns = !rowLevelOperation.isEmpty();
+        final boolean filterStaticColumns = hasStaticExpression();
 
         return new Transformation<>()
         {
@@ -277,8 +279,18 @@ public class RowFilter
             {
                 pk = partition.partitionKey();
 
+                // As for the other rows (see applyToRow), the expressions expect a static row without deleted cells:
+                // otherwise a deleted or expired element of a static collection would be seen as a live element.
+                Row staticRow = partition.staticRow();
+                if (filterStaticColumns && !needsReconciliation())
+                {
+                    staticRow = staticRow.purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
+                    if (staticRow == null)
+                        staticRow = Rows.EMPTY_STATIC_ROW;
+                }
+
                 // Short-circuit all partitions that won't match based on static and partition keys
-                if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow(), nowInSec))
+                if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), staticRow, nowInSec))
                 {
                     partition.close();
                     return null;
@@ -1547,6 +1559,10 @@ public class RowFilter
                     AbstractType<?> elementType = type.kind == CollectionType.Kind.SET ? type.nameComparator() : type.valueComparator();
                     for (Cell<?> cell : complexData)
                     {
+                        // the row isn't purged when the read needs reconciliation (see RowFilter#filter)
+                        if (!cell.isLive(nowInSec))
+                            continue;
+
                         ByteBuffer elementValue = type.kind == CollectionType.Kind.SET ? cell.path().get(0) : cell.buffer();
                         if (analyzer != null)
                         {
@@ -1582,6 +1598,9 @@ public class RowFilter
                 {
                     for (Cell<?> cell : row.getComplexColumnData(column))
                     {
+                        if (!cell.isLive(nowInSec))
+                            continue;
+
                         AbstractType<?> elementType = mapType.nameComparator();
                         ByteBuffer elementValue = cell.path().get(0);
                         List<ByteBuffer> elementTokens = analyzer.indexedTokens(elementValue);
@@ -1591,7 +1610,8 @@ public class RowFilter
                     }
                     return false;
                 }
-                return row.getCell(column, CellPath.create(value)) != null;
+                Cell<?> cell = row.getCell(column, CellPath.create(value));
+                return cell != null && cell.isLive(nowInSec);
             }
             else
             {
@@ -1738,7 +1758,7 @@ public class RowFilter
             if (column.isComplex())
             {
                 Cell<?> cell = row.getCell(column, CellPath.create(key));
-                if (cell == null)
+                if (cell == null || !cell.isLive(nowInSec))
                     return false;
                 comp = mt.valueComparator().compare(cell.buffer(), value);
             }
