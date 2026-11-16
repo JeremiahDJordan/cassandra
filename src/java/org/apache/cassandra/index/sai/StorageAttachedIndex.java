@@ -343,9 +343,12 @@ public class StorageAttachedIndex implements Index
             StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
             assert indexGroup != null : "Index group does not exist for table " + baseCfs.keyspace + '.' + baseCfs.name;
 
-            Collection<SSTableReader> nonIndexed = findNonIndexedSSTables(baseCfs, indexGroup, validation);
+            // This runs under the monitor of the index manager, which an add needs to build legacy indexes, so don't wait
+            // for SSTables being added without this index's components (streamed or imported): if there are any, the
+            // initial build selects them once they are added
+            Collection<SSTableReader> nonIndexed = baseCfs.indexManager.trySelectSSTablesForInitialBuild(() -> findNonIndexedSSTables(baseCfs, indexGroup, validation));
 
-            if (nonIndexed.isEmpty())
+            if (nonIndexed != null && nonIndexed.isEmpty())
             {
                 // If the index is complete, mark it queryable and avoid an initial build:
                 baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);
@@ -924,9 +927,11 @@ public class StorageAttachedIndex implements Index
             StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
             assert indexGroup != null : "Index group does not exist for table " + baseCfs.keyspace + '.' + baseCfs.name;
 
-            Collection<SSTableReader> nonIndexed = findNonIndexedSSTables(baseCfs, indexGroup, IndexValidation.HEADER_FOOTER);
+            // If SSTables are being added without this index's components (streamed or imported), leave it to the
+            // initial build, which selects them once added, to make the index queryable
+            Collection<SSTableReader> nonIndexed = baseCfs.indexManager.trySelectSSTablesForInitialBuild(() -> findNonIndexedSSTables(baseCfs, indexGroup, IndexValidation.HEADER_FOOTER));
 
-            if (nonIndexed.isEmpty())
+            if (nonIndexed != null && nonIndexed.isEmpty())
             {
                 // If the index is complete, mark it queryable before the node starts accepting requests:
                 baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);

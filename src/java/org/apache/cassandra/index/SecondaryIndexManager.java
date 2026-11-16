@@ -642,6 +642,32 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     }
 
     /**
+     * As {@link #selectSSTablesForInitialBuild}, but doesn't wait for SSTables prepared by
+     * {@link #buildSSTableAttachedIndexesBeforeAdding} to be added to the table: if any are, this selects nothing and
+     * returns {@code null}. This is for callers that must not wait for an add, e.g. because they hold the monitor of
+     * this manager, which an add needs to build the indexes that are not SSTable-attached on the added SSTables.
+     *
+     * @param select selects the live SSTables to build
+     *
+     * @return the selected SSTables, or {@code null} if SSTables are being added
+     */
+    public <T> T trySelectSSTablesForInitialBuild(Supplier<T> select)
+    {
+        Lock lock = sstableAttachedIndexesAddLock.writeLock();
+        if (!lock.tryLock())
+            return null;
+
+        try
+        {
+            return select.get();
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    /**
      * Incrementally builds indexes for the specified SSTables in a blocking fashion.
      * <p>
      * This is similar to {@link #buildIndexesBlocking}, but it is designed to be used in cases where failure will

@@ -44,6 +44,7 @@ import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.v1.SAICodecUtils;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.CountDownLatch;
 import org.apache.lucene.index.CorruptIndexException;
@@ -292,6 +293,125 @@ public class ImportIndexedSSTablesTest extends TestBaseImpl
     }
 
     @Test
+    public void testIndexCreatedWhileStartingBeforeAddingImportedSSTables()
+    {
+        String table = "index_created_while_starting_test";
+        cluster.schemaChange(String.format("CREATE TABLE %s.%s (pk int PRIMARY KEY, v text)", KEYSPACE, table));
+
+        IInvokableInstance first = cluster.get(1);
+        first.runOnInstance(()-> ByteBuddyHelper.failValidation = false);
+        first.runOnInstance(()-> ByteBuddyHelper.interruptBuild = false);
+
+        first.executeInternal(String.format("INSERT INTO %s.%s(pk, v) VALUES (?, ?)", KEYSPACE, table), 1, "v1");
+        first.flush(KEYSPACE);
+
+        first.runOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore(table).clearUnsafe());
+
+        // Hold the import once it has checked the indexes of the imported SSTables, before it adds them, and create an
+        // index meanwhile, while the node is starting
+        first.runOnInstance(() -> ByteBuddyHelper.holdBeforeAdding(table));
+        CompletableFuture<Void> load = CompletableFuture.runAsync(() -> first.runOnInstance(() -> ColumnFamilyStore.loadNewSSTables(KEYSPACE, table)));
+        String indexName = table + "_v_index";
+        try
+        {
+            await().atMost(1, TimeUnit.MINUTES).until(() -> load.isDone() || first.callOnInstance(ByteBuddyHelper::isHeldBeforeAdding));
+            assertThat(first.callOnInstance(ByteBuddyHelper::isHeldBeforeAdding)).describedAs("The import should be held").isTrue();
+
+            first.runOnInstance(() -> StorageService.instance.setStartingModeUnsafe());
+            try
+            {
+                cluster.schemaChange(String.format("CREATE INDEX %s ON %s.%s(v) USING 'sai'", indexName, KEYSPACE, table));
+            }
+            finally
+            {
+                first.runOnInstance(() -> StorageService.instance.setNormalModeUnsafe());
+            }
+
+            // The new index must not be made queryable without the imported SSTables
+            try
+            {
+                await().atMost(10, TimeUnit.SECONDS).until(() -> first.callOnInstance(() -> isQueryable(table, indexName)));
+            }
+            catch (ConditionTimeoutException e)
+            {
+                // the index is still not queryable
+            }
+        }
+        finally
+        {
+            first.runOnInstance(ByteBuddyHelper::releaseBeforeAdding);
+        }
+
+        load.join();
+        SAIUtil.waitForIndexQueryable(cluster, KEYSPACE, indexName);
+
+        Object[][] rs = first.executeInternal(String.format("SELECT pk FROM %s.%s WHERE v = ?", KEYSPACE, table), "v1");
+        assertThat(rs.length).describedAs("Rows found through the index").isEqualTo(1);
+        assertThat(rs[0][0]).isEqualTo(1);
+    }
+
+    @Test
+    public void testPreJoinTaskBeforeAddingImportedSSTables()
+    {
+        String table = "pre_join_before_adding_test";
+        cluster.schemaChange(String.format("CREATE TABLE %s.%s (pk int PRIMARY KEY, v text)", KEYSPACE, table));
+
+        IInvokableInstance first = cluster.get(1);
+        first.runOnInstance(()-> ByteBuddyHelper.failValidation = false);
+        first.runOnInstance(()-> ByteBuddyHelper.interruptBuild = false);
+
+        first.executeInternal(String.format("INSERT INTO %s.%s(pk, v) VALUES (?, ?)", KEYSPACE, table), 1, "v1");
+        first.flush(KEYSPACE);
+
+        first.runOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore(table).clearUnsafe());
+
+        // Hold the import once it has checked the indexes of the imported SSTables, before it adds them, and create an
+        // index and run the pre-join tasks meanwhile
+        first.runOnInstance(() -> ByteBuddyHelper.holdBeforeAdding(table));
+        CompletableFuture<Void> load = CompletableFuture.runAsync(() -> first.runOnInstance(() -> ColumnFamilyStore.loadNewSSTables(KEYSPACE, table)));
+        String indexName = table + "_v_index";
+        try
+        {
+            await().atMost(1, TimeUnit.MINUTES).until(() -> load.isDone() || first.callOnInstance(ByteBuddyHelper::isHeldBeforeAdding));
+            assertThat(first.callOnInstance(ByteBuddyHelper::isHeldBeforeAdding)).describedAs("The import should be held").isTrue();
+
+            cluster.schemaChange(String.format("CREATE INDEX %s ON %s.%s(v) USING 'sai'", indexName, KEYSPACE, table));
+            first.runOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore(table).indexManager.executePreJoinTasksBlocking(false));
+
+            // Hold the initial build of the new index once the import has added the SSTables
+            first.runOnInstance(() -> ByteBuddyHelper.holdBuild(table));
+        }
+        finally
+        {
+            first.runOnInstance(ByteBuddyHelper::releaseBeforeAdding);
+        }
+
+        load.join();
+        try
+        {
+            await().atMost(1, TimeUnit.MINUTES).until(() -> first.callOnInstance(ByteBuddyHelper::isBuildHeld));
+
+            // The index must not be queryable before its initial build has built the imported SSTables
+            Object[][] rs = first.executeInternal(String.format("SELECT pk FROM %s.%s", KEYSPACE, table));
+            assertThat(rs.length).describedAs("Imported rows").isEqualTo(1);
+            boolean queryable = first.callOnInstance(() -> isQueryable(table, indexName));
+            rs = queryable ? first.executeInternal(String.format("SELECT pk FROM %s.%s WHERE v = ?", KEYSPACE, table), "v1") : null;
+            assertThat(queryable).describedAs("The index is queryable before its initial build has built the imported SSTables, and finds %s rows",
+                                              rs == null ? null : rs.length).isFalse();
+        }
+        finally
+        {
+            first.runOnInstance(ByteBuddyHelper::releaseBuild);
+        }
+
+        SAIUtil.waitForIndexQueryable(cluster, KEYSPACE, indexName);
+
+        Object[][] rs = first.executeInternal(String.format("SELECT pk FROM %s.%s WHERE v = ?", KEYSPACE, table), "v1");
+        assertThat(rs.length).describedAs("Rows found through the index").isEqualTo(1);
+        assertThat(rs[0][0]).isEqualTo(1);
+    }
+
+    @Test
     public void testIndexBuildingFailureAfterBuildingAnSSTable()
     {
         String table = "fail_after_sstable_test";
@@ -365,6 +485,10 @@ public class ImportIndexedSSTablesTest extends TestBaseImpl
         private static volatile String failBuildAfterSSTablesTable;
         private static volatile int sstablesBeforeFailure;
 
+        private static volatile String heldBuildTable;
+        private static volatile CountDownLatch buildHeld = CountDownLatch.newCountDownLatch(1);
+        private static volatile CountDownLatch releaseBuild = CountDownLatch.newCountDownLatch(1);
+
         static void installErrors(ClassLoader loader, int node)
         {
             new ByteBuddy().rebase(StorageAttachedIndexBuilder.class)
@@ -408,6 +532,24 @@ public class ImportIndexedSSTablesTest extends TestBaseImpl
         {
             heldBeforeAddingTable = null;
             releaseBeforeAdding.decrement();
+        }
+
+        static void holdBuild(String table)
+        {
+            buildHeld = CountDownLatch.newCountDownLatch(1);
+            releaseBuild = CountDownLatch.newCountDownLatch(1);
+            heldBuildTable = table;
+        }
+
+        static boolean isBuildHeld()
+        {
+            return buildHeld.count() == 0;
+        }
+
+        static void releaseBuild()
+        {
+            heldBuildTable = null;
+            releaseBuild.decrement();
         }
 
         static void failBuildAfterSSTables(String table, int sstables)
@@ -470,6 +612,12 @@ public class ImportIndexedSSTablesTest extends TestBaseImpl
             {
                 if (indexDescriptor.sstableDescriptor.cfname.equals(failBuildAfterSSTablesTable) && sstablesBeforeFailure-- <= 0)
                     throw new RuntimeException(INJECTED_FAILURE);
+
+                if (indexDescriptor.sstableDescriptor.cfname.equals(heldBuildTable))
+                {
+                    buildHeld.decrement();
+                    releaseBuild.awaitUninterruptibly(1, TimeUnit.MINUTES);
+                }
 
                 return zuper.call();
             }
