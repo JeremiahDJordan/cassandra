@@ -83,6 +83,44 @@ public class VectorUpdateDeleteTest extends VectorTester
         assertContainsInt(result, "pk", 0);
     }
 
+    // the row has no live data after the delete, and then gets a new vector
+    @Test
+    public void rowDeleteThenInsertVectorInMemoryAndFlushTest() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, val vector<float, 2>, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (pk, ck, val) VALUES (0, 0, [0.9, 0.1])");
+        execute("INSERT INTO %s (pk, ck, val) VALUES (1, 0, [0.1, 0.9])");
+        execute("INSERT INTO %s (pk, ck, val) VALUES (2, 0, [1.0, 0.0])");
+        execute("DELETE FROM %s WHERE pk = 2 AND ck = 0");
+        execute("INSERT INTO %s (pk, ck, val) VALUES (2, 0, [0.0, 1.0])");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk FROM %s ORDER BY val ANN OF [1.0, 0.0] LIMIT 1"), row(0));
+            assertRows(execute("SELECT pk FROM %s ORDER BY val ANN OF [1.0, 0.0] LIMIT 3"), row(0), row(1), row(2));
+        });
+    }
+
+    // a row written by UPDATE has no row marker, so it has no live data after its vector is deleted
+    @Test
+    public void deleteVectorOfRowWithoutRowMarkerThenUpdateInMemoryAndFlushTest() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, val vector<float, 2>, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (pk, val) VALUES (0, [0.9, 0.1])");
+        execute("INSERT INTO %s (pk, val) VALUES (1, [0.1, 0.9])");
+        execute("UPDATE %s SET val = [1.0, 0.0] WHERE pk = 2");
+        execute("DELETE val FROM %s WHERE pk = 2");
+        execute("UPDATE %s SET val = [0.0, 1.0] WHERE pk = 2");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk FROM %s ORDER BY val ANN OF [1.0, 0.0] LIMIT 1"), row(0));
+            assertRows(execute("SELECT pk FROM %s ORDER BY val ANN OF [1.0, 0.0] LIMIT 3"), row(0), row(1), row(2));
+        });
+    }
+
     @Test
     public void testFlushWithDeletedVectors()
     {

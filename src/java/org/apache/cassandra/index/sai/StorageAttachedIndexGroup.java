@@ -20,7 +20,6 @@ package org.apache.cassandra.index.sai;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
-import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Predicate;
@@ -166,11 +165,23 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                                     IndexTransaction.Type transactionType,
                                     Memtable memtable)
     {
-        final Set<Index.Indexer> indexers =
-                indexes.stream().filter(indexSelector)
-                       .map(i -> i.indexerFor(key, columns, nowInSec, ctx, transactionType, memtable))
-                       .filter(Objects::nonNull)
-                       .collect(Collectors.toSet());
+        final Set<Index.Indexer> indexers = new HashSet<>();
+        // The memtable index of a vector index keeps a single vector per row, and replaces it on update, so it must
+        // also see the updates that leave the row with no live data, or it keeps the vector the row no longer has.
+        final Set<Index.Indexer> vectorIndexers = new HashSet<>();
+        for (StorageAttachedIndex index : indexes)
+        {
+            if (!indexSelector.test(index))
+                continue;
+
+            Index.Indexer indexer = index.indexerFor(key, columns, nowInSec, ctx, transactionType, memtable);
+            if (indexer == null)
+                continue;
+
+            indexers.add(indexer);
+            if (index.termType().isVector())
+                vectorIndexers.add(indexer);
+        }
 
         return indexers.isEmpty() ? null : new Index.Indexer()
         {
@@ -186,10 +197,10 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             @Override
             public void updateRow(Row oldRow, Row newRow)
             {
-                // SAI does not index deletions, as these are resolved during post-filtering.
-                if (newRow.hasLiveData(nowInSec, false))
-                    for (Index.Indexer indexer : indexers)
-                        indexer.updateRow(oldRow, newRow);
+                // SAI does not index deletions, as these are resolved during post-filtering, but a vector index must
+                // remove the vector of a row that is deleted or loses its vector.
+                for (Index.Indexer indexer : newRow.hasLiveData(nowInSec, false) ? indexers : vectorIndexers)
+                    indexer.updateRow(oldRow, newRow);
             }
         };
     }

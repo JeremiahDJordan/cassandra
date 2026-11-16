@@ -1,4 +1,5 @@
 5.0.10
+ * Remove the old vector of a row from the SAI vector memtable index when a delete leaves the row with no live data (CASSANDRA-XXXXX)
  * Fix AssertionError in an SAI vector query with another predicate or a partition restriction on an SSTable whose rows have no vectors left (CASSANDRA-XXXXX)
  * CONTAINS KEY restriction on a frozen map clustering column with descending order is rejected: "Cannot use CONTAINS KEY on non-map column" (CASSANDRA-21742)
  * Prevent tiny SSTables from accumulating under UCS (CASSANDRA-21615)
