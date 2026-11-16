@@ -149,7 +149,13 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     {
         this.keyspace = keyspace;
         this.command = command;
-        this.consumeEntirePartitions = command.limits().isUnlimited() || !command.isLimitedToOnePartition() || command.rowFilter().hasStaticExpression();
+        // When it doesn't consume entire partitions, it hands the partition over to the second phase in several pages,
+        // each of which restarts the per-partition count of the second phase, so it can't do that if there is a
+        // per-partition limit.
+        this.consumeEntirePartitions = command.limits().isUnlimited()
+                                       || !command.isLimitedToOnePartition()
+                                       || command.rowFilter().hasStaticExpression()
+                                       || command.limits().perPartitionCount() != DataLimits.NO_LIMIT;
         this.consistency = consistency;
         this.requestTime = requestTime;
         this.sources = sources;
