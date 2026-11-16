@@ -22,6 +22,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.Duration;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 
 import org.apache.cassandra.serializers.SimpleDateSerializer;
@@ -1309,6 +1310,60 @@ public class JsonTest extends CQLTester
 
         execute("INSERT INTO %s JSON ?", "{\"k\": 0, \"a\": {\"a\": 0, \"b\": [1, 2, 3], \"c\": null}, \"b\": null}");
         assertRows(execute("SELECT k, a.a, a.b, a.c, b FROM %s"), row(0, 0, set(1, 2, 3), null, null));
+    }
+
+    @Test
+    public void testTupleWithFewerComponentsThanItsType() throws Throwable
+    {
+        String typeName = createType("CREATE TYPE %s (a int, t frozen<tuple<int, int, int>>)");
+        createTable("CREATE TABLE %s (" +
+                    "k int PRIMARY KEY, " +
+                    "t tuple<int, int, int>, " +
+                    "l list<frozen<tuple<int, int, int>>>, " +
+                    "s set<frozen<tuple<int, int, int>>>, " +
+                    "m map<frozen<tuple<int, int, int>>, frozen<tuple<int, int, int>>>, " +
+                    "u frozen<" + typeName + ">)");
+
+        // a tuple value can have fewer components than its type, the missing ones are null
+        execute("INSERT INTO %s (k, t, l, s, m, u) VALUES (0, (1, 2), [(1, 2)], {(1, 2)}, {(1, 2): (3, 4)}, {a: 1, t: (1, 2)})");
+        execute("INSERT INTO %s (k, t) VALUES (1, ?)", TupleType.buildValue(ByteBufferUtil.bytes(1), ByteBufferUtil.bytes(2)));
+
+        String json = "{\"k\": 0, " +
+                      "\"l\": [[1, 2, null]], " +
+                      "\"m\": {\"[1, 2, null]\": [3, 4, null]}, " +
+                      "\"s\": [[1, 2, null]], " +
+                      "\"t\": [1, 2, null], " +
+                      "\"u\": {\"a\": 1, \"t\": [1, 2, null]}}";
+        assertRows(execute("SELECT JSON * FROM %s WHERE k = 0"), row(json));
+        assertRows(execute("SELECT JSON k, t FROM %s WHERE k = 1"), row("{\"k\": 1, \"t\": [1, 2, null]}"));
+        assertRows(execute("SELECT to_json(t), to_json(l), to_json(s), to_json(m), to_json(u), to_json(u.t) FROM %s WHERE k = 0"),
+                   row("[1, 2, null]",
+                       "[[1, 2, null]]",
+                       "[[1, 2, null]]",
+                       "{\"[1, 2, null]\": [3, 4, null]}",
+                       "{\"a\": 1, \"t\": [1, 2, null]}",
+                       "[1, 2, null]"));
+        assertRows(execute("SELECT to_json(t) FROM %s WHERE k = 1"), row("[1, 2, null]"));
+
+        // the JSON is read back as the same values
+        execute("INSERT INTO %s JSON ?", json.replace("\"k\": 0", "\"k\": 2"));
+        assertRows(execute("SELECT JSON * FROM %s WHERE k = 2"), row(json.replace("\"k\": 0", "\"k\": 2")));
+        assertRows(execute("SELECT k FROM %s WHERE t = (1, 2) ALLOW FILTERING"), row(0), row(1), row(2));
+    }
+
+    @Test
+    public void testTupleKeyWithFewerComponentsThanItsType() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k frozen<tuple<int, int, int>>, c frozen<tuple<int, int, int>>, " +
+                    "n tuple<int, frozen<tuple<int, int, int>>>, PRIMARY KEY (k, c))");
+        execute("INSERT INTO %s (k, c, n) VALUES ((1, 2), (3, 4), (1, (2, 3)))");
+        // a tuple value without any component, all of them are null
+        execute("INSERT INTO %s (k, c, n) VALUES ((5, 6, 7), (5, 6, 7), ?)", ByteBufferUtil.EMPTY_BYTE_BUFFER);
+
+        assertRows(execute("SELECT JSON * FROM %s WHERE k = (1, 2)"),
+                   row("{\"k\": [1, 2, null], \"c\": [3, 4, null], \"n\": [1, [2, 3, null]]}"));
+        assertRows(execute("SELECT to_json(k), to_json(c), to_json(n) FROM %s WHERE k = (5, 6, 7)"),
+                   row("[5, 6, 7]", "[5, 6, 7]", "[null, null]"));
     }
 
     // done for CASSANDRA-11146
