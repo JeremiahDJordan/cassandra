@@ -214,6 +214,27 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
                    row(1), row(2), row(7));
     }
 
+    @Test
+    public void testNoShortReadProtectionWhenReturnedRowsFillLimit()
+    {
+        cluster.get(1).runOnInstance(() -> StorageService.instance.setCachedReplicaRowsWarnThreshold(DEFAULT_WARN_THRESHOLD));
+        cluster.get(1).runOnInstance(() -> StorageService.instance.setCachedReplicaRowsFailThreshold(DEFAULT_FAIL_THRESHOLD));
+        String tableName = "no_srp_when_rows_fill_limit";
+        String table = KEYSPACE + '.' + tableName;
+        cluster.schemaChange("CREATE TABLE " + table + " (k int, c int, v int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'");
+
+        // The same rows on both replicas, all of them matches
+        for (int k = 0; k < PARTITIONS; k++)
+            for (int c = 0; c < 10; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (?, ?, 1)", ALL, k, c);
+
+        // The rows both replicas return fill the limit, so neither replica is asked for the rest of the partition
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE v = 1 LIMIT 2 ALLOW FILTERING", ALL),
+                   row(1, 0), row(1, 1));
+        assertEquals(0, shortReadProtectionRequestCount(cluster.get(1), tableName));
+        assertEquals(0, protectionQueryCount(cluster.get(1), tableName));
+    }
+
     private String createRangeTombstoneTable(String name)
     {
         cluster.get(1).runOnInstance(() -> StorageService.instance.setCachedReplicaRowsWarnThreshold(DEFAULT_WARN_THRESHOLD));
@@ -330,6 +351,13 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
         List<String> futureWarnings = futureResult.warnings();
         assertEquals(shouldWarn, futureWarnings.stream().anyMatch(w -> w.contains("cached_replica_rows_warn_threshold")));
         assertEquals(shouldWarn ? 1 : 0, futureWarnings.size());
+    }
+
+    private long shortReadProtectionRequestCount(IInvokableInstance instance, String tableName)
+    {
+        return instance.callOnInstance(() -> Keyspace.open(KEYSPACE)
+                                                     .getColumnFamilyStore(tableName)
+                                                     .metric.shortReadProtectionRequests.getCount());
     }
 
     private long protectionQueryCount(IInvokableInstance instance, String tableName)
