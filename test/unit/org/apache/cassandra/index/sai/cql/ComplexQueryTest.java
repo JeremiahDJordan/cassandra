@@ -411,4 +411,44 @@ public class ComplexQueryTest extends SAITester
         assertInvalidMessage(invalid + "ck", "SELECT * FROM %s WHERE ck IN (?, ?) ALLOW FILTERING", null, 1);
         assertInvalidMessage(invalid + "ck", "SELECT * FROM %s WHERE pk = 1 AND ck IN (?, ?)", 1, null);
     }
+
+    /**
+     * A null element of a filtered (c) IN ((x), (y)) matches no row, also when an index serves a restriction of the
+     * query, and the other elements are matched.
+     */
+    @Test
+    public void testMultiColumnInWithNullElement() throws Throwable
+    {
+        for (String type : new String[]{ "int", "text" })
+        {
+            Object[] values = type.equals("int") ? new Object[]{ 0, 1, 2 } : new Object[]{ "a", "b", "c" };
+            String literal = type.equals("int") ? "1" : "'b'";
+            for (String indexed : new String[]{ "v", "c2" })
+            {
+                createTable("CREATE TABLE %s (pk int, c1 int, c2 " + type + ", v int, u int, PRIMARY KEY (pk, c1, c2))");
+                createIndex("CREATE CUSTOM INDEX ON %s(" + indexed + ") USING 'StorageAttachedIndex'");
+                for (int i = 0; i < 3; i++)
+                    execute("INSERT INTO %s (pk, c1, c2, v, u) VALUES (?, ?, ?, ?, ?)", i, i, values[i], i, i);
+
+                beforeAndAfterFlush(() -> {
+                    // v is indexed or not, u is never indexed
+                    for (String column : new String[]{ "v", "u" })
+                    {
+                        String select = "SELECT pk FROM %s WHERE (c2) IN ";
+                        String eq = " AND " + column + " = 1 ALLOW FILTERING";
+                        String gt = " AND " + column + " >= 0 ALLOW FILTERING";
+                        assertRows(execute(select + "((?), (?))" + eq, null, values[1]), row(1));
+                        assertRows(execute(select + "((?), (?))" + eq, values[1], null), row(1));
+                        assertRowsIgnoringOrder(execute(select + "((?), (?), (?))" + gt, values[1], null, values[2]), row(1), row(2));
+                        assertRows(execute(select + "((?), (?))" + gt, null, null));
+                        assertRows(execute(select + "((null), (" + literal + "))" + eq), row(1));
+                        assertRows(execute(select + "?" + eq, list(tuple(new Object[]{ null }), tuple(values[1]))), row(1));
+                        assertRows(execute("SELECT pk FROM %s WHERE pk = 1 AND (c2) IN ((?), (?))" + eq, null, values[1]), row(1));
+                    }
+                    assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((?), (?), (?)) ALLOW FILTERING", null, values[0], values[2]),
+                                            row(0), row(2));
+                });
+            }
+        }
+    }
 }
