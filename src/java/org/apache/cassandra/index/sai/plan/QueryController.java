@@ -379,8 +379,8 @@ public class QueryController
         }
         catch (Throwable t)
         {
-            // all sstable indexes in view have been referenced, need to clean up when exception is thrown
-            queryExpressionView.sstableIndexes.forEach(SSTableIndex::releaseQuietly);
+            // The sstable indexes are referenced by the QueryView that owns them and are released when it is closed,
+            // so only the iterators opened here need to be closed.
             intermediateResults.forEach(FileUtils::closeQuietly);
             throw Throwables.cleaned(t);
         }
@@ -411,8 +411,8 @@ public class QueryController
         }
         catch (Throwable t)
         {
-            // all sstable indexes in view have been referenced, need to clean up when exception is thrown
-            queryExpressionView.sstableIndexes.forEach(SSTableIndex::releaseQuietly);
+            // The sstable indexes are referenced by the QueryView that owns them and are released when it is closed,
+            // so only the iterators opened here need to be closed.
             intermediateResults.forEach(FileUtils::closeQuietly);
             throw Throwables.cleaned(t);
         }
