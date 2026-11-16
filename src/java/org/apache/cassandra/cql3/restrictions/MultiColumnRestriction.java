@@ -101,6 +101,18 @@ public abstract class MultiColumnRestriction implements SingleRestriction
     protected abstract SingleRestriction doMergeWith(SingleRestriction otherRestriction);
 
     /**
+     * Returns the elements of the specified bound tuple. A tuple bound to {@code null} is handled as a tuple whose
+     * elements are all {@code null}, so that it is validated, and used for filtering, like a tuple with null elements.
+     *
+     * @param tuple the bound tuple, or {@code null}
+     * @return the elements of the tuple
+     */
+    protected List<ByteBuffer> getElements(Term.MultiItemTerminal tuple)
+    {
+        return tuple == null ? Collections.nCopies(columnDefs.size(), null) : tuple.getElements();
+    }
+
+    /**
      * Returns the names of the columns that are specified within this <code>Restrictions</code> and the other one
      * as a comma separated <code>String</code>.
      *
@@ -234,8 +246,7 @@ public abstract class MultiColumnRestriction implements SingleRestriction
         @Override
         public MultiCBuilder appendTo(MultiCBuilder builder, QueryOptions options)
         {
-            Tuples.Value t = ((Tuples.Value) value.bind(options));
-            List<ByteBuffer> values = t.getElements();
+            List<ByteBuffer> values = getElements((Tuples.Value) value.bind(options));
             for (int i = 0, m = values.size(); i < m; i++)
             {
                 builder.addElementToAll(values.get(i));
@@ -247,8 +258,7 @@ public abstract class MultiColumnRestriction implements SingleRestriction
         @Override
         public final void addToRowFilter(RowFilter filter, IndexRegistry indexRegistry, QueryOptions options)
         {
-            Tuples.Value t = ((Tuples.Value) value.bind(options));
-            List<ByteBuffer> values = t.getElements();
+            List<ByteBuffer> values = getElements((Tuples.Value) value.bind(options));
 
             for (int i = 0, m = columnDefs.size(); i < m; i++)
             {
@@ -356,8 +366,7 @@ public abstract class MultiColumnRestriction implements SingleRestriction
             List<List<ByteBuffer>> buffers = new ArrayList<>(values.size());
             for (Term value : values)
             {
-                Term.MultiItemTerminal term = (Term.MultiItemTerminal) value.bind(options);
-                buffers.add(term.getElements());
+                buffers.add(getElements((Term.MultiItemTerminal) value.bind(options)));
             }
             return buffers;
         }
@@ -567,9 +576,9 @@ public abstract class MultiColumnRestriction implements SingleRestriction
 
             Terminal terminal = slice.bound(b).bind(options);
 
-            if (terminal instanceof Tuples.Value)
+            if (terminal == null || terminal instanceof Tuples.Value)
             {
-                return ((Tuples.Value) terminal).getElements();
+                return getElements((Tuples.Value) terminal);
             }
 
             return Collections.singletonList(terminal.get(options.getProtocolVersion()));
