@@ -569,7 +569,8 @@ public class StorageAttachedIndex implements Index
         // From now on, all memtable will have attached memtable index. It is now safe to flush indexes directly from flushing Memtables.
         canFlushFromMemtableIndex = true;
 
-        List<SSTableReader> nonIndexed = findNonIndexedSSTables(baseCfs, indexGroup, validate);
+        // Wait for SSTables being added without this index's components (streamed or imported), so they are selected
+        List<SSTableReader> nonIndexed = baseCfs.indexManager.selectSSTablesForInitialBuild(() -> findNonIndexedSSTables(baseCfs, indexGroup, validate));
 
         if (nonIndexed.isEmpty())
         {
@@ -740,9 +741,12 @@ public class StorageAttachedIndex implements Index
             }
 
             StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
-            Collection<SSTableReader> nonIndexed = findNonIndexedSSTables(baseCfs, group, true);
 
-            if (nonIndexed.isEmpty())
+            // If SSTables are being added without this index's components (streamed or imported), leave it to the
+            // initial build, which selects them once added, to make the index queryable
+            Collection<SSTableReader> nonIndexed = baseCfs.indexManager.trySelectSSTablesForInitialBuild(() -> findNonIndexedSSTables(baseCfs, group, true));
+
+            if (nonIndexed != null && nonIndexed.isEmpty())
             {
                 // If the index is complete, mark it queryable before the node starts accepting requests:
                 baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);

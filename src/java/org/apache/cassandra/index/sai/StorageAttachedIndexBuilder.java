@@ -411,6 +411,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         // there is nothing to commit. Close() effectively abort the transaction.
         txn.close();
 
+        // A streamed or imported SSTable that isn't live yet joins the index views only once it is added to the table
+        if (!tracker.getView().liveSSTables().contains(sstable))
+            return;
+
         Set<StorageAttachedIndex> incomplete = group.onSSTableChanged(Collections.emptyList(), Collections.singleton(sstable), existing, false);
         if (!incomplete.isEmpty())
         {

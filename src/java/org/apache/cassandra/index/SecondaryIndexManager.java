@@ -38,6 +38,9 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -195,6 +198,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     // default page size (in rows) when rebuilding the index for a whole partition
     public static final int DEFAULT_PAGE_SIZE = 10000;
 
+    // how many times the SSTable-attached indexes missing on SSTables about to be added are built before giving up
+    private static final int MAX_SSTABLE_ATTACHED_INDEX_BUILDS = 3;
+
     /**
      * All registered indexes.
      */
@@ -231,6 +237,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * The count of pending index builds for each index.
      */
     private final Map<String, AtomicInteger> inProgressBuilds = Maps.newConcurrentMap();
+
+    /**
+     * Read: held by {@link #buildSSTableAttachedIndexesBeforeAdding} until the SSTables are added. Write: held while
+     * the initial build of an SSTable-attached index selects the live SSTables.
+     */
+    private final ReadWriteLock sstableAttachedIndexesAddLock = new ReentrantReadWriteLock();
 
     // executes tasks returned by Indexer#addIndexColumn which may require index(es) to be (re)built
     private static final ExecutorPlus asyncExecutor = executorFactory()
@@ -607,6 +619,131 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         }
 
         return complete;
+    }
+
+    /**
+     * @return the SSTable-attached indexes of the index groups of the table, which are the indexes whose components
+     * the flush observers of a new SSTable writer write
+     */
+    public Set<Index> listSSTableAttachedIndexes()
+    {
+        Set<Index> sstableAttachedIndexes = new HashSet<>();
+        for (Index.Group group : indexGroups.values())
+        {
+            for (Index index : group.getIndexes())
+            {
+                if (index.isSSTableAttached())
+                    sstableAttachedIndexes.add(index);
+            }
+        }
+        return sstableAttachedIndexes;
+    }
+
+    /**
+     * Makes sure that every SSTable-attached index of the table is complete on SSTables that aren't live yet (streamed
+     * or imported) before they are added to the table, validating them and building the missing ones. The indexes
+     * are checked again after each build, as one can be created during it, and the SSTables are refused after
+     * {@link #MAX_SSTABLE_ATTACHED_INDEX_BUILDS} builds.
+     * <p>
+     * This returns holding a lock, which the caller must release once it has added the SSTables to the table, or
+     * failed to. Until then, the initial build of an SSTable-attached index doesn't select the live SSTables it builds
+     * (see {@link #selectSSTablesForInitialBuild}), so an index created after the last check builds the SSTables once
+     * they are added.
+     *
+     * @param sstables SSTables that aren't live yet, and are about to be added to the table
+     * @param complete SSTable-attached indexes known to be complete on the SSTables, e.g. because their writers wrote
+     *                 them, which are not validated
+     * @param throwOnIncomplete whether to throw rather than build an index that is incomplete on the SSTables
+     * @param validateChecksum whether to validate the checksums of the index components
+     *
+     * @return the lock to release once the SSTables are added
+     *
+     * @throws IllegalStateException if an index is incomplete on the SSTables and {@code throwOnIncomplete} is true,
+     * or it is still incomplete after the last build
+     * @throws UncheckedIOException if there is a problem validating any on-disk component
+     */
+    public Lock buildSSTableAttachedIndexesBeforeAdding(Collection<SSTableReader> sstables,
+                                                        Set<Index> complete,
+                                                        boolean throwOnIncomplete,
+                                                        boolean validateChecksum)
+    {
+        Lock lock = sstableAttachedIndexesAddLock.readLock();
+        int builds = 0;
+        while (true)
+        {
+            boolean ready = false;
+            lock.lock();
+            try
+            {
+                ready = complete.containsAll(listSSTableAttachedIndexes());
+            }
+            finally
+            {
+                if (!ready)
+                    lock.unlock();
+            }
+            if (ready)
+                return lock;
+
+            Set<Index> indexes = listSSTableAttachedIndexes();
+            if (validateSSTableAttachedIndexes(sstables, throwOnIncomplete || builds == MAX_SSTABLE_ATTACHED_INDEX_BUILDS, validateChecksum))
+            {
+                complete = indexes;
+            }
+            else
+            {
+                buildSSTableAttachedIndexesBlocking(sstables);
+                builds++;
+            }
+        }
+    }
+
+    /**
+     * Selects the live SSTables that the initial build of an SSTable-attached index builds, after the SSTables
+     * prepared by {@link #buildSSTableAttachedIndexesBeforeAdding} are added to the table.
+     *
+     * @param select selects the live SSTables to build
+     *
+     * @return the selected SSTables
+     */
+    public <T> T selectSSTablesForInitialBuild(Supplier<T> select)
+    {
+        Lock lock = sstableAttachedIndexesAddLock.writeLock();
+        lock.lock();
+        try
+        {
+            return select.get();
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * As {@link #selectSSTablesForInitialBuild}, but doesn't wait for SSTables prepared by
+     * {@link #buildSSTableAttachedIndexesBeforeAdding} to be added to the table: if any are, this selects nothing and
+     * returns {@code null}. This is for callers that shouldn't wait for an add, such as the pre-join task, which then
+     * leaves the index to its initial build, which selects the SSTables once they are added.
+     *
+     * @param select selects the live SSTables to build
+     *
+     * @return the selected SSTables, or {@code null} if SSTables are being added
+     */
+    public <T> T trySelectSSTablesForInitialBuild(Supplier<T> select)
+    {
+        Lock lock = sstableAttachedIndexesAddLock.writeLock();
+        if (!lock.tryLock())
+            return null;
+
+        try
+        {
+            return select.get();
+        }
+        finally
+        {
+            lock.unlock();
+        }
     }
 
     /**

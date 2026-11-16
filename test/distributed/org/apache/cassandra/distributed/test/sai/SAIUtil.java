@@ -26,6 +26,8 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.Feature;
 import org.apache.cassandra.distributed.api.IInstance;
@@ -34,9 +36,11 @@ import org.apache.cassandra.distributed.api.SimpleQueryResult;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexStatusManager;
 import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.virtual.ColumnIndexesSystemView;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.assertj.core.util.Streams;
+import org.awaitility.core.ConditionTimeoutException;
 
 import static org.awaitility.Awaitility.await;
 
@@ -125,6 +129,44 @@ public class SAIUtil
             await().atMost(INDEX_BUILD_TIMEOUT_SECONDS, TimeUnit.SECONDS)
                    .untilAsserted(() -> assertIndexesQueryable(cluster, keyspace, indexes, node));
         }
+    }
+
+    /**
+     * Returns whether the index is queryable on the node, as its {@link SecondaryIndexManager} sees it.
+     */
+    public static boolean isIndexQueryable(IInvokableInstance node, String keyspace, String table, String index)
+    {
+        return node.callOnInstance(() -> {
+            ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+            return cfs.indexManager.isIndexQueryable(cfs.indexManager.getIndexByName(index));
+        });
+    }
+
+    /**
+     * Waits up to 10 seconds for the index to become queryable on the node, without failing if it doesn't, for tests
+     * that check that an index doesn't become queryable too early.
+     */
+    public static void awaitIndexQueryableQuietly(IInvokableInstance node, String keyspace, String table, String index)
+    {
+        try
+        {
+            await().atMost(10, TimeUnit.SECONDS).until(() -> isIndexQueryable(node, keyspace, table, index));
+        }
+        catch (ConditionTimeoutException e)
+        {
+            // the index is still not queryable
+        }
+    }
+
+    /**
+     * Returns the number of SSTables in the view of the SAI index on the node.
+     */
+    public static int indexedSSTables(IInvokableInstance node, String keyspace, String table, String index)
+    {
+        return node.callOnInstance(() -> {
+            ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+            return ((StorageAttachedIndex) cfs.indexManager.getIndexByName(index)).getIndexContext().getView().getIndexes().size();
+        });
     }
 
     private static void assertGossipEnabled(Cluster cluster)
