@@ -157,10 +157,10 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
             for (int i = 0; i < s; i++)
             {
                 int size = accessor.getInt(input, offset);
+                offset += TypeSizes.INT_SIZE;
+
                 if (size < 0)
                     continue;
-
-                offset += TypeSizes.INT_SIZE;
 
                 V value = accessor.slice(input, offset, size);
 

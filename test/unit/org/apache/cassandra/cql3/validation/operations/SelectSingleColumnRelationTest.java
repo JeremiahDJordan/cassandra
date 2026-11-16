@@ -1336,4 +1336,26 @@ public class SelectSingleColumnRelationTest extends CQLTester
         );
     }
 
+    @Test
+    public void testInRestrictionsWithNullElementsAndAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, c1 int, c2 int, v int, PRIMARY KEY (pk, c1, c2))");
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (1, 1, 1, 1)");
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (2, 2, 2, 2)");
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (3, 3, 3, 3)");
+
+        // A single-column IN restriction rejects null elements, but (c) IN ((x), (y)) is filtered as c IN (x, y) with
+        // its null elements
+        beforeAndAfterFlush(() -> {
+            // A null element matches no row, and the elements after it are still matched
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((null), (1)) ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((1), (null), (2)) ALLOW FILTERING"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((null), (null), (3)) ALLOW FILTERING"), row(3));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((2), (null)) ALLOW FILTERING"), row(2));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ((?), (?), (?)) ALLOW FILTERING", 2, null, 3), row(2), row(3));
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE (c2) IN ? ALLOW FILTERING", list(tuple(new Object[]{ null }), tuple(1), tuple(3))),
+                                    row(1), row(3));
+            assertRows(execute("SELECT pk FROM %s WHERE pk = 1 AND (c2) IN ((null), (1)) ALLOW FILTERING"), row(1));
+        });
+    }
 }
