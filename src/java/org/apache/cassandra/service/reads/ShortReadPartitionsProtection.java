@@ -55,6 +55,9 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
     private final ReadCommand command;
     private final Replica source;
 
+    private UnfilteredPartitionIterator firstResponse; // the replica's response to the command, until moreContents() replaces it
+    private ShortReadRowsProtection lastRowsProtection; // the protection of the last partition of the replica's response
+
     private final Runnable preFetchCallback; // called immediately before fetching more contents
 
     private final DataLimits.Counter singleResultCounter; // unmerged per-source counter
@@ -70,6 +73,7 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
     public ShortReadPartitionsProtection(ReadCoordinator coordinator,
                                          ReadCommand command,
                                          Replica source,
+                                         UnfilteredPartitionIterator firstResponse,
                                          Runnable preFetchCallback,
                                          DataLimits.Counter singleResultCounter,
                                          DataLimits.Counter mergedResultCounter,
@@ -78,6 +82,7 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         this.coordinator = coordinator;
         this.command = command;
         this.source = source;
+        this.firstResponse = firstResponse;
         this.preFetchCallback = preFetchCallback;
         this.singleResultCounter = singleResultCounter;
         this.mergedResultCounter = mergedResultCounter;
@@ -88,6 +93,22 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
     public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
     {
         partitionsFetched = true;
+
+        /*
+         * A replica whose GROUP BY counter reaches the limit as a new partition starts still returns that partition,
+         * without its static row and rows (see GroupByAwareCounter#applyToStatic): they belong to the next page. Taken
+         * for the replica's data, the partition would lose its static row, as the rows that ShortReadRowsProtection
+         * fetches come without it, or be skipped, as the next request for partitions starts after it.
+         *
+         * So drop it and leave lastPartitionKey alone: singleResultCounter then still says that the replica reached
+         * the limit, and moreContents() asks for the partitions after the previous one. That request has row limits
+         * (see DataLimits#forShortReadRetry), so it returns this partition whole.
+         */
+        if (isCutByGroupByLimit(partition))
+        {
+            partition.close();
+            return null;
+        }
 
         lastPartitionKey = partition.partitionKey();
 
@@ -103,8 +124,29 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
                                                                          command, source,
                                                                          (cmd) -> executeReadCommand(cmd, sharedReplicaPlan),
                                                                          singleResultCounter,
-                                                                         mergedResultCounter);
+                                                                         mergedResultCounter,
+                                                                         () -> firstResponse != null && firstResponse.hasNext(),
+                                                                         firstResponse != null);
+        if (firstResponse != null)
+            lastRowsProtection = protection;
         return Transformation.apply(MoreRows.extend(partition, protection), protection);
+    }
+
+    /**
+     * Whether the given partition is the empty last partition of the response of a replica that reached a GROUP BY limit.
+     * The response can only tell whether it has more partitions once the current one is consumed, hence the order.
+     */
+    private boolean isCutByGroupByLimit(UnfilteredRowIterator partition)
+    {
+        return firstResponse != null
+               && command.limits().isGroupByLimit()
+               && !command.isLimitedToOnePartition() // moreContents() only runs for range reads
+               && !command.limits().isReplicaExhausted(singleResultCounter)
+               // the start of the next partition completes the merged result, which then needs nothing of this one
+               && command.limits().isReplicaExhausted(mergedResultCounter)
+               && partition.staticRow().isEmpty()
+               && !partition.hasNext()
+               && !firstResponse.hasNext();
     }
 
     /*
@@ -129,13 +171,23 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
          */
         assert !command.isLimitedToOnePartition();
 
+        boolean inFirstResponse = firstResponse != null;
+        firstResponse = null;
+
         /*
          * If the returned result doesn't have enough rows/partitions to satisfy even the original limit, don't ask for more.
          *
          * Can only take the short cut if there is no per partition limit set. Otherwise it's possible to hit false
          * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
          */
-        if (command.limits().isExhausted(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+        if (command.limits().isReplicaExhausted(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+            return null;
+
+        // the merged result needs no more rows from the replica (GROUP BY, see DataLimits#isCompleteWithLastRowOf)
+        if (inFirstResponse && (lastRowsProtection != null
+                                ? lastRowsProtection.isCompleteWithLastRow()
+                                : command.limits().isCompleteWithLastRowOf(mergedResultCounter, singleResultCounter, null, null,
+                                                                           command.metadata().comparator, command.isReversed())))
             return null;
 
         /*
@@ -147,18 +199,17 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         partitionsFetched = false;
 
         /*
-         * We are going to fetch one partition at a time for thrift and potentially more for CQL.
-         * The row limit will either be set to the per partition limit - if the command has no total row limit set, or
-         * the total # of rows remaining - if it has some. If we don't grab enough rows in some of the partitions,
-         * then future ShortReadRowsProtection.moreContents() calls will fetch the missing ones.
+         * Request one row per remaining result, or use the per-partition limit if there is no total limit.
+         * For GROUP BY, count() and counted() measure groups. ShortReadRowsProtection fetches any additional
+         * rows needed to complete those groups.
          */
         int toQuery = command.limits().count() != DataLimits.NO_LIMIT
-                      ? command.limits().count() - mergedResultCounter.rowsCounted()
+                      ? command.limits().count() - mergedResultCounter.counted()
                       : command.limits().perPartitionCount();
 
         ColumnFamilyStore.metricsFor(command.metadata().id).shortReadProtectionRequests.mark();
         Tracing.trace("Requesting {} extra rows from {} for short read protection", toQuery, source);
-        logger.info("Requesting {} extra rows from {} for short read protection", toQuery, source);
+        logger.debug("Requesting {} extra rows from {} for short read protection", toQuery, source);
 
         // If we've arrived here, all responses have been consumed, and we're about to request more.
         preFetchCallback.run();
@@ -172,11 +223,16 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
 
         DataLimits newLimits = cmd.limits().forShortReadRetry(toQuery);
 
-        AbstractBounds<PartitionPosition> bounds = cmd.dataRange().keyRange();
-        AbstractBounds<PartitionPosition> newBounds = bounds.inclusiveRight()
-                                                      ? new Range<>(lastPartitionKey, bounds.right)
-                                                      : new ExcludingBounds<>(lastPartitionKey, bounds.right);
-        DataRange newDataRange = cmd.dataRange().forSubRange(newBounds);
+        // lastPartitionKey is null when the only partition of the response was cut by a GROUP BY limit: read the range again
+        DataRange newDataRange = cmd.dataRange();
+        if (lastPartitionKey != null)
+        {
+            AbstractBounds<PartitionPosition> bounds = newDataRange.keyRange();
+            AbstractBounds<PartitionPosition> newBounds = bounds.inclusiveRight()
+                                                          ? new Range<>(lastPartitionKey, bounds.right)
+                                                          : new ExcludingBounds<>(lastPartitionKey, bounds.right);
+            newDataRange = newDataRange.forSubRange(newBounds);
+        }
 
         ReplicaPlan.ForRangeRead replicaPlan = ReplicaPlans.forSingleReplicaRead(Keyspace.open(command.metadata().keyspace), cmd.dataRange().keyRange(), source, 1);
         return executeReadCommand(cmd.withUpdatedLimitsAndDataRange(newLimits, newDataRange), ReplicaPlan.shared(replicaPlan));
