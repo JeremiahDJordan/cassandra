@@ -20,9 +20,10 @@ package org.apache.cassandra.db.streaming;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 import java.util.Set;
-import java.util.stream.Collectors;
+import java.util.concurrent.locks.Lock;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Iterables;
@@ -64,9 +65,6 @@ public class CassandraStreamReceiver implements StreamReceiver
 
     private static final int MAX_ROWS_PER_BATCH = REPAIR_MUTATION_REPAIR_ROWS_PER_BATCH.getInt();
 
-    // How many times the SSTable-attached indexes missing on the received SSTables are built before the stream fails
-    private static final int MAX_INDEX_BUILDS = 3;
-
     private final ColumnFamilyStore cfs;
     private final StreamSession session;
 
@@ -93,12 +91,7 @@ public class CassandraStreamReceiver implements StreamReceiver
         this.txn = LifecycleTransaction.offline(OperationType.STREAM, cfs.metadata);
         this.sstables = new ArrayList<>(totalFiles);
         this.requiresWritePath = requiresWritePath(cfs);
-        this.sstableAttachedIndexesAtStart = sstableAttachedIndexes(cfs);
-    }
-
-    private static Set<Index> sstableAttachedIndexes(ColumnFamilyStore cfs)
-    {
-        return cfs.indexManager.listIndexes().stream().filter(Index::isSSTableAttached).collect(Collectors.toSet());
+        this.sstableAttachedIndexesAtStart = cfs.indexManager.listSSTableAttachedIndexes();
     }
 
     public static CassandraStreamReceiver fromReceiver(StreamReceiver receiver)
@@ -266,22 +259,16 @@ public class CassandraStreamReceiver implements StreamReceiver
             }
             else
             {
+                Lock addLock;
                 try
                 {
-                    // Validate SSTable-attached indexes that should have streamed in an already complete state. If we
-                    // do validate, any exception thrown doing so will also fail the stream.
-                    if (receivedEntireSSTable)
-                    {
-                        cfs.indexManager.validateSSTableAttachedIndexes(readers, true, true);
-                    }
-                    // When we don't stream the entire SSTable, the indexes have just been written via the SSTable
-                    // flush observer, and an error there would have aborted the streaming transaction. However, the
-                    // observer only writes the indexes that existed when the SSTable writer was created, so build any
-                    // index created since then before the SSTables become live (see CASSANDRA-18670 for import):
-                    else if (!sstableAttachedIndexesAtStart.containsAll(sstableAttachedIndexes(cfs)))
-                    {
-                        buildMissingSSTableAttachedIndexes(readers);
-                    }
+                    // Validate the SSTable-attached indexes of entire SSTables. Otherwise, the flush observers have
+                    // written the indexes in sstableAttachedIndexesAtStart, so only the indexes created since are built.
+                    // Any exception thrown doing so fails the stream.
+                    addLock = cfs.indexManager.buildSSTableAttachedIndexesBeforeAdding(readers,
+                                                                                      receivedEntireSSTable ? Collections.emptySet() : sstableAttachedIndexesAtStart,
+                                                                                      receivedEntireSSTable,
+                                                                                      receivedEntireSSTable);
                 }
                 catch (Throwable t)
                 {
@@ -298,11 +285,18 @@ public class CassandraStreamReceiver implements StreamReceiver
                     throw t;
                 }
 
-                finishTransaction();
+                try
+                {
+                    finishTransaction();
 
-                // add sstables (this will build non-SSTable-attached secondary indexes too, see CASSANDRA-10130)
-                logger.debug("[Stream #{}] Received {} sstables from {} ({})", session.planId(), readers.size(), session.peer, readers);
-                cfs.addSSTables(readers, OperationType.STREAM);
+                    // add sstables (this will build non-SSTable-attached secondary indexes too, see CASSANDRA-10130)
+                    logger.debug("[Stream #{}] Received {} sstables from {} ({})", session.planId(), readers.size(), session.peer, readers);
+                    cfs.addSSTables(readers, OperationType.STREAM);
+                }
+                finally
+                {
+                    addLock.unlock();
+                }
 
                 //invalidate row and counter cache
                 if (cfs.isRowCacheEnabled() || cfs.metadata().isCounter())
@@ -331,16 +325,6 @@ public class CassandraStreamReceiver implements StreamReceiver
                 }
             }
         }
-    }
-
-    /**
-     * Builds the SSTable-attached indexes missing on the received SSTables. An index created during a build isn't
-     * covered by it, so check again, and fail rather than add the SSTables without one of their indexes.
-     */
-    private void buildMissingSSTableAttachedIndexes(Collection<SSTableReader> readers)
-    {
-        for (int builds = 0; !cfs.indexManager.validateSSTableAttachedIndexes(readers, builds == MAX_INDEX_BUILDS, false); builds++)
-            cfs.indexManager.buildSSTableAttachedIndexesBlocking(readers);
     }
 
     @Override
