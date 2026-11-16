@@ -545,6 +545,44 @@ public class UFTest extends CQLTester
     }
 
     @Test
+    public void testFunctionOverloadingWithListLiteral() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, j int, t text)");
+        execute("INSERT INTO %s (k, i, j) VALUES (0, 1, 2)");
+
+        String fOverload = createFunction(KEYSPACE, "list<bigint>",
+                                          "CREATE FUNCTION %s (l list<bigint>) " +
+                                          "CALLED ON NULL INPUT " +
+                                          "RETURNS text " +
+                                          "LANGUAGE java " +
+                                          "AS 'return \"list\";'");
+        createFunctionOverload(fOverload,
+                               "blob",
+                               "CREATE FUNCTION %s (b blob) " +
+                               "CALLED ON NULL INPUT " +
+                               "RETURNS text " +
+                               "LANGUAGE java " +
+                               "AS 'return \"blob\";'");
+
+        // a list literal is not assignable to blob, so the list overload is picked
+        assertRowsNet(executeNet("SELECT " + fOverload + "([1]) FROM %s WHERE k = 0"), row("list"));
+        executeNet("UPDATE %s SET t = " + fOverload + "([1]) WHERE k = 0");
+        executeNet("INSERT INTO %s (k, t) VALUES (1, " + fOverload + "([1, 2]))");
+        assertRowsNet(executeNet("SELECT t FROM %s WHERE k = 0"), row("list"));
+        assertRowsNet(executeNet("SELECT t FROM %s WHERE k = 1"), row("list"));
+        assertRowsNet(executeNet("SELECT k FROM %s WHERE k = 0 AND t = " + fOverload + "([1]) ALLOW FILTERING"), row(0));
+
+        assertInvalidMessageNet("Type error: [1] cannot be passed as argument 0 of function system.blob_as_text of type blob",
+                                "UPDATE %s SET t = blob_as_text([1]) WHERE k = 0");
+
+        // a slice of a list literal passed to a blob parameter is rejected as a slice of a list
+        assertInvalidMessageNet("Slice selection is only allowed on sets and maps, but [i, j] is a list",
+                                "SELECT " + fOverload + "([i, j][0..1]) FROM %s");
+        assertInvalidMessageNet("Slice selection is only allowed on sets and maps, but [i, j] is a list",
+                                "SELECT blob_as_text([i, j][0..1]) FROM %s");
+    }
+
+    @Test
     public void testCreateOrReplaceJavaFunction() throws Throwable
     {
         createTable("CREATE TABLE %s (key int primary key, val double)");

@@ -1,4 +1,5 @@
 5.0.10
+ * Resolve function overloads for list literal arguments in INSERT, UPDATE and WHERE, and reject a slice of a list literal passed to a blob parameter with InvalidRequestException (CASSANDRA-XXXXX)
  * Reject list and map literals passed as an argument of another type with InvalidRequestException (CASSANDRA-XXXXX)
  * CONTAINS KEY restriction on a frozen map clustering column with descending order is rejected: "Cannot use CONTAINS KEY on non-map column" (CASSANDRA-21742)
  * Prevent tiny SSTables from accumulating under UCS (CASSANDRA-21615)
