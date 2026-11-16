@@ -23,6 +23,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
 import java.util.List;
+import java.util.Optional;
 
 import org.junit.Assert;
 import org.junit.Test;
@@ -545,6 +546,90 @@ public class UFTest extends CQLTester
         assertRows(execute("SELECT v FROM %s WHERE k = " + fOverload + "((int)?)", 3), row(1));
         // overloaded has just one overload now - so the following DROP FUNCTION is not ambigious (CASSANDRA-7812)
         execute("DROP FUNCTION " + fOverload);
+    }
+
+    @Test
+    public void testFunctionOverloadingWithListLiteral() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, j int, t text)");
+        execute("INSERT INTO %s (k, i, j) VALUES (0, 1, 2)");
+
+        String fOverload = createFunction(KEYSPACE, "list<bigint>",
+                                          "CREATE FUNCTION %s (l list<bigint>) " +
+                                          "CALLED ON NULL INPUT " +
+                                          "RETURNS text " +
+                                          "LANGUAGE java " +
+                                          "AS 'return \"list\";'");
+        createFunctionOverload(fOverload,
+                               "blob",
+                               "CREATE FUNCTION %s (b blob) " +
+                               "CALLED ON NULL INPUT " +
+                               "RETURNS text " +
+                               "LANGUAGE java " +
+                               "AS 'return \"blob\";'");
+
+        // a list literal is not assignable to blob, so the list overload is picked
+        assertRowsNet(executeNet("SELECT " + fOverload + "([1]) FROM %s WHERE k = 0"), row("list"));
+        executeNet("UPDATE %s SET t = " + fOverload + "([1]) WHERE k = 0");
+        executeNet("INSERT INTO %s (k, t) VALUES (1, " + fOverload + "([1, 2]))");
+        assertRowsNet(executeNet("SELECT t FROM %s WHERE k = 0"), row("list"));
+        assertRowsNet(executeNet("SELECT t FROM %s WHERE k = 1"), row("list"));
+        assertRowsNet(executeNet("SELECT k FROM %s WHERE k = 0 AND t = " + fOverload + "([1]) ALLOW FILTERING"), row(0));
+
+        assertInvalidThrowMessage(Optional.of(ProtocolVersion.CURRENT),
+                                  "Type error: [1] cannot be passed as argument 0 of function system.blob_as_text of type blob",
+                                  InvalidQueryException.class,
+                                  "UPDATE %s SET t = blob_as_text([1]) WHERE k = 0");
+
+        // a slice of a list literal passed to a blob parameter is rejected as a slice of a list
+        assertInvalidThrowMessage(Optional.of(ProtocolVersion.CURRENT),
+                                  "Slice selection is only allowed on sets and maps, but [i, j] is a list",
+                                  InvalidQueryException.class,
+                                  "SELECT " + fOverload + "([i, j][0..1]) FROM %s");
+        assertInvalidThrowMessage(Optional.of(ProtocolVersion.CURRENT),
+                                  "Slice selection is only allowed on sets and maps, but [i, j] is a list",
+                                  InvalidQueryException.class,
+                                  "SELECT blob_as_text([i, j][0..1]) FROM %s");
+    }
+
+    @Test
+    public void testFunctionOverloadingWithMapLiteral() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, j int, t text)");
+        execute("INSERT INTO %s (k, i, j) VALUES (0, 1, 2)");
+
+        String fOverload = createFunction(KEYSPACE, "map<bigint, bigint>",
+                                          "CREATE FUNCTION %s (m map<bigint, bigint>) " +
+                                          "CALLED ON NULL INPUT " +
+                                          "RETURNS text " +
+                                          "LANGUAGE java " +
+                                          "AS 'return \"map\";'");
+        createFunctionOverload(fOverload,
+                               "blob",
+                               "CREATE FUNCTION %s (b blob) " +
+                               "CALLED ON NULL INPUT " +
+                               "RETURNS text " +
+                               "LANGUAGE java " +
+                               "AS 'return \"blob\";'");
+
+        // a map literal is not assignable to blob, so the map overload is picked
+        assertRowsNet(executeNet("SELECT " + fOverload + "({1: 2}) FROM %s WHERE k = 0"), row("map"));
+        executeNet("UPDATE %s SET t = " + fOverload + "({1: 2}) WHERE k = 0");
+        executeNet("INSERT INTO %s (k, t) VALUES (1, " + fOverload + "({1: 2}))");
+        assertRowsNet(executeNet("SELECT t FROM %s WHERE k = 0"), row("map"));
+        assertRowsNet(executeNet("SELECT t FROM %s WHERE k = 1"), row("map"));
+        assertRowsNet(executeNet("SELECT k FROM %s WHERE k = 0 AND t = " + fOverload + "({1: 2}) ALLOW FILTERING"), row(0));
+
+        String error = "Type error: {1: 2} cannot be passed as argument 0 of function system.%s of type blob";
+        String[][] rejected = { { "blob_as_int", "SELECT k FROM %s WHERE k = blob_as_int({1: 2})" },
+                                { "blob_as_int", "SELECT k FROM %s WHERE k IN (blob_as_int({1: 2}))" },
+                                { "blob_as_text", "UPDATE %s SET t = blob_as_text({1: 2}) WHERE k = 0" },
+                                { "blob_as_text", "INSERT INTO %s (k, t) VALUES (2, blob_as_text({1: 2}))" },
+                                { "blob_as_text", "UPDATE %s SET t = 'a' WHERE k = 0 IF t = blob_as_text({1: 2})" },
+                                { "blob_as_int", "DELETE FROM %s WHERE k = blob_as_int({1: 2})" } };
+        for (String[] r : rejected)
+            assertInvalidThrowMessage(Optional.of(ProtocolVersion.CURRENT), String.format(error, r[0]),
+                                      InvalidQueryException.class, r[1]);
     }
 
     @Test
