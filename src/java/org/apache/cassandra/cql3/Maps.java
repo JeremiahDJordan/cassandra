@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -161,12 +162,12 @@ public abstract class Maps
     public static <T> MapType<?, ?> getPreferredCompatibleType(List<Pair<T, T>> entries,
                                                                java.util.function.Function<T, AbstractType<?>> mapper)
     {
-        Set<AbstractType<?>> keyTypes = entries.stream().map(Pair::left).map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> keyTypes = entries.stream().map(Pair::left).map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> keyType = AssignmentTestable.getCompatibleTypeIfKnown(keyTypes);
         if (keyType == null)
             return null;
 
-        Set<AbstractType<?>> valueTypes = entries.stream().map(Pair::right).map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> valueTypes = entries.stream().map(Pair::right).map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> valueType = AssignmentTestable.getCompatibleTypeIfKnown(valueTypes);
         if (valueType == null)
             return null;
