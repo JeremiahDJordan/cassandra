@@ -269,7 +269,10 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         //   3) After a "complete" row is materialized, it must pass the row filter supplied by the original query
         //      before it counts against the limit. If this "pre-count" filter causes a short read, additional rows
         //      will be fetched from the first-phase iterator.
+        // The first phase doesn't apply its merged result counter; replica filtering protection counts in it the rows
+        // that the second phase returns as they are (see ReplicaFilteringProtection.CompleteRows).
 
+        ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
         UnaryOperator<PartitionIterator> filter = preCountFilterForReplicaFilteringProtection();
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(replicaPlan().keyspace(),
                                                                              command,
@@ -278,9 +281,9 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                                                              replicas,
                                                                              filter,
                                                                              DatabaseDescriptor.getCachedReplicaRowsWarnThreshold(),
-                                                                             DatabaseDescriptor.getCachedReplicaRowsFailThreshold());
+                                                                             DatabaseDescriptor.getCachedReplicaRowsFailThreshold(),
+                                                                             firstPhaseContext.mergedResultCounter);
 
-        ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
         PartitionIterator firstPhasePartitions = resolveInternal(firstPhaseContext,
                                                                  rfp.mergeController(),
                                                                  i -> shortReadProtectedResponse(i, firstPhaseContext, null),

@@ -85,7 +85,9 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     public UnfilteredRowIterator moreContents()
     {
         // never try to request additional rows from replicas if our reconciled partition is already filled to the limit
-        assert !mergedResultCounter.isDoneForPartition();
+        // (the first phase of replica filtering protection doesn't stop at the limit, see DataResolver)
+        if (mergedResultCounter.isDoneForPartition())
+            return null;
 
         // we do not apply short read protection when we have no limits at all
         assert !command.limits().isUnlimited();

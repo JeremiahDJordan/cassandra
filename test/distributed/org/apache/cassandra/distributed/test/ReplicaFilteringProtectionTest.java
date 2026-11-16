@@ -276,6 +276,24 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
         assertRows(Iterators.toArray(cluster.coordinator(1).executeWithPaging(query, ALL, 1), Object[].class));
     }
 
+    @Test
+    public void testNoShortReadProtectionWhenReturnedRowsFillLimit()
+    {
+        String tableName = "no_srp_when_rows_fill_limit";
+        String table = createTable(tableName, "(k int, c int, v int, PRIMARY KEY (k, c))");
+
+        // The same rows on both replicas, all of them match
+        for (int k = 0; k < PARTITIONS; k++)
+            for (int c = 0; c < 10; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (?, ?, 1)", ALL, k, c);
+
+        // The rows both replicas return fill the limit, so neither replica is asked for the rest of the partition
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE v = 1 LIMIT 2 ALLOW FILTERING", ALL),
+                   row(1, 0), row(1, 1));
+        assertEquals(0, shortReadProtectionRequestCount(cluster.get(1), tableName));
+        assertEquals(0, protectionQueryCount(cluster.get(1), tableName));
+    }
+
     private String createRangeTombstoneTable(String name)
     {
         return createTable(name, "(k int, c int, v int, PRIMARY KEY (k, c))");
@@ -406,6 +424,13 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
         {
             warnings.isEmpty();
         }
+    }
+
+    private long shortReadProtectionRequestCount(IInvokableInstance instance, String tableName)
+    {
+        return instance.callOnInstance(() -> Keyspace.open(KEYSPACE)
+                                                     .getColumnFamilyStore(tableName)
+                                                     .metric.shortReadProtectionRequests.getCount());
     }
 
     private long protectionQueryCount(IInvokableInstance instance, String tableName)
