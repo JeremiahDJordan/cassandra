@@ -245,11 +245,6 @@ public class ReplicaFilteringStaticDivergenceTest extends TestBaseImpl
                     List<String> expected = ordered.subList(0, Math.min(limit, ordered.size()));
                     for (int pageSize : new int[]{ 0, 1, 2, 100 })
                     {
-                        // a paged read of one partition with the legacy index on the static column ends after its
-                        // first page, even with identical replicas
-                        if (table.equals("legacy") && query.startsWith("pk = ") && pageSize > 0 && expected.size() > pageSize)
-                            continue;
-
                         String select = "SELECT pk, ck FROM " + KEYSPACE + '.' + table + " WHERE " + query + " ALLOW FILTERING";
                         List<String> actual = readClusterings(cluster, select, pageSize, c);
                         if (!actual.equals(expected))
