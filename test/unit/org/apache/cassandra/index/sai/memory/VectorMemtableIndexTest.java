@@ -35,6 +35,9 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
+import io.github.jbellis.jvector.vector.VectorizationProvider;
+import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -44,6 +47,8 @@ import org.apache.cassandra.db.filter.ANNOptions;
 import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.VectorType;
+import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.BootStrapper;
 import org.apache.cassandra.dht.Bounds;
@@ -61,9 +66,11 @@ import org.apache.cassandra.index.sai.utils.PrimaryKeyWithScore;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.locator.TokenMetadata;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.MockSchema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
@@ -74,6 +81,7 @@ import static org.junit.Assert.assertTrue;
 
 public class VectorMemtableIndexTest extends SAITester
 {
+    private static final VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
     private static final Injections.Counter indexSearchCounter = Injections.newCounter("IndexSearchCounter")
                                                                            .add(InvokePointBuilder.newInvokePoint()
                                                                                                   .onClass(TrieMemoryIndex.class)
@@ -202,6 +210,101 @@ public class VectorMemtableIndexTest extends SAITester
         });
         assertTrue("Expected at least " + expectedVectorsReturned + " results but got " + actualVectorsReturned,
                    actualVectorsReturned.get() >= expectedVectorsReturned.get() * expectedRecall);
+    }
+
+    /**
+     * The cells of concurrent writes of a row can reach the index in any order, and more than once. The row must be
+     * indexed under the vector of the cell that wins their reconciliation only.
+     */
+    @Test
+    public void testUpdateIndexesVectorOfReconciledCell()
+    {
+        memtableIndex = new VectorMemtableIndex(indexContext, cfs.getCurrentMemtable());
+        ColumnMetadata column = indexContext.getDefinition();
+        long nowInSec = FBUtilities.nowInSeconds();
+        ByteBuffer older = randomVectorSerialized();
+        ByteBuffer newer = randomVectorSerialized();
+        ByteBuffer other = randomVectorSerialized();
+        update(0, BufferCell.live(column, 1, randomVectorSerialized()));
+
+        // the newest cell first, then older ones, then the newest one again
+        update(1, BufferCell.live(column, 20, newer));
+        update(1, BufferCell.live(column, 10, older));
+        update(1, BufferCell.tombstone(column, 15, nowInSec));
+        update(1, BufferCell.live(column, 20, newer));
+        assertIndexedUnder(1, newer);
+
+        // a tombstone wins over a live cell of the same timestamp
+        update(1, BufferCell.tombstone(column, 20, nowInSec));
+        assertIndexedUnder(1, null);
+        update(1, BufferCell.live(column, 20, other));
+        assertIndexedUnder(1, null);
+        update(1, BufferCell.live(column, 21, other));
+        assertIndexedUnder(1, other);
+
+        // of two live cells of the same timestamp, the one with the greater value wins, whatever the order
+        boolean newerIsGreater = ByteBufferUtil.compareUnsigned(newer, older) > 0;
+        ByteBuffer greater = newerIsGreater ? newer : older;
+        ByteBuffer lesser = newerIsGreater ? older : newer;
+        update(2, BufferCell.live(column, 30, greater));
+        update(2, BufferCell.live(column, 30, lesser));
+        assertIndexedUnder(2, greater);
+        update(3, BufferCell.live(column, 30, lesser));
+        update(3, BufferCell.live(column, 30, greater));
+        assertIndexedUnder(3, greater);
+
+        // an expired cell removes the vector
+        update(3, BufferCell.expiring(column, 40, 1, nowInSec - 10, other));
+        assertIndexedUnder(3, null);
+    }
+
+    private void update(int pk, Cell<?> cell)
+    {
+        memtableIndex.update(makeKey(cfs.metadata(), pk), Clustering.EMPTY, cell, cfs.getCurrentMemtable(), new OpOrder().start());
+    }
+
+    /**
+     * Checks the vector the row is indexed under, with searches of the graph and brute force searches, of the whole
+     * ring and of the row's key only.
+     */
+    private void assertIndexedUnder(int pk, ByteBuffer vector)
+    {
+        DecoratedKey key = makeKey(cfs.metadata(), pk);
+        Orderer orderer = randomVectorOrderer();
+        VectorSimilarityFunction similarityFunction = indexContext.getIndexWriterConfig().getSimilarityFunction();
+        List<Float> expected = vector == null ? List.of()
+                                              : List.of(similarityFunction.compare(orderer.getVectorTerm(), vts.createFloatVector(((VectorType<?>) indexContext.getValidator()).composeAsFloat(vector))));
+
+        AbstractBounds<PartitionPosition> fullRing = new Range<>(partitioner.getMinimumToken().minKeyBound(), partitioner.getMinimumToken().minKeyBound());
+        AbstractBounds<PartitionPosition> keyOnly = new Bounds<>(key.getToken().minKeyBound(), key.getToken().maxKeyBound());
+        int maxBruteForceRows = VectorMemtableIndex.GLOBAL_BRUTE_FORCE_ROWS;
+        try
+        {
+            for (int bruteForceRows : new int[]{ 0, Integer.MAX_VALUE })
+            {
+                VectorMemtableIndex.GLOBAL_BRUTE_FORCE_ROWS = bruteForceRows;
+                for (AbstractBounds<PartitionPosition> keyRange : List.of(fullRing, keyOnly))
+                {
+                    List<Float> scores = new ArrayList<>();
+                    var iterators = memtableIndex.orderBy(new QueryContext(), orderer, null, keyRange, 10);
+                    assertEquals(1, iterators.size());
+                    try (var iterator = iterators.get(0))
+                    {
+                        while (iterator.hasNext())
+                        {
+                            PrimaryKeyWithScore result = (PrimaryKeyWithScore) iterator.next();
+                            if (result.partitionKey().equals(key))
+                                scores.add(result.indexScore);
+                        }
+                    }
+                    assertEquals("Scores of row " + pk + " in " + keyRange + " with brute force rows " + bruteForceRows, expected, scores);
+                }
+            }
+        }
+        finally
+        {
+            VectorMemtableIndex.GLOBAL_BRUTE_FORCE_ROWS = maxBruteForceRows;
+        }
     }
 
     @Test
