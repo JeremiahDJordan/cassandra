@@ -1082,8 +1082,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         // According to the CQL semantics a row exists if at least one of its columns is not null (including the primary key columns).
         // Having the queried columns not null is unfortunately not enough to prove that a row exists as some column deletion
         // for the queried columns can exist on another node.
-        // For CQL tables it is enough to have the primary key liveness and the queried columns as the primary key liveness prove that
-        // the row exists even if all the other columns are deleted.
+        // For CQL tables it is enough to have a live primary key liveness and the queried columns as the live primary key liveness
+        // proves that the row exists even if all the other columns are deleted.
         // COMPACT tables do not have primary key liveness and by consequence we are forced to get  all the fetched columns to ensure that
         // we can return the correct result if the queried columns are deleted on another node but one of the non-queried columns is not.
         RegularAndStaticColumns columns = metadata().isCompactTable() ? columnFilter().fetchedColumns() : columnFilter().queriedColumns();
@@ -1179,7 +1179,9 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 return true;
 
             // Note that compact tables will always have an empty primary key liveness info.
-            if (!metadata().isCompactTable() && (row.primaryKeyLivenessInfo().isEmpty() || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp))
+            // A primary key liveness info that is not live (an expired TTL) doesn't prove that the row exists: the
+            // row may still be alive by older cells, possibly in the older sstables.
+            if (!metadata().isCompactTable() && (!row.primaryKeyLivenessInfo().isLive(nowInSec()) || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp))
                 return false;
         }
 

@@ -27,7 +27,6 @@ import com.google.common.base.Function;
 import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.Digest;
-import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.ByteType;
 import org.apache.cassandra.db.marshal.SetType;
@@ -185,7 +184,7 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
         return transformAndFilter(complexDeletion, Cell::markCounterLocalToBeCleared);
     }
 
-    public ComplexColumnData filter(ColumnFilter filter, DeletionTime activeDeletion, DroppedColumn dropped, LivenessInfo rowLiveness)
+    public ComplexColumnData filter(ColumnFilter filter, DeletionTime activeDeletion, DroppedColumn dropped)
     {
         ColumnFilter.Tester cellTester = filter.newTester(column);
         boolean isQueriedColumn = filter.fetchedColumnIsQueried(column);
@@ -200,8 +199,7 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
             boolean isShadowed = activeDeletion.deletes(cell);
             boolean isFetchedCell = cellTester == null || cellTester.fetches(path);
             boolean isQueriedCell = isQueriedColumn && isFetchedCell && (cellTester == null || cellTester.fetchedCellIsQueried(path));
-            boolean isSkippableCell = !isFetchedCell || (!isQueriedCell && cell.timestamp() < rowLiveness.timestamp());
-            if (isForDropped || isShadowed || isSkippableCell)
+            if (isForDropped || isShadowed || !isFetchedCell)
                 return null;
             // We should apply the same "optimization" as in Cell.deserialize to avoid discrepances
             // between sstables and memtables data, i.e resulting in a digest mismatch.

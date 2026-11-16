@@ -61,6 +61,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.net.Message;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
@@ -454,6 +455,7 @@ public abstract class ReadCommand extends AbstractReadQuery
 
             try
             {
+                iterator = withoutSkippableCells(iterator);
                 iterator = withQuerySizeTracking(iterator);
                 iterator = maybeSlowDownForTesting(iterator);
                 iterator = withQueryCancellation(iterator);
@@ -861,6 +863,68 @@ public abstract class ReadCommand extends AbstractReadQuery
     public abstract Verb verb();
 
     protected abstract void appendCQLWhereClause(StringBuilder sb);
+
+    /**
+     * Removes the cells of the columns that are fetched but not queried (see {@link ColumnFilter}) and that are older
+     * than the primary key liveness info of their row. A live cell is removed only when that info is live: the row
+     * exists without the cell and its value is not returned (CASSANDRA-10657). A cell that is not live (a tombstone or
+     * an expired cell) is removed in either case. This is done on the rows merged from every source, not on each
+     * source, as the primary key liveness info of a source can be superseded by one from another source that is not
+     * live (an expired TTL), and the older live cells are then what keeps the row alive. For complex columns, the cells
+     * outside the sub-selection of a queried column are removed as above, and of a column that is not queried, only
+     * the cells that are not live are removed.
+     */
+    private UnfilteredPartitionIterator withoutSkippableCells(UnfilteredPartitionIterator iterator)
+    {
+        ColumnFilter columnFilter = columnFilter();
+        if (columnFilter.allFetchedColumnsAreQueried())
+            return iterator;
+
+        long nowInSec = nowInSec();
+        boolean enforceStrictLiveness = metadata().enforceStrictLiveness();
+
+        class WithoutSkippableCells extends Transformation<UnfilteredRowIterator>
+        {
+            @Override
+            protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+            {
+                return Transformation.apply(partition, this);
+            }
+
+            @Override
+            protected Row applyToRow(Row row)
+            {
+                LivenessInfo liveness = row.primaryKeyLivenessInfo();
+                if (liveness.isEmpty())
+                    return row;
+
+                long timestamp = liveness.timestamp();
+                boolean isLive = enforceStrictLiveness || liveness.isLive(nowInSec);
+                return row.transformAndFilter(cd -> {
+                    ColumnMetadata column = cd.column();
+                    if (column.isComplex())
+                    {
+                        if (!columnFilter.fetchedColumnIsQueried(column))
+                            return ((ComplexColumnData) cd).transformAndFilter(cell -> isSkippable(cell, timestamp, false) ? null : cell);
+
+                        ColumnFilter.Tester tester = columnFilter.newTester(column);
+                        if (tester == null)
+                            return cd;
+
+                        return ((ComplexColumnData) cd).transformAndFilter(cell -> isSkippable(cell, timestamp, isLive) && !tester.fetchedCellIsQueried(cell.path()) ? null : cell);
+                    }
+
+                    return isSkippable((Cell<?>) cd, timestamp, isLive) && !columnFilter.fetchedColumnIsQueried(column) ? null : cd;
+                });
+            }
+
+            private boolean isSkippable(Cell<?> cell, long rowTimestamp, boolean isRowLivenessLive)
+            {
+                return cell.timestamp() < rowTimestamp && (isRowLivenessLive || !cell.isLive(nowInSec));
+            }
+        }
+        return Transformation.apply(iterator, new WithoutSkippableCells());
+    }
 
     // Skip purgeable tombstones. We do this because it's safe to do (post-merge of the memtable and sstable at least), it
     // can save us some bandwith, and avoid making us throw a TombstoneOverwhelmingException for purgeable tombstones (which

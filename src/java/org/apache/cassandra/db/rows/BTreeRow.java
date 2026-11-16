@@ -346,7 +346,6 @@ public class BTreeRow extends AbstractRow
         Columns columns = filter.fetchedColumns().columns(isStatic());
         Predicate<ColumnMetadata> inclusionTester = columns.inOrderInclusionTester();
         Predicate<ColumnMetadata> queriedByUserTester = filter.queriedColumns().columns(isStatic()).inOrderInclusionTester();
-        final LivenessInfo rowLiveness = newInfo;
         return transformAndFilter(newInfo, newDeletion, (cd) -> {
 
             ColumnMetadata column = cd.column();
@@ -355,17 +354,17 @@ public class BTreeRow extends AbstractRow
 
             DroppedColumn dropped = droppedColumns.get(column.name.bytes);
             if (column.isComplex())
-                return ((ComplexColumnData) cd).filter(filter, mayHaveShadowed ? activeDeletion : DeletionTime.LIVE, dropped, rowLiveness);
+                return ((ComplexColumnData) cd).filter(filter, mayHaveShadowed ? activeDeletion : DeletionTime.LIVE, dropped);
 
             Cell<?> cell = (Cell<?>) cd;
-            // We include the cell unless it is 1) shadowed, 2) for a dropped column or 3) skippable.
-            // And a cell is skippable if it is for a column that is not queried by the user and its timestamp
-            // is lower than the row timestamp (see #10657 or SerializationHelper.includes() for details).
+            // We include the cell unless it is 1) shadowed or 2) for a dropped column. The cell of a column that is
+            // not queried by the user is kept even if it is older than the row timestamp, as it may be what keeps the
+            // row alive (see DeserializationHelper.includes() for details).
             boolean isForDropped = dropped != null && cell.timestamp() <= dropped.droppedTime;
             boolean isShadowed = mayHaveShadowed && activeDeletion.deletes(cell);
             boolean isSkippable = !queriedByUserTester.test(column);
 
-            if (isForDropped || isShadowed || (isSkippable && cell.timestamp() < rowLiveness.timestamp()))
+            if (isForDropped || isShadowed)
                 return null;
 
             // We should apply the same "optimization" as in Cell.deserialize to avoid discrepances

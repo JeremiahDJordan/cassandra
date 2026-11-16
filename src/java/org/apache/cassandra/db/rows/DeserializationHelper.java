@@ -76,29 +76,16 @@ public class DeserializationHelper
         return columnsToFetch == null || columnsToFetch.fetches(column);
     }
 
-    public boolean includes(Cell<?> cell, LivenessInfo rowLiveness)
+    public boolean includes(Cell<?> cell)
     {
-        if (columnsToFetch == null)
-            return true;
-
         // During queries, some columns are included even though they are not queried by the user because
         // we always need to distinguish between having a row (with potentially only null values) and not
-        // having a row at all (see #CASSANDRA-7085 for background). In the case where the column is not
-        // actually requested by the user however (canSkipValue), we can skip the full cell if the cell
-        // timestamp is lower than the row one, because in that case, the row timestamp is enough proof
-        // of the liveness of the row. Otherwise, we'll only be able to skip the values of those cells.
-        ColumnMetadata column = cell.column();
-        if (column.isComplex())
-        {
-            if (!includes(cell.path()))
-                return false;
-
-            return !canSkipValue(cell.path()) || cell.timestamp() >= rowLiveness.timestamp();
-        }
-        else
-        {
-            return columnsToFetch.fetchedColumnIsQueried(column) || cell.timestamp() >= rowLiveness.timestamp();
-        }
+        // having a row at all (see #CASSANDRA-7085 for background). The values of the cells of those columns
+        // are skipped (canSkipValue), but the cells are kept, even when they are older than the primary key
+        // liveness info of the row: that info may not be live, or may be superseded by one from another source
+        // that is not live, and those cells are then what keeps the row alive. Cells older than the primary key
+        // liveness info are only removed once the sources are merged (see ReadCommand#withoutSkippableCells).
+        return columnsToFetch == null || !cell.column().isComplex() || includes(cell.path());
     }
 
     public boolean includes(CellPath path)
