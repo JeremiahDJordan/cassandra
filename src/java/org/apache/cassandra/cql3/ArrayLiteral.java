@@ -57,6 +57,10 @@ public class ArrayLiteral extends Term.Raw
     @Override
     public AssignmentTestable.TestResult testAssignment(String keyspace, ColumnSpecification receiver)
     {
+        AbstractType<?> type = receiver.type.unwrap();
+        if (!(type instanceof ListType) && !(type instanceof VectorType))
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
         return forReceiver(receiver).testAssignment(keyspace, receiver);
     }
 
