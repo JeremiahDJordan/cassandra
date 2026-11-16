@@ -54,6 +54,7 @@ public class ShortReadProtection
 
         ShortReadPartitionsProtection protection = new ShortReadPartitionsProtection(command,
                                                                                      source,
+                                                                                     partitions,
                                                                                      preFetchCallback,
                                                                                      singleResultCounter,
                                                                                      mergedResultCounter,

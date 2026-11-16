@@ -152,7 +152,12 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     {
         this.keyspace = keyspace;
         this.command = command;
-        this.consumeEntirePartitions = command.limits().isUnlimited() || !command.isLimitedToOnePartition() || command.rowFilter().hasStaticExpression();
+        // When it doesn't consume entire partitions, it hands a partition over to the second phase in several pages,
+        // which the GROUP BY counter of the second phase can't take: its GroupMaker expects each partition key once.
+        this.consumeEntirePartitions = command.limits().isUnlimited()
+                                       || !command.isLimitedToOnePartition()
+                                       || command.rowFilter().hasStaticExpression()
+                                       || command.limits().isGroupByLimit();
         this.consistency = consistency;
         this.requestTime = requestTime;
         this.sources = sources;
@@ -170,12 +175,10 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         mergeListener = new QueryMergeListener();
 
-        // A count of rows only tells short read protection that it has enough of them for row limits: GROUP BY limits
-        // count groups, and per-partition limits would need the rows counted by partition. A filter on a static column
-        // can stop matching the rows of a partition when its static row is completed.
+        // Per-partition limits would need the rows counted by partition. A filter on a static column can stop matching
+        // the rows of a partition when its static row is completed.
         DataLimits limits = command.limits();
         completeRows = limits.isUnlimited()
-                       || limits.isGroupByLimit()
                        || limits.perPartitionCount() != DataLimits.NO_LIMIT
                        || command.rowFilter().hasStaticExpression()
                        ? null
@@ -332,7 +335,11 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
         {
             if (currentListener == null || !currentListener.key.equals(partitionKey))
+            {
                 currentListener = new PartitionMergeListerner(partitionKey, versions);
+                if (completeRows != null)
+                    completeRows.startPartition(partitionKey);
+            }
 
             return currentListener;
         }
@@ -493,11 +500,18 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
      * aren't asked for more rows, as the rows merged so far already fill the limit.
      * <p>
      * The rows are filtered and counted in batches, once there are enough of them to fill the rest of the limit.
+     * <p>
+     * A GROUP BY counter counts the groups of the rows, and closes a group when the next one starts, also when the next
+     * partition starts. As it expects each partition once, it counts the start of each merged partition and each row
+     * as it comes, and a group whose last row is the last row of a replica's response can tell short read protection
+     * that the replica isn't needed (see DataLimits#isCompleteWithLastRowOf). The rows that it doesn't count, as some
+     * replica is silent about them, can only make more groups, so the result has at least as many as it counts.
      */
     private class CompleteRows
     {
         private final DataLimits.Counter counter;
         private final UnaryOperator<PartitionIterator> rowFilter;
+        private final boolean groupBy;
         private final List<DecoratedKey> keys = new ArrayList<>();
         private final List<List<Row>> rows = new ArrayList<>();
         private int pending = 0;
@@ -506,6 +520,13 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         {
             this.counter = counter;
             this.rowFilter = rowFilter;
+            this.groupBy = command.limits().isGroupByLimit();
+        }
+
+        private void startPartition(DecoratedKey key)
+        {
+            if (groupBy && !counter.isDone())
+                counter.countPartitionStart(key);
         }
 
         private void add(DecoratedKey key, Row merged)
@@ -525,15 +546,32 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             }
             rows.get(rows.size() - 1).add(row);
 
-            if (++pending >= command.limits().count() - counter.rowsCounted())
+            if (groupBy || ++pending >= command.limits().count() - counter.rowsCounted())
                 count();
         }
 
         private void count()
         {
-            try (PartitionIterator partitions = counter.applyTo(rowFilter.apply(pendingPartitions())))
+            if (groupBy)
             {
-                PartitionIterators.consume(partitions);
+                try (PartitionIterator partitions = rowFilter.apply(pendingPartitions()))
+                {
+                    while (partitions.hasNext())
+                    {
+                        try (RowIterator partition = partitions.next())
+                        {
+                            while (partition.hasNext())
+                                counter.countRow(partition.next());
+                        }
+                    }
+                }
+            }
+            else
+            {
+                try (PartitionIterator partitions = counter.applyTo(rowFilter.apply(pendingPartitions())))
+                {
+                    PartitionIterators.consume(partitions);
+                }
             }
 
             keys.clear();
