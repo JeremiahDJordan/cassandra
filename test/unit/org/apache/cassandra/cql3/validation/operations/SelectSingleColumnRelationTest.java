@@ -21,11 +21,17 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.Session;
+import com.datastax.driver.core.exceptions.InvalidQueryException;
 import org.junit.Test;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.transport.ProtocolVersion;
+
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class SelectSingleColumnRelationTest extends CQLTester
 {
@@ -580,6 +586,40 @@ public class SelectSingleColumnRelationTest extends CQLTester
         assertInvalidMessage("Unsupported unset value for column s", "SELECT * from %s WHERE s = ?", unset());
         // range
         assertInvalidMessage("Invalid unset value for column i", "SELECT * from %s WHERE k = 1 AND i > ?", unset());
+    }
+
+    @Test
+    public void testInRestrictionsWithUnsetElementsAndAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, c1 int, c2 int, v int, t text, s int static, PRIMARY KEY (pk, c1, c2))");
+        execute("INSERT INTO %s (pk, c1, c2, v, t, s) VALUES (1, 1, 1, 1, 'a', 1)");
+        execute("INSERT INTO %s (pk, c1, c2, v, t, s) VALUES (2, 2, blobAsInt(0x), blobAsInt(0x), '', blobAsInt(0x))");
+
+        // an unset element is rejected, as an unset value of EQ, instead of matching the empty values
+        assertInvalidMessage("Invalid unset value for column v",
+                             "SELECT pk FROM %s WHERE v IN (?, ?) ALLOW FILTERING", unset(), 1);
+        assertInvalidMessage("Invalid unset value for column t",
+                             "SELECT pk FROM %s WHERE t IN (?, ?) ALLOW FILTERING", "a", unset());
+        assertInvalidMessage("Invalid unset value for column s",
+                             "SELECT pk FROM %s WHERE s IN (?, ?) ALLOW FILTERING", unset(), 1);
+        assertInvalidMessage("Invalid unset value for column c2",
+                             "SELECT pk FROM %s WHERE c2 IN (?, ?) ALLOW FILTERING", unset(), 1);
+        assertInvalidMessage("Invalid unset value for tuple field number 0",
+                             "SELECT pk FROM %s WHERE (c2) IN ((?), (?)) ALLOW FILTERING", unset(), 1);
+
+        // since protocol v4, the driver sends a marker that is not bound as unset
+        for (ProtocolVersion version : PROTOCOL_VERSIONS)
+        {
+            if (version.isSmallerThan(ProtocolVersion.V4))
+                continue;
+
+            Session session = sessionNet(version);
+            BoundStatement statement = session.prepare(formatQuery("SELECT pk FROM %s WHERE v IN (?, ?) ALLOW FILTERING"))
+                                              .bind()
+                                              .setInt(1, 1);
+            assertThatThrownBy(() -> session.execute(statement)).isInstanceOf(InvalidQueryException.class)
+                                                                 .hasMessage("Invalid unset value for column v");
+        }
     }
 
     @Test
