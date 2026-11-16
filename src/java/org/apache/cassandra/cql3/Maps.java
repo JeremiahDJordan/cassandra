@@ -84,6 +84,9 @@ public abstract class Maps
     public static <T extends AssignmentTestable> AssignmentTestable.TestResult testMapAssignment(ColumnSpecification receiver,
                                                                                                  List<Pair<T, T>> entries)
     {
+        if (!(receiver.type.unwrap() instanceof MapType))
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
         ColumnSpecification keySpec = keySpecOf(receiver);
         ColumnSpecification valueSpec = valueSpecOf(receiver);
 
