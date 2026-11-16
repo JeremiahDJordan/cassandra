@@ -94,9 +94,28 @@ public class SerializationHeader
             stats.updateTimestamp(sstable.getMinTimestamp());
             stats.updateLocalDeletionTime(sstable.getMinLocalDeletionTime());
             stats.updateTTL(sstable.getMinTTL());
-            columns.addAll(sstable.header.columns());
+            for (ColumnMetadata column : sstable.header.columns())
+                columns.add(currentDefinition(metadata, column));
         }
         return new SerializationHeader(true, metadata, columns.build(), stats.get());
+    }
+
+    /**
+     * Returns the definition to use in a new sstable header for {@code column}, a column of the header of an existing
+     * sstable: the table's current definition of the column or, if the column is dropped, the definition it was last
+     * dropped with. This is the definition the column gets in the header of an sstable opened now (see
+     * {@link Component#toHeader}). The header of an sstable that is already open keeps the definitions it was opened
+     * or written with, which can be from before a type change, like {@code ALTER TYPE ... ADD} or a column dropped and
+     * re-added with another type, and so may not be able to represent the data of the other sstables.
+     */
+    private static ColumnMetadata currentDefinition(TableMetadata metadata, ColumnMetadata column)
+    {
+        ColumnMetadata current = metadata.getColumn(column.name);
+        if (current == null || current.kind != column.kind)
+            current = metadata.getDroppedColumn(column.name.bytes, column.isStatic());
+
+        // simple and complex columns are serialized differently
+        return current == null || current.isComplex() != column.isComplex() ? column : current;
     }
 
     private static Collection<SSTableReader> orderByDescendingGeneration(Collection<SSTableReader> sstables)
