@@ -166,8 +166,10 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                                     Memtable memtable)
     {
         final Set<Index.Indexer> indexers = new HashSet<>();
-        // The memtable index of a vector index keeps a single vector per row, and replaces it on update, so it must
-        // also see the updates that leave the row with no live data, or it keeps the vector the row no longer has.
+        // The memtable index of a vector index on a regular or static column keeps a single vector per row, and
+        // replaces it with the cell of each write, so it must also see the writes that leave the row with no live data,
+        // or it keeps the vector the row no longer has. A vector that is part of the primary key never changes for a
+        // row, and a deleted row must not be indexed under it.
         final Set<Index.Indexer> vectorIndexers = new HashSet<>();
         for (StorageAttachedIndex index : indexes)
         {
@@ -179,7 +181,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 continue;
 
             indexers.add(indexer);
-            if (index.termType().isVector())
+            if (index.termType().isVector() && !index.termType().columnMetadata().isPrimaryKeyColumn())
                 vectorIndexers.add(indexer);
         }
 
@@ -188,10 +190,10 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             @Override
             public void insertRow(Row row)
             {
-                // SAI does not index deletions, as these are resolved during post-filtering.
-                if (row.hasLiveData(nowInSec, false))
-                    for (Index.Indexer indexer : indexers)
-                        indexer.insertRow(row);
+                // SAI does not index deletions, as these are resolved during post-filtering, but a vector index must
+                // see them, see updateRow.
+                for (Index.Indexer indexer : row.hasLiveData(nowInSec, false) ? indexers : vectorIndexers)
+                    indexer.insertRow(row);
             }
 
             @Override

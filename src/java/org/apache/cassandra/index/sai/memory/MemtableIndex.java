@@ -29,6 +29,7 @@ import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
@@ -98,9 +99,9 @@ public class MemtableIndex implements MemtableOrdering
         return ram;
     }
 
-    public long update(DecoratedKey key, Clustering<?> clustering, ByteBuffer oldValue, ByteBuffer newValue)
+    public long update(DecoratedKey key, Clustering<?> clustering, Cell<?> cell)
     {
-        return memoryIndex.update(key, clustering, oldValue, newValue);
+        return memoryIndex.update(key, clustering, cell);
     }
 
     public KeyRangeIterator search(QueryContext queryContext, Expression expression, AbstractBounds<PartitionPosition> keyRange)

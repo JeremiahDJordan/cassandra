@@ -175,7 +175,8 @@ public class OnHeapGraph<T>
         long bytesUsed = 0L;
 
         // Store a cached reference to the vector for brute force computations later. Because insertions
-        // for the same primary key are guaranteed to be sequential, there is no race condition here.
+        // for the same primary key are guaranteed to be sequential (VectorMemoryIndex updates a row under a lock of
+        // that row), there is no race condition here.
         if (vectorsByKey != null)
         {
             vectorsByKey.put(key, vector);
@@ -286,11 +287,16 @@ public class OnHeapGraph<T>
         return vectorsByKey.get(key);
     }
 
-    public long remove(ByteBuffer term, T key)
+    /**
+     * Removes the key from the postings of the given vector.
+     *
+     * @param vector the vector to remove the key from; if it is the instance {@link #vectorForKey} returns for the key,
+     *               the key no longer has a vector
+     */
+    public long remove(float[] vector, T key)
     {
-        assert term != null && term.remaining() != 0;
+        assert vector != null;
 
-        float[] vector = vectorType.composeAsFloat(term);
         VectorPostings<T> postings = postingsMap.get(vector);
         if (postings == null)
         {
@@ -306,7 +312,7 @@ public class OnHeapGraph<T>
         if (vectorsByKey != null)
         {
             // On updates to a row, we call add then remove, so we must pass the key's value to ensure we only remove
-            // the deleted vector from vectorsByKey.
+            // the deleted vector from vectorsByKey (the map compares the values by reference).
             vectorsByKey.remove(key, vector);
         }
 
