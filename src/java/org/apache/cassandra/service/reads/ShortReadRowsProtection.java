@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.service.reads;
 
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 import org.apache.cassandra.db.Clustering;
@@ -46,6 +47,8 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     private final Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor;
     private final TableMetadata metadata;
     private final DecoratedKey partitionKey;
+    private final BooleanSupplier hasNextPartition; // whether the replica's response has a partition after this one
+    private final boolean inFirstResponse; // whether the partition is from the replica's response to the command
 
     private Clustering<?> lastClustering; // clustering of the last observed row
 
@@ -55,7 +58,8 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
 
     ShortReadRowsProtection(DecoratedKey partitionKey, ReadCommand command, Replica source,
                             Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor,
-                            DataLimits.Counter singleResultCounter, DataLimits.Counter mergedResultCounter)
+                            DataLimits.Counter singleResultCounter, DataLimits.Counter mergedResultCounter,
+                            BooleanSupplier hasNextPartition, boolean inFirstResponse)
     {
         this.command = command;
         this.source = source;
@@ -64,6 +68,8 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
         this.mergedResultCounter = mergedResultCounter;
         this.metadata = command.metadata();
         this.partitionKey = partitionKey;
+        this.hasNextPartition = hasNextPartition;
+        this.inFirstResponse = inFirstResponse;
     }
 
     @Override
@@ -95,7 +101,18 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
          * Can only take the short cut if there is no per partition limit set. Otherwise it's possible to hit false
          * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
          */
-        if (command.limits().isExhausted(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+        if (command.limits().isReplicaExhausted(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+            return null;
+
+        /*
+         * A replica without a per partition limit only goes on to another partition once this one has no more rows. A
+         * GROUP BY response needs this: the replica that returned as many groups as the limit isn't exhausted, as far
+         * as the counter can tell, even when its last group is followed by the partition that closed it.
+         */
+        if (command.limits().perPartitionCount() == DataLimits.NO_LIMIT && hasNextPartition.getAsBoolean())
+            return null;
+
+        if (isCompleteWithLastRow())
             return null;
 
         /*
@@ -172,6 +189,21 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
 
         SinglePartitionReadCommand cmd = makeFetchAdditionalRowsReadCommand(lastQueried);
         return UnfilteredPartitionIterators.getOnlyElement(commandExecutor.apply(cmd), cmd);
+    }
+
+    /**
+     * Whether the merged result needs no more rows from the replica, whose last row so far is the last row of this
+     * partition (see DataLimits#isCompleteWithLastRowOf). GROUP BY responses need this: a replica that returned as many
+     * groups as the limit isn't exhausted, as far as its counter can tell, also when the replicas agree.
+     */
+    boolean isCompleteWithLastRow()
+    {
+        return command.limits().isCompleteWithLastRowOf(mergedResultCounter,
+                                                        inFirstResponse && lastQueried == 0 ? singleResultCounter : null,
+                                                        lastClustering == null ? null : partitionKey,
+                                                        lastClustering,
+                                                        metadata.comparator,
+                                                        command.isReversed());
     }
 
     private SinglePartitionReadCommand makeFetchAdditionalRowsReadCommand(int toQuery)
