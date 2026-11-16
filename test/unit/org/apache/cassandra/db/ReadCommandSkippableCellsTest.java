@@ -112,6 +112,15 @@ public class ReadCommandSkippableCellsTest extends CQLTester
                 b.addCell(BufferCell.live(m, 1, ByteBufferUtil.bytes(2), mapPath("b")));
             });
             assertSame(type.toString(), unchanged, apply(command, unchanged));
+
+            // No cell older than the row marker: the row is returned as it is.
+            Row notOlder = type.build(this, liveMarker, b -> {
+                b.addCell(BufferCell.live(r, 10, ByteBufferUtil.bytes(7)));
+                b.addCell(BufferCell.tombstone(t, 10, nowInSec));
+                b.addCell(BufferCell.live(l, 10, ByteBufferUtil.EMPTY_BYTE_BUFFER, setPath(1)));
+                b.addCell(BufferCell.live(m, 11, ByteBufferUtil.bytes(1), mapPath("a")));
+            });
+            assertSame(type.toString(), notOlder, apply(command, notOlder));
         }
     }
 

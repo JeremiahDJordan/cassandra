@@ -52,6 +52,8 @@ public class DeserializationHelper
     private final ColumnFilter columnsToFetch;
     private ColumnFilter.Tester tester;
 
+    private final boolean dropsNotQueriedCellsOlderThanRow;
+
     private final boolean hasDroppedColumns;
     private final Map<ByteBuffer, DroppedColumn> droppedColumns;
     private DroppedColumn currentDroppedComplex;
@@ -62,6 +64,7 @@ public class DeserializationHelper
         this.flag = flag;
         this.version = version;
         this.columnsToFetch = columnsToFetch;
+        this.dropsNotQueriedCellsOlderThanRow = columnsToFetch != null && columnsToFetch.dropsNotQueriedCellsOlderThanRow();
         this.droppedColumns = metadata.droppedColumns;
         this.hasDroppedColumns = droppedColumns.size() > 0;
     }
@@ -87,13 +90,24 @@ public class DeserializationHelper
                || columnsToFetch.fetchedColumns().contains(column);
     }
 
-    public boolean includes(Cell<?> cell)
+    public boolean includes(Cell<?> cell, LivenessInfo rowLiveness)
     {
         // During queries, some columns are included even though they are not queried by the user because
         // we always need to distinguish between having a row (with potentially only null values) and not
         // having a row at all (see #CASSANDRA-7085 for background). The values of those cells are skipped
-        // (canSkipValue), but the cells are kept until the sources are merged, see ReadCommand#withoutSkippableCells.
-        return columnsToFetch == null || !cell.column().isComplex() || includes(cell.path());
+        // (canSkipValue), but the cells are kept until the sources are merged, see ReadCommand#withoutSkippableCells,
+        // except simple cells older than the row's liveness info when the filter allows it
+        // (ColumnFilter#withNotQueriedCellsOlderThanRowDropped).
+        if (columnsToFetch == null)
+            return true;
+
+        ColumnMetadata column = cell.column();
+        if (column.isComplex())
+            return includes(cell.path());
+
+        return !dropsNotQueriedCellsOlderThanRow
+               || cell.timestamp() >= rowLiveness.timestamp()
+               || columnsToFetch.fetchedColumnIsQueried(column);
     }
 
     public boolean includes(CellPath path)
