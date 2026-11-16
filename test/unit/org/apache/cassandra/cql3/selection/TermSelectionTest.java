@@ -33,6 +33,7 @@ import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class TermSelectionTest extends CQLTester
 {
@@ -611,7 +612,7 @@ public class TermSelectionTest extends CQLTester
         assertInvalidTupleLiteral(message, "SELECT [[tp], [(1, 2, 3)]] FROM %s");
         assertInvalidTupleLiteral(message, "SELECT [(tp, tp), (tp, (1, 2, 3))] FROM %s");
         assertInvalidTupleLiteral(message, "SELECT [(map<int, frozen<tuple<int, int>>>){1: tp}, {1: (1, 2, 3)}] FROM %s");
-        assertInvalidTupleLiteral("Invalid tuple literal (1, 2, 3, 4): too many elements. Type frozen<tuple<int, int>> expects 2 but got 4",
+        assertInvalidTupleLiteral("Invalid tuple literal (1, 2, 3, 4): too many elements. Type frozen<tuple<int, int, int>> expects 3 but got 4",
                                   "SELECT [tp, tp3, (1, 2, 3, 4)] FROM %s");
         assertInvalidTupleLiteral("Invalid tuple literal (1, 2, 3): too many elements. Type " + type + " expects 2 but got 3",
                                   "SELECT [v, (1, 2, 3)] FROM %s");
@@ -625,6 +626,101 @@ public class TermSelectionTest extends CQLTester
     private void assertInvalidTupleLiteral(String message, String query) throws Throwable
     {
         assertInvalidThrowMessage(Optional.of(ProtocolVersion.CURRENT), message, InvalidQueryException.class, query);
+    }
+
+    @Test
+    public void testCollectionLiteralTypeOfWiderElement() throws Throwable
+    {
+        requireNetwork();
+        String type = createType("CREATE TYPE %s (a int, b int)");
+        String type3 = createType("CREATE TYPE %s (a int, b int, c int)");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, bi bigint, vi varint, v " + type + ", fv3 frozen<" + type3 + ">, " +
+                    "tp frozen<tuple<int, int>>, tp3 frozen<tuple<int, int, int>>, tt frozen<tuple<text, int>>, " +
+                    "l list<frozen<tuple<int, int>>>, l3 list<frozen<tuple<int, int, int>>>)");
+        execute("INSERT INTO %s (k, i, bi, vi, v, fv3, tp, tp3, tt, l, l3) VALUES " +
+                "(0, 1, 2, 3, {a: 4, b: 5}, {a: 6, b: 7, c: 8}, (9, 10), (11, 12, 13), ('x', 14), [(15, 16)], [(17, 18, 19)])");
+
+        // the type of the literal is the type of the first element of which all the elements are, whatever their order
+        String tupleList = "(list<frozen<tuple<int, int, int>>>)";
+        assertSameResultNet("SELECT [tp, tp3] FROM %s", "SELECT " + tupleList + "[tp, tp3] FROM %s");
+        assertSameResultNet("SELECT [tp3, tp] FROM %s", "SELECT " + tupleList + "[tp3, tp] FROM %s");
+        assertSameResultNet("SELECT [tp, null, tp3] FROM %s", "SELECT " + tupleList + "[tp, null, tp3] FROM %s");
+        assertSameResultNet("SELECT [v, tp3] FROM %s", "SELECT " + tupleList + "[v, tp3] FROM %s");
+        assertSameResultNet("SELECT [tp, v, tp3] FROM %s", "SELECT " + tupleList + "[tp, v, tp3] FROM %s");
+        assertSameResultNet("SELECT {tp, tp3} FROM %s", "SELECT (set<frozen<tuple<int, int, int>>>){tp, tp3} FROM %s");
+        assertSameResultNet("SELECT [i, vi] FROM %s", "SELECT (list<varint>)[i, vi] FROM %s");
+        assertEquals(executeNet("SELECT [l3, l3] FROM %s").getColumnDefinitions().getType(0),
+                     executeNet("SELECT [l, l3] FROM %s").getColumnDefinitions().getType(0));
+        assertSameResultNet("SELECT [[tp], [tp3]] FROM %s",
+                            "SELECT (list<frozen<list<frozen<tuple<int, int, int>>>>>)[[tp], [tp3]] FROM %s");
+
+        List<com.datastax.driver.core.TupleValue> tuples = executeNet("SELECT [tp, tp3] FROM %s").one()
+                                                                    .getList(0, com.datastax.driver.core.TupleValue.class);
+        assertEquals(10, tuples.get(0).getInt(1));
+        assertTrue(tuples.get(0).isNull(2));
+        assertEquals(13, tuples.get(1).getInt(2));
+
+        com.datastax.driver.core.ResultSet result = executeNet("SELECT [v, fv3] FROM %s");
+        assertEquals(executeNet("SELECT [fv3, fv3] FROM %s").getColumnDefinitions().getType(0),
+                     result.getColumnDefinitions().getType(0));
+        List<com.datastax.driver.core.UDTValue> values = result.one().getList(0, com.datastax.driver.core.UDTValue.class);
+        assertEquals(5, values.get(0).getInt("b"));
+        assertTrue(values.get(0).isNull("c"));
+        assertEquals(8, values.get(1).getInt("c"));
+
+        assertRowsNet(executeNet("SELECT collection_count([[tp], [tp3]]) FROM %s"), row(2));
+
+        // the first element type is kept when all the elements are of it
+        assertEquals(executeNet("SELECT [tp, tp] FROM %s").getColumnDefinitions().getType(0),
+                     executeNet("SELECT [tp, v] FROM %s").getColumnDefinitions().getType(0));
+        assertEquals(executeNet("SELECT [v, v] FROM %s").getColumnDefinitions().getType(0),
+                     executeNet("SELECT [v, tp] FROM %s").getColumnDefinitions().getType(0));
+
+        // no element type of which all the elements are
+        assertInvalidMessage("Invalid list literal [tp, tt, tp3]: value tt is not of type frozen<tuple<int, int>>",
+                             "SELECT [tp, tt, tp3] FROM %s");
+        assertInvalidMessage("Invalid list literal [i, bi]: value bi is not of type int", "SELECT [i, bi] FROM %s");
+        assertInvalidMessage("Invalid list literal [tp3, tt]: value tt is not of type frozen<tuple<int, int, int>>",
+                             "SELECT [tp3, tt] FROM %s");
+    }
+
+    @Test
+    public void testCollectionLiteralTypeOfWiderNativeElement() throws Throwable
+    {
+        requireNetwork();
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, b bigint, vi varint, at ascii, txt text, bl blob, " +
+                    "d date, tm time, ts timestamp, u uuid, tu timeuuid)");
+        execute("INSERT INTO %s (k, i, b, vi, at, txt, bl, d, tm, ts, u, tu) VALUES (0, 1, 2, 3, 'a', 'b', 0xcafe, " +
+                "'2020-01-01', '01:00:00', '2020-01-01 00:00:00+0000', 3e5e9a3a-3f6e-4d0a-9a39-7c2b5e3f4a10, " +
+                "6d3d1c40-c25b-11ee-8000-000000000000)");
+
+        // a text reads the values of an ascii, a blob those of any type, a varint those of an int or a bigint and a
+        // uuid those of a timeuuid
+        assertSameResultNet("SELECT [at, txt] FROM %s", "SELECT (list<text>)[at, txt] FROM %s");
+        assertSameResultNet("SELECT {at, txt} FROM %s", "SELECT (set<text>){at, txt} FROM %s");
+        assertSameResultNet("SELECT [i, bl] FROM %s", "SELECT (list<blob>)[i, bl] FROM %s");
+        assertSameResultNet("SELECT [at, txt, bl] FROM %s", "SELECT (list<blob>)[at, txt, bl] FROM %s");
+        assertSameResultNet("SELECT [b, vi] FROM %s", "SELECT (list<varint>)[b, vi] FROM %s");
+        assertSameResultNet("SELECT [tu, u] FROM %s", "SELECT (list<uuid>)[tu, u] FROM %s");
+
+        // a type whose values are those of another type but mean other values doesn't widen it
+        assertInvalidMessage("Invalid list literal [i, d]: value d is not of type int", "SELECT [i, d] FROM %s");
+        assertInvalidMessage("Invalid list literal [b, tm]: value tm is not of type bigint", "SELECT [b, tm] FROM %s");
+        assertInvalidMessage("Invalid list literal [ts, vi]: value vi is not of type timestamp", "SELECT [ts, vi] FROM %s");
+        assertInvalidMessage("Invalid list literal [d]: value d is not of type int", "SELECT [[i], [d]] FROM %s");
+        assertInvalidMessage("Invalid list literal [(i, i), (d, i)]: value (d, i) is not of type frozen<tuple<int, int>>",
+                             "SELECT [(i, i), (d, i)] FROM %s");
+    }
+
+    private void assertSameResultNet(String query, String expectedQuery)
+    {
+        com.datastax.driver.core.ResultSet result = executeNet(query);
+        com.datastax.driver.core.ResultSet expected = executeNet(expectedQuery);
+        assertEquals(expected.getColumnDefinitions().getType(0), result.getColumnDefinitions().getType(0));
+        com.datastax.driver.core.Row row = result.one();
+        com.datastax.driver.core.Row expectedRow = expected.one();
+        assertEquals(expectedRow.getBytesUnsafe(0), row.getBytesUnsafe(0));
+        assertEquals(expectedRow.getObject(0), row.getObject(0));
     }
 
     @Test
