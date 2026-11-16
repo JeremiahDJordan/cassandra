@@ -28,9 +28,11 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.test.sai.SAIUtil;
+import org.apache.cassandra.metrics.TableMetrics;
 
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
@@ -275,6 +277,93 @@ public class GroupByShortReadProtectionTest extends TestBaseImpl
             }
         }
         assertThat(mismatches).isEmpty();
+    }
+
+    /**
+     * The same rows on every replica, so short read protection needs no rows: a replica that returns as many groups as
+     * the limit has the rows of its last group that the merged result has, which has as many groups as the limit.
+     * Partitions 0 to 2 have 20 groups of 2 rows, partition 3 has 100 groups of a single row. The queries run with and
+     * without a filter.
+     */
+    @Test
+    public void testNoShortReadProtectionWhenReplicasAgree()
+    {
+        createGroupTable("agreeing_groups", "a");
+        for (int k = 0; k < 4; k++)
+            for (int c = 0; c < (k == 3 ? 100 : 20); c++)
+                for (int d = 0; d < (k == 3 ? 1 : 2); d++)
+                    write("agreeing_groups", ALL_NODES, "INSERT INTO %s (k, c, d, a, b, x) VALUES (?, ?, ?, 1, 2, 0) USING TIMESTAMP 1", k, c, d);
+
+        String[] queries = {
+            "SELECT k, count(*) FROM %s GROUP BY k",
+            "SELECT k, c, count(*) FROM %s GROUP BY k, c",
+            "SELECT k, c, count(*) FROM %s WHERE b = 2 GROUP BY k, c ALLOW FILTERING",
+            "SELECT k, c, count(*) FROM %s WHERE a = 1 GROUP BY k, c",
+            "SELECT k, count(*) FROM %s WHERE a = 1 GROUP BY k",
+            "SELECT c, count(*) FROM %s WHERE k = 3 GROUP BY k, c",
+            "SELECT c, count(*) FROM %s WHERE k = 3 AND b = 2 GROUP BY k, c ALLOW FILTERING",
+        };
+
+        List<String> mismatches = new ArrayList<>();
+        for (boolean flush : new boolean[]{ false, true })
+        {
+            if (flush)
+                CLUSTER.forEach(node -> node.flush(KEYSPACE));
+            String when = flush ? " after flush" : "";
+            for (String query : queries)
+            {
+                String select = String.format(query, KEYSPACE + ".agreeing_groups");
+                String limited = select.replace(" ALLOW FILTERING", "") + " LIMIT 2" + (select.endsWith(" ALLOW FILTERING") ? " ALLOW FILTERING" : "");
+                List<String> expected = toStrings(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ONE));
+                for (ConsistencyLevel cl : ABOVE_ONE)
+                {
+                    long before = protectionRequests("agreeing_groups");
+                    check(limited, when, cl, 0, expected.subList(0, 2), mismatches);
+                    for (int pageSize : new int[]{ 1, 2, 10 })
+                        check(select, when, cl, pageSize, expected, mismatches);
+                    long requests = protectionRequests("agreeing_groups") - before;
+                    if (requests != 0)
+                        mismatches.add(select + when + " at " + cl + ": " + requests + " short read or replica filtering protection requests");
+                }
+            }
+        }
+        assertThat(mismatches).isEmpty();
+    }
+
+    /**
+     * A filtered GROUP BY query over a partition of 100 groups of a single row, whose first group node 2 deletes. The
+     * replicas have to be asked for more rows once, as their first groups are shadowed, and not for the rest of the
+     * partition: the merged result has as many groups as the limit, whose last one has every replica's rows.
+     */
+    @Test
+    public void testBoundedShortReadProtectionWithFilter()
+    {
+        createGroupTable("filtered_groups", "a");
+        for (int c = 0; c < 100; c++)
+            write("filtered_groups", ALL_NODES, "INSERT INTO %s (k, c, d, a, b, x) VALUES (0, ?, 0, 1, 2, 0) USING TIMESTAMP 1", c);
+        write("filtered_groups", new int[]{ 2 }, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 0 AND c = 0 AND d = 0");
+
+        List<String> mismatches = new ArrayList<>();
+        for (String query : new String[]{ "SELECT c, count(*) FROM %s WHERE b = 2 GROUP BY k, c LIMIT 2 ALLOW FILTERING",
+                                          "SELECT c, count(*) FROM %s WHERE k = 0 AND b = 2 GROUP BY k, c LIMIT 2 ALLOW FILTERING",
+                                          "SELECT c, count(*) FROM %s WHERE a = 1 GROUP BY k, c LIMIT 2" })
+        {
+            long before = protectionRequests("filtered_groups");
+            checkAll("filtered_groups", query, "", new int[]{ 0 }, mismatches, "[1, 1]", "[2, 1]");
+            long requests = protectionRequests("filtered_groups") - before;
+            // one short read protection request to nodes 1 and 3, and one replica filtering protection request
+            if (requests > 3)
+                mismatches.add(query + ": " + requests + " short read or replica filtering protection requests");
+        }
+        assertThat(mismatches).isEmpty();
+    }
+
+    private static long protectionRequests(String table)
+    {
+        return CLUSTER.get(1).callOnInstance(() -> {
+            TableMetrics metrics = Keyspace.open(KEYSPACE).getColumnFamilyStore(table).metric;
+            return metrics.shortReadProtectionRequests.getCount() + metrics.replicaFilteringProtectionRequests.getCount();
+        });
     }
 
     /**

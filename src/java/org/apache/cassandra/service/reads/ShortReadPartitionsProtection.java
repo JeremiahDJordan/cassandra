@@ -61,6 +61,7 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
     private final Replica source;
 
     private UnfilteredPartitionIterator firstResponse; // the replica's response to the command, until moreContents() replaces it
+    private ShortReadRowsProtection lastRowsProtection; // the protection of the last partition of the replica's response
 
     private final Runnable preFetchCallback; // called immediately before fetching more contents
 
@@ -124,7 +125,10 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
                                                                          (cmd) -> executeReadCommand(cmd, sharedReplicaPlan),
                                                                          singleResultCounter,
                                                                          mergedResultCounter,
-                                                                         () -> firstResponse != null && firstResponse.hasNext());
+                                                                         () -> firstResponse != null && firstResponse.hasNext(),
+                                                                         firstResponse != null);
+        if (firstResponse != null)
+            lastRowsProtection = protection;
         return Transformation.apply(MoreRows.extend(partition, protection), protection);
     }
 
@@ -167,6 +171,7 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
          */
         assert !command.isLimitedToOnePartition();
 
+        boolean inFirstResponse = firstResponse != null;
         firstResponse = null;
 
         /*
@@ -176,6 +181,13 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
          * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
          */
         if (command.limits().isReplicaExhausted(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+            return null;
+
+        // the merged result needs no more rows from the replica (GROUP BY, see DataLimits#isCompleteWithLastRowOf)
+        if (inFirstResponse && (lastRowsProtection != null
+                                ? lastRowsProtection.isCompleteWithLastRow()
+                                : command.limits().isCompleteWithLastRowOf(mergedResultCounter, singleResultCounter, null, null,
+                                                                           command.metadata().comparator, command.isReversed())))
             return null;
 
         /*
