@@ -32,6 +32,7 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
@@ -92,6 +93,11 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
          *
          * If we don't apply the transformation *after* extending the partition with MoreRows,
          * applyToRow() method of protection will not be called on the first row of the new extension iterator.
+         *
+         * The extended partition declares the columns that the command fetches: the rows that moreContents() adds can
+         * have columns that the replica's response for this partition doesn't declare, for instance when it is the
+         * empty partition that a replica returns once it reaches a GROUP BY limit, which declares no columns at all.
+         * The merge of the replica responses only merges non-frozen collections if the partitions declare one.
          */
         ReplicaPlan.ForTokenRead replicaPlan = ReplicaPlans.forSingleReplicaRead(Keyspace.open(command.metadata().keyspace), partition.partitionKey().getToken(), source);
         ReplicaPlan.SharedForTokenRead sharedReplicaPlan = ReplicaPlan.shared(replicaPlan);
@@ -100,7 +106,8 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
                                                                          (cmd) -> executeReadCommand(cmd, sharedReplicaPlan),
                                                                          singleResultCounter,
                                                                          mergedResultCounter);
-        return Transformation.apply(MoreRows.extend(partition, protection), protection);
+        RegularAndStaticColumns columns = partition.columns().mergeTo(command.columnFilter().fetchedColumns());
+        return Transformation.apply(MoreRows.extend(partition, protection, columns), protection);
     }
 
     /*

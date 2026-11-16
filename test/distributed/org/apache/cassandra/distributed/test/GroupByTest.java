@@ -32,11 +32,13 @@ import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
 import org.apache.cassandra.distributed.api.ICoordinator;
+import org.apache.cassandra.distributed.test.sai.SAIUtil;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TimeSerializer;
 import org.apache.cassandra.serializers.TimestampSerializer;
 
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.QUORUM;
+import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
@@ -150,6 +152,57 @@ public class GroupByTest extends TestBaseImpl
                 stmt.setFetchSize(1);
                 Iterator<Row> rs = session.execute(stmt).iterator();
                 Assert.assertFalse(rs.hasNext());
+            }
+        }
+    }
+
+    /**
+     * A replica that reaches a GROUP BY limit as a new partition starts returns that partition without rows. Replica
+     * filtering protection doesn't stop at the limit while it reads the replica responses, so short read protection
+     * then asks the replica for the rows of that partition, which it appended to a partition that declares no columns.
+     * The merge of the responses, which only merges non-frozen collections if the partitions declare one, failed with
+     * NullPointerException on the cells of a non-frozen collection.
+     */
+    @Test
+    public void testGroupByWithFilteringOnTableWithCollection() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(2).withConfig(cfg -> cfg.with(GOSSIP, NETWORK)).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.filtered (pk int, ck int, v int, s set<int>, PRIMARY KEY (pk, ck))"));
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.indexed (pk int, ck int, v int, s set<int>, PRIMARY KEY (pk, ck))"));
+            cluster.schemaChange(withKeyspace("CREATE INDEX ON %s.indexed(v) USING 'sai'"));
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.no_clustering (pk int PRIMARY KEY, v int, s set<int>)"));
+            SAIUtil.waitForIndexQueryable(cluster, KEYSPACE);
+
+            ICoordinator coordinator = cluster.coordinator(1);
+            for (int pk = 0; pk < 4; pk++)
+            {
+                for (int ck = 0; ck < 2; ck++)
+                {
+                    coordinator.execute(withKeyspace("INSERT INTO %s.filtered (pk, ck, v, s) VALUES (?, ?, 1, {1})"), ConsistencyLevel.ALL, pk, ck);
+                    coordinator.execute(withKeyspace("INSERT INTO %s.indexed (pk, ck, v, s) VALUES (?, ?, 1, {1})"), ConsistencyLevel.ALL, pk, ck);
+                }
+                coordinator.execute(withKeyspace("INSERT INTO %s.no_clustering (pk, v, s) VALUES (?, 1, {1})"), ConsistencyLevel.ALL, pk);
+            }
+
+            for (boolean flush : new boolean[]{ false, true })
+            {
+                if (flush)
+                    cluster.forEach(node -> node.flush(KEYSPACE));
+
+                // partitions in token order: 1, 0, 2, 3
+                for (String table : new String[]{ "filtered", "indexed" })
+                {
+                    String query = withKeyspace("SELECT pk, count(*) FROM %s." + table + " WHERE v = 1 GROUP BY pk LIMIT 2 ALLOW FILTERING");
+                    assertRows(coordinator.execute(query, ConsistencyLevel.ALL), row(1, 2L), row(0, 2L));
+                    for (int pageSize = 1; pageSize <= 4; pageSize++)
+                        assertRows(coordinator.executeWithPaging(query, ConsistencyLevel.ALL, pageSize), row(1, 2L), row(0, 2L));
+                }
+
+                String query = withKeyspace("SELECT pk, count(*) FROM %s.no_clustering WHERE v = 1 GROUP BY pk LIMIT 2 ALLOW FILTERING");
+                assertRows(coordinator.execute(query, ConsistencyLevel.ALL), row(1, 1L), row(0, 1L));
+                for (int pageSize = 1; pageSize <= 4; pageSize++)
+                    assertRows(coordinator.executeWithPaging(query, ConsistencyLevel.ALL, pageSize), row(1, 1L), row(0, 1L));
             }
         }
     }
