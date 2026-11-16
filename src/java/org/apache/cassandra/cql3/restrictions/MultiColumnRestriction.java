@@ -329,7 +329,12 @@ public abstract class MultiColumnRestriction implements SingleRestriction
                 List<List<ByteBuffer>> splitValues = terms.bindAndGetTuples(options, columnIdentifiers);
                 List<ByteBuffer> values = new ArrayList<>(splitValues.size());
                 for (List<ByteBuffer> splitValue : splitValues)
-                    values.add(splitValue.get(0));
+                {
+                    // a null element matches no row, so it is left out of the filter
+                    ByteBuffer value = splitValue.get(0);
+                    if (value != null)
+                        values.add(value);
+                }
 
                 ByteBuffer buffer = CollectionSerializer.pack(values, ByteBufferAccessor.instance, values.size());
                 filter.add(getFirstColumn(), Operator.IN, buffer);
