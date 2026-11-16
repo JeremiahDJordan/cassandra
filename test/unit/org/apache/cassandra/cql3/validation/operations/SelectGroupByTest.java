@@ -585,6 +585,25 @@ public class SelectGroupByTest extends CQLTester
     }
 
     @Test
+    public void testGroupByWithPagingBeforePartitionWithOnlyRangeTombstone() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b, c))");
+        execute("INSERT INTO %s (a, b, c, d) VALUES (2, 5, 1, 0)");
+        execute("DELETE FROM %s WHERE a = 3 AND b = 1");
+
+        beforeAndAfterFlush(() -> {
+            // partition 3 follows partition 2 and has only a range tombstone
+            for (int pageSize = 1; pageSize < 4; pageSize++)
+            {
+                assertRowsNet(executeNetWithPaging("SELECT a, count(*) FROM %s GROUP BY a", pageSize),
+                              row(2, 1L));
+                assertRowsNet(executeNetWithPaging("SELECT a, b, count(*) FROM %s GROUP BY a, b", pageSize),
+                              row(2, 5, 1L));
+            }
+        });
+    }
+
+    @Test
     public void testGroupByWithRangeNamesQueryWithoutPaging() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d int, primary key (a, b, c))");

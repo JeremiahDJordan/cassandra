@@ -575,24 +575,35 @@ public abstract class ReadCommand extends AbstractReadQuery
                  */
                 iterator = filter.filter(iterator, nowInSec());
 
+                // GROUP BY limits can read a row that they don't return, RTBoundCloser needs to know about it
+                RTBoundCloser.LastReadRow lastReadRow = null;
+                if (limits().isGroupByLimit())
+                {
+                    lastReadRow = new RTBoundCloser.LastReadRow();
+                    iterator = Transformation.apply(iterator, lastReadRow);
+                }
+
                 // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
                 // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
-                // Because of that, we need to append an artifical end bound if the source iterator was stopped short by a counter.
-                iterator = RTBoundCloser.close(iterator, unlimited -> {
-                    // If tracking repaired data, the counter is needed for overreading repaired data, otherwise we can
-                    // optimise the case where this.limit = DataLimits.NONE which skips an unnecessary transform
-                    if (executionController.isTrackingRepairedStatus())
-                    {
-                        DataLimits.Counter limit =
-                        limits().newCounter(nowInSec(), false, selectsFullPartition(), metadata().enforceStrictLiveness());
-                        // ensure that a consistent amount of repaired data is read on each replica. This causes silent
-                        // overreading from the repaired data set, up to limits(). The extra data is not visible to
-                        // the caller, only iterated to produce the repaired data digest.
-                        return executionController.getRepairedDataInfo().extend(limit.applyTo(unlimited), limit);
-                    }
+                // If tracking repaired data, the counter is needed for overreading repaired data, otherwise we can
+                // optimise the case where this.limit = DataLimits.NONE which skips an unnecessary transform
+                if (executionController.isTrackingRepairedStatus())
+                {
+                    DataLimits.Counter limit =
+                    limits().newCounter(nowInSec(), false, selectsFullPartition(), metadata().enforceStrictLiveness());
+                    iterator = limit.applyTo(iterator);
+                    // ensure that a consistent amount of repaired data is read on each replica. This causes silent
+                    // overreading from the repaired data set, up to limits(). The extra data is not visible to
+                    // the caller, only iterated to produce the repaired data digest.
+                    iterator = executionController.getRepairedDataInfo().extend(iterator, limit);
+                }
+                else
+                {
+                    iterator = limits().filter(iterator, nowInSec(), selectsFullPartition());
+                }
 
-                    return limits().filter(unlimited, nowInSec(), selectsFullPartition());
-                });
+                // because of the above, we need to append an artifical end bound if the source iterator was stopped short by a counter.
+                iterator = RTBoundCloser.close(iterator, lastReadRow);
 
                 if (executionInfo != null)
                     iterator = executionInfo.countReturned(iterator, nowInSec());
