@@ -591,8 +591,10 @@ public abstract class AbstractCommitLogSegmentManager
         shutdown();
         try
         {
-            // On heavily loaded test envs we need a longer wait
-            assert awaitTermination(5L, TimeUnit.MINUTES) : "Assert waiting for termination failed on " + FBUtilities.now().toString();
+            // On heavily loaded test envs we need a longer wait.
+            // Not inside the assert: it is not evaluated with assertions disabled.
+            boolean terminated = awaitTermination(5L, TimeUnit.MINUTES);
+            assert terminated : "Assert waiting for termination failed on " + FBUtilities.now().toString();
         }
         catch (InterruptedException e)
         {
