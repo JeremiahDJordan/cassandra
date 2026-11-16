@@ -578,6 +578,8 @@ public class TermSelectionTest extends CQLTester
                      selectedValue("SELECT {i, i2} FROM %s"));
         assertEquals(CollectionSerializer.pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 2),
                      selectedValue("SELECT {i, i2, i} FROM %s"));
+        assertEquals(CollectionSerializer.pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 2),
+                     selectedValue("SELECT (set<int>){i, i2} FROM %s"));
         assertEquals(CollectionSerializer.pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 1),
                      selectedValue("SELECT (map<int, int>){i2: i} FROM %s"));
         assertEquals(CollectionSerializer.pack(Arrays.asList(ByteBufferUtil.bytes(7), null), 1),
@@ -592,6 +594,33 @@ public class TermSelectionTest extends CQLTester
         assertEquals(new HashSet<>(Arrays.asList(null, "x")), executeNet("SELECT {t, t2} FROM %s").one().getSet(0, String.class));
         assertEquals(2, executeNet("SELECT {u, u2} FROM %s").one().getSet(0, UDTValue.class).size());
         assertEquals(Collections.singletonMap(null, 7), executeNet("SELECT (map<text, int>){t2: i} FROM %s").one().getMap(0, String.class, Integer.class));
+    }
+
+    @Test
+    public void testSetAndMapLiteralsWithNullElementsAsFunctionArguments() throws Throwable
+    {
+        String fSet = createFunction(KEYSPACE,
+                                     "set<int>",
+                                     "CREATE FUNCTION %s (s set<int>) " +
+                                     "CALLED ON NULL INPUT " +
+                                     "RETURNS int " +
+                                     "LANGUAGE java\n" +
+                                     "AS 'return s.size();';");
+        String fMap = createFunction(KEYSPACE,
+                                     "map<int, int>",
+                                     "CREATE FUNCTION %s (m map<int, int>) " +
+                                     "CALLED ON NULL INPUT " +
+                                     "RETURNS int " +
+                                     "LANGUAGE java\n" +
+                                     "AS 'return m.size();';");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, i2 int)");
+        execute("INSERT INTO %s (k, i) VALUES (0, 7)");
+
+        assertEquals(2, executeNet("SELECT " + fSet + "({i, i2}) FROM %s").one().getInt(0));
+        assertEquals(1, executeNet("SELECT " + fMap + "({i2: i}) FROM %s").one().getInt(0));
+        assertEquals(2, executeNet("SELECT collection_count({i, i2}) FROM %s").one().getInt(0));
+        assertEquals(2, executeNet("SELECT collection_count((set<int>){i, i2}) FROM %s").one().getInt(0));
+        assertEquals(1, executeNet("SELECT collection_count((map<int, int>){i2: i}) FROM %s").one().getInt(0));
     }
 
     @Test
