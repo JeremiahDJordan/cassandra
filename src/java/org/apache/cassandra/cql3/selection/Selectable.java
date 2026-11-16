@@ -28,6 +28,7 @@ import org.apache.cassandra.cql3.selection.Selector.Factory;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.Pair;
 
@@ -112,10 +113,7 @@ public interface Selectable extends AssignmentTestable
                                     Factory factory,
                                     AbstractType<?> expectedType)
     {
-        if (element.testAssignment(table.keyspace, receiver(table, literal, expectedType)).isAssignable())
-            return;
-
-        if (!selectedValueType(factory.getReturnType()).testAssignment(selectedValueType(expectedType)).isAssignable())
+        if (!isOfType(table.keyspace, receiver(table, literal, expectedType), element, factory.getReturnType()))
             throw invalidRequest("Invalid %s literal %s: %s %s is not of type %s",
                                  kind, literal, role, element, expectedType.asCQL3Type());
     }
@@ -139,6 +137,107 @@ public interface Selectable extends AssignmentTestable
     private static ColumnSpecification receiver(TableMetadata table, Selectable literal, AbstractType<?> type)
     {
         return new ColumnSpecification(table.keyspace, table.name, new ColumnIdentifier(literal.toString(), true), type);
+    }
+
+    /**
+     * Checks if an element of a literal, whose selector returns values of the specified type, is of the type of the
+     * receiver: if it is assignable to it, as for a function argument, or if the values its selector returns are values
+     * of the type of the receiver.
+     */
+    private static boolean isOfType(String keyspace,
+                                    ColumnSpecification receiver,
+                                    Selectable element,
+                                    AbstractType<?> elementType)
+    {
+        if (element.testAssignment(keyspace, receiver).isAssignable())
+            return true;
+
+        return selectedValueType(elementType).testAssignment(selectedValueType(receiver.type)).isAssignable();
+    }
+
+    /**
+     * Returns the element type of a list, set or vector literal, or {@code null} if none of its elements has a known
+     * type. It is the type of the first element of known type if all the elements of known type are of it (see
+     * {@link #isOfType}). Otherwise, it is the type of the first later element, in element order, of which all the
+     * elements of known type are and which widens their types (see {@link #isWidening}), so that the values of all of
+     * them can be read with it and keep their meaning: for example {@code tuple<int, int, int>} for {@code [tp, tp3]}
+     * as for {@code [tp3, tp]}, with {@code tp} a {@code tuple<int, int>} and {@code tp3} a
+     * {@code tuple<int, int, int>}. If there is no such element, it is the type of the first element of known type, and
+     * the elements that are not of that type are rejected when the selector factory is created.
+     */
+    static AbstractType<?> getExactElementTypeIfKnown(String keyspace, List<Selectable> elements)
+    {
+        List<Selectable> typedElements = new ArrayList<>(elements.size());
+        List<AbstractType<?>> types = new ArrayList<>(elements.size());
+        for (Selectable element : elements)
+        {
+            AbstractType<?> type = element.getExactTypeIfKnown(keyspace);
+            if (type != null)
+            {
+                typedElements.add(element);
+                types.add(type);
+            }
+        }
+
+        for (int c = 0, m = types.size(); c < m; c++)
+        {
+            AbstractType<?> candidate = types.get(c);
+            ColumnSpecification receiver = new ColumnSpecification(keyspace,
+                                                                   SchemaConstants.DUMMY_KEYSPACE_OR_TABLE_NAME,
+                                                                   new ColumnIdentifier("(dummy)", true),
+                                                                   candidate);
+            boolean isOfCandidateType = true;
+            for (int i = 0; isOfCandidateType && i < m; i++)
+                isOfCandidateType = isOfType(keyspace, receiver, typedElements.get(i), types.get(i))
+                                    && (c == 0 || isWidening(candidate, types.get(i)));
+
+            if (isOfCandidateType)
+                return candidate;
+        }
+        return types.isEmpty() ? null : types.get(0);
+    }
+
+    /**
+     * Checks if the values that a selector of the specified type returns keep their meaning as values of the candidate
+     * type: if the candidate type is the same type once frozen, with user types expanded to tuples and counters taken as
+     * bigints, or is {@code blob}, or is a collection, vector or tuple whose element or component types widen those of
+     * the specified type, a tuple having possibly more components, or if it is {@code text} for {@code ascii},
+     * {@code varint} for {@code int} or {@code bigint}, or {@code uuid} for {@code timeuuid}. Other types whose values are
+     * values of the candidate type are not widened by it, because their values would read as other values, such as an
+     * {@code int} read as a {@code date}, a {@code bigint} read as a {@code time} or {@code timestamp}, or a
+     * {@code timestamp} read as a {@code bigint} or {@code varint}.
+     */
+    private static boolean isWidening(AbstractType<?> candidate, AbstractType<?> type)
+    {
+        return widens(selectedValueType(candidate), selectedValueType(type));
+    }
+
+    private static boolean widens(AbstractType<?> wider, AbstractType<?> narrower)
+    {
+        if (wider.equals(narrower) || wider instanceof BytesType)
+            return true;
+
+        if (wider.isCollection() || wider.isVector() || wider.isTuple())
+        {
+            if (wider.getClass() != narrower.getClass())
+                return false;
+
+            List<AbstractType<?>> widerTypes = wider.subTypes();
+            List<AbstractType<?>> narrowerTypes = narrower.subTypes();
+            if (widerTypes.size() < narrowerTypes.size())
+                return false;
+
+            for (int i = 0, m = narrowerTypes.size(); i < m; i++)
+            {
+                if (!widens(widerTypes.get(i), narrowerTypes.get(i)))
+                    return false;
+            }
+            return true;
+        }
+
+        return (wider instanceof UTF8Type && narrower instanceof AsciiType)
+               || (wider instanceof IntegerType && (narrower instanceof Int32Type || narrower instanceof LongType))
+               || (wider instanceof UUIDType && narrower instanceof TimeUUIDType);
     }
 
     /**
@@ -962,7 +1061,8 @@ public interface Selectable extends AssignmentTestable
         @Override
         public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            return Lists.getExactListTypeIfKnown(selectables, p -> p.getExactTypeIfKnown(keyspace));
+            AbstractType<?> elementType = getExactElementTypeIfKnown(keyspace, selectables);
+            return elementType == null ? null : ListType.getInstance(elementType, false);
         }
 
         @Override
@@ -1035,7 +1135,8 @@ public interface Selectable extends AssignmentTestable
         @Override
         public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            return Vectors.getExactVectorTypeIfKnown(selectables, p -> p.getExactTypeIfKnown(keyspace));
+            AbstractType<?> elementType = getExactElementTypeIfKnown(keyspace, selectables);
+            return elementType == null ? null : VectorType.getInstance(elementType, selectables.size());
         }
 
         @Override
@@ -1124,7 +1225,8 @@ public interface Selectable extends AssignmentTestable
         @Override
         public AbstractType<?> getExactTypeIfKnown(String keyspace)
         {
-            return Sets.getExactSetTypeIfKnown(selectables, p -> p.getExactTypeIfKnown(keyspace));
+            AbstractType<?> elementType = getExactElementTypeIfKnown(keyspace, selectables);
+            return elementType == null ? null : SetType.getInstance(elementType, false);
         }
 
         @Override

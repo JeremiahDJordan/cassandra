@@ -1,4 +1,5 @@
 5.0.10
+ * Infer the type of list, set and vector literals in the selection from the first element type that all elements are of (CASSANDRA-XXXXX)
  * Reject collection, tuple and user type literals in the selection whose elements are not of the expected type (CASSANDRA-21736)
  * CONTAINS KEY restriction on a frozen map clustering column with descending order is rejected: "Cannot use CONTAINS KEY on non-map column" (CASSANDRA-21742)
  * Prevent tiny SSTables from accumulating under UCS (CASSANDRA-21615)
