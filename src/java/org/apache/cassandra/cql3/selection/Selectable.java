@@ -83,6 +83,98 @@ public interface Selectable extends AssignmentTestable
         return true;
     }
 
+    /**
+     * Checks that each element of a collection literal is of the element type of the collection. See
+     * {@link #validateElementType}.
+     */
+    static void validateElementTypes(TableMetadata table,
+                                     Selectable literal,
+                                     String kind,
+                                     List<Selectable> elements,
+                                     SelectorFactories factories,
+                                     AbstractType<?> elementType)
+    {
+        for (int i = 0, m = elements.size(); i < m; i++)
+            validateElementType(table, literal, kind, "value", elements.get(i), factories.get(i), elementType);
+    }
+
+    /**
+     * Checks that an element of a collection, tuple or user type literal is of the type the literal expects for it.
+     * Literal terms are prepared with that type, but other elements, such as columns, function calls or elements
+     * between parentheses, keep their own type. The element is accepted if it is assignable to the expected type, as
+     * for a function argument, or if the values its selector returns are values of the expected type.
+     */
+    static void validateElementType(TableMetadata table,
+                                    Selectable literal,
+                                    String kind,
+                                    String role,
+                                    Selectable element,
+                                    Factory factory,
+                                    AbstractType<?> expectedType)
+    {
+        if (element.testAssignment(table.keyspace, receiver(table, literal, expectedType)).isAssignable())
+            return;
+
+        if (!selectedValueType(factory.getReturnType()).testAssignment(selectedValueType(expectedType)).isAssignable())
+            throw invalidRequest("Invalid %s literal %s: %s %s is not of type %s",
+                                 kind, literal, role, element, expectedType.asCQL3Type());
+    }
+
+    /**
+     * Returns the type whose element types the elements of a collection or tuple literal are given as expected types.
+     * It is the type inferred for the literal if the literal is assignable to it, so that the literal terms and bind
+     * markers among its elements keep the types they have without an expected type. Otherwise, it is the type the
+     * values of the literal are read with, if the literal is assignable to it, as it is to the type of a function
+     * parameter or of a cast, so that nested literals are checked against the types their values are read with.
+     */
+    static <T extends AbstractType<?>> T typeForElements(TableMetadata table, Selectable literal, T valuesType, T inferredType)
+    {
+        if (valuesType == inferredType
+            || literal.testAssignment(table.keyspace, receiver(table, literal, inferredType)).isAssignable()
+            || !literal.testAssignment(table.keyspace, receiver(table, literal, valuesType)).isAssignable())
+            return inferredType;
+        return valuesType;
+    }
+
+    private static ColumnSpecification receiver(TableMetadata table, Selectable literal, AbstractType<?> type)
+    {
+        return new ColumnSpecification(table.keyspace, table.name, new ColumnIdentifier(literal.toString(), true), type);
+    }
+
+    /**
+     * Returns the type of the values that a selector of the specified type returns, as far as their serialization is
+     * concerned: values of non-frozen types are returned in their frozen form, at any level of nesting, a user type
+     * value is serialized as a tuple of its field values, and a counter value as a bigint.
+     */
+    private static AbstractType<?> selectedValueType(AbstractType<?> type)
+    {
+        return frozenForm(type).expandUserTypes();
+    }
+
+    private static AbstractType<?> frozenForm(AbstractType<?> type)
+    {
+        type = type.unwrap();
+        if (type.isCounter())
+            return LongType.instance;
+        if (type instanceof ListType)
+            return ListType.getInstance(frozenForm(((ListType<?>) type).getElementsType()), false);
+        if (type instanceof SetType)
+            return SetType.getInstance(frozenForm(((SetType<?>) type).getElementsType()), false);
+        if (type instanceof MapType)
+        {
+            MapType<?, ?> mapType = (MapType<?, ?>) type;
+            return MapType.getInstance(frozenForm(mapType.getKeysType()), frozenForm(mapType.getValuesType()), false);
+        }
+        if (type.isVector())
+        {
+            VectorType<?> vectorType = (VectorType<?>) type;
+            return VectorType.getInstance(frozenForm(vectorType.getElementsType()), vectorType.dimension);
+        }
+        if (type.isTuple() && !type.isUDT())
+            return new TupleType(((TupleType) type).allTypes().stream().map(Selectable::frozenForm).collect(Collectors.toList()));
+        return type.freeze();
+    }
+
     // Term.Raw overrides this since some literals can be WEAKLY_ASSIGNABLE
     default public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
     {
@@ -628,7 +720,7 @@ public interface Selectable extends AssignmentTestable
             if (selectables.size() == 1 && !type.isTuple())
                 return newBetweenParenthesesSelectorFactory(cfm, expectedType, defs, boundNames);
 
-            return newTupleSelectorFactory(cfm, (TupleType) type, defs, boundNames);
+            return newTupleSelectorFactory(cfm, (TupleType) type, expectedType, defs, boundNames);
         }
 
         private Factory newBetweenParenthesesSelectorFactory(TableMetadata cfm,
@@ -655,14 +747,26 @@ public interface Selectable extends AssignmentTestable
 
         private Factory newTupleSelectorFactory(TableMetadata cfm,
                                                 TupleType tupleType,
+                                                AbstractType<?> expectedType,
                                                 List<ColumnMetadata> defs,
                                                 VariableSpecifications boundNames)
         {
+            // the components are given, and checked against, the component types of the expected type if the tuple is
+            // assignable to it, such as the type of a function parameter, or else of the type of the tuple
+            TupleType valuesType = expectedType instanceof TupleType ? (TupleType) expectedType : tupleType;
+            TupleType componentsType = typeForElements(cfm, this, valuesType, tupleType);
+            // a tuple literal can have fewer components than its type, but not more
+            if (selectables.size() > componentsType.size())
+                throw invalidRequest("Invalid tuple literal %s: too many elements. Type %s expects %d but got %d",
+                                     this, componentsType.asCQL3Type(), componentsType.size(), selectables.size());
+
             SelectorFactories factories = createFactoriesAndCollectColumnDefinitions(selectables,
-                                                                                     tupleType.allTypes(),
+                                                                                     componentsType.allTypes(),
                                                                                      cfm,
                                                                                      defs,
                                                                                      boundNames);
+            for (int i = 0, m = selectables.size(); i < m; i++)
+                validateElementType(cfm, this, "tuple", "component", selectables.get(i), factories.get(i), componentsType.type(i));
 
             return TupleSelector.newFactory(tupleType, factories);
         }
@@ -839,15 +943,19 @@ public interface Selectable extends AssignmentTestable
 
             ListType<?> listType = (ListType<?>) type;
 
+            // the values are read with the expected type if there is one, such as the type of a function parameter
+            ListType<?> valuesType = expectedType instanceof ListType ? (ListType<?>) expectedType : listType;
+            AbstractType<?> elementType = typeForElements(cfm, this, valuesType, listType).getElementsType();
             List<AbstractType<?>> expectedTypes = new ArrayList<>(selectables.size());
             for (int i = 0, m = selectables.size(); i < m; i++)
-                expectedTypes.add(listType.getElementsType());
+                expectedTypes.add(elementType);
 
             SelectorFactories factories = createFactoriesAndCollectColumnDefinitions(selectables,
                                                                                      expectedTypes,
                                                                                      cfm,
                                                                                      defs,
                                                                                      boundNames);
+            validateElementTypes(cfm, this, "list", selectables, factories, valuesType.getElementsType());
             return ListSelector.newFactory(type, factories);
         }
 
@@ -908,15 +1016,19 @@ public interface Selectable extends AssignmentTestable
             if (vectorType.dimension != selectables.size())
                 throw invalidRequest("Unable to create a vector selector of type %s from %d elements", vectorType.asCQL3Type(), selectables.size());
 
+            // the values are read with the expected type if there is one, such as the type of a function parameter
+            VectorType<?> valuesType = expectedType instanceof VectorType ? (VectorType<?>) expectedType : vectorType;
+            AbstractType<?> elementType = typeForElements(cfm, this, valuesType, vectorType).getElementsType();
             List<AbstractType<?>> expectedTypes = new ArrayList<>(selectables.size());
             for (int i = 0, m = selectables.size(); i < m; i++)
-                expectedTypes.add(vectorType.getElementsType());
+                expectedTypes.add(elementType);
 
             SelectorFactories factories = createFactoriesAndCollectColumnDefinitions(selectables,
                                                                                      expectedTypes,
                                                                                      cfm,
                                                                                      defs,
                                                                                      boundNames);
+            validateElementTypes(cfm, this, "vector", selectables, factories, valuesType.getElementsType());
             return VectorSelector.newFactory(type, factories);
         }
 
@@ -990,17 +1102,23 @@ public interface Selectable extends AssignmentTestable
             if (setType.getElementsType() == DurationType.instance)
                 throw invalidRequest("Durations are not allowed inside sets: %s", setType.asCQL3Type());
 
+            // the values are read with the expected type if there is one, such as the type of a function parameter
+            SetType<?> valuesType = expectedType instanceof SetType ? (SetType<?>) expectedType : setType;
+            // the set is sorted with the type its elements are given, with which its literal terms are serialized
+            SetType<?> elementsType = typeForElements(cfm, this, valuesType, setType);
+            AbstractType<?> elementType = elementsType.getElementsType();
             List<AbstractType<?>> expectedTypes = new ArrayList<>(selectables.size());
             for (int i = 0, m = selectables.size(); i < m; i++)
-                expectedTypes.add(setType.getElementsType());
+                expectedTypes.add(elementType);
 
             SelectorFactories factories = createFactoriesAndCollectColumnDefinitions(selectables,
                                                                                      expectedTypes,
                                                                                      cfm,
                                                                                      defs,
                                                                                      boundNames);
+            validateElementTypes(cfm, this, "set", selectables, factories, valuesType.getElementsType());
 
-            return SetSelector.newFactory(type, factories);
+            return SetSelector.newFactory(elementsType, factories);
         }
 
         @Override
@@ -1107,10 +1225,16 @@ public interface Selectable extends AssignmentTestable
             if (mapType.getKeysType() == DurationType.instance)
                 throw invalidRequest("Durations are not allowed as map keys: %s", mapType.asCQL3Type());
 
-            return MapSelector.newFactory(type, getMapEntries(cfm).stream()
-                                                                  .map(p -> Pair.create(p.left.newSelectorFactory(cfm, mapType.getKeysType(), defs, boundNames),
-                                                                                        p.right.newSelectorFactory(cfm, mapType.getValuesType(), defs, boundNames)))
-                                                                  .collect(Collectors.toList()));
+            List<Pair<Factory, Factory>> factories = new ArrayList<>(raws.size());
+            for (Pair<Selectable, Selectable> entry : getMapEntries(cfm))
+            {
+                Factory keyFactory = entry.left.newSelectorFactory(cfm, mapType.getKeysType(), defs, boundNames);
+                Factory valueFactory = entry.right.newSelectorFactory(cfm, mapType.getValuesType(), defs, boundNames);
+                validateElementType(cfm, this, "map", "key", entry.left, keyFactory, mapType.getKeysType());
+                validateElementType(cfm, this, "map", "value", entry.right, valueFactory, mapType.getValuesType());
+                factories.add(Pair.create(keyFactory, valueFactory));
+            }
+            return MapSelector.newFactory(type, factories);
         }
 
         private Factory newUdtSelectorFactory(TableMetadata cfm,
@@ -1137,8 +1261,10 @@ public interface Selectable extends AssignmentTestable
                                          ut.getNameAsString());
 
                 AbstractType<?> fieldType = ut.fieldType(fieldPosition);
-                factories.put(fieldName,
-                              raw.right.prepare(cfm).newSelectorFactory(cfm, fieldType, defs, boundNames));
+                Selectable field = raw.right.prepare(cfm);
+                Factory factory = field.newSelectorFactory(cfm, fieldType, defs, boundNames);
+                validateElementType(cfm, this, "user type", "field", field, factory, fieldType);
+                factories.put(fieldName, factory);
             }
 
             return UserTypeSelector.newFactory(expectedType, factories);
