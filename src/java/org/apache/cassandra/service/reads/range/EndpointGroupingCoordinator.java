@@ -356,6 +356,7 @@ public class EndpointGroupingCoordinator
                                                   command,
                                                   new EndpointShortReadResponseProtection(command,
                                                                                           context.replicas.get(i),
+                                                                                          originalResponse,
                                                                                           () -> { responses.clearUnsafe(i); if (onShortRead != null) onShortRead.run(); },
                                                                                           singleResultCounter,
                                                                                           context.mergedResultCounter(),
@@ -375,12 +376,13 @@ public class EndpointGroupingCoordinator
         {
             public EndpointShortReadResponseProtection(ReadCommand command,
                                                        Replica source,
+                                                       UnfilteredPartitionIterator firstResponse,
                                                        Runnable preFetchCallback,
                                                        DataLimits.Counter singleResultCounter,
                                                        DataLimits.Counter mergedResultCounter,
                                                        Dispatcher.RequestTime requestTime)
             {
-                super(command, source, preFetchCallback, singleResultCounter, mergedResultCounter, requestTime);
+                super(command, source, firstResponse, preFetchCallback, singleResultCounter, mergedResultCounter, requestTime);
             }
 
             @Override
