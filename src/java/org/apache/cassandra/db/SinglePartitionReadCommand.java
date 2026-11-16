@@ -757,12 +757,15 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         try
         {
             SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
+            boolean hasMemtableData = false;
 
             for (Memtable memtable : view.memtables)
             {
                 UnfilteredRowIterator iter = memtable.rowIterator(partitionKey(), filter.getSlices(metadata()), columnFilter(), filter.isReversed(), metricsCollector);
                 if (iter == null)
                     continue;
+
+                hasMemtableData = true;
 
                 if (memtable.getMinTimestamp() != Memtable.NO_MIN_TIMESTAMP)
                     minTimestamp = Math.min(minTimestamp, memtable.getMinTimestamp());
@@ -793,6 +796,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             view.sstables.sort(SSTableReader.maxTimestampDescending);
             int nonIntersectingSSTables = 0;
             int includedDueToTombstones = 0;
+            ColumnFilter sstableColumnFilter = hasMemtableData ? columnFilter() : sstableColumnFilter(view.sstables, controller);
 
             if (controller.isTrackingRepairedStatus())
                 Tracing.trace("Collecting data from sstables and tracking repaired status");
@@ -827,8 +831,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                         controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
 
                     // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
-                    iter = intersects ? makeRowIteratorWithLowerBound(cfs, sstable, metricsCollector)
-                                                            : makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, metricsCollector);
+                    iter = intersects ? makeRowIteratorWithLowerBound(cfs, sstable, sstableColumnFilter, metricsCollector)
+                                                            : makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, sstableColumnFilter, metricsCollector);
                 }
                 else
                 {
@@ -840,7 +844,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     // an iterator figure out that (see `StatsMetadata.hasPartitionLevelDeletions`)
 
                     // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
-                    iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, metricsCollector);
+                    iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, sstableColumnFilter, metricsCollector);
 
                     // if the sstable contains a partition delete, then we must include it regardless of whether it
                     // shadows any other data seen locally as we can't guarantee that other replicas have seen it
@@ -902,13 +906,14 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
     private UnfilteredRowIteratorWithLowerBound makeRowIteratorWithLowerBound(ColumnFamilyStore cfs,
                                                                               SSTableReader sstable,
+                                                                              ColumnFilter columnFilter,
                                                                               SSTableReadsListener listener)
     {
         return StorageHook.instance.makeRowIteratorWithLowerBound(cfs,
                                                                   sstable,
                                                                   partitionKey(),
                                                                   clusteringIndexFilter(),
-                                                                  columnFilter(),
+                                                                  columnFilter,
                                                                   listener);
 
     }
@@ -916,28 +921,54 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
     private UnfilteredRowIterator makeRowIterator(ColumnFamilyStore cfs,
                                                   SSTableReader sstable,
                                                   ClusteringIndexNamesFilter clusteringIndexFilter,
+                                                  ColumnFilter columnFilter,
                                                   SSTableReadsListener listener)
     {
         return StorageHook.instance.makeRowIterator(cfs,
                                                     sstable,
                                                     partitionKey(),
                                                     clusteringIndexFilter.getSlices(cfs.metadata()),
-                                                    columnFilter(),
+                                                    columnFilter,
                                                     clusteringIndexFilter.isReversed(),
                                                     listener);
     }
 
     private UnfilteredRowIterator makeRowIteratorWithSkippedNonStaticContent(ColumnFamilyStore cfs,
                                                                              SSTableReader sstable,
+                                                                             ColumnFilter columnFilter,
                                                                              SSTableReadsListener listener)
     {
         return StorageHook.instance.makeRowIterator(cfs,
                                                     sstable,
                                                     partitionKey(),
                                                     Slices.NONE,
-                                                    columnFilter(),
+                                                    columnFilter,
                                                     clusteringIndexFilter().isReversed(),
                                                     listener);
+    }
+
+    /**
+     * The filter of the sstables of a read that reads no memtable data. When none of the sstables can hold a primary
+     * key liveness info that is not live (no TTL, or nothing expired or deleted at {@code nowInSec}), the primary key
+     * liveness info of each merged row is live, or is shadowed by a deletion that also shadows the cells older than
+     * it. {@link ReadCommand#withoutSkippableCells} then removes from the merged rows the fetched but not queried simple
+     * cells older than the primary key liveness info of their row in any source, so the sstables can skip them.
+     */
+    private ColumnFilter sstableColumnFilter(List<SSTableReader> sstables, ReadExecutionController controller)
+    {
+        ColumnFilter filter = columnFilter();
+        if (filter.allFetchedColumnsAreQueried() || controller.isTrackingRepairedStatus())
+            return filter;
+
+        for (SSTableReader sstable : sstables)
+        {
+            int maxTTL = sstable.getMaxTTL();
+            // a view's expired liveness info is never live, whatever its local expiration time
+            if (maxTTL == LivenessInfo.EXPIRED_LIVENESS_TTL
+                || (maxTTL != LivenessInfo.NO_TTL && sstable.getMinLocalDeletionTime() <= nowInSec()))
+                return filter;
+        }
+        return filter.withNotQueriedCellsOlderThanRowDropped();
     }
 
     /**
@@ -1009,6 +1040,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
         ImmutableBTreePartition result = null;
         SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
+        boolean hasMemtableData = false;
 
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Merging memtable contents");
@@ -1019,6 +1051,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             {
                 if (iter == null)
                     continue;
+
+                hasMemtableData = true;
 
                 UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable))
                                                                        : iter;
@@ -1032,6 +1066,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
         /* add the SSTables on disk */
         view.sstables.sort(SSTableReader.maxTimestampDescending);
+        ColumnFilter sstableColumnFilter = hasMemtableData ? columnFilter() : sstableColumnFilter(view.sstables, controller);
         // read sorted sstables
         for (SSTableReader sstable : view.sstables)
         {
@@ -1061,7 +1096,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     continue; // no tombstone at all, we can skip that sstable
 
                 // We need to get the partition deletion and include it if it's live. In any case though, we're done with that sstable.
-                try (UnfilteredRowIterator iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, metricsCollector))
+                try (UnfilteredRowIterator iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, sstableColumnFilter, metricsCollector))
                 {
                     if (!iter.partitionLevelDeletion().isLive())
                     {
@@ -1091,7 +1126,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 continue;
             }
 
-            try (UnfilteredRowIterator iter = makeRowIterator(cfs, sstable, filter, metricsCollector))
+            try (UnfilteredRowIterator iter = makeRowIterator(cfs, sstable, filter, sstableColumnFilter, metricsCollector))
             {
                 if (iter.isEmpty())
                     continue;
@@ -1143,8 +1178,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         // According to the CQL semantics a row exists if at least one of its columns is not null (including the primary key columns).
         // Having the queried columns not null is unfortunately not enough to prove that a row exists as some column deletion
         // for the queried columns can exist on another node.
-        // For CQL tables it is enough to have the primary key liveness and the queried columns as the primary key liveness prove that
-        // the row exists even if all the other columns are deleted.
+        // For CQL tables it is enough to have a live primary key liveness and the queried columns as the live primary key liveness
+        // proves that the row exists even if all the other columns are deleted.
         // COMPACT tables do not have primary key liveness and by consequence we are forced to get  all the fetched columns to ensure that
         // we can return the correct result if the queried columns are deleted on another node but one of the non-queried columns is not.
         RegularAndStaticColumns columns = metadata().isCompactTable() ? columnFilter().fetchedColumns() : columnFilter().queriedColumns();
@@ -1240,7 +1275,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 return true;
 
             // Note that compact tables will always have an empty primary key liveness info.
-            if (!metadata().isCompactTable() && (row.primaryKeyLivenessInfo().isEmpty() || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp))
+            // An expired primary key liveness info doesn't prove the row exists; older cells may still keep it alive.
+            if (!metadata().isCompactTable() && (!row.primaryKeyLivenessInfo().isLive(nowInSec()) || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp))
                 return false;
         }
 

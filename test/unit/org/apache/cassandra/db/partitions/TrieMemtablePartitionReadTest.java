@@ -74,8 +74,8 @@ public class TrieMemtablePartitionReadTest extends CQLTester
 
     /// Clustering (100, 'x'), used by some tests for rows without primary key liveness, and never written by others.
     private static final int EXTRA_ROW = 100;
-    /// Clustering (101, 'y'): v2 is older than the row's primary key liveness, so it is skipped when v2 is fetched
-    /// but not queried.
+    /// Clustering (101, 'y'): v2 is older than the row's primary key liveness; it is kept, with its value skipped,
+    /// when v2 is fetched but not queried (as in sstable reads).
     private static final int OLDER_CELL_ROW = 101;
 
     @Test

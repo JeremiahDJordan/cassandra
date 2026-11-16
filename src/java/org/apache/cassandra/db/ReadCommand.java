@@ -67,7 +67,11 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PurgeFunction;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.BTreeComplexColumn;
+import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
@@ -88,6 +92,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.net.Message;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
@@ -104,6 +109,7 @@ import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.btree.BTree;
 
 import static com.google.common.collect.Iterables.any;
 import static com.google.common.collect.Iterables.filter;
@@ -535,7 +541,8 @@ public abstract class ReadCommand extends AbstractReadQuery
             var storageTarget = (null == searcher) ? queryStorage(cfs, executionController)
                                                    : searchStorage(searcher, executionController);
 
-            UnfilteredPartitionIterator iterator = Transformation.apply(storageTarget, new TrackingRowIterator(context));
+            // Skippable cells are not returned, so they are not counted as read bytes.
+            UnfilteredPartitionIterator iterator = Transformation.apply(withoutSkippableCells(storageTarget), new TrackingRowIterator(context));
             iterator = RTBoundValidator.validate(iterator, Stage.MERGED, false);
 
             try
@@ -1024,6 +1031,117 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     public abstract Verb verb();
+
+    /**
+     * Removes the cells of fetched but not queried columns (see {@link ColumnFilter}) that are older than the primary
+     * key liveness info of their row: live cells only if that info is live (CASSANDRA-10657), other cells in any case.
+     * A complex column that isn't queried at all only loses its cells that are not live. It runs on the merged rows,
+     * as an expired liveness info of one source must not hide older live cells of another.
+     */
+    @VisibleForTesting
+    UnfilteredPartitionIterator withoutSkippableCells(UnfilteredPartitionIterator iterator)
+    {
+        ColumnFilter columnFilter = columnFilter();
+        if (columnFilter.allFetchedColumnsAreQueried())
+            return iterator;
+
+        long nowInSec = nowInSec();
+        boolean enforceStrictLiveness = metadata().enforceStrictLiveness();
+
+        class WithoutSkippableCells extends Transformation<UnfilteredRowIterator>
+        {
+            @Override
+            protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+            {
+                return Transformation.apply(partition, this);
+            }
+
+            @Override
+            protected Row applyToRow(Row row)
+            {
+                LivenessInfo liveness = row.primaryKeyLivenessInfo();
+                if (liveness.isEmpty())
+                    return row;
+
+                long timestamp = liveness.timestamp();
+                boolean isBTreeRow = row instanceof BTreeRow;
+                // Only the cells older than the primary key liveness info are removed.
+                if (isBTreeRow && !hasCellOlderThan(row, timestamp))
+                    return row;
+
+                boolean isLive = enforceStrictLiveness || liveness.isLive(nowInSec);
+                // Row#transformAndFilter gives the cell function of a TrieBackedRow CellData without column or path,
+                // so other rows are converted to a BTreeRow, only when they have a cell to remove.
+                if (!isBTreeRow && !hasSkippableCell(row, timestamp, isLive))
+                    return row;
+
+                BTreeRow btreeRow = BTreeRow.asBTreeRow(row);
+                Row filtered = btreeRow.transformAndFilterColumns(btreeRow.primaryKeyLivenessInfo(), btreeRow.deletion(), cd -> {
+                    ColumnMetadata column = cd.column();
+                    if (column.isComplex())
+                    {
+                        BTreeComplexColumn complex = (BTreeComplexColumn) cd;
+                        if (!columnFilter.fetchedColumnIsQueried(column))
+                            return complex.transformAndFilter(complex.complexDeletion(), cell -> isSkippable(cell, timestamp, false) ? null : cell);
+
+                        ColumnFilter.Tester tester = columnFilter.newTester(column);
+                        if (tester == null)
+                            return cd;
+
+                        return complex.transformAndFilter(complex.complexDeletion(),
+                                                          cell -> isSkippable(cell, timestamp, isLive) && !tester.fetchedCellIsQueried(cell.path())
+                                                                  ? null : cell);
+                    }
+
+                    return isSkippable((Cell<?>) cd, timestamp, isLive) && !columnFilter.fetchedColumnIsQueried(column) ? null : cd;
+                });
+                return filtered == btreeRow ? row : filtered;
+            }
+
+            private boolean hasSkippableCell(Row row, long rowTimestamp, boolean isRowLivenessLive)
+            {
+                for (Cell<?> cell : row.cells())
+                {
+                    ColumnMetadata column = cell.column();
+                    boolean isQueried = columnFilter.fetchedColumnIsQueried(column);
+                    if (column.isComplex() && !isQueried)
+                    {
+                        if (isSkippable(cell, rowTimestamp, false))
+                            return true;
+                    }
+                    else if (isSkippable(cell, rowTimestamp, isRowLivenessLive)
+                             && !(column.isComplex() ? columnFilter.fetchedCellIsQueried(column, cell.path()) : isQueried))
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+
+            private boolean isSkippable(Cell<?> cell, long rowTimestamp, boolean isRowLivenessLive)
+            {
+                return cell.timestamp() < rowTimestamp && (isRowLivenessLive || !cell.isLive(nowInSec));
+            }
+        }
+        return Transformation.apply(iterator, new WithoutSkippableCells());
+    }
+
+    private static boolean hasCellOlderThan(Row row, long timestamp)
+    {
+        return row.accumulate(ReadCommand::stopAtColumnDataOlderThan, timestamp) == BTree.STOP_SENTINEL_VALUE;
+    }
+
+    private static long stopAtColumnDataOlderThan(ColumnData data, long timestamp)
+    {
+        if (data.column().isSimple())
+            return stopAtCellOlderThan((Cell<?>) data, timestamp);
+        return ((ComplexColumnData) data).accumulate(ReadCommand::stopAtCellOlderThan, timestamp);
+    }
+
+    private static long stopAtCellOlderThan(Cell<?> cell, long timestamp)
+    {
+        return cell.timestamp() < timestamp ? BTree.STOP_SENTINEL_VALUE : timestamp;
+    }
 
     // Skip purgeable tombstones. We do this because it's safe to do (post-merge of the memtable and sstable at least), it
     // can save us some bandwith, and avoid making us throw a TombstoneOverwhelmingException for purgeable tombstones (which
