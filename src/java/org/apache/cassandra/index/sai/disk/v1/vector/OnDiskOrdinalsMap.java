@@ -135,6 +135,10 @@ public class OnDiskOrdinalsMap implements AutoCloseable
          */
         public int getOrdinalForRowId(int rowId) throws IOException
         {
+            // no row of the segment has a vector, e.g. all of them were deleted before the flush
+            if (high == 0)
+                return -1;
+
             // Compute the offset of the start of the rowId to vectorOrdinal mapping
             long index = DiskBinarySearch.searchInt(0, Math.toIntExact(high), rowId, i -> {
                 try
