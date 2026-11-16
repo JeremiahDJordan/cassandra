@@ -89,7 +89,11 @@ public abstract class AbstractSSTableIterator<RIE extends AbstractRowIndexEntry>
         this.key = key;
         this.columns = columnFilter;
         this.slices = slices;
-        this.helper = new DeserializationHelper(metadata, sstable.descriptor.version.correspondingMessagingVersion(), DeserializationHelper.Flag.LOCAL, columnFilter);
+        this.helper = new DeserializationHelper(metadata,
+                                                sstable.descriptor.version.correspondingMessagingVersion(),
+                                                DeserializationHelper.Flag.LOCAL,
+                                                columnFilter,
+                                                sstable.header.hasDroppedColumnNotFetched(metadata, sstable.getMaxTimestamp(), columnFilter));
 
         if (indexEntry == null)
         {

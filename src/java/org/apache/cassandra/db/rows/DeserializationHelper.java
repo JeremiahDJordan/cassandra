@@ -55,11 +55,21 @@ public class DeserializationHelper
     private final boolean dropsNotQueriedCellsOlderThanRow;
 
     private final boolean hasDroppedColumns;
+    private final boolean mayHaveDroppedColumnsNewerThanDrop;
     private final Map<ByteBuffer, DroppedColumn> droppedColumns;
     private DroppedColumn currentDroppedComplex;
 
 
     public DeserializationHelper(TableMetadata metadata, int version, Flag flag, ColumnFilter columnsToFetch)
+    {
+        this(metadata, version, flag, columnsToFetch, true);
+    }
+
+    /**
+     * @param mayHaveDroppedColumnsNewerThanDrop false if the data cannot have cells newer than the drop of a dropped
+     * column that {@code columnsToFetch} does not fetch
+     */
+    public DeserializationHelper(TableMetadata metadata, int version, Flag flag, ColumnFilter columnsToFetch, boolean mayHaveDroppedColumnsNewerThanDrop)
     {
         this.flag = flag;
         this.version = version;
@@ -67,6 +77,7 @@ public class DeserializationHelper
         this.dropsNotQueriedCellsOlderThanRow = columnsToFetch != null && columnsToFetch.dropsNotQueriedCellsOlderThanRow();
         this.droppedColumns = metadata.droppedColumns;
         this.hasDroppedColumns = droppedColumns.size() > 0;
+        this.mayHaveDroppedColumnsNewerThanDrop = hasDroppedColumns && mayHaveDroppedColumnsNewerThanDrop;
     }
 
     public DeserializationHelper(TableMetadata metadata, int version, Flag flag)
@@ -85,7 +96,7 @@ public class DeserializationHelper
         // A filter that fetches all columns accepts any column, including a dropped one, whose cells that are newer
         // than the drop are kept. Such a column is not part of the fetched columns, which the result of a read must
         // only contain (for instance to be serialized), so it is skipped.
-        return !hasDroppedColumns
+        return !mayHaveDroppedColumnsNewerThanDrop
                || !columnsToFetch.fetchesAllColumns(column.isStatic())
                || columnsToFetch.fetchedColumns().contains(column);
     }
