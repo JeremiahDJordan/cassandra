@@ -194,12 +194,11 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         mergeListener = new QueryMergeListener();
 
-        // Only row limits can be checked with a count of rows: GROUP BY limits count groups, per-partition limits
-        // count by partition, and without a row limit the rows would be held and never counted. A filter on a static
-        // column can stop matching the rows of a partition when its static row is completed.
+        // Per-partition limits would need the rows counted by partition. Without a row or group limit (no limit, or
+        // only a limit in bytes), the rows would be held and never counted. A filter on a static column can stop
+        // matching the rows of a partition when its static row is completed.
         DataLimits limits = command.limits();
         completeRows = limits.count() == DataLimits.NO_LIMIT
-                       || limits.isGroupByLimit()
                        || limits.perPartitionCount() != DataLimits.NO_LIMIT
                        || command.rowFilter().hasStaticExpression()
                        ? null
@@ -416,7 +415,11 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
         {
             if (currentListener == null || !currentListener.key.equals(partitionKey))
+            {
                 currentListener = new PartitionMergeListerner(partitionKey, versions);
+                if (completeRows != null)
+                    completeRows.startPartition(partitionKey);
+            }
 
             return currentListener;
         }
@@ -570,11 +573,20 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /**
      * Counts, in the first phase's merged result counter, the rows that no replica is silent about and that match the
      * row filter: the second phase returns them as they are, so short read protection stops asking for more rows once
-     * they fill the limit. The rows are filtered and counted in batches big enough to fill the rest of the limit.
+     * they fill the limit. The rows are filtered and counted in batches big enough to fill the rest of the limit, or
+     * one at a time for GROUP BY.
+     * <p>
+     * A GROUP BY counter closes a group when the next one starts and expects each partition once, so it is given the
+     * start of each merged partition and each row as they come. A group whose last row is the last row of a replica's
+     * response tells short read protection that the replica isn't needed (see DataLimits#isCompleteWithLastRowOf). The
+     * rows it doesn't count can only make more groups.
      */
     private class CompleteRows
     {
         private final DataLimits.Counter counter;
+        private final boolean groupBy;
+        // whether the coordinator filter filters rows (see DataResolver#preCountFilterForReplicaFilteringProtection)
+        private final boolean filtersRows;
         private final List<DecoratedKey> keys = new ArrayList<>();
         private final List<List<Row>> rows = new ArrayList<>();
         private int pending = 0;
@@ -582,6 +594,14 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         private CompleteRows(DataLimits.Counter counter)
         {
             this.counter = counter;
+            this.groupBy = command.limits().isGroupByLimit();
+            this.filtersRows = command.rowFilter().hasNonKeyExpression();
+        }
+
+        private void startPartition(DecoratedKey key)
+        {
+            if (groupBy && !counter.isDone())
+                counter.countPartitionStart(key);
         }
 
         private void add(DecoratedKey key, Row merged)
@@ -593,6 +613,14 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             Row row = merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
             if (row == null)
                 return;
+
+            if (groupBy)
+            {
+                // The filter has no static expression, so this is what the coordinator filter does with the row
+                if (!filtersRows || command.rowFilter().root().isSatisfiedBy(command.metadata(), key, row, command.nowInSec()))
+                    counter.countRow(row);
+                return;
+            }
 
             if (keys.isEmpty() || !keys.get(keys.size() - 1).equals(key))
             {
