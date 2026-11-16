@@ -26,6 +26,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 import org.apache.cassandra.cql3.AssignmentTestable;
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.SchemaConstants;
@@ -116,6 +117,43 @@ public abstract class FunctionFactory
         }
 
         return doGetOrCreateFunction(args, types, receiverType);
+    }
+
+    /**
+     * Tests an argument of a function call that isn't assignable to its parameter type in the function that this
+     * factory built for the call, in case that type is the type inferred from the argument itself.
+     * <p>
+     * The type inferred for a collection literal has a frozen element type, because a frozen type can't have non-frozen
+     * subtypes, so a literal of non-frozen values, like {@code [v, v]} for a non-frozen UDT column {@code v}, isn't
+     * assignable to it. Apache Cassandra keeps the non-frozen element type in the inferred type, and accepts such
+     * literals. So the argument is tested as it is there, against the element types as they were inferred (see
+     * {@link AssignmentTestable#testAssignmentToInferredType}). Its values are passed to the function in their frozen
+     * form in any case.
+     * <p>
+     * A type taken from another argument (see {@link FunctionParameter#prefersTypeOfOtherArgument()}) isn't inferred
+     * from the argument, so the argument isn't tested again, as for the declared parameter types of other functions.
+     *
+     * @param keyspace the current keyspace
+     * @param args the arguments in the function call for which the function has been built
+     * @param index the index of the argument
+     * @param receiver the specification of the argument's parameter in the built function
+     * @return the result of testing the argument against the type inferred from it, or {@code NOT_ASSIGNABLE} if the
+     * parameter type isn't the type inferred from the argument
+     */
+    public AssignmentTestable.TestResult testArgumentAgainstInferredType(String keyspace,
+                                                                         List<? extends AssignmentTestable> args,
+                                                                         int index,
+                                                                         ColumnSpecification receiver)
+    {
+        if (index >= parameters.size() || parameters.get(index).prefersTypeOfOtherArgument())
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
+        AssignmentTestable arg = args.get(index);
+        AbstractType<?> inferred = arg.getCompatibleTypeIfKnown(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+        if (inferred == null || !inferred.udfType().equals(receiver.type))
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
+        return arg.testAssignmentToInferredType(keyspace, receiver);
     }
 
     protected void validateNumberOfArguments(int numArgs)

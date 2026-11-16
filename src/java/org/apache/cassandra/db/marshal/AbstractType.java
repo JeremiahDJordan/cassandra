@@ -864,7 +864,26 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
         if (receiverType.isValueCompatibleWith(this))
             return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
 
+        if (isNonFrozenUdtAcceptedByTuple(receiverType, this))
+            return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
+
         return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+    }
+
+    /**
+     * Whether a value of the provided non-frozen UDT type can be assigned to the provided (frozen) tuple receiver.
+     * <p>
+     * A value of a non-frozen UDT is handed on in its frozen form, and a tuple accepts it as it accepts a frozen UDT
+     * value, as Apache Cassandra does. This is checked by the CQL assignment tests rather than in
+     * {@link #isValueCompatibleWith}, which deliberately never relates a multi-cell type to a frozen one.
+     */
+    public static boolean isNonFrozenUdtAcceptedByTuple(AbstractType<?> receiverType, AbstractType<?> valueType)
+    {
+        return valueType.isMultiCell()
+               && valueType.isUDT()
+               && receiverType.unwrap().isTuple()
+               && !receiverType.isMultiCell()
+               && receiverType.isValueCompatibleWith(valueType.freeze());
     }
 
     /**
