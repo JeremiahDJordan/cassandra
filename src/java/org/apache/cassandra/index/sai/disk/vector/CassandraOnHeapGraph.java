@@ -252,9 +252,8 @@ public class CassandraOnHeapGraph<T> implements Accountable
 
         var bytesUsed = 0L;
 
-        // Store a cached reference to the vector for brute force computations later. There is a small race
-        // condition here: if inserts for the same PrimaryKey add different vectors, vectorsByKey might
-        // become out of sync with the graph.
+        // Store a cached reference to the vector for brute force computations later. VectorMemtableIndex serializes
+        // the writes of a PrimaryKey, so vectorsByKey stays in sync with the graph.
         if (vectorsByKey != null)
         {
             vectorsByKey.put(key, vector);
@@ -323,8 +322,13 @@ public class CassandraOnHeapGraph<T> implements Accountable
     {
         assert term != null && term.remaining() != 0;
 
-        var rawVector = serializer.deserializeFloatArray(term);
-        VectorFloat<?> v = vts.createFloatVector(rawVector);
+        remove(vts.createFloatVector(serializer.deserializeFloatArray(term)), key);
+    }
+
+    public void remove(VectorFloat<?> v, T key)
+    {
+        assert v != null;
+
         var postings = postingsMap.get(v);
         if (postings == null)
         {
