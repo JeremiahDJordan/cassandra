@@ -1,4 +1,5 @@
 5.0.10
+ * Don't make SAI indexes created while streamed or imported SSTables are added queryable without them, also at startup, and keep failed builds out of the index views (CASSANDRA-XXXXX)
  * Build SAI indexes created while a stream is received before adding the streamed SSTables (CASSANDRA-XXXXX)
  * CONTAINS KEY restriction on a frozen map clustering column with descending order is rejected: "Cannot use CONTAINS KEY on non-map column" (CASSANDRA-21742)
  * Prevent tiny SSTables from accumulating under UCS (CASSANDRA-21615)

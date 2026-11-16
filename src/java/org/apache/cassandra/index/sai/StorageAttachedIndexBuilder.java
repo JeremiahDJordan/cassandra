@@ -356,6 +356,12 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
         // register custom index components into existing sstables
         sstable.registerComponents(StorageAttachedIndexGroup.getLiveComponents(sstable, existing), tracker);
+
+        // An SSTable that isn't live, e.g. a streamed or imported one built before it is added to the table, joins the
+        // index views when it is added, so they don't keep it if it never is
+        if (!tracker.getView().liveSSTables().contains(sstable))
+            return;
+
         Set<StorageAttachedIndex> incomplete = group.onSSTableChanged(Collections.emptyList(), Collections.singleton(sstable), existing, IndexValidation.NONE);
 
         if (!incomplete.isEmpty())
