@@ -42,8 +42,13 @@ import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.NodeToolResult;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
 import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.CountDownLatch;
+import org.awaitility.core.ConditionTimeoutException;
 
 import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
@@ -59,6 +64,7 @@ import static org.awaitility.Awaitility.await;
 public class IndexCreatedDuringStreamingTest extends TestBaseImpl
 {
     private static final int ROWS = 100;
+    private static final String INJECTED_FAILURE = "Injected index build failure";
 
     private static Cluster cluster;
     private static IInvokableInstance sender;
@@ -74,6 +80,7 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
                                       BBHelper.install(cl);
                               })
                               .start());
+        cluster.setUncaughtExceptionsFilter(t -> Throwables.anyCauseMatches(t, c -> INJECTED_FAILURE.equals(c.getMessage())));
         cluster.disableAutoCompaction(KEYSPACE);
         sender = cluster.get(1);
         receiver = cluster.get(2);
@@ -162,6 +169,85 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
         assertRowsThroughIndex(table, "v", ROWS);
     }
 
+    @Test
+    public void testIndexCreatedBeforeAddingStreamedSSTables()
+    {
+        String table = "before_adding";
+        createTable(table, false);
+        cluster.forEach(i -> i.runOnInstance(() -> DatabaseDescriptor.setStreamEntireSSTables(false)));
+
+        // Hold the receiver once it has checked the indexes of the received SSTables, before it adds them, and create
+        // an index meanwhile
+        receiver.runOnInstance(() -> BBHelper.holdBeforeAdding(table));
+        CompletableFuture<NodeToolResult> repair = CompletableFuture.supplyAsync(() -> repair(table));
+        String index = table + "_v_idx";
+        try
+        {
+            await().atMost(1, TimeUnit.MINUTES).until(() -> repair.isDone() || receiver.callOnInstance(BBHelper::isHeldBeforeAdding));
+            assertThat(receiver.callOnInstance(BBHelper::isHeldBeforeAdding)).describedAs("The receiver should be held").isTrue();
+
+            cluster.schemaChange(withKeyspace("CREATE INDEX " + index + " ON %s." + table + "(v) USING 'sai'"));
+
+            // The initial build of the new index must not complete without the received SSTables
+            awaitQuietly(() -> isQueryable(table, index));
+        }
+        finally
+        {
+            receiver.runOnInstance(BBHelper::releaseBeforeAdding);
+        }
+
+        repair.join().asserts().success();
+        SAIUtil.waitForIndexQueryable(cluster, KEYSPACE, index);
+        assertRowsThroughIndex(table, "v", ROWS);
+    }
+
+    @Test
+    public void testFailedReceiverIndexBuildAfterBuildingAnSSTable()
+    {
+        String table = "failed_receiver_build_after_sstable";
+        createTable(table, false, 3);
+
+        // The build of the new index fails on the second received SSTable, so does the stream, the SSTable built before
+        // the failure doesn't stay in the index, and the received SSTables are removed...
+        receiver.runOnInstance(() -> BBHelper.failBuildAfterSSTables(table, 1));
+        NodeToolResult result = streamWhileCreatingIndexAsync(table, false, () -> {}).join();
+        receiver.runOnInstance(() -> BBHelper.failBuildAfterSSTables(null, 0));
+        result.asserts().failure();
+        assertThat(receiver.executeInternal(withKeyspace("SELECT * FROM %s." + table))).isEmpty();
+        assertThat(receiver.callOnInstance(() -> dataFiles(table))).isZero();
+        assertThat(receiver.callOnInstance(() -> indexedSSTables(table, table + "_v_idx"))).isZero();
+
+        // ...and a new stream succeeds.
+        repair(table).asserts().success();
+        assertRowsThroughIndex(table, "v", ROWS);
+    }
+
+    private static boolean isQueryable(String table, String index)
+    {
+        return receiver.callOnInstance(() -> {
+            ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(table);
+            return cfs.indexManager.isIndexQueryable(cfs.indexManager.getIndexByName(index));
+        });
+    }
+
+    private static void awaitQuietly(Callable<Boolean> condition)
+    {
+        try
+        {
+            await().atMost(10, TimeUnit.SECONDS).until(condition);
+        }
+        catch (ConditionTimeoutException e)
+        {
+            // the condition is still false
+        }
+    }
+
+    private static int indexedSSTables(String table, String index)
+    {
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(table);
+        return ((StorageAttachedIndex) cfs.indexManager.getIndexByName(index)).view().getIndexes().size();
+    }
+
     private static int dataFiles(String table)
     {
         LifecycleTransaction.waitForDeletions();
@@ -175,6 +261,11 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
 
     private static void createTable(String table, boolean existingIndex)
     {
+        createTable(table, existingIndex, 1);
+    }
+
+    private static void createTable(String table, boolean existingIndex, int sstables)
+    {
         cluster.schemaChange(withKeyspace("CREATE TABLE %s." + table + " (pk int PRIMARY KEY, v int, w int)"));
         if (existingIndex)
         {
@@ -183,7 +274,11 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
         }
 
         for (int i = 0; i < ROWS; i++)
+        {
             sender.executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk, v, w) VALUES (?, ?, ?)"), i, i, i);
+            if ((i + 1) % (ROWS / sstables) == 0)
+                sender.flush(KEYSPACE);
+        }
         sender.flush(KEYSPACE);
     }
 
@@ -254,10 +349,17 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
         private static volatile CountDownLatch releaseAfterBuild = CountDownLatch.newCountDownLatch(1);
         private static volatile String failBuildTable;
 
+        private static volatile String heldBeforeAddingTable;
+        private static volatile CountDownLatch heldBeforeAdding = CountDownLatch.newCountDownLatch(1);
+        private static volatile CountDownLatch releaseBeforeAdding = CountDownLatch.newCountDownLatch(1);
+
+        private static volatile String failBuildAfterSSTablesTable;
+        private static volatile int sstablesBeforeFailure;
+
         static void install(ClassLoader classLoader)
         {
             new ByteBuddy().rebase(CassandraStreamReceiver.class)
-                           .method(named("finished"))
+                           .method(named("finished").or(named("finishTransaction")))
                            .intercept(MethodDelegation.to(BBHelper.class))
                            .make()
                            .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
@@ -266,6 +368,35 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
                            .intercept(MethodDelegation.to(BuildInterceptor.class))
                            .make()
                            .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+            new ByteBuddy().rebase(StorageAttachedIndexWriter.class)
+                           .method(named("createBuilderWriter"))
+                           .intercept(MethodDelegation.to(BuilderWriterInterceptor.class))
+                           .make()
+                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+        }
+
+        static void holdBeforeAdding(String table)
+        {
+            heldBeforeAdding = CountDownLatch.newCountDownLatch(1);
+            releaseBeforeAdding = CountDownLatch.newCountDownLatch(1);
+            heldBeforeAddingTable = table;
+        }
+
+        static boolean isHeldBeforeAdding()
+        {
+            return heldBeforeAdding.count() == 0;
+        }
+
+        static void releaseBeforeAdding()
+        {
+            heldBeforeAddingTable = null;
+            releaseBeforeAdding.decrement();
+        }
+
+        static void failBuildAfterSSTables(String table, int sstables)
+        {
+            sstablesBeforeFailure = sstables;
+            failBuildAfterSSTablesTable = table;
         }
 
         static void holdAfterBuild(String table)
@@ -320,13 +451,24 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
             zuper.call();
         }
 
+        @SuppressWarnings("unused")
+        public static void finishTransaction(@FieldValue("cfs") ColumnFamilyStore cfs, @SuperCall Callable<Void> zuper) throws Exception
+        {
+            if (cfs.name.equals(heldBeforeAddingTable))
+            {
+                heldBeforeAdding.decrement();
+                releaseBeforeAdding.awaitUninterruptibly(1, TimeUnit.MINUTES);
+            }
+            zuper.call();
+        }
+
         public static class BuildInterceptor
         {
             @SuppressWarnings("unused")
             public static void buildSSTableAttachedIndexesBlocking(@FieldValue("baseCfs") ColumnFamilyStore cfs, @SuperCall Callable<Void> zuper) throws Exception
             {
                 if (cfs.name.equals(failBuildTable))
-                    throw new RuntimeException("Injected index build failure");
+                    throw new RuntimeException(INJECTED_FAILURE);
 
                 zuper.call();
 
@@ -336,6 +478,19 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
                     heldAfterBuild.decrement();
                     releaseAfterBuild.awaitUninterruptibly(1, TimeUnit.MINUTES);
                 }
+            }
+        }
+
+        public static class BuilderWriterInterceptor
+        {
+            @SuppressWarnings("unused")
+            public static StorageAttachedIndexWriter createBuilderWriter(IndexDescriptor indexDescriptor,
+                                                                         @SuperCall Callable<StorageAttachedIndexWriter> zuper) throws Exception
+            {
+                if (indexDescriptor.sstableDescriptor.cfname.equals(failBuildAfterSSTablesTable) && sstablesBeforeFailure-- <= 0)
+                    throw new RuntimeException(INJECTED_FAILURE);
+
+                return zuper.call();
             }
         }
     }
