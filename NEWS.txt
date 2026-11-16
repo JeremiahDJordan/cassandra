@@ -98,6 +98,13 @@ New features
 
 Upgrading
 ---------
+    - Filtering queries with an expression on a static column, at consistency levels that need reconciliation, can
+      now make more replica filtering protection reads: a whole partition from each replica whose static row selects
+      fewer rows than the static row of the partition, has different data for a LIKE or analyzed expression, or is
+      shadowed by a partition deletion that the replica missed; the partitions whose first merge has no live data;
+      and, by name, from the replicas that didn't return them, the rows that the coordinator selects from every
+      partition read whole. The rows of these reads are held at the coordinator while the partition is merged, but
+      don't count against replica_filtering_protection.cached_rows_warn_threshold and cached_rows_fail_threshold.
     - Breaking change in CQL LIKE patterns: every '%' is now a wildcard wherever it appears (previously only the
       leading and trailing ones), '_' is now a single-character wildcard (previously a literal character), and a
       pattern without wildcards matches only equal values. Queries whose pattern contains '_' or an inner '%' may
