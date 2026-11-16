@@ -740,21 +740,28 @@ public interface Selectable extends AssignmentTestable
             this.selectables = selectables;
         }
 
+        private static boolean isListOrVector(AbstractType<?> type)
+        {
+            return type instanceof ListType || (type != null && type.isVector());
+        }
+
         private Selectable target(AbstractType<?> target)
         {
             // when the target isn't known, fallback to list; cases like "SELECT [1, 2]" can't be known, but used to be list type!
             // If a vector is actually desired, then can use type cast/hints: "SELECT (vector<int, 2>) [k, v1]"
-            if (target == null || target instanceof ListType)
-                return new WithList(selectables);
-            else if (target.isVector())
+            if (target != null && target.isVector())
                 return new WithVector(selectables);
-            throw new IllegalArgumentException("Unsupported target type: " + target.asCQL3Type());
+            return new WithList(selectables);
         }
 
         @Override
         public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            return target(receiver == null ? null : receiver.type).testAssignment(keyspace, receiver);
+            AbstractType<?> type = receiver == null ? null : receiver.type;
+            if (type != null && !isListOrVector(type))
+                return TestResult.NOT_ASSIGNABLE;
+
+            return target(type).testAssignment(keyspace, receiver);
         }
 
         @Override
@@ -763,7 +770,11 @@ public interface Selectable extends AssignmentTestable
                                           List<ColumnMetadata> defs,
                                           VariableSpecifications boundNames)
         {
-            return target(expectedType).newSelectorFactory(cfm, expectedType, defs, boundNames);
+            // An expected type that is neither a list nor a vector comes from a selection that was found assignable
+            // through the type of the literal itself, such as a slice of the literal passed to a blob parameter:
+            // the literal is then selected with its own type.
+            AbstractType<?> type = isListOrVector(expectedType) ? expectedType : null;
+            return target(type).newSelectorFactory(cfm, type, defs, boundNames);
         }
 
         @Override
