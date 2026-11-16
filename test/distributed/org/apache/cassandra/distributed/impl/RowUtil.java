@@ -110,7 +110,7 @@ public class RowUtil
 
     public static Iterator<Object[]> toIter(ResultMessage.Rows rows)
     {
-        return toIterInternal(rows.result.metadata.names, rows.result.rows);
+        return toIterInternal(rows.result.metadata.requestNames(), rows.result.rows);
     }
 
     public static Iterator<Object[]> toIter(List<ColumnSpecification> columnSpecs, Iterator<UntypedResultSet.Row> rs)
