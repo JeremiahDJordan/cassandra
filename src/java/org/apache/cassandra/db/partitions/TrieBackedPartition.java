@@ -390,7 +390,19 @@ public class TrieBackedPartition implements Partition
         // We don't count row that only contain deleted columns in tombstoneCount. To account for these, check if the
         // trie has a deletion branch.
         // However, we may use the fact that we have a tombstone to know that the row is not empty quicker.
-        return rowCountIncludingStatic + tombstoneCount == 0 && !trie.hasDeletionBranchAtRoot();
+        // The counters are updated in place while an update is merged and are not restored when the merge fails and
+        // the trie is rolled back, so a sum of zero does not prove that the partition has no rows either. Flush skips
+        // empty partitions, so confirm with the trie before reporting one.
+        return rowCountIncludingStatic + tombstoneCount == 0 && !trie.hasDeletionBranchAtRoot() && !hasContentBelowRoot();
+    }
+
+    /// Whether the trie holds anything (row marker, cell, complex column marker) other than the partition marker.
+    private boolean hasContentBelowRoot()
+    {
+        for (Object content : trie.contentOnlyTrie().values())
+            if (!isPartitionBoundary(content))
+                return true;
+        return false;
     }
 
     @Override
