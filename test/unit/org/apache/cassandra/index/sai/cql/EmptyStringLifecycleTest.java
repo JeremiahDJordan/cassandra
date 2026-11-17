@@ -30,7 +30,7 @@ public class EmptyStringLifecycleTest extends SAITester
     @BeforeClass
     public static void setup()
     {
-        StorageService.instance.setStartingModeUnsafe(); // Ensure the node has advanced out of STARTING mode
+        StorageService.instance.setNormalModeUnsafe(); // Ensure the node has advanced out of STARTING mode
     }
 
     @Test
