@@ -221,6 +221,32 @@ public class VectorUpdateDeleteTest extends VectorTester.VersionedWithChecksums
         assertContainsInt(result, "pk", 2);
     }
 
+    // A row deleted by a range or partition deletion and written again with the same vector is indexed under that
+    // vector again: the trie memtables report the rows such a deletion removes to the index.
+    @Test
+    public void rowDeletedByRangeOrPartitionDeletionAndWrittenAgainWithSameVectorTest() throws Throwable
+    {
+        for (String memtable : new String[]{ "trie", "trie_stage3" })
+        {
+            for (String deletion : new String[]{ "DELETE FROM %s WHERE pk = 0 AND ck >= 0 AND ck < 2", "DELETE FROM %s WHERE pk = 0" })
+            {
+                createTable("CREATE TABLE %s (pk int, ck int, val vector<float, 2>, PRIMARY KEY(pk, ck)) WITH memtable = '" + memtable + "'");
+                createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function': 'euclidean'}");
+                disableCompaction();
+
+                execute("INSERT INTO %s (pk, ck, val) VALUES (0, 0, [1.0, 1.0])");
+                execute("INSERT INTO %s (pk, ck, val) VALUES (1, 0, [2.0, 2.0])");
+                execute(deletion);
+                execute("INSERT INTO %s (pk, ck, val) VALUES (0, 0, [1.0, 1.0])");
+
+                beforeAndAfterFlush(() -> {
+                    assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [1.0, 1.0] LIMIT 1"), row(0, 0));
+                    assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [1.0, 1.0] LIMIT 2"), row(0, 0), row(1, 0));
+                });
+            }
+        }
+    }
+
     @Test
     public void rangeDeletedInOtherSSTablesTest()
     {

@@ -284,6 +284,42 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
         }
     }
 
+    /**
+     * Removes the row from the vector it is indexed under, if that is the given value, and records it as indexed under
+     * no vector, so that a later cell of the row is indexed whatever its vector (see {@link #update(DecoratedKey,
+     * Clustering, Cell, Memtable, OpOrder.Group)}).
+     */
+    @Override
+    public void remove(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, Memtable memtable, OpOrder.Group opGroup)
+    {
+        if (oldValue == null || oldValue.remaining() == 0)
+            return;
+
+        PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
+        IndexedCell indexed = indexedCells.get(primaryKey);
+        if (indexed == null)
+        {
+            update(key, clustering, oldValue, null, memtable, opGroup);
+            return;
+        }
+
+        boolean changed = false;
+        synchronized (indexed)
+        {
+            VectorFloat<?> vector = indexed.vector;
+            if (vector != null && vector.equals(vts.createFloatVector(serializer.deserializeFloatArray(oldValue))))
+            {
+                graph.remove(vector, primaryKey);
+                primaryKeys.remove(primaryKey);
+                removedCount.increment();
+                indexed.vector = null;
+                changed = true;
+            }
+        }
+        if (changed)
+            onIndexUpdated();
+    }
+
     @Override
     public void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup)
     {

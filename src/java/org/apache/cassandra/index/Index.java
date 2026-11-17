@@ -871,6 +871,21 @@ public interface Index
         default void removeRow(Row row) {}
 
         /**
+         * Notification that an update removed data of a row from the base table's Memtable and wrote nothing in its
+         * place: a range or partition deletion on a Memtable that applies them to rows (the trie Memtables), the older
+         * cells of a row that keeps newer ones, or a collection deletion on a row without primary key liveness info.
+         * The row may still exist, in the Memtable or in SSTables, and on the trie Memtables an insertRow or updateRow
+         * for the same row can follow. Like the other calls, it can be repeated for a retried merge on the skip-list
+         * Memtables, unless the Indexer {@linkplain #requiresAtomicUpdates requires atomic updates}. The default does
+         * nothing, so the Index keeps the entries until compaction; an Index that keeps per-row data in memory can drop
+         * the removed values, but must not take this to mean that the row is gone. An Indexer that delegates must
+         * forward this call.
+         *
+         * @param oldRowData data that was present in the row and that the update removed from the Memtable
+         */
+        default void removeRowData(Row oldRowData) {}
+
+        /**
          * Notification of the end of the partition update.
          * This event always occurs after all others for the particular update.
          */
