@@ -208,7 +208,11 @@ public class SSTableIndexWriter implements PerIndexWriter
 
         aborted = true;
 
-        logger.warn("Aborting SSTable index flush for {}...", perIndexComponents.descriptor(), cause);
+        // Without a cause, this is a normal abort of the SSTable write (e.g. an interrupted compaction), not an error.
+        if (cause == null)
+            logger.debug("Aborting SSTable index flush for {}...", perIndexComponents.descriptor());
+        else
+            logger.warn("Aborting SSTable index flush for {}...", perIndexComponents.descriptor(), cause);
 
         // It's possible for the current builder to be unassigned after we flush a final segment.
         if (currentBuilder != null)

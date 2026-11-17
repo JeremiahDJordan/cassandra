@@ -97,7 +97,12 @@ public class MemtableIndexWriter implements PerIndexWriter
     @Override
     public void abort(Throwable cause)
     {
-        logger.warn(perIndexComponents.logMessage("Aborting index memtable flush for {}..."), perIndexComponents.descriptor(), cause);
+        // Without a cause, this is a normal abort of the SSTable write, not an error.
+        String message = perIndexComponents.logMessage("Aborting index memtable flush for {}...");
+        if (cause == null)
+            logger.debug(message, perIndexComponents.descriptor());
+        else
+            logger.warn(message, perIndexComponents.descriptor(), cause);
         perIndexComponents.forceDeleteAllComponents();
     }
 
