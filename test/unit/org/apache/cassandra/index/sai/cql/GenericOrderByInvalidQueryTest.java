@@ -27,7 +27,6 @@ import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.ResultSet;
-import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.exceptions.InvalidRequestException;
@@ -136,7 +135,7 @@ public class GenericOrderByInvalidQueryTest extends SAITester
     }
 
     @Test
-    public void disallowClusteringColumnPredicateWithoutSupportingIndex()
+    public void allowClusteringColumnPredicateWithoutSupportingIndex()
     {
         createTable("CREATE TABLE %s (pk int, num int, v text, PRIMARY KEY(pk, num))");
         createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
@@ -144,15 +143,14 @@ public class GenericOrderByInvalidQueryTest extends SAITester
         execute("INSERT INTO %s (pk, num, v) VALUES (3, 4, 'b')");
         flush();
 
-        // If we didn't have the query planner fail this query, we would get incorrect results for both queries
-        // because the clustering columns are not yet available to restrict the ORDER BY result set.
-        assertThatThrownBy(() -> execute("SELECT num FROM %s WHERE pk=3 AND num > 3 ORDER BY v LIMIT 1"))
-        .isInstanceOf(InvalidRequestException.class)
-        .hasMessage(StatementRestrictions.NON_CLUSTER_ORDERING_REQUIRES_ALL_RESTRICTED_NON_PARTITION_KEY_COLUMNS_INDEXED_MESSAGE);
+        // the clustering restrictions are applied by the clustering index filter (CASSANDRA-19544): the ordered search
+        // skips the row num=1, which isn't selected
+        assertRows(execute("SELECT num FROM %s WHERE pk=3 AND num > 3 ORDER BY v LIMIT 1"), row(4));
+        assertRows(execute("SELECT num FROM %s WHERE pk=3 AND num = 4 ORDER BY v LIMIT 1"), row(4));
 
-        assertThatThrownBy(() -> execute("SELECT num FROM %s WHERE pk=3 AND num = 4 ORDER BY v LIMIT 1"))
-        .isInstanceOf(InvalidRequestException.class)
-        .hasMessage(StatementRestrictions.NON_CLUSTER_ORDERING_REQUIRES_ALL_RESTRICTED_NON_PARTITION_KEY_COLUMNS_INDEXED_MESSAGE);
+        // Without a restricted partition key, the clustering column restrictions need filtering
+        assertThatThrownBy(() -> execute("SELECT num FROM %s WHERE num = 4 ORDER BY v LIMIT 1"))
+        .isInstanceOf(InvalidRequestException.class);
 
         // Cover the alternative code path
         createIndex("CREATE CUSTOM INDEX ON %s(num) USING 'StorageAttachedIndex'");
