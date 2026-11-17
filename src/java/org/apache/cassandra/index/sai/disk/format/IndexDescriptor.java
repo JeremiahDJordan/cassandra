@@ -497,23 +497,31 @@ public class IndexDescriptor
         @Override
         public void invalidate(SSTable sstable, Tracker tracker)
         {
-            // This rewrite the TOC to stop listing the components, which ensures that if the node is restarted,
-            // then discovery will use an empty group for that context (like we add at the end of this method).
-            sstable.unregisterComponents(allAsCustomComponents(), tracker);
+            try
+            {
+                // This rewrite the TOC to stop listing the components, which ensures that if the node is restarted,
+                // then discovery will use an empty group for that context (like we add at the end of this method).
+                sstable.unregisterComponents(allAsCustomComponents(), tracker);
+            }
+            finally
+            {
+                // Whatever happens above, make sure the group can't be used anymore, on disk and in memory, or a
+                // failure to update the TOC could leave a group that looks complete.
 
-            // Also delete the completion marker, to make it clear the group of components shouldn't be used anymore.
-            // Note it's comparatively safe to do so in that the marker is never accessed during reads, so we cannot
-            // break ongoing operations here.
-            var marker = components.remove(completionMarkerComponent());
-            if (marker != null)
-                marker.delete();
+                // Also delete the completion marker, to make it clear the group of components shouldn't be used anymore.
+                // Note it's comparatively safe to do so in that the marker is never accessed during reads, so we cannot
+                // break ongoing operations here.
+                var marker = components.remove(completionMarkerComponent());
+                if (marker != null)
+                    marker.delete();
 
-            // Keeping legacy behavior if immutable components is disabled.
-            if (!buildId.version().useImmutableComponentFiles() && CassandraRelevantProperties.DELETE_CORRUPT_SAI_COMPONENTS.getBoolean())
-                forceDeleteAllComponents();
+                // Keeping legacy behavior if immutable components is disabled.
+                if (!buildId.version().useImmutableComponentFiles() && CassandraRelevantProperties.DELETE_CORRUPT_SAI_COMPONENTS.getBoolean())
+                    forceDeleteAllComponents();
 
-            // We replace ourselves by an explicitly empty group in the parent.
-            updateParentLink(createEmptyGroup(context));
+                // We replace ourselves by an explicitly empty group in the parent.
+                updateParentLink(createEmptyGroup(context));
+            }
         }
 
         @Override
