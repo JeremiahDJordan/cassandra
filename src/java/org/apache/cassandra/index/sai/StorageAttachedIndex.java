@@ -108,6 +108,7 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.RANGE_READ_ENDPOINT_GROUPING_ENABLED;
@@ -473,7 +474,114 @@ public class StorageAttachedIndex implements Index
         // New storage-attached indexes will be available for queries after on disk index data are built.
         // Memtable data will be indexed via flushing triggered by schema change
         // We only want to validate the index files if we are starting up
-        return () -> startInitialBuild(baseCfs, StorageService.instance.isStarting(), decision.skipped()).get();
+        boolean isStarting = StorageService.instance.isStarting();
+
+        // If we are starting up and the index is already built for every live SSTable, mark it queryable right away,
+        // before gossip starts, so peers never see this node UP with a non-queryable index (CASSANDRA-20732).
+        if (isStarting && !decision.skipped())
+        {
+            try
+            {
+                if (tryMarkQueryableWithoutInitialBuild())
+                    return () -> null;
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                // This runs synchronously while the table is opened, so don't fail there. The initial build will
+                // validate the index again and fail it if it has to.
+                logger.warn(indexContext.logMessage("Failed to check whether the index can skip its initial build. " +
+                                                    "Falling back to the initial build."), t);
+            }
+        }
+
+        return () -> startInitialBuild(baseCfs, isStarting, decision.skipped()).get();
+    }
+
+    /**
+     * Marks this index queryable without an initial build if every live SSTable already has a valid index, and
+     * nothing else stands in the way.
+     * <p>
+     * This is only safe when there is no memtable data: rows written before the index was created are not in the
+     * memtable index, and the initial build flushes them so they get indexed. That holds on startup, where this is
+     * called before the commit log is replayed. It also checks the memtables, in case something leaves the node in
+     * STARTING mode for longer (unit tests, for example).
+     *
+     * @return {@code true} if the index was marked queryable, {@code false} if the initial build must run as usual
+     */
+    private boolean tryMarkQueryableWithoutInitialBuild()
+    {
+        for (Memtable memtable : baseCfs.getTracker().getView().getAllMemtables())
+        {
+            if (!memtable.isClean())
+                return false;
+        }
+
+        StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
+        assert indexGroup != null : "Index group does not exist for table " + baseCfs.keyspace + '.' + baseCfs.name;
+
+        // Leave version incompatibilities to the initial build, which fails the index with a clear error.
+        if (vectorVersionIncompatibility(indexGroup) != null)
+            return false;
+
+        if (!isIndexLoadedForAllSSTables(indexGroup))
+            return false;
+
+        // CNDB may want the index to stay non-queryable after the initial build.
+        if (!IndexBuildDecider.instance.isIndexQueryableAfterInitialBuild(baseCfs))
+            return false;
+
+        // From now on, all memtables will have an attached memtable index, so it is safe to flush indexes directly
+        // from flushing memtables.
+        canFlushFromMemtableIndex = true;
+        baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);
+        logger.debug(indexContext.logMessage("Skipping initial build, as the index is already built for all SSTables..."));
+        return true;
+    }
+
+    /**
+     * Loads the index of every live SSTable into the view, validating its components.
+     *
+     * @return {@code true} if every component was valid and every live SSTable is now in the view, {@code false}
+     * otherwise, in which case the initial build must take care of it
+     */
+    private synchronized boolean isIndexLoadedForAllSSTables(StorageAttachedIndexGroup indexGroup)
+    {
+        Set<SSTableReader> sstables = baseCfs.getLiveSSTables();
+        if (!indexGroup.onSSTableChanged(Collections.emptyList(), sstables, Collections.singleton(this), true).isEmpty())
+            return false;
+
+        // Unlike findNonIndexedSSTables, don't trust completion markers on disk: an SSTable that isn't in the view
+        // can't be queried, whatever the reason, so the index isn't ready.
+        View view = indexContext.getView();
+        for (SSTableReader sstable : sstables)
+        {
+            if (!sstable.isMarkedCompacted() && !view.containsSSTableIndex(sstable.descriptor))
+                return false;
+        }
+        return true;
+    }
+
+    /**
+     * @return the error message if this is a vector index and either the current on-disk format version or the
+     * version of other indexes on the existing SSTables doesn't support vectors, or {@code null} otherwise
+     */
+    private String vectorVersionIncompatibility(StorageAttachedIndexGroup indexGroup)
+    {
+        if (!indexContext.isVector())
+            return null;
+
+        // The current version must support vectors
+        Version currentVersion = indexContext.version();
+        if (currentVersion.compareTo(Version.JVECTOR_EARLIEST) < 0)
+            return vectorUnsupportedByCurrentVersionError(currentVersion);
+
+        // Also, any pre-existing indexes must be in a version compatible with vectors
+        Version minVersion = indexGroup.getMinVersion();
+        if (minVersion.compareTo(Version.JVECTOR_EARLIEST) < 0)
+            return vectorUnsupportedByExistingVersionError(minVersion);
+
+        return null;
     }
 
     private Future<?> startInitialBuild(ColumnFamilyStore baseCfs, boolean validate, boolean skipIndexBuild)
@@ -508,22 +616,9 @@ public class StorageAttachedIndex implements Index
         assert indexGroup != null;
 
         // verify the compatibility of the on-disk format version with the vector index
-        if (indexContext.isVector())
-        {
-            // The current version must support vectors
-            Version currentVersion = indexContext.version();
-            if (currentVersion.compareTo(Version.JVECTOR_EARLIEST) < 0)
-            {
-                throw new FeatureNeedsIndexRebuildException(vectorUnsupportedByCurrentVersionError(currentVersion));
-            }
-
-            // Also, any pre-existing indexes must be in a version compatible with vectors
-            Version minVersion = indexGroup.getMinVersion();
-            if (minVersion.compareTo(Version.JVECTOR_EARLIEST) < 0)
-            {
-                throw new FeatureNeedsIndexRebuildException(vectorUnsupportedByExistingVersionError(minVersion));
-            }
-        }
+        String vectorVersionError = vectorVersionIncompatibility(indexGroup);
+        if (vectorVersionError != null)
+            throw new FeatureNeedsIndexRebuildException(vectorVersionError);
 
         // stop in-progress compaction tasks to prevent compacted sstables not being indexed.
         logger.debug(indexContext.logMessage("Stopping active compactions to make sure all sstables are indexed after initial build."));

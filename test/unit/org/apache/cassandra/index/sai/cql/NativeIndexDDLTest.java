@@ -28,6 +28,7 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -87,6 +88,7 @@ import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
 import org.assertj.core.api.Assertions;
@@ -668,6 +670,121 @@ public class NativeIndexDDLTest extends SAITester
         waitForCompactions();
 
         assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+    }
+
+    @Test
+    public void shouldMarkQueryableInInitializationTask() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+        String indexName = createIndex(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+
+        // create 10 SSTables
+        for (int i = 0; i < 10; i++)
+        {
+            execute("INSERT INTO %s (id1, v1, v2) VALUES (?, ?, ?)", String.valueOf(i), i, String.valueOf(i));
+            flush();
+        }
+
+        ResultSet rows = executeNet("SELECT id1 FROM %s WHERE v1 >= 5");
+        assertEquals(5, rows.all().size());
+
+        // Make the index artificially non-queryable:
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Index index = cfs.indexManager.getIndexByName(indexName);
+        cfs.indexManager.makeIndexNonQueryable(index, Index.Status.BUILD_FAILED);
+
+        // Query should fail with the index in an artificially non-queryable state:
+        assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1 >= 5")).isInstanceOf(ReadFailureException.class);
+
+        // hold back the initial build: only the initialization task can then make the index queryable
+        Injections.Barrier delayInitialBuild = delayInitialBuild();
+        Injections.inject(delayInitialBuild);
+
+        // at startup, the initialization task may validate the existing components itself
+        StorageService.instance.setStartingModeUnsafe();
+        try
+        {
+            cfs.indexManager.buildIndex(index);
+            assertTrue(cfs.indexManager.isIndexQueryable(index));
+        }
+        finally
+        {
+            StorageService.instance.setNormalModeUnsafe();
+            delayInitialBuild.countDown();
+        }
+        rows = executeNet("SELECT id1 FROM %s WHERE v1 >= 5");
+        assertEquals(5, rows.all().size());
+    }
+
+    @Test
+    public void shouldNotMarkQueryableInInitializationTaskWithMemtableData() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+
+        // With no SSTables, everything else would let the index take the fast path, but this row is only in the
+        // memtable, so the index must not become queryable until the initial build flushes it:
+        execute("INSERT INTO %s (id1, v1, v2) VALUES ('1', 1, '1')");
+
+        Injections.Barrier delayInitialBuild = delayInitialBuild();
+        Injections.inject(delayInitialBuild);
+        StorageService.instance.setStartingModeUnsafe();
+        try
+        {
+            String indexName = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+            Index index = cfs.indexManager.getIndexByName(indexName);
+            assertFalse(cfs.indexManager.isIndexQueryable(index));
+        }
+        finally
+        {
+            StorageService.instance.setNormalModeUnsafe();
+            delayInitialBuild.countDown();
+        }
+
+        waitForTableIndexesQueryable();
+        ResultSet rows = executeNet("SELECT id1 FROM %s WHERE v1 >= 0");
+        assertEquals(1, rows.all().size());
+    }
+
+    @Test
+    public void shouldNotMarkQueryableInInitializationTaskWithUnindexedSSTable() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+
+        // This SSTable is written before the index exists, so the index must not become queryable until the initial
+        // build has indexed it
+        execute("INSERT INTO %s (id1, v1, v2) VALUES ('1', 1, '1')");
+        flush();
+
+        Injections.Barrier delayInitialBuild = delayInitialBuild();
+        Injections.inject(delayInitialBuild);
+        StorageService.instance.setStartingModeUnsafe();
+        try
+        {
+            String indexName = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+            Index index = cfs.indexManager.getIndexByName(indexName);
+            assertFalse(cfs.indexManager.isIndexQueryable(index));
+        }
+        finally
+        {
+            StorageService.instance.setNormalModeUnsafe();
+            delayInitialBuild.countDown();
+        }
+
+        waitForTableIndexesQueryable();
+        ResultSet rows = executeNet("SELECT id1 FROM %s WHERE v1 >= 0");
+        assertEquals(1, rows.all().size());
+    }
+
+    private static Injections.Barrier delayInitialBuild()
+    {
+        return Injections.newBarrier("delayInitialBuild-" + UUID.randomUUID(), 2, false)
+                         .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndex.class).onMethod("startInitialBuild"))
+                         .build();
     }
 
     @Test
