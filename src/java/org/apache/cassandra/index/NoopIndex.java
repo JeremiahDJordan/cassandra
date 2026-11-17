@@ -184,6 +184,13 @@ public final class NoopIndex implements Index, INotificationConsumer
     }
 
     @Override
+    public boolean notifyIndexerAboutRowsInFullyExpiredSSTables()
+    {
+        // This index never returns an indexer, so don't make compaction read fully expired SSTables for it.
+        return false;
+    }
+
+    @Override
     public Searcher searcherFor(ReadCommand command) throws InvalidRequestException
     {
         throw new UnsupportedOperationException(getUnsupportedMessage());
