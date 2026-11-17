@@ -82,16 +82,24 @@ public class KeyRangeTermIterator extends KeyRangeIterator
 
         for (final SSTableIndex index : view.sstableIndexes)
         {
+            KeyRangeIterator keyIterator = null;
             try
             {
                 queryContext.checkpoint();
                 queryContext.addSstablesHit(1);
                 assert !index.isReleased();
 
-                KeyRangeIterator keyIterator = index.search(e, keyRange, queryContext, defer);
+                keyIterator = index.search(e, keyRange, queryContext, defer);
 
-                if (keyIterator == null || !keyIterator.hasNext())
+                if (keyIterator == null)
                     continue;
+
+                // hasNext() reads the first key, which can time out
+                if (!keyIterator.hasNext())
+                {
+                    FileUtils.closeQuietly(keyIterator);
+                    continue;
+                }
 
                 tokens.add(keyIterator);
             }
@@ -100,7 +108,9 @@ public class KeyRangeTermIterator extends KeyRangeIterator
                 if (logger.isDebugEnabled() && !(e1 instanceof AbortedOperationException))
                     logger.debug(String.format("Failed search an index %s, skipping.", index.getSSTable()), e1);
 
-                // Close the iterators that were successfully opened before the error
+                // Close the iterators that were successfully opened before the error, and the one that failed
+                if (keyIterator != null && !tokens.contains(keyIterator))
+                    FileUtils.closeQuietly(keyIterator);
                 FileUtils.closeQuietly(tokens);
 
                 throw Throwables.cleaned(e1);

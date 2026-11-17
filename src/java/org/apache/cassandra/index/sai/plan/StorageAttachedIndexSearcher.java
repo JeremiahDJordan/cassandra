@@ -510,10 +510,19 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         public UnfilteredRowIterator apply(List<PrimaryKey> keys)
         {
             UnfilteredRowIterator partition = controller.getPartition(keys, executionController);
-            UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
-            queryContext.checkpoint();
-            queryContext.addKeysFetched(keys.size());
-            return applyIndexFilter(counted, filterTree);
+            try
+            {
+                UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
+                queryContext.checkpoint();
+                queryContext.addKeysFetched(keys.size());
+                return applyIndexFilter(counted, filterTree);
+            }
+            catch (Throwable t)
+            {
+                // The partition isn't returned, so nothing else will close it. This happens when the query times out.
+                FileUtils.closeQuietly(partition);
+                throw t;
+            }
         }
 
         @Override
