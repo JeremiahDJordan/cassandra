@@ -247,6 +247,12 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             }
 
             @Override
+            public void removeRowData(Row oldRowData)
+            {
+                forEach(indexer -> indexer.removeRowData(oldRowData));
+            }
+
+            @Override
             public void partitionDelete(DeletionTime deletionTime)
             {
                 forEach(indexer -> indexer.partitionDelete(deletionTime));

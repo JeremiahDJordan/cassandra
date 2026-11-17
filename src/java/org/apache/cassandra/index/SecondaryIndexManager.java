@@ -1839,7 +1839,15 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                     Row oldRow = toRemove.build();
                     Row newRow = toInsert.build();
                     if (newRow != null && !newRow.isEmpty())
+                    {
                         deliver(indexer -> indexer.updateRow(oldRow, newRow));
+                    }
+                    else if (oldRow != null && oldRow.columnCount() > 0)
+                    {
+                        // The memtable removed data of the row and wrote nothing in its place: not an update of
+                        // the row, indexes only see it if they ask for it (see Index.Indexer#removeRowData).
+                        deliver(indexer -> indexer.removeRowData(oldRow));
+                    }
                 }
                 else
                 {

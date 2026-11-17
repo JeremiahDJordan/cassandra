@@ -454,6 +454,42 @@ public class IndexContext
         }
     }
 
+    /**
+     * Removes the value(s) that the memtable no longer holds for a row: data that an update removed and replaced with
+     * nothing (see {@link org.apache.cassandra.index.Index.Indexer#removeRowData}). The row may still exist. Unlike an
+     * update, this doesn't count as a write of the memtable index.
+     */
+    public void removeRowData(DecoratedKey key, Row oldRow, Memtable memtable, OpOrder.Group opGroup)
+    {
+        // AA indexes partition keys, so it can't remove the value of a single row (as for updates)
+        if (version.equals(Version.AA))
+            return;
+
+        // The removed data says nothing about the row's key: the row may keep other cells (a deletion older than some
+        // of them, or a collection deletion), and the value of a primary key column never changes for a key, so an
+        // entry left behind for a removed row is only a candidate that reading the row rejects.
+        if (column.isPrimaryKeyColumn())
+            return;
+
+        MemtableIndex target = liveMemtables.get(memtable);
+        if (target == null)
+            return;
+
+        // Use 0 for nowInSecs to get the value(s) of the removed row regardless of their liveness, as update() does
+        if (isNonFrozenCollection())
+        {
+            Iterator<ByteBuffer> oldValues = getValuesOf(oldRow, 0);
+            if (oldValues != null)
+                target.remove(key, oldRow.clustering(), oldValues, memtable, opGroup);
+        }
+        else
+        {
+            ByteBuffer oldValue = getValueOf(key, oldRow, 0);
+            if (oldValue != null)
+                target.remove(key, oldRow.clustering(), oldValue, memtable, opGroup);
+        }
+    }
+
     public void renewMemtable(Memtable renewed)
     {
         // remove every index but the one that corresponds to the post-truncate Memtable
