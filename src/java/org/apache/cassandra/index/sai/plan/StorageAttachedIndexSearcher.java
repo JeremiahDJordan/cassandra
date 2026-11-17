@@ -215,7 +215,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         if (!Guardrails.saiSSTableIndexesPerQuery.enabled())
             return;
 
-        int numReferencedIndexes = filterTree.numSSTableIndexes();
+        int numReferencedIndexes = filterTree.maxSSTableIndexesPerExpression(controller.mergeRange());
 
         if (Guardrails.saiSSTableIndexesPerQuery.failsOn(numReferencedIndexes, null))
         {
