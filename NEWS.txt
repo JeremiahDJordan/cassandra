@@ -117,6 +117,11 @@ Upgrading
       after a restart that follows a CREATE INDEX that couldn't list the sstable files (an error is logged): don't
       re-use the name of a dropped index for another definition while these can happen, or run nodetool rebuild_index
       on the nodes concerned.
+    - Creating a storage-attached index (CREATE INDEX) now also stops a running major compaction of the table, on
+      every node, as it already did for other compactions: nodetool compact fails with a
+      CompactionInterruptedException, and its work is discarded. The initial build of the index waits for the
+      compaction to stop; if it can't stop within 2 minutes, the build fails on that node, and the index needs
+      nodetool rebuild_index there.
 
 5.0.7
 ======
