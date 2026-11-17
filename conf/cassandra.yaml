@@ -1800,9 +1800,9 @@ transparent_data_encryption_options:
   # segment_write_buffer_size: 1024MiB
   #
   ## When more than one index exists on a single column, this flag determines whether or not SAI
-  ## should take precedence over legacy table-backed indexes during reads. By default, legacy
-  ## indexes take precedence to maintain continuity during migration. 
-  # prioritize_over_legacy_index: false
+  ## should take precedence over legacy table-backed indexes during reads. Defaults to true (Apache Cassandra:
+  ## false); set it to false to prefer legacy indexes.
+  # prioritize_over_legacy_index: true
 
 #####################
 # SAFETY THRESHOLDS #
