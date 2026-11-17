@@ -418,6 +418,21 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     }
 
     /**
+     * A vector index doesn't support splitting a flush into several SSTables: the memtable index builds its on-disk
+     * graph once, for the whole memtable (CASSANDRA-19661).
+     */
+    @Override
+    public boolean supportsL0Shards()
+    {
+        for (StorageAttachedIndex index : indices)
+        {
+            if (index.getIndexContext().isVector())
+                return false;
+        }
+        return true;
+    }
+
+    /**
      * open index files by checking number of {@link SSTableContext} and {@link SSTableIndex},
      * so transient open files during validation and files that are still open for in-flight requests will not be tracked.
      *

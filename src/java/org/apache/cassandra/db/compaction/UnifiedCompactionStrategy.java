@@ -706,7 +706,8 @@ public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
     /// Create the sstable writer used for flushing.
     ///
     /// @return an sstable writer that will split sstables into a number of shards as calculated by the controller for
-    ///         the expected flush density.
+    ///         the expected flush density, or a single one if an index group doesn't support splitting a flush
+    ///         (see [Index.Group#supportsL0Shards()]).
     @Override
     public SSTableMultiWriter createSSTableMultiWriter(Descriptor descriptor,
                                                        long keyCount,
@@ -729,7 +730,24 @@ public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
                                       header,
                                       indexGroups,
                                       lifecycleNewTracker,
-                                      getFlushShardBoundaries());
+                                      supportsL0Shards(sstableLevel, indexGroups)
+                                      ? getFlushShardBoundaries()
+                                      : getShardManager().boundaries(1));
+    }
+
+    /// Whether the sstables written at the given level can be split into shards. A vector index can't be split across
+    /// the sstables of a flush, because it builds the on-disk index of the memtable once (CASSANDRA-19661).
+    private static boolean supportsL0Shards(int sstableLevel, Collection<Index.Group> indexGroups)
+    {
+        if (sstableLevel > 0)
+            return true;
+
+        for (Index.Group group : indexGroups)
+        {
+            if (!group.supportsL0Shards())
+                return false;
+        }
+        return true;
     }
 
     /// Get the boundaries on which to split flushed sstables, using the number of shards that the controller
