@@ -177,7 +177,10 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
     public Object applyPartitionDeletion(TrieMemtableStage3.PartitionData existing, DeletionTime deletion)
     {
         indexer.onPartitionDeletion(deletion);
-        existing.clearStats();
+        // Do not reset the partition's counters here. The rows the deletion removes are subtracted one by one in
+        // applyRowDeletion, rows newer than the deletion stay, and the deletion itself is counted in mergeMarkers.
+        // Flush skips a partition whose counters add up to zero, so a reset could drop the partition deletion or live
+        // rows from the flushed SSTable.
         return existing;
     }
 
