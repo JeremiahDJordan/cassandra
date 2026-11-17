@@ -508,19 +508,13 @@ public class TrieBackedPartition implements Partition
             super(trie, Direction.fromBoolean(reversed), TrieBackedPartition::combineDataAndDeletionForUnfilteredIterator, false);
             this.selection = selection;
             this.reversed = reversed;
-            this.mayFilterColumns = !droppedColumnsSource().droppedColumns.isEmpty() ||
-                                    selection != null && (!selection.fetchesAllColumns(false) ||
-                                                          !selection.fetchesAllColumns(true) ||
-                                                          !selection.allFetchedColumnsAreQueried());
-            Row staticRow = filter(TrieBackedPartition.this.staticRow());
-            this.staticRow = staticRow != null ? staticRow : Rows.EMPTY_STATIC_ROW;
+            this.mayFilterColumns = mayFilterColumns(selection);
+            this.staticRow = filteredStaticRow(selection, mayFilterColumns);
         }
 
         Row filter(Row row)
         {
-            if (!mayFilterColumns || row == null)
-                return row;
-            return row.filter(selection, droppedColumnsSource());
+            return filterColumns(row, selection, mayFilterColumns);
         }
 
         @Override
@@ -599,10 +593,41 @@ public class TrieBackedPartition implements Partition
         }
     }
 
+    /// Whether the rows returned for the given selection may have to be filtered: to the selected columns, or to drop
+    /// the cells of dropped columns.
+    private boolean mayFilterColumns(ColumnFilter selection)
+    {
+        return !droppedColumnsSource().droppedColumns.isEmpty() ||
+               selection != null && (!selection.fetchesAllColumns(false) ||
+                                     !selection.fetchesAllColumns(true) ||
+                                     !selection.allFetchedColumnsAreQueried());
+    }
+
+    private Row filterColumns(Row row, ColumnFilter selection, boolean mayFilterColumns)
+    {
+        if (!mayFilterColumns || row == null)
+            return row;
+        return row.filter(selection, droppedColumnsSource());
+    }
+
+    /// The static row of this partition as returned for the given selection, never null.
+    private Row filteredStaticRow(ColumnFilter selection, boolean mayFilterColumns)
+    {
+        Row staticRow = filterColumns(staticRow(), selection, mayFilterColumns);
+        return staticRow != null ? staticRow : Rows.EMPTY_STATIC_ROW;
+    }
+
     private UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, ByteComparable[] bounds, boolean reversed)
     {
+        // With no slice to read, the static row must still be filtered like that of a sliced iterator (and like
+        // AbstractBTreePartition does): a response's serialization header only has the fetched static columns, so a
+        // static row with any other column fails to serialize ("... is not a subset of ...").
         if (bounds.length == 0)
-            return UnfilteredRowIterators.noRowsIterator(metadata, partitionKey, staticRow(), partitionLevelDeletion(), reversed);
+            return UnfilteredRowIterators.noRowsIterator(metadata,
+                                                         partitionKey,
+                                                         filteredStaticRow(selection, mayFilterColumns(selection)),
+                                                         partitionLevelDeletion(),
+                                                         reversed);
 
         DeletionAwareTrie<Object, TrieTombstoneMarker> slicedTrie =
             trie.intersect(TrieSet.ranges(BYTE_COMPARABLE_VERSION, bounds));

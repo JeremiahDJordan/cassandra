@@ -669,8 +669,17 @@ public class TrieBackedPartitionStage3 implements Partition
 
     public UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, ByteComparable[] bounds, boolean reversed)
     {
+        // With no slice to read, the static row must still be filtered to the selected columns, as UnfilteredIterator
+        // does: a response's serialization header only has the fetched static columns.
         if (bounds.length == 0)
-            return UnfilteredRowIterators.noRowsIterator(metadata, partitionKey, staticRow(), partitionLevelDeletion(), reversed);
+        {
+            Row staticRow = staticRow().filter(selection, metadata());
+            return UnfilteredRowIterators.noRowsIterator(metadata,
+                                                         partitionKey,
+                                                         staticRow != null ? staticRow : Rows.EMPTY_STATIC_ROW,
+                                                         partitionLevelDeletion(),
+                                                         reversed);
+        }
 
         DeletionAwareTrie<Object, TrieTombstoneMarker> slicedTrie =
             trie.intersect(TrieSet.ranges(BYTE_COMPARABLE_VERSION, bounds));
