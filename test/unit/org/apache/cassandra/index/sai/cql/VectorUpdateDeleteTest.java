@@ -221,6 +221,38 @@ public class VectorUpdateDeleteTest extends VectorTester.VersionedWithChecksums
         assertContainsInt(result, "pk", 2);
     }
 
+    // Range and partition deletions don't update the memtable index, so the vector of a row they delete keeps the key
+    // of the row. A row written again in the same memtable has its key under its old and its new vector; the flush must
+    // accept it and keep the row under the vector it has.
+    @Test
+    public void rowDeletedByRangeOrPartitionDeletionAndWrittenAgainTest() throws Throwable
+    {
+        for (String deletion : new String[]{ "DELETE FROM %s WHERE pk = 0 AND ck >= 0 AND ck < 2", "DELETE FROM %s WHERE pk = 0" })
+        {
+            createTable("CREATE TABLE %s (pk int, ck int, val vector<float, 2>, PRIMARY KEY(pk, ck))");
+            createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function': 'euclidean'}");
+            disableCompaction();
+
+            execute("INSERT INTO %s (pk, ck, val) VALUES (0, 0, [1.0, 1.0])");
+            execute("INSERT INTO %s (pk, ck, val) VALUES (0, 1, [1.5, 1.5])");
+            execute("INSERT INTO %s (pk, ck, val) VALUES (1, 0, [2.0, 2.0])");
+            execute(deletion);
+            // written again with another vector, and without a vector
+            execute("INSERT INTO %s (pk, ck, val) VALUES (0, 0, [9.0, 9.0])");
+            execute("INSERT INTO %s (pk, ck) VALUES (0, 1)");
+
+            flush();
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [1.0, 1.0] LIMIT 1"), row(1, 0));
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [1.0, 1.0] LIMIT 3"), row(1, 0), row(0, 0));
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [9.0, 9.0] LIMIT 1"), row(0, 0));
+
+            compact();
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [1.0, 1.0] LIMIT 1"), row(1, 0));
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [1.0, 1.0] LIMIT 3"), row(1, 0), row(0, 0));
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [9.0, 9.0] LIMIT 1"), row(0, 0));
+        }
+    }
+
     @Test
     public void rangeDeletedInOtherSSTablesTest()
     {

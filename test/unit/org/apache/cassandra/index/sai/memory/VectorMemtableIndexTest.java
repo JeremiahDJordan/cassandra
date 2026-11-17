@@ -55,6 +55,7 @@ import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.cql.VectorTester;
+import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.index.sai.plan.Orderer;
 import org.apache.cassandra.index.sai.utils.PrimaryKeyWithScore;
@@ -202,6 +203,25 @@ public class VectorMemtableIndexTest extends SAITester
         });
         assertTrue("Expected at least " + expectedVectorsReturned + " results but got " + actualVectorsReturned,
                    actualVectorsReturned.get() >= expectedVectorsReturned.get() * expectedRecall);
+    }
+
+    @Test
+    public void preFlushWithRowIdClaimedByTwoVectorsTest()
+    {
+        // A key in the postings of two vectors: both vectors claim the row id, and only the vector of the row keeps it.
+        CassandraOnHeapGraph<Integer> graph = new CassandraOnHeapGraph<>(indexContext, false, null);
+        ByteBuffer stale = randomVectorSerialized();
+        ByteBuffer current = randomVectorSerialized();
+        ByteBuffer other = randomVectorSerialized();
+        graph.add(stale, 0);
+        graph.add(stale, 1);
+        graph.add(current, 0);
+        graph.add(other, 2);
+
+        assertTrue(graph.preFlush(key -> key, key -> current));
+        assertEquals(List.of(1), graph.rowIdsOf(stale));
+        assertEquals(List.of(0), graph.rowIdsOf(current));
+        assertEquals(List.of(2), graph.rowIdsOf(other));
     }
 
     @Test

@@ -107,6 +107,16 @@ public class VectorPostings<T>
         return rowIds;
     }
 
+    /**
+     * Removes the given row id from the row ids of this postings list (see CassandraOnHeapGraph#removeStaleRowIds).
+     * Must be called after computeRowIds.
+     */
+    public void removeRowId(int rowId)
+    {
+        Preconditions.checkNotNull(rowIds);
+        rowIds.removeInt(rowId);
+    }
+
     public void remove(T key)
     {
         postings.remove(key);
