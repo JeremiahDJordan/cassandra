@@ -119,6 +119,11 @@ Upgrading
       and CREATE INDEX as one schema change (e.g. it was down), and after a restart that follows a CREATE INDEX that
       couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes concerned. Older
       versions ignore the content of the marker.
+    - Creating a storage-attached index (CREATE INDEX) now also stops a running major compaction of the table, on
+      every node, as it already did for other compactions: nodetool compact fails with a
+      CompactionInterruptedException, and its work is discarded. The initial build of the index waits for the
+      compaction to stop; if it can't stop within 2 minutes, the build fails on that node, and the index needs
+      nodetool rebuild_index there.
 
 5.0.7
 ======
