@@ -50,6 +50,11 @@ import com.datastax.driver.core.exceptions.QueryValidationException;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.PageSize;
+import org.apache.cassandra.db.compaction.AbstractCompactionTask;
+import org.apache.cassandra.db.compaction.CompactionSSTable;
+import org.apache.cassandra.db.compaction.CompactionStrategy;
+import org.apache.cassandra.db.compaction.ExpirationTask;
+import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.memtable.Memtable;
@@ -105,6 +110,9 @@ import static org.junit.Assert.fail;
 
 public class CustomIndexTest extends CQLTester
 {
+    private static final String UCS_WITH_FAST_EXPIRATION_CHECK = "{'class': 'UnifiedCompactionStrategy', " +
+                                                                 " 'expired_sstable_check_frequency_seconds': 1}";
+
     @Test
     public void testInsertsOnCfsBackedIndex() throws Throwable
     {
@@ -793,6 +801,117 @@ public class CustomIndexTest extends CQLTester
         Assert.assertEquals("Static rows in fully-expired SSTables should be forwarded to the indexer",
                             2, index.rowsDeleted.size());
         Assert.assertTrue(cfs.getLiveSSTables().isEmpty());
+    }
+
+    @Test
+    public void notifyIndexesOfFullyExpiredSSTablesDuringUCSExpiration()
+    {
+        createTable("CREATE TABLE %s (id int primary key, col1 int, col2 int) " +
+                    "WITH compaction = " + UCS_WITH_FAST_EXPIRATION_CHECK + " AND gc_grace_seconds = 0");
+        disableCompaction();
+
+        createIndex(String.format("CREATE CUSTOM INDEX ucs_row_ttl_test_index_1 ON %%s(col1) USING '%s'", StubIndex1.class.getName()));
+        createIndex(String.format("CREATE CUSTOM INDEX ucs_row_ttl_test_index_2 ON %%s(col2) USING '%s'", StubIndex2.class.getName()));
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StubIndex index1 = (StubIndex1) cfs.indexManager.getIndexByName("ucs_row_ttl_test_index_1");
+        StubIndex index2 = (StubIndex2) cfs.indexManager.getIndexByName("ucs_row_ttl_test_index_2");
+
+        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 2", 0, 0);
+        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 2", 1, 1);
+        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 2", 2, 2);
+
+        execute("INSERT INTO %s (id, col2) VALUES (?, ?) USING TTL 2", 0, 0);
+        execute("INSERT INTO %s (id, col2) VALUES (?, ?) USING TTL 2", 1, 1);
+        execute("INSERT INTO %s (id, col2) VALUES (?, ?) USING TTL 2", 2, 2);
+
+        flush();
+        awaitFullyExpired(cfs);
+
+        index1.reset();
+        index2.reset();
+        runUCSExpirationTasks(cfs);
+
+        Assert.assertEquals(3, index1.rowsDeleted.size());
+        Assert.assertEquals(3, index2.rowsDeleted.size());
+        Assert.assertTrue(cfs.getLiveSSTables().isEmpty());
+    }
+
+    @Test
+    public void indexerFailureDoesNotBlockDroppingFullyExpiredSSTablesDuringUCSExpiration()
+    {
+        createTable("CREATE TABLE %s (id int primary key, col1 int) " +
+                    "WITH compaction = " + UCS_WITH_FAST_EXPIRATION_CHECK + " AND gc_grace_seconds = 0");
+        disableCompaction();
+
+        createIndex(String.format("CREATE CUSTOM INDEX ucs_throwing_expired_index ON %%s(col1) USING '%s'", ThrowingStubIndex.class.getName()));
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 2", 0, 0);
+        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 2", 1, 1);
+        execute("INSERT INTO %s (id, col1) VALUES (?, ?) USING TTL 2", 2, 2);
+
+        flush();
+        Assert.assertFalse(cfs.getLiveSSTables().isEmpty());
+        awaitFullyExpired(cfs);
+
+        // The indexer throws while being notified, but the expiration task must still drop the expired SSTables.
+        runUCSExpirationTasks(cfs);
+
+        Assert.assertTrue("Fully expired SSTables should have been dropped despite the indexer throwing",
+                          cfs.getLiveSSTables().isEmpty());
+    }
+
+    @Test
+    public void notifyIndexesOfStaticRowsInFullyExpiredSSTablesDuringUCSExpiration()
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, s int static, v int, PRIMARY KEY (pk, ck)) " +
+                    "WITH compaction = " + UCS_WITH_FAST_EXPIRATION_CHECK + " AND gc_grace_seconds = 0");
+        disableCompaction();
+
+        createIndex(String.format("CREATE CUSTOM INDEX ucs_static_expired_index ON %%s(s) USING '%s'", StubIndex.class.getName()));
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StubIndex index = (StubIndex) cfs.indexManager.getIndexByName("ucs_static_expired_index");
+        Assert.assertNotNull(index);
+
+        execute("INSERT INTO %s (pk, s) VALUES (?, ?) USING TTL 2", 0, 100);
+        execute("INSERT INTO %s (pk, s) VALUES (?, ?) USING TTL 2", 1, 200);
+
+        flush();
+        Assert.assertFalse(cfs.getLiveSSTables().isEmpty());
+        awaitFullyExpired(cfs);
+
+        index.reset();
+        runUCSExpirationTasks(cfs);
+
+        Assert.assertEquals("Static rows in fully-expired SSTables should be forwarded to the indexer",
+                            2, index.rowsDeleted.size());
+        Assert.assertTrue(cfs.getLiveSSTables().isEmpty());
+    }
+
+    /**
+     * Drops the fully expired SSTables of a UCS table through {@link UnifiedCompactionStrategy#createExpirationTasks},
+     * which creates {@link ExpirationTask}s, as UCS background compaction does, rather than through a
+     * {@link org.apache.cassandra.db.compaction.CompactionTask} like a major compaction.
+     */
+    private void runUCSExpirationTasks(ColumnFamilyStore cfs)
+    {
+        CompactionStrategy strategy = cfs.getCompactionStrategyContainer().getStrategies().get(0);
+        Assert.assertTrue(strategy instanceof UnifiedCompactionStrategy);
+        UnifiedCompactionStrategy ucs = (UnifiedCompactionStrategy) strategy;
+
+        Set<CompactionSSTable> expired = ucs.getFullyExpiredSSTables(FBUtilities.nowInSeconds());
+        Assert.assertEquals(cfs.getLiveSSTables(), expired);
+
+        List<AbstractCompactionTask> tasks = ucs.createExpirationTasks(expired);
+        Assert.assertFalse(tasks.isEmpty());
+        for (AbstractCompactionTask task : tasks)
+        {
+            Assert.assertTrue(task instanceof ExpirationTask);
+            task.execute();
+        }
     }
 
     @Test

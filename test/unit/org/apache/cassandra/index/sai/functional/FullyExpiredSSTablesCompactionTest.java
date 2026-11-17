@@ -16,12 +16,18 @@
 
 package org.apache.cassandra.index.sai.functional;
 
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 import org.junit.After;
 import org.junit.Test;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.compaction.AbstractCompactionTask;
+import org.apache.cassandra.db.compaction.CompactionSSTable;
+import org.apache.cassandra.db.compaction.ExpirationTask;
+import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy;
 import org.apache.cassandra.index.NoopIndex;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.inject.Injections;
@@ -44,6 +50,8 @@ public class FullyExpiredSSTablesCompactionTest extends SAITester
                                        " 'compaction_window_unit': 'MINUTES', " +
                                        " 'expired_sstable_check_frequency_seconds': 1}";
 
+    private static final String UCS = "{'class': 'UnifiedCompactionStrategy', 'expired_sstable_check_frequency_seconds': 1}";
+
     // Counts the full scans of an SSTable, which is how expired SSTables are read to notify indexes about their rows.
     private static final Injections.Counter FULL_SCANS = Injections.newCounter("FullSSTableScans")
                                                                    .add(InvokePointBuilder.newInvokePoint()
@@ -60,18 +68,45 @@ public class FullyExpiredSSTablesCompactionTest extends SAITester
     @Test
     public void shouldNotReadFullyExpiredSSTablesForStorageAttachedIndex() throws Throwable
     {
-        assertFullyExpiredSSTableIsDroppedWithoutReading("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        assertFullyExpiredSSTableIsDroppedWithoutReading(TWCS,
+                                                         "CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'",
+                                                         cfs -> compact());
     }
 
     @Test
     public void shouldNotReadFullyExpiredSSTablesForNoopIndex() throws Throwable
     {
-        assertFullyExpiredSSTableIsDroppedWithoutReading("CREATE CUSTOM INDEX ON %s(v) USING '" + NoopIndex.class.getName() + '\'');
+        assertFullyExpiredSSTableIsDroppedWithoutReading(TWCS,
+                                                         "CREATE CUSTOM INDEX ON %s(v) USING '" +
+                                                         NoopIndex.class.getName() + '\'',
+                                                         cfs -> compact());
     }
 
-    private void assertFullyExpiredSSTableIsDroppedWithoutReading(String createIndex) throws Throwable
+    @Test
+    public void shouldNotReadFullyExpiredSSTablesForStorageAttachedIndexDuringUCSExpiration() throws Throwable
     {
-        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int) WITH compaction = " + TWCS + " AND gc_grace_seconds = 0");
+        assertFullyExpiredSSTableIsDroppedWithoutReading(UCS,
+                                                         "CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'",
+                                                         cfs -> {
+            // Drop it through an ExpirationTask, as UCS background compaction does
+            UnifiedCompactionStrategy ucs =
+                (UnifiedCompactionStrategy) cfs.getCompactionStrategyContainer().getStrategies().get(0);
+            Set<CompactionSSTable> expired = ucs.getFullyExpiredSSTables(FBUtilities.nowInSeconds());
+            assertEquals(1, expired.size());
+            for (AbstractCompactionTask task : ucs.createExpirationTasks(expired))
+            {
+                assertTrue(task instanceof ExpirationTask);
+                task.execute();
+            }
+        });
+    }
+
+    private void assertFullyExpiredSSTableIsDroppedWithoutReading(String compaction,
+                                                                  String createIndex,
+                                                                  Consumer<ColumnFamilyStore> drop) throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int) WITH compaction = " + compaction +
+                    " AND gc_grace_seconds = 0");
         disableCompaction(KEYSPACE);
         createIndex(createIndex);
 
@@ -85,7 +120,7 @@ public class FullyExpiredSSTablesCompactionTest extends SAITester
 
         Injections.inject(FULL_SCANS);
         FULL_SCANS.reset();
-        compact();
+        drop.accept(cfs);
 
         assertTrue("The fully expired SSTable should have been dropped", cfs.getLiveSSTables().isEmpty());
         assertEquals("The fully expired SSTable should have been dropped without reading it", 0, FULL_SCANS.get());
