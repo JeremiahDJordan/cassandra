@@ -172,7 +172,8 @@ public class TrieMemoryIndex extends MemoryIndex
                                  LongConsumer offHeapAllocationsTracker)
     {
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
-        applyTransformer(primaryKey, value, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+        int tokenCount = applyTransformer(primaryKey, value, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+        recordAddedDocLength(primaryKey, tokenCount, onHeapAllocationsTracker);
     }
 
     public synchronized void update(DecoratedKey key,
@@ -196,10 +197,18 @@ public class TrieMemoryIndex extends MemoryIndex
             }
 
             // Add before removing to prevent a period where the value is not available in the index
-            if (newValue != null && newValue.hasRemaining())
-                applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
-            if (oldValue != null && oldValue.hasRemaining())
+            boolean indexesNewValue = TypeUtil.indexesValue(newValue, indexContext.getValidator());
+            int newTokenCount = indexesNewValue
+                                ? applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator)
+                                : 0;
+            if (TypeUtil.indexesValue(oldValue, indexContext.getValidator()))
                 applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+
+            // The document length is that of the new value, or none if the update indexes no new value
+            if (indexesNewValue)
+                recordUpdatedDocLength(primaryKey, newTokenCount, onHeapAllocationsTracker);
+            else
+                forgetDocLength(primaryKey);
         }
         finally
         {
@@ -230,15 +239,25 @@ public class TrieMemoryIndex extends MemoryIndex
             while (newValues != null && newValues.hasNext())
             {
                 ByteBuffer newValue = newValues.next();
-                if (newValue != null && newValue.hasRemaining())
-                    applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+                if (TypeUtil.indexesValue(newValue, indexContext.getValidator()))
+                {
+                    int tokenCount = applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+                    recordAddedDocLength(primaryKey, tokenCount, onHeapAllocationsTracker);
+                }
             }
 
             while (oldValues != null && oldValues.hasNext())
             {
                 ByteBuffer oldValue = oldValues.next();
+                // The empty value is added, but not removed: the old values of an update are only those of the
+                // elements it changes, so another element may still hold it, and removing it would lose the row.
+                // (Non-empty values have that problem too.)
                 if (oldValue != null && oldValue.hasRemaining())
-                    applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+                {
+                    int tokenCount = applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+                    if (docLengths.containsKey(primaryKey))
+                        totalTermCount -= tokenCount;
+                }
             }
         }
         finally
@@ -249,11 +268,12 @@ public class TrieMemoryIndex extends MemoryIndex
         }
     }
 
-    private void applyTransformer(PrimaryKey primaryKey,
-                                  ByteBuffer value,
-                                  LongConsumer onHeapAllocationsTracker,
-                                  LongConsumer offHeapAllocationsTracker,
-                                  InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey> transformer)
+    // Adds or removes the terms of a value of the row with the transformer, and returns the number of terms
+    private int applyTransformer(PrimaryKey primaryKey,
+                                 ByteBuffer value,
+                                 LongConsumer onHeapAllocationsTracker,
+                                 LongConsumer offHeapAllocationsTracker,
+                                 InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey> transformer)
     {
         AbstractAnalyzer analyzer = indexContext.getAnalyzerFactory().create();
         try
@@ -288,36 +308,60 @@ public class TrieMemoryIndex extends MemoryIndex
                 }
             }
 
-            Object prev = docLengths.put(primaryKey, tokenCount);
-            if (prev != null)
-            {
-                // An update first transforms with Accumulator to the new value,
-                // then transforms with Remover from the old value.
-                if (transformer instanceof PrimaryKeysAccumulator)
-                    totalTermCount += tokenCount;
-                if (transformer instanceof PrimaryKeysRemover)
-                    totalTermCount -= tokenCount;
-                // heap used for doc lengths
-                long heapUsed = RamUsageEstimator.HASHTABLE_RAM_BYTES_PER_ENTRY
-                                + primaryKey.ramBytesUsed() // TODO do we count these bytes?
-                                + Integer.BYTES;
-                onHeapAllocationsTracker.accept(heapUsed);
-            }
-            else
-            {
-                indexedRows++;
-                totalTermCount += tokenCount;
-            }
-
             // memory used by the trie
             onHeapAllocationsTracker.accept((data.usedSizeOnHeap() - initialSizeOnHeap) +
                                             (primaryKeysHeapAllocations.longValue() - initialPrimaryKeysHeapAllocations));
             offHeapAllocationsTracker.accept(data.usedSizeOffHeap() - initialSizeOffHeap);
+            return tokenCount;
         }
         finally
         {
             analyzer.end();
         }
+    }
+
+    // A row with several values (collection elements) has the document length of the last; only BM25 uses it
+    private void recordAddedDocLength(PrimaryKey primaryKey, int tokenCount, LongConsumer onHeapAllocationsTracker)
+    {
+        Integer previous = docLengths.put(primaryKey, tokenCount);
+        totalTermCount += tokenCount;
+        if (previous == null)
+            indexedRows++;
+        else
+            onHeapAllocationsTracker.accept(docLengthHeapSize(primaryKey));
+    }
+
+    // Only the new value of an update sets the document length
+    private void recordUpdatedDocLength(PrimaryKey primaryKey, int tokenCount, LongConsumer onHeapAllocationsTracker)
+    {
+        Integer previous = docLengths.put(primaryKey, tokenCount);
+        if (previous == null)
+        {
+            indexedRows++;
+            totalTermCount += tokenCount;
+        }
+        else
+        {
+            totalTermCount += tokenCount - previous;
+            onHeapAllocationsTracker.accept(docLengthHeapSize(primaryKey));
+        }
+    }
+
+    private void forgetDocLength(PrimaryKey primaryKey)
+    {
+        Integer previous = docLengths.remove(primaryKey);
+        if (previous != null)
+        {
+            indexedRows--;
+            totalTermCount -= previous;
+        }
+    }
+
+    private static long docLengthHeapSize(PrimaryKey primaryKey)
+    {
+        return RamUsageEstimator.HASHTABLE_RAM_BYTES_PER_ENTRY
+               + primaryKey.ramBytesUsed() // TODO do we count these bytes?
+               + Integer.BYTES;
     }
 
     @Override
