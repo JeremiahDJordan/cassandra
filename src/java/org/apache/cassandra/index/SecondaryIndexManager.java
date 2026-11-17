@@ -475,7 +475,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     }
 
     /**
-     * Does a blocking full rebuild/recovery of the specifed indexes from all the sstables in the base table.
+     * Does a blocking full rebuild/recovery of the specifed indexes from all the sstables in the base table, after
+     * flushing its memtable.
      * Note also that this method of (re)building/recovering indexes:
      * a) takes a set of index *names* rather than Indexers
      * b) marks existing indexes removed prior to rebuilding
@@ -500,20 +501,16 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         }
 
         // Optimistically mark the indexes as writable, so we don't miss incoming writes
-        boolean needsFlush = false;
         for (Index index : toRebuild)
         {
             String name = index.getIndexMetadata().name;
             if (writableIndexes.put(name, index) == null)
-            {
                 logger.info("Index [{}] became writable starting recovery.", name);
-                needsFlush = true;
-            }
         }
 
-        // Once we are tracking new writes, flush any memtable contents to not miss them from the sstable-based rebuild
-        if (needsFlush)
-            baseCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_BUILD_STARTED);
+        // Once we are tracking new writes, flush the memtable so the sstable-based rebuild covers its contents, even
+        // if the indexes were already writable: a write that failed once applied is in the memtable but not the index.
+        baseCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_BUILD_STARTED);
 
         // Now that we are tracking new writes and we haven't left untracked contents on the memtables, we are ready to
         // index the sstables

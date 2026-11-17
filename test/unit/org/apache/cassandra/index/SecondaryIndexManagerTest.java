@@ -20,6 +20,7 @@ package org.apache.cassandra.index;
 import java.io.FileNotFoundException;
 import java.lang.reflect.Method;
 import java.net.SocketException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -30,6 +31,9 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import javax.annotation.Nullable;
+
+import com.google.common.base.Throwables;
 import com.google.common.collect.Sets;
 import org.junit.After;
 import org.junit.AfterClass;
@@ -42,15 +46,19 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.WriteContext;
+import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.RangeTombstone;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.gms.Gossiper;
-import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.notifications.SSTableAddedNotification;
 import org.apache.cassandra.notifications.SSTableListChangedNotification;
@@ -572,6 +580,48 @@ public class SecondaryIndexManagerTest extends CQLTester
         assertNotMarkedAsBuilt(indexName);
     }
 
+    /**
+     * A write that an index fails after the memtable applied it stays in the memtable without the index; a rebuild
+     * flushes the memtable first, so that it indexes the row from the sstable.
+     */
+    @Test
+    public void rebuildIndexesRowsMissedInTheMemtable()
+    {
+        String[][] cases = { { "TrieMemtable", "finish" } };
+        for (String[] c : cases)
+        {
+            String memtable = c[0];
+            String context = memtable + ", failing in " + c[1];
+            createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b)) WITH memtable = { 'class': '" + memtable + "' }");
+            String indexName = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", FailingIndex.class.getName()));
+            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+            FailingIndex index = (FailingIndex) cfs.indexManager.getIndexByName(indexName);
+
+            FailingIndex.failingMethod = c[1];
+            try
+            {
+                execute("INSERT INTO %s (a, b, c) VALUES (0, 0, 0)");
+                fail(context + ": expected the index failure");
+            }
+            catch (RuntimeException e)
+            {
+                assertTrue(context + ": " + e, Throwables.getStackTraceAsString(e).contains(FailingIndex.FAILURE));
+            }
+            finally
+            {
+                FailingIndex.failingMethod = null;
+            }
+            // the write is applied, and the index missed it
+            assertRows(execute("SELECT a, b, c FROM %s"), row(0, 0, 0));
+            assertEquals(context, 0, index.rowsInserted.size());
+            assertEquals(context, 0, cfs.getLiveSSTables().size());
+
+            cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(indexName));
+            assertEquals(context, 1, cfs.getLiveSSTables().size());
+            assertEquals(context, 1, index.rowsInserted.size());
+        }
+    }
+
     @Test
     public void initializingIndexNotQueryableButMaybeWritable()
     {
@@ -959,6 +1009,67 @@ public class SecondaryIndexManagerTest extends CQLTester
         SecondaryIndexManager manager = getCurrentColumnFamilyStore().indexManager;
         Index index = manager.getIndexByName(indexName);
         return manager.isIndexWritable(index);
+    }
+
+    /**
+     * An index whose indexer records the rows inserted when it finishes, and fails in {@link #failingMethod} (insertRow
+     * or finish) if set, so that it misses the rows of that update.
+     */
+    public static class FailingIndex extends StubIndex
+    {
+        static final String FAILURE = "Injected failure of FailingIndex";
+        @Nullable
+        static volatile String failingMethod;
+
+        public FailingIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        @Override
+        public boolean shouldBuildBlocking()
+        {
+            return true;
+        }
+
+        @Override
+        public Indexer indexerFor(DecoratedKey key,
+                                  RegularAndStaticColumns columns,
+                                  int nowInSec,
+                                  WriteContext ctx,
+                                  IndexTransaction.Type transactionType,
+                                  Memtable memtable)
+        {
+            List<Row> inserted = new ArrayList<>();
+            return new Indexer()
+            {
+                @Override
+                public void insertRow(Row row)
+                {
+                    maybeFail("insertRow");
+                    inserted.add(row);
+                }
+
+                @Override
+                public void finish()
+                {
+                    maybeFail("finish");
+                    rowsInserted.addAll(inserted);
+                }
+
+                public void begin() {}
+                public void partitionDelete(DeletionTime deletionTime) {}
+                public void rangeTombstone(RangeTombstone tombstone) {}
+                public void updateRow(Row oldRowData, Row newRowData) {}
+                public void removeRow(Row row) {}
+            };
+        }
+
+        private static void maybeFail(String method)
+        {
+            if (method.equals(failingMethod))
+                throw new RuntimeException(FAILURE);
+        }
     }
 
     public static class TestingIndex extends StubIndex

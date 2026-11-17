@@ -75,6 +75,11 @@ Upgrading
       was flushed to. If you query such columns for the empty value, rebuild those indexes on each node after
       upgrading it, with nodetool rebuild_index: the SSTables flushed before the upgrade keep missing such rows until
       then, or until compacted.
+    - nodetool rebuild_index flushes the table before it rebuilds the indexes, also when they were already writable,
+      so that the rebuild repairs an index that missed a write still in the memtable, such as an index whose indexer
+      failed when it finished an update that the trie memtable applied. A write that fails this way while the rebuild
+      runs is missed again, and needs another rebuild. On a memtable that doesn't flush for index builds, a rebuild
+      can't repair such a row.
 
 Deprecation
 ---------

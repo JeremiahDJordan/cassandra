@@ -1125,12 +1125,13 @@ public class SecondaryIndexTest extends CQLTester
         ReadOnlyOnFailureIndex index = (ReadOnlyOnFailureIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
         assertEquals(1, index.rowsInserted.size());
 
-        // Upon rebuild, both reads and writes still go through
+        // Upon rebuild, both reads and writes still go through; the rebuild indexes the row again from the
+        // flushed sstable
         getCurrentColumnFamilyStore().indexManager.rebuildIndexesBlocking(ImmutableSet.of(indexName));
-        assertEquals(1, index.rowsInserted.size());
+        assertEquals(2, index.rowsInserted.size());
         execute("SELECT value FROM %s WHERE value = 1");
         execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 2, 1, 1);
-        assertEquals(2, index.rowsInserted.size());
+        assertEquals(3, index.rowsInserted.size());
         dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
 
         // On bad initial build writes are not forwarded to the index
@@ -1163,12 +1164,13 @@ public class SecondaryIndexTest extends CQLTester
         WriteOnlyOnFailureIndex index = (WriteOnlyOnFailureIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(indexName);
         assertEquals(1, index.rowsInserted.size());
 
-        // Upon rebuild, both reads and writes still go through
+        // Upon rebuild, both reads and writes still go through; the rebuild indexes the row again from the
+        // flushed sstable
         getCurrentColumnFamilyStore().indexManager.rebuildIndexesBlocking(ImmutableSet.of(indexName));
-        assertEquals(1, index.rowsInserted.size());
+        assertEquals(2, index.rowsInserted.size());
         execute("SELECT value FROM %s WHERE value = 1");
         execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 2, 1, 1);
-        assertEquals(2, index.rowsInserted.size());
+        assertEquals(3, index.rowsInserted.size());
         dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
 
         // On bad initial build writes are forwarded to the index
