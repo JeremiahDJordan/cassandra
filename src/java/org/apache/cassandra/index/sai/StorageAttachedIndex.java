@@ -57,6 +57,7 @@ import org.apache.cassandra.db.CassandraWriteContext;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.RegularAndStaticColumns;
@@ -67,6 +68,7 @@ import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
@@ -107,11 +109,23 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.RANGE_READ_ENDPOINT_GROUPING_ENABLED;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VALIDATE_TERMS_AT_COORDINATOR;
 import static org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig.MAX_TOP_K;
 
 public class StorageAttachedIndex implements Index
 {
+    public static final String QUERY_VALUE_TOO_LARGE_ERROR_MESSAGE =
+    "%s of column %s is too large to be sent to the replicas: %d bytes, the maximum is %d bytes.";
+    public static final String MAP_ENTRY_TOO_LARGE_ERROR_MESSAGE =
+    "%s of column %s is too large: %d bytes, the maximum is %d bytes.";
+    public static final String MAP_KEY_TOO_LARGE_FOR_ENTRIES_INDEX_ERROR_MESSAGE =
+    "%s of column %s is too large for its entries index: %d bytes, the maximum is %d bytes.";
+    /**
+     * The largest first component of a {@link CompositeType} value, such as the map key of an entries index term: a
+     * component length is an unsigned short, and 0xFFFF is reserved for the first one (the static prefix).
+     */
+    public static final int MAX_COMPOSITE_FIRST_COMPONENT_SIZE = FBUtilities.MAX_UNSIGNED_SHORT - 1;
     public static final String NGRAM_WITHOUT_QUERY_ANALYZER_WARNING =
     "Using an ngram analyzer without defining a query_analyzer. " +
     "This means that the same ngram analyzer will be applied to both indexed and queried column values. " +
@@ -798,6 +812,15 @@ public class StorageAttachedIndex implements Index
     @Override
     public void validate(ReadCommand command) throws InvalidRequestException
     {
+        // With range read endpoint grouping (the default), an SAI range read is always sent through messaging, even to
+        // this node, and so is a top-k one. A single-partition read, or without endpoint grouping a range read, served
+        // by this node's replica alone isn't serialized, and works with larger values.
+        boolean serialized = command instanceof PartitionRangeReadCommand
+                             && (RANGE_READ_ENDPOINT_GROUPING_ENABLED.getBoolean() || command.isTopK());
+        if (serialized)
+            validateSerializedValueSizes(command.rowFilter().root);
+        validateMapEntrySizes(command.rowFilter().root);
+
         var indexQueryPlan = command.indexQueryPlan();
         if (indexQueryPlan == null)
             return;
@@ -811,6 +834,73 @@ public class StorageAttachedIndex implements Index
                                                             MAX_TOP_K, command.limits().isUnlimited() ? "NO LIMIT" : command.limits().count()));
 
         indexContext.validate(command.rowFilter());
+    }
+
+    /**
+     * Rejects the query values of a range read sent through messaging, on any column, that are larger than
+     * {@link FBUtilities#MAX_UNSIGNED_SHORT} bytes, the most the read command can serialize. The whole value of an IN
+     * restriction (the packed list) is serialized as one value, and a map entry's key and value separately.
+     * <p>
+     * Values larger than the index's maximum term size aren't rejected: that limit is a write-time guardrail, which
+     * may have been different when the indexed values were written, and such a value can only match nothing.
+     */
+    private static void validateSerializedValueSizes(RowFilter.FilterElement element)
+    {
+        for (RowFilter.Expression expression : element.expressions())
+        {
+            if (expression instanceof RowFilter.SimpleExpression)
+            {
+                validateValueSize(QUERY_VALUE_TOO_LARGE_ERROR_MESSAGE,
+                                  expression.operator() == Operator.IN ? "IN list" : "Query value",
+                                  expression.column(), expression.getIndexValue(), FBUtilities.MAX_UNSIGNED_SHORT);
+            }
+            else if (expression instanceof RowFilter.MapComparisonExpression)
+            {
+                RowFilter.MapComparisonExpression entry = (RowFilter.MapComparisonExpression) expression;
+                validateValueSize(QUERY_VALUE_TOO_LARGE_ERROR_MESSAGE, "Map key", expression.column(),
+                                  entry.getMapKey(), FBUtilities.MAX_UNSIGNED_SHORT);
+                validateValueSize(QUERY_VALUE_TOO_LARGE_ERROR_MESSAGE, "Map value", expression.column(),
+                                  entry.getMapValue(), FBUtilities.MAX_UNSIGNED_SHORT);
+            }
+        }
+
+        for (RowFilter.FilterElement child : element.children())
+            validateSerializedValueSizes(child);
+    }
+
+    /**
+     * Rejects, in any read that SAI plans, the map entry comparisons whose key or value can't be encoded in a
+     * {@link CompositeType} value, which SAI builds for each of them, on any map column, indexed or not: a component
+     * length is an unsigned short, so the key and value can have at most 65535 bytes. On an entries index the key is
+     * limited to 65534 bytes, as {@code 0xFFFF} is reserved for the length of the first component of a composite.
+     */
+    private void validateMapEntrySizes(RowFilter.FilterElement element)
+    {
+        boolean entriesIndex = TypeUtil.isComposite(indexContext.getValidator());
+        for (RowFilter.Expression expression : element.expressions())
+        {
+            if (expression instanceof RowFilter.MapComparisonExpression)
+            {
+                RowFilter.MapComparisonExpression entry = (RowFilter.MapComparisonExpression) expression;
+                validateValueSize(MAP_ENTRY_TOO_LARGE_ERROR_MESSAGE, "Map key", expression.column(),
+                                  entry.getMapKey(), FBUtilities.MAX_UNSIGNED_SHORT);
+                validateValueSize(MAP_ENTRY_TOO_LARGE_ERROR_MESSAGE, "Map value", expression.column(),
+                                  entry.getMapValue(), FBUtilities.MAX_UNSIGNED_SHORT);
+
+                if (entriesIndex && expression.column().equals(indexContext.getDefinition()))
+                    validateValueSize(MAP_KEY_TOO_LARGE_FOR_ENTRIES_INDEX_ERROR_MESSAGE, "Map key", expression.column(),
+                                      entry.getMapKey(), MAX_COMPOSITE_FIRST_COMPONENT_SIZE);
+            }
+        }
+
+        for (RowFilter.FilterElement child : element.children())
+            validateMapEntrySizes(child);
+    }
+
+    private static void validateValueSize(String message, String what, ColumnMetadata column, ByteBuffer value, int max)
+    {
+        if (value != null && value.remaining() > max)
+            throw new InvalidRequestException(String.format(message, what, column.name, value.remaining(), max));
     }
 
     @Override
