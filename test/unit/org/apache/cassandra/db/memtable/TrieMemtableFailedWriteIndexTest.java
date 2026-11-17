@@ -552,10 +552,10 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
         }
     }
 
-    /// The same failure on a skip-list memtable, where it fails the update before the update is applied. The SAI
-    /// group must stop at the failing index, as before, or the sibling index drops the old value of a row that did not
-    /// change. (Rows 1-3 were already delivered to both indexes as the memtable merged them, and are lost from the old
-    /// value in both: memtables that do not apply updates atomically deliver events as they merge.)
+    /// The same failure on a skip-list memtable. SAI requires atomic updates (Index.Indexer#requiresAtomicUpdates), so
+    /// the skip-list memtable applies the update under the partition's lock and delivers SAI's events once it has
+    /// applied it, as the trie memtables do: the update stays applied, the write fails, and only the failing index
+    /// misses row 4.
     @Test
     public void testOneOfTwoSaiIndexesFailsSkipList()
     {
@@ -563,6 +563,7 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
         createIndex("CREATE INDEX ON %s(v) USING 'sai'");
         createIndex("CREATE INDEX ON %s(w) USING 'sai'");
         assertFalse(getCurrentColumnFamilyStore().getCurrentMemtable().appliesUpdatesAtomically());
+        assertTrue(getCurrentColumnFamilyStore().getCurrentMemtable().appliesUpdatesAtomicallyOnRequest());
 
         for (int ck = 1; ck <= 5; ++ck)
             execute("INSERT INTO %s (pk, ck, v, w) VALUES (1, ?, 0, 0) USING TIMESTAMP 10", ck);
@@ -584,11 +585,11 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
             failAtKind = null;
         }
 
-        // The update is not applied, and neither index got row 4.
         assertRows(execute("SELECT ck, v, w FROM %s WHERE pk = 1"),
-                   row(1, 0, 0), row(2, 0, 0), row(3, 0, 0), row(4, 0, 0), row(5, 0, 0));
-        assertRowsWithContext("SAI v", execute("SELECT ck FROM %s WHERE v = 0"), row(4), row(5));
-        assertRowsWithContext("SAI w", execute("SELECT ck FROM %s WHERE w = 0"), row(4), row(5));
+                   row(1, 1, 1), row(2, 1, 1), row(3, 1, 1), row(4, 1, 1), row(5, 1, 1));
+        assertOneIndexMissesRowFour("skiplist");
+        flush();
+        assertOneIndexMissesRowFour("skiplist, flushed");
     }
 
     private void assertOneIndexMissesRowFour(String context)

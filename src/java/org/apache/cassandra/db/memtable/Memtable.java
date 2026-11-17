@@ -245,11 +245,26 @@ public interface Memtable extends Comparable<Memtable>, UnfilteredSource, CellSo
      * the partition: a {@code put} that throws leaves none of the update's rows and deletions and ends the transaction
      * with {@link UpdateTransaction#abort}, and {@code put} ends the transaction while it holds the lock that
      * serializes writes to the partition. The secondary index manager then holds the index events of an update until
-     * {@code commit()} and drops them on {@code abort()}; otherwise it delivers them as the update is merged. An
-     * indexer that throws in {@code commit()} misses its event, and the write fails. The flag is inherited: a subclass
-     * that overrides {@link #put}, or a memtable that wraps another one, must re-evaluate or forward it.
+     * {@code commit()} and drops them on {@code abort()}; otherwise it delivers them as the update is merged (but see
+     * {@link #appliesUpdatesAtomicallyOnRequest}). An indexer that throws in {@code commit()} misses its event, and the
+     * write fails. The flag is inherited: a subclass that overrides {@link #put}, or a memtable that wraps another one,
+     * must re-evaluate or forward it.
      */
     default boolean appliesUpdatesAtomically()
+    {
+        return false;
+    }
+
+    /**
+     * Whether {@link #put} applies an update atomically for the indexers that need it, when its index transaction asks
+     * for that with {@link UpdateTransaction#requiresAtomicApply}. Only asked if {@link #appliesUpdatesAtomically} is
+     * false. For such a transaction, {@code put} merges the update and makes it visible under a partition lock that
+     * every such update takes, calls {@link UpdateTransaction#onAttemptLost} for each merge it doesn't apply and {@link
+     * UpdateTransaction#onApplied} for the one it applies before releasing the lock, and calls neither for an update it
+     * fails to apply. The flag is inherited: once {@code put} has asked and been told true, the held events of an
+     * update that it doesn't report applied are dropped.
+     */
+    default boolean appliesUpdatesAtomicallyOnRequest()
     {
         return false;
     }

@@ -128,6 +128,13 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
         return shard.put(key, update, indexer, opGroup);
     }
 
+    @Override
+    public boolean appliesUpdatesAtomicallyOnRequest()
+    {
+        // AtomicBTreePartition.addAll merges and applies such an update under the partition's lock.
+        return true;
+    }
+
     /**
      * Technically we should scatter gather on all the core threads because the size in following calls are not
      * using volatile variables, but for metrics purpose this should be good enough.
@@ -402,13 +409,15 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
                 }
             }
 
-            BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
-            updateMin(minTimestamp, update.stats().minTimestamp);
-            updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
-            liveDataSize.addAndGet(initialSize + updater.dataSize);
-            columnsCollector.update(update.columns());
-            statsCollector.update(update.stats());
-            currentOperations.addAndGet(update.operationCount());
+            long addedSize = initialSize;
+            BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer, applied -> {
+                updateMin(minTimestamp, update.stats().minTimestamp);
+                updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
+                liveDataSize.addAndGet(addedSize + applied.dataSize);
+                columnsCollector.update(update.columns());
+                statsCollector.update(update.stats());
+                currentOperations.addAndGet(update.operationCount());
+            });
             return updater.colUpdateTimeDelta;
         }
 
