@@ -25,6 +25,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 import org.slf4j.Logger;
@@ -138,6 +139,29 @@ public class RangeTermTree implements TermTree
             if (o.term == null)
                 return 1;
             return TypeUtil.compare(term, o.term, comparator, version);
+        }
+
+        // IntervalTree checks, with its expensive checks enabled (cassandra.test.interval_tree_expensive_checks), that
+        // the center of a node equals the endpoint at the same position in the sorted endpoints, which can be an equal
+        // endpoint of another interval (CASSANDRA-20866).
+        @Override
+        public boolean equals(Object other)
+        {
+            if (this == other)
+                return true;
+            if (other == null || getClass() != other.getClass())
+                return false;
+            Term otherTerm = (Term) other;
+            // as compareTo, which takes some terms with different bytes as equal (e.g. 1.0 and 1.00 in a map entry)
+            return Objects.equals(comparator, otherTerm.comparator)
+                   && Objects.equals(version, otherTerm.version)
+                   && compareTo(otherTerm) == 0;
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return Objects.hash(comparator, version);
         }
     }
 }
