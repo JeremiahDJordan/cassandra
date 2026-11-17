@@ -62,6 +62,10 @@ import org.apache.cassandra.schema.ColumnMetadata;
 ///                                  rows.
 /// - `commit()`                      -- finally, finish is called when the new Partition is swapped into the Memtable
 ///
+/// A Memtable that applies updates atomically (see `Memtable#appliesUpdatesAtomically()`) calls `abort()` instead of
+/// `commit()` when it fails to apply the update. It then holds none of the update's rows and deletions, so
+/// implementations should not deliver any event they still hold. Other Memtables always call `commit()`.
+///
 /// If the memtable prefers to supply individual cells rather than rows, the `onInserted`/`onUpdated` calls above
 /// are replaced with a sequence of `startRow` plus zero or more calls to `onCellUpdate`.
 public interface UpdateTransaction extends IndexTransaction
@@ -85,6 +89,16 @@ public interface UpdateTransaction extends IndexTransaction
 
     void onCellUpdate(@Nullable Cell<?> original, @Nullable Cell<?> merged);
     void onComplexColumnDeletion(ColumnMetadata column, DeletionTime deletionTime);
+
+    /// Ends the transaction because the memtable failed to apply the update, and holds none of its rows and
+    /// deletions. Called instead of [#commit], and only by memtables that apply updates atomically.
+    ///
+    /// Implementations that hold events until [#commit] should drop them, and end the transaction for the indexers.
+    /// The default calls [#commit]: implementations that deliver events as they arrive cannot take them back.
+    default void abort()
+    {
+        commit();
+    }
 
     UpdateTransaction NO_OP = new UpdateTransaction()
     {
