@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.index.sai.disk.vector;
 
+import java.util.Locale;
 import java.util.function.Function;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -89,7 +90,7 @@ public enum VectorSourceModel
 
     public static VectorSourceModel fromString(String value)
     {
-        return valueOf(value.toUpperCase());
+        return valueOf(value.toUpperCase(Locale.US));
     }
 
     private static VectorCompression genericCompressionFor(int dimension)
