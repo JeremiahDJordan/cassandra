@@ -60,6 +60,11 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - nodetool rebuild_index flushes the table before it rebuilds the indexes, also when they were already writable,
+      so that the rebuild repairs an index that missed a write still in the memtable, such as an index whose indexer
+      failed when it finished an update that the trie memtable applied. A write that fails this way while the rebuild
+      runs is missed again, and needs another rebuild. On a memtable that doesn't flush for index builds, a rebuild
+      can't repair such a row.
 
 Deprecation
 ---------
