@@ -165,8 +165,8 @@ public class MultipleColumnIndexTest extends SAITester
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Johann'", row1, row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Richard'", row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Debussy'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann Strauss'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss'").uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann Strauss'", row2).uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss'", row1).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Strauss'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard'", row1).uses(analyzedIndex).doesntWarn();
@@ -223,8 +223,8 @@ public class MultipleColumnIndexTest extends SAITester
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Johann'", row1, row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Richard'", row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Debussy'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann Strauss'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss'").uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann Strauss'", row2).uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss'", row1).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Strauss'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard'", row1).uses(analyzedIndex).doesntWarn();
@@ -281,8 +281,8 @@ public class MultipleColumnIndexTest extends SAITester
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Johann'", row1, row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Richard'", row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Debussy'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann Strauss'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss'").uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann Strauss'", row2).uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss'", row1).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Strauss'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard'", row1).uses(analyzedIndex).doesntWarn();
@@ -339,8 +339,8 @@ public class MultipleColumnIndexTest extends SAITester
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS KEY 'Johann'", row1, row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS KEY 'Richard'", row2).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v CONTAINS KEY 'Debussy'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS KEY 'Johann Strauss'").uses(analyzedIndex).doesntWarn();
-        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS KEY 'Richard Strauss'").uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS KEY 'Johann Strauss'", row2).uses(analyzedIndex).doesntWarn();
+        assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS KEY 'Richard Strauss'", row1).uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS KEY 'Strauss'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS KEY 'Johann'").uses(analyzedIndex).doesntWarn();
         assertThatPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS KEY 'Richard'", row1).uses(analyzedIndex).doesntWarn();
