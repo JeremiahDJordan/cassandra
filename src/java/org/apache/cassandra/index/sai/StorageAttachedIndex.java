@@ -968,34 +968,67 @@ public class StorageAttachedIndex implements Index
      * synchronized so that the view is unchanged between validation and the selection of non-indexed SSTables.
      *
      * @return a list SSTables without attached indexes
+     * @throws IllegalStateException if the index of some SSTables failed to load although their components are
+     * complete, and neither missing nor corrupt: they aren't rebuilt, and the index can't be made queryable
      */
     private synchronized List<SSTableReader> findNonIndexedSSTables(ColumnFamilyStore baseCfs, StorageAttachedIndexGroup group, boolean validate)
     {
         Set<SSTableReader> sstables = baseCfs.getLiveSSTables();
 
-        // Initialize the SSTable indexes w/ valid existing components...
+        // Initialize the SSTable indexes w/ valid existing components (some of them may already be in the view)...
         assert group != null : "Missing index group on " + baseCfs.name;
-        group.onSSTableChanged(Collections.emptyList(), sstables, Collections.singleton(this), validate);
+        if (group.onSSTableChanged(Collections.emptyList(), sstablesNotInView(sstables), Collections.singleton(this), validate).contains(this))
+        {
+            // Some components were invalid, and have been invalidated. An invalid per-SSTable component fails the
+            // whole batch, so the valid SSTables may not have been added to the view either. Load the SSTables that
+            // aren't in the view again, now that the invalid components are out of the way: the valid ones are added,
+            // and the ones whose components were invalidated are reported as not indexed below, and rebuilt.
+            group.onSSTableChanged(Collections.emptyList(), sstablesNotInView(sstables), Collections.singleton(this), validate);
+        }
 
         // ...then identify and rebuild the SSTable indexes that are missing.
         List<SSTableReader> nonIndexed = new ArrayList<>();
-        View view = indexContext.getView();
-
-        for (SSTableReader sstable : sstables)
+        List<SSTableReader> failedToLoad = new ArrayList<>();
+        for (SSTableReader sstable : sstablesNotInView(sstables))
         {
-            // An SSTable is considered not indexed if:
-            //   1. The current view does not contain the SSTable
-            //   2. The SSTable is not marked compacted
-            //   3. The column index does not have a completion marker
-            if (!view.containsSSTableIndex(sstable.descriptor)
-                && !sstable.isMarkedCompacted()
-                && !IndexDescriptor.isIndexBuildCompleteOnDisk(sstable, indexContext))
-            {
+            if (sstable.isMarkedCompacted())
+                continue;
+
+            // The view doesn't contain the SSTable after the load above. If its components are still complete on
+            // disk, they are neither missing nor corrupt (corrupt components are invalidated when they fail to
+            // validate or to load), so loading them failed for another reason (e.g. too many open files, out of
+            // direct memory, or the mmap limit). Rebuilding wouldn't help, and would replace healthy components.
+            if (IndexDescriptor.isIndexBuildCompleteOnDisk(sstable, indexContext))
+                failedToLoad.add(sstable);
+            else
                 nonIndexed.add(sstable);
-            }
+        }
+
+        if (!failedToLoad.isEmpty())
+        {
+            String message = String.format("Failed to load the index of %d SSTable(s) whose index components are " +
+                                           "complete: %s. They are not rebuilt, as the failure isn't corruption " +
+                                           "(see the errors above), and the index stays non-queryable. Once the " +
+                                           "cause is fixed, restart the node, or rebuild the index.",
+                                           failedToLoad.size(),
+                                           failedToLoad.stream().map(s -> s.descriptor.toString())
+                                                       .collect(Collectors.joining(", ")));
+            throw new IllegalStateException(indexContext.logMessage(message));
         }
 
         return nonIndexed;
+    }
+
+    private List<SSTableReader> sstablesNotInView(Collection<SSTableReader> sstables)
+    {
+        View view = indexContext.getView();
+        List<SSTableReader> notInView = new ArrayList<>();
+        for (SSTableReader sstable : sstables)
+        {
+            if (!view.containsSSTableIndex(sstable.descriptor))
+                notInView.add(sstable);
+        }
+        return notInView;
     }
 
     private class UpdateIndexer extends IndexerAdapter
