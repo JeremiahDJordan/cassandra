@@ -1695,7 +1695,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         if (indexers.length == 0)
             return UpdateTransaction.NO_OP;
-        return new WriteTimeTransaction(baseCfs, memtable != null && memtable.appliesUpdatesAtomically(), indexers);
+        boolean atomicMemtable = memtable != null && memtable.appliesUpdatesAtomically();
+        boolean atomicOnRequest = !atomicMemtable && memtable != null && memtable.appliesUpdatesAtomicallyOnRequest();
+        return new WriteTimeTransaction(baseCfs, atomicMemtable, atomicOnRequest, indexers);
     }
 
     private Predicate<Index> writableIndexSelector()
@@ -1747,11 +1749,26 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      */
     private static final class WriteTimeTransaction implements UpdateTransaction
     {
+        private static final Index.Indexer[] NO_INDEXERS = new Index.Indexer[0];
+
         private final Index.Indexer[] indexers;
-        /// Events not yet delivered to the indexers, or null if events are delivered as they arrive: on a memtable that
-        /// applies updates atomically, they are held until [#commit] and dropped by [#abort].
+        /// The indexers that get each event as it arrives.
+        private final Index.Indexer[] immediateIndexers;
+        /// The indexers whose events are held in [#pendingEvents]: all of them on a memtable that applies updates
+        /// atomically ([#commit] delivers the events, [#abort] drops them), and on one that does so on request, those
+        /// that [require atomic updates][Index.Indexer#requiresAtomicUpdates] (see [#onApplied]).
+        private final Index.Indexer[] heldIndexers;
+        /// Whether the memtable applies every update atomically, and [#commit] delivers the held events.
+        private final boolean atomicMemtable;
+        /// Whether events are held for the [#heldIndexers]: on a memtable that applies updates atomically, and on one
+        /// that does so on request once it has asked [#requiresAtomicApply]; until then they get events as they arrive.
+        private boolean holding;
+        /// The held events not yet delivered, or null if there are no [#heldIndexers].
         @Nullable
         private final List<Consumer<Index.Indexer>> pendingEvents;
+        /// The failures of the held indexers in [#onApplied], reported by [#commit], or null.
+        @Nullable
+        private IndexerFailures appliedFailures;
         /// The table whose indexes this transaction updates, for the log.
         private final ColumnFamilyStore table;
         final Row.Builder toRemove = BTreeRow.sortedBuilder();
@@ -1759,19 +1776,98 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         boolean rowUpdated = false;
         boolean rowExisted = true;
 
-        private WriteTimeTransaction(ColumnFamilyStore table, boolean holdEventsUntilCommit, Index.Indexer... indexers)
+        /// @param atomicMemtable whether the memtable applies updates atomically
+        /// @param atomicOnRequest whether the memtable applies updates atomically on request, if it doesn't always
+        private WriteTimeTransaction(ColumnFamilyStore table, boolean atomicMemtable, boolean atomicOnRequest, Index.Indexer... indexers)
         {
             this.table = table;
-            this.pendingEvents = holdEventsUntilCommit ? new ArrayList<>() : null;
+            this.atomicMemtable = atomicMemtable;
             // don't allow null indexers, if we don't need any use a NullUpdater object
             for (Index.Indexer indexer : indexers) assert indexer != null;
             this.indexers = indexers;
+
+            if (atomicMemtable)
+            {
+                this.heldIndexers = indexers;
+                this.immediateIndexers = NO_INDEXERS;
+            }
+            else if (atomicOnRequest)
+            {
+                this.heldIndexers = select(indexers, true);
+                this.immediateIndexers = heldIndexers.length == 0 ? indexers : select(indexers, false);
+            }
+            else
+            {
+                this.heldIndexers = NO_INDEXERS;
+                this.immediateIndexers = indexers;
+            }
+            this.pendingEvents = heldIndexers.length > 0 ? new ArrayList<>() : null;
+            this.holding = atomicMemtable;
+        }
+
+        /// The indexers that do, or don't, [require atomic updates][Index.Indexer#requiresAtomicUpdates].
+        private static Index.Indexer[] select(Index.Indexer[] indexers, boolean requiresAtomicUpdates)
+        {
+            int count = 0;
+            for (Index.Indexer indexer : indexers)
+                if (indexer.requiresAtomicUpdates() == requiresAtomicUpdates)
+                    count++;
+            if (count == indexers.length)
+                return indexers;
+            Index.Indexer[] selected = new Index.Indexer[count];
+            int i = 0;
+            for (Index.Indexer indexer : indexers)
+                if (indexer.requiresAtomicUpdates() == requiresAtomicUpdates)
+                    selected[i++] = indexer;
+            return selected;
         }
 
         public void start()
         {
             for (Index.Indexer indexer : indexers)
                 indexer.begin();
+        }
+
+        @Override
+        public boolean requiresAtomicApply()
+        {
+            if (atomicMemtable || pendingEvents == null)
+                return false;
+            // The memtable asks before the first event; from now on it must report the merge it applies.
+            assert !rowUpdated && pendingEvents.isEmpty() : "requiresAtomicApply() asked after the first event";
+            holding = true;
+            return true;
+        }
+
+        @Override
+        public void onAttemptLost()
+        {
+            if (!holding)
+                return;
+            // The last row of the attempt goes to the immediate indexers now rather than with the next attempt's first
+            // event. The held indexers never see the attempt.
+            maybeCompleteRow();
+            pendingEvents.clear();
+        }
+
+        @Override
+        public void onApplied()
+        {
+            if (!holding)
+                return;
+            // The memtable has applied the update, so an indexer that fails on one event must not cost the other
+            // events, or the other indexers: deliver everything, and report the failures in commit().
+            IndexerFailures failures = new IndexerFailures(table);
+            try
+            {
+                maybeCompleteRow();
+            }
+            catch (Throwable t)
+            {
+                failures.add(t);
+            }
+            deliverPendingEvents(failures);
+            appliedFailures = failures;
         }
 
         public void onPartitionDeletion(DeletionTime deletionTime)
@@ -1821,13 +1917,37 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         private void deliver(Consumer<Index.Indexer> event)
         {
-            if (pendingEvents != null)
+            if (!holding)
             {
-                pendingEvents.add(event);
+                for (Index.Indexer indexer : indexers)
+                    event.accept(indexer);
                 return;
             }
-            for (Index.Indexer indexer : indexers)
+            // Held first, so that an immediate indexer that fails on the last row in onApplied() doesn't cost the held
+            // indexers the event.
+            pendingEvents.add(event);
+            for (Index.Indexer indexer : immediateIndexers)
                 event.accept(indexer);
+        }
+
+        /// Delivers the held events to every held indexer, even if some fail, and records the failures.
+        private void deliverPendingEvents(IndexerFailures failures)
+        {
+            for (Consumer<Index.Indexer> event : pendingEvents)
+            {
+                for (Index.Indexer indexer : heldIndexers)
+                {
+                    try
+                    {
+                        event.accept(indexer);
+                    }
+                    catch (Throwable t)
+                    {
+                        failures.add(t);
+                    }
+                }
+            }
+            pendingEvents.clear();
         }
 
         private void maybeCompleteRow()
@@ -1888,7 +2008,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         public void commit()
         {
-            IndexerFailures failures = new IndexerFailures(table);
+            IndexerFailures failures = appliedFailures != null ? appliedFailures : new IndexerFailures(table);
             try
             {
                 maybeCompleteRow();
@@ -1900,23 +2020,18 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
             if (pendingEvents != null)
             {
-                // The memtable has already applied the update, so an indexer that fails on one event must not cost
-                // the other events, or the other indexers: deliver everything, then report the first failure.
-                for (Consumer<Index.Indexer> event : pendingEvents)
+                if (atomicMemtable)
                 {
-                    for (Index.Indexer indexer : indexers)
-                    {
-                        try
-                        {
-                            event.accept(indexer);
-                        }
-                        catch (Throwable t)
-                        {
-                            failures.add(t);
-                        }
-                    }
+                    // The memtable has already applied the update, so an indexer that fails on one event must not cost
+                    // the other events, or the other indexers: deliver everything, then report the first failure.
+                    deliverPendingEvents(failures);
                 }
-                pendingEvents.clear();
+                else
+                {
+                    // onApplied() delivered the events of the merge the memtable applied. Anything left belongs to a
+                    // merge it didn't apply, because the update failed.
+                    pendingEvents.clear();
+                }
             }
 
             finish(failures);
@@ -1926,9 +2041,10 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         @Override
         public void abort()
         {
-            if (pendingEvents == null)
+            if (!atomicMemtable)
             {
-                // The events were delivered as they arrived and cannot be taken back.
+                // Only memtables that apply updates atomically call abort(). For others, the events of the immediate
+                // indexers were delivered as they arrived and cannot be taken back.
                 commit();
                 return;
             }

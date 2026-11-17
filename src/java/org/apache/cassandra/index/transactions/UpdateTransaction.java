@@ -66,6 +66,10 @@ import org.apache.cassandra.schema.ColumnMetadata;
 /// `commit()` when it fails to apply the update. It then holds none of the update's rows and deletions, so
 /// implementations should not deliver any event they still hold. Other Memtables always call `commit()`.
 ///
+/// A Memtable that merges updates in a CAS loop calls the methods above again for each merge attempt, including the
+/// attempts that lose the race against another writer. If the transaction [requires it][#requiresAtomicApply], it
+/// also tells the transaction which attempts it applied ([#onApplied]) and which it did not ([#onAttemptLost]).
+///
 /// If the memtable prefers to supply individual cells rather than rows, the `onInserted`/`onUpdated` calls above
 /// are replaced with a sequence of `startRow` plus zero or more calls to `onCellUpdate`.
 public interface UpdateTransaction extends IndexTransaction
@@ -98,6 +102,32 @@ public interface UpdateTransaction extends IndexTransaction
     default void abort()
     {
         commit();
+    }
+
+    /// Whether the memtable should apply this update atomically for some of its indexers: merge it and make it
+    /// visible under a lock of the partition that every update of the partition that asks for this takes, and call
+    /// [#onApplied] before releasing that lock. Only asked by memtables that merge updates in a CAS loop and support
+    /// this (see `Memtable#appliesUpdatesAtomicallyOnRequest()`), and only true for transactions made for such a
+    /// memtable. A memtable that honours it calls [#onAttemptLost] for every merge attempt it does not apply, and
+    /// [#onApplied] for the one it applies, then [#commit] as usual. The memtable asks before the first event, and
+    /// asking commits it to that protocol: the transaction then holds the events of those indexers until [#onApplied],
+    /// and drops them at [#commit] if it was never called.
+    default boolean requiresAtomicApply()
+    {
+        return false;
+    }
+
+    /// The memtable merged the update but did not apply that merge, because another writer changed the partition
+    /// first, and will merge the update again. Only called if [#requiresAtomicApply] is true.
+    default void onAttemptLost()
+    {
+    }
+
+    /// The memtable applied the last merge of the update, and still holds the lock that serializes the updates of the
+    /// partition that [require it][#requiresAtomicApply]. Only called if [#requiresAtomicApply] is true, at most once,
+    /// and before [#commit].
+    default void onApplied()
+    {
     }
 
     UpdateTransaction NO_OP = new UpdateTransaction()
