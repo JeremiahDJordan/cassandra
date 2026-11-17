@@ -105,6 +105,14 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
     }
 
     @Override
+    public boolean appliesUpdatesAtomically()
+    {
+        // A failed update leaves the trie without any of the update's rows and deletions, and put() completes the index
+        // transaction under the shard lock.
+        return true;
+    }
+
+    @Override
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
         DecoratedKey key = update.partitionKey();
@@ -509,6 +517,7 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
             acquireWriteLock();
             try
             {
+                Throwable updateFailure = null;
                 try
                 {
                     indexer.start();
@@ -534,15 +543,31 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
                         partitionCount += getUpdaterPartitionsAdded(updater);
                     }
                 }
+                catch (Throwable t)
+                {
+                    updateFailure = t;
+                    throw t;
+                }
                 finally
                 {
-                    indexer.commit();
-                    updateMinTimestamp(update.stats().minTimestamp);
-                    updateLiveDataSize(updater.dataSize);
-                    updateCurrentOperations(update.operationCount());
+                    try
+                    {
+                        // A failed update leaves the trie without any of its rows and deletions, so the indexes must
+                        // not see it either.
+                        if (updateFailure == null)
+                            indexer.commit();
+                        else
+                            abortIndexTransaction(indexer, updateFailure);
+                    }
+                    finally
+                    {
+                        updateMinTimestamp(update.stats().minTimestamp);
+                        updateLiveDataSize(updater.dataSize);
+                        updateCurrentOperations(update.operationCount());
 
-                    columns = columns.mergeTo(update.columns());
-                    stats = stats.mergeWith(update.stats());
+                        columns = columns.mergeTo(update.columns());
+                        stats = stats.mergeWith(update.stats());
+                    }
                 }
             }
             finally
