@@ -241,6 +241,20 @@ public interface Memtable extends Comparable<Memtable>, UnfilteredSource, CellSo
     }
 
     /**
+     * Whether {@link #put} applies each update atomically and completes its index transaction before the next write to
+     * the partition: a {@code put} that throws leaves none of the update's rows and deletions and ends the transaction
+     * with {@link UpdateTransaction#abort}, and {@code put} ends the transaction while it holds the lock that
+     * serializes writes to the partition. The secondary index manager then holds the index events of an update until
+     * {@code commit()} and drops them on {@code abort()}; otherwise it delivers them as the update is merged. An
+     * indexer that throws in {@code commit()} misses its event, and the write fails. The flag is inherited: a subclass
+     * that overrides {@link #put}, or a memtable that wraps another one, must re-evaluate or forward it.
+     */
+    default boolean appliesUpdatesAtomically()
+    {
+        return false;
+    }
+
+    /**
      * Get the partition for the specified key. Returns null if no such partition is present.
      */
     Partition getPartition(DecoratedKey key);
