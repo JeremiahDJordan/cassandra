@@ -540,15 +540,24 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         {
             long startTimeNanos = Clock.Global.nanoTime();
             UnfilteredRowIterator partition = controller.getPartition(keys, executionController);
-            UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
-            queryContext.checkpoint();
+            try
+            {
+                UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
+                queryContext.checkpoint();
 
-            // Note that we record the duration of the read after post-filtering, which actually
-            // materializes the rows from disk.
-            queryContext.addPostFilteringReadLatency(Clock.Global.nanoTime() - startTimeNanos);
+                // Note that we record the duration of the read after post-filtering, which actually
+                // materializes the rows from disk.
+                queryContext.addPostFilteringReadLatency(Clock.Global.nanoTime() - startTimeNanos);
 
-            queryContext.addKeysFetched(keys.size());
-            return applyIndexFilter(counted, filterTree);
+                queryContext.addKeysFetched(keys.size());
+                return applyIndexFilter(counted, filterTree);
+            }
+            catch (Throwable t)
+            {
+                // The partition isn't returned, so nothing else will close it. This happens when the query times out.
+                FileUtils.closeQuietly(partition);
+                throw t;
+            }
         }
 
         @Override
