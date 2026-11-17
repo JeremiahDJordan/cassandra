@@ -32,12 +32,10 @@ import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
-import org.apache.cassandra.index.Index;
-import org.apache.cassandra.index.TargetParser;
 import org.apache.cassandra.index.sai.IndexContext;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.io.sstable.Component;
@@ -48,9 +46,6 @@ import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
-import org.apache.cassandra.schema.ColumnMetadata;
-import org.apache.cassandra.schema.IndexMetadata;
-import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.OutputHandler;
@@ -120,48 +115,9 @@ public class SSTableImporter
 
                             if (options.failOnMissingIndex)
                             {
-                                Index.Group saiIndexGroup = cfs.indexManager.getIndexGroup(StorageAttachedIndexGroup.GROUP_KEY);
-                                if (saiIndexGroup != null)
-                                {
-                                    String keyspace = cfs.getKeyspaceName();
-                                    String table = cfs.getTableName();
-
-                                    SSTableReader reader = SSTableReader.open(cfs, descriptor);
-                                    StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
-                                    if (group == null)
-                                        throw new IllegalStateException(String.format("Missing SAI index group to import for SSTable %s on %s.%s",
-                                                                                      descriptor.toString(),
-                                                                                      keyspace,
-                                                                                      table));
-
-                                    IndexDescriptor indexDescriptor = group.descriptorFor(reader);
-                                    if (!indexDescriptor.perSSTableComponents().isComplete())
-                                        throw new IllegalStateException(String.format("Missing SAI index to import for SSTable %s on %s.%s",
-                                                                                      descriptor.toString(),
-                                                                                      keyspace,
-                                                                                      table));
-
-                                    for (Index index : saiIndexGroup.getIndexes())
-                                    {
-                                        TableMetadata tableMetadata = cfs.metadata();
-                                        IndexMetadata indexMetadata = index.getIndexMetadata();
-                                        Pair<ColumnMetadata, IndexTarget.Type> target = TargetParser.parse(tableMetadata, indexMetadata);
-                                        IndexContext indexContext = new IndexContext(tableMetadata.keyspace,
-                                                                                     tableMetadata.name,
-                                                                                     tableMetadata.id,
-                                                                                     tableMetadata.partitionKeyType,
-                                                                                     tableMetadata.comparator,
-                                                                                     target.left,
-                                                                                     target.right,
-                                                                                     indexMetadata,
-                                                                                     cfs);
-                                        if (!indexDescriptor.perIndexComponents(indexContext).isComplete())
-                                            throw new IllegalStateException(String.format("Missing SAI index to import for index %s on %s.%s",
-                                                                                          index.getIndexMetadata().name,
-                                                                                          keyspace,
-                                                                                          table));
-                                    }
-                                }
+                                StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+                                if (group != null)
+                                    checkSAIComponentsComplete(descriptor, group);
                             }
 
                             if (options.verifySSTables || options.verifyTokens)
@@ -439,6 +395,35 @@ public class SSTableImporter
         catch (IOException ex)
         {
             throw new RuntimeException("Failed to import sstable " + reader.getFilename(), ex);
+        }
+    }
+
+    /**
+     * Checks that the SSTable to import has complete SAI components for every SAI index of the table.
+     * <p>
+     * This works from the descriptor alone, without opening the SSTable or caching anything in the index group, as
+     * the SSTable isn't part of the table yet.
+     */
+    private void checkSAIComponentsComplete(Descriptor descriptor, StorageAttachedIndexGroup group)
+    {
+        Set<IndexContext> contexts = new HashSet<>();
+        for (StorageAttachedIndex index : group.getIndexes())
+            contexts.add(index.getIndexContext());
+
+        IndexDescriptor indexDescriptor = IndexDescriptor.load(descriptor, cfs.metadata(), contexts);
+        if (!indexDescriptor.perSSTableComponents().isComplete())
+            throw new IllegalStateException(String.format("Missing SAI index to import for SSTable %s on %s.%s",
+                                                          descriptor,
+                                                          cfs.getKeyspaceName(),
+                                                          cfs.getTableName()));
+
+        for (IndexContext context : contexts)
+        {
+            if (!indexDescriptor.perIndexComponents(context).isComplete())
+                throw new IllegalStateException(String.format("Missing SAI index to import for index %s on %s.%s",
+                                                              context.getIndexName(),
+                                                              cfs.getKeyspaceName(),
+                                                              cfs.getTableName()));
         }
     }
 
