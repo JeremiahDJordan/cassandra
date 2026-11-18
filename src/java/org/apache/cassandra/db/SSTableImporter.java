@@ -222,6 +222,8 @@ public class SSTableImporter
             {
                 addLock.unlock();
             }
+            // An SSTable-attached index created since they were validated or built doesn't cover them.
+            cfs.indexManager.checkSSTableAttachedIndexesAfterAdding(newSSTables);
             for (SSTableReader reader : newSSTables)
             {
                 if (options.invalidateCaches && cfs.isRowCacheEnabled())

@@ -31,6 +31,8 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
@@ -43,9 +45,14 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.cache.RowCacheKey;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.dht.BootStrapper;
+import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
+import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
@@ -936,6 +943,70 @@ public class ImportTest extends CQLTester
             }
 
             execute(String.format("DROP TABLE IF EXISTS %s.%s", KEYSPACE, "sai_test"));
+        }
+    }
+
+    /** A stopped build of the indexes missing on the imported SSTables fails the import; the index stays queryable. */
+    @Test
+    public void mustFailWithoutAffectingIndexWhenSAIBuildIsStoppedTest() throws Throwable
+    {
+        File backupDir = null;
+        Injections.Barrier holdBuild = Injections.newBarrier("hold_import_sai_build", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(StorageAttachedIndexBuilder.class)
+                                                                        .onMethod("indexSSTable"))
+                                                 .build();
+        try
+        {
+            schemaChange(String.format("CREATE TABLE %s.%s (id int primary key, d int)", KEYSPACE, "sai_stopped_test"));
+
+            for (int i = 0; i < 10; i++)
+                execute(String.format("INSERT INTO %s.%s (id, d) values (?, ?)", KEYSPACE, "sai_stopped_test"), i, i);
+
+            ColumnFamilyStore cfs = getColumnFamilyStore(KEYSPACE, "sai_stopped_test");
+            Util.flush(cfs);
+
+            Set<SSTableReader> sstables = cfs.getLiveSSTables();
+            cfs.clearUnsafe();
+
+            backupDir = moveToBackupDir(sstables);
+
+            // The SSTables were written before the index, so the import has to build it on them...
+            createIndexAndWait(String.format("CREATE INDEX idx1 ON %s.%s (d) USING 'sai'", KEYSPACE, "sai_stopped_test"), "idx1");
+            assertTrue(cfs.indexManager.isIndexQueryable("idx1"));
+
+            // ...and that build is stopped, as nodetool stop INDEX_BUILD would.
+            Injections.inject(holdBuild);
+            SSTableImporter importer = new SSTableImporter(cfs);
+            SSTableImporter.Options options = SSTableImporter.Options.options(backupDir.toString())
+                                                                     .copyData(true)
+                                                                     .build();
+            CompletableFuture<List<String>> result = CompletableFuture.supplyAsync(() -> importer.importNewSSTables(options));
+            Util.spinAssertEquals(1L, holdBuild::getCount, 60);
+            CompactionManager.instance.stopCompaction("INDEX_BUILD");
+            holdBuild.countDown();
+            holdBuild.disable();
+
+            assertThatThrownBy(() -> result.get(60, TimeUnit.SECONDS)).hasStackTraceContaining("Failed adding SSTables")
+                                                                      .hasRootCauseInstanceOf(CompactionInterruptedException.class);
+
+            // The SSTables weren't added, and the index is unaffected.
+            assertEquals(0, execute(String.format("SELECT * FROM %s.%s", KEYSPACE, "sai_stopped_test")).size());
+            assertTrue(cfs.indexManager.isIndexQueryable("idx1"));
+            assertEquals(0, execute(String.format("SELECT * FROM %s.%s WHERE d >= 0", KEYSPACE, "sai_stopped_test")).size());
+        }
+        finally
+        {
+            holdBuild.disable();
+            Injections.deleteAll();
+
+            if (backupDir != null)
+            {
+                backupDir.deleteRecursive();
+                backupDir.parent().deleteRecursive();
+            }
+
+            execute(String.format("DROP TABLE IF EXISTS %s.%s", KEYSPACE, "sai_stopped_test"));
         }
     }
 

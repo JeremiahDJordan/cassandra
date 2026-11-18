@@ -90,9 +90,11 @@ public class IndexParallelBuildTest extends SAITester
         String index = createIndex(String.format(CREATE_INDEX_TEMPLATE, "v1"));
         assertTrue(getCurrentColumnFamilyStore().getLiveSSTables().isEmpty());
 
+        // Both the build of the indexes missing on loaded SSTables and a full rebuild split the SSTables to build
+        // into groups built in parallel.
         Injections.Counter parallelBuildCounter = Injections.newCounter("IndexParallelBuildCounter")
-                                                            .add(InvokePointBuilder.newInvokePoint().onClass("org.apache.cassandra.index.sai.StorageAttachedIndex$StorageAttachedIndexBuildingSupport")
-                                                                                   .onMethod("getParallelIndexBuildTasks"))
+                                                            .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndex.class)
+                                                                                   .onMethod("groupBySize"))
                                                             .build();
 
         Injections.inject(parallelBuildCounter);

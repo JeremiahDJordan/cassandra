@@ -1158,6 +1158,25 @@ public interface Index
         }
 
         /**
+         * Builds the SSTable-attached indexes of this group that are missing or incomplete on the specified SSTables,
+         * which are about to be added to the table (e.g. those of a stream, written without the indexes created while
+         * they were received). {@link #checkSSTableAttachedIndexesAfterAdding} must be called once they are added.
+         *
+         * @throws RuntimeException if an index can't be built, or is still incomplete after it has been built
+         */
+        default void buildMissingSSTableAttachedIndexes(Collection<SSTableReader> sstables)
+        {
+        }
+
+        /**
+         * Checks the SSTable-attached indexes of this group against the specified SSTables, just added to the table
+         * after {@link #buildMissingSSTableAttachedIndexes}: an index created after that build doesn't cover them.
+         */
+        default void checkSSTableAttachedIndexesAfterAdding(Collection<SSTableReader> sstables)
+        {
+        }
+
+        /**
          * Whether this index group supports sharding when flushing memtables, e.g. level 0 of UCS.
          * @return true iff all indexes in the group support L0 sharding.
          */

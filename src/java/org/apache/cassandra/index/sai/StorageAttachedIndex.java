@@ -38,6 +38,7 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
@@ -356,6 +357,10 @@ public class StorageAttachedIndex implements Index
     // once per instance, and the pre-join task read it. It is never cleared: a rebuild (nodetool rebuild_index) doesn't
     // read it, and builds every SSTable from the data, deleting the files of the index's names first.
     private volatile String cannotBuildReason = null;
+
+    // SSTables added without this index while it was being built, which its initial build must build before it
+    // completes (see StorageAttachedIndexGroup#checkSSTableAttachedIndexesAfterAdding).
+    private final Set<SSTableReader> toBuildBeforeQueryable = ConcurrentHashMap.newKeySet();
 
     /**
      * Called via reflection from SecondaryIndexManager
@@ -818,6 +823,8 @@ public class StorageAttachedIndex implements Index
             {
                 checkCanBuild();
                 Object result = startInitialBuild(baseCfs, isStarting, decision.skipped()).get();
+                if (!decision.skipped())
+                    buildSSTablesAddedDuringInitialBuild();
                 return result;
             }
             finally
@@ -924,6 +931,72 @@ public class StorageAttachedIndex implements Index
         if (reason != null)
             throw new IllegalStateException(indexContext.logMessage("Cannot build the index: " + reason + ". " +
                                                                     "Rebuild the index once the cause is fixed."));
+    }
+
+    /**
+     * Hands the specified live SSTables, which have been added without this index while it is being built, to its
+     * initial build, which builds them before it completes, as it may have selected the SSTables to build before they
+     * were added.
+     */
+    void buildBeforeQueryable(Collection<SSTableReader> sstables)
+    {
+        toBuildBeforeQueryable.addAll(sstables);
+    }
+
+    void forgetBuildBeforeQueryable(Collection<SSTableReader> sstables)
+    {
+        toBuildBeforeQueryable.removeAll(sstables);
+    }
+
+    /**
+     * Builds this index on the SSTables that have been handed to its initial build by {@link #buildBeforeQueryable},
+     * if it hasn't built them yet, so that it doesn't become queryable without them.
+     *
+     * @throws IllegalStateException if some of those SSTables are still live without this index once built
+     */
+    private void buildSSTablesAddedDuringInitialBuild() throws Exception
+    {
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
+        if (group == null || !group.containsIndex(this))
+            return;
+
+        Set<SSTableReader> handled = new HashSet<>();
+        while (!toBuildBeforeQueryable.isEmpty())
+        {
+            List<SSTableReader> sstables = new ArrayList<>(toBuildBeforeQueryable);
+            toBuildBeforeQueryable.removeAll(sstables);
+            handled.addAll(sstables);
+
+            List<SSTableReader> unindexed = group.unindexedLiveSSTables(this, sstables)
+                                                 .stream()
+                                                 .filter(sstable -> !IndexDescriptor.isIndexBuildCompleteOnDisk(sstable, indexContext))
+                                                 .collect(Collectors.toList());
+            if (unindexed.isEmpty())
+                continue;
+
+            logger.info(indexContext.logMessage("Building {} SSTables added without this index during its initial build: {}"),
+                        unindexed.size(), unindexed.stream().map(sstable -> sstable.descriptor).collect(Collectors.toList()));
+            buildSSTables(group, unindexed);
+        }
+
+        List<SSTableReader> missing = group.unindexedLiveSSTables(this, handled);
+        if (!missing.isEmpty() && group.containsIndex(this))
+            throw new IllegalStateException(indexContext.logMessage(
+                "SSTables added during the initial build are still missing from the index after building them: " +
+                missing.stream().map(sstable -> sstable.descriptor).collect(Collectors.toList())));
+    }
+
+    private void buildSSTables(StorageAttachedIndexGroup group, List<SSTableReader> sstables) throws Exception
+    {
+        List<Future<?>> futures = new ArrayList<>();
+        for (List<SSTableReader> sstablesGroup : groupBySize(sstables, DatabaseDescriptor.getConcurrentCompactors()))
+        {
+            SortedMap<SSTableReader, Set<StorageAttachedIndex>> current = new TreeMap<>(SSTableReader.idComparator);
+            sstablesGroup.forEach(sstable -> current.put(sstable, Collections.singleton(this)));
+            StorageAttachedIndexBuilder builder = new StorageAttachedIndexBuilder(group, current, false, true);
+            futures.add(CompactionManager.instance.submitIndexBuild(builder));
+        }
+        FutureCombiner.allOf(futures).get();
     }
 
     private Future<?> startInitialBuild(ColumnFamilyStore baseCfs, boolean validate, boolean skipIndexBuild)

@@ -99,6 +99,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     private final TimeUUID compactionId = nextTimeUUID();
     private final boolean isFullRebuild;
     private final boolean isInitialBuild;
+    /** Whether the built SSTables are added to the views of their indexes, see {@link #completeSSTable}. */
+    private final boolean updateViews;
 
     // The reserved SSTables whose rebuild status this builder still owns and must release.
     private final Set<SSTableReader> outstandingReservations;
@@ -122,12 +124,28 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                                 boolean isInitialBuild,
                                 boolean ownsStreamRebuildStatus)
     {
+        this(group, sstables, isFullRebuild, isInitialBuild, ownsStreamRebuildStatus, true);
+    }
+
+    /**
+     * @param updateViews whether to add each SSTable to the views of the built indexes once it's built. This must be
+     *                    {@code false} for SSTables that aren't live yet, which their indexes pick up when they are
+     *                    added to the table: their views must not reference an SSTable that may never be added.
+     */
+    StorageAttachedIndexBuilder(StorageAttachedIndexGroup group,
+                                SortedMap<SSTableReader, Set<StorageAttachedIndex>> sstables,
+                                boolean isFullRebuild,
+                                boolean isInitialBuild,
+                                boolean ownsStreamRebuildStatus,
+                                boolean updateViews)
+    {
         this.group = group;
         this.metadata = group.metadata();
         this.sstables = sstables;
         this.tracker = group.table().getTracker();
         this.isFullRebuild = isFullRebuild;
         this.isInitialBuild = isInitialBuild;
+        this.updateViews = updateViews;
         this.outstandingReservations = ownsStreamRebuildStatus ? new HashSet<>(sstables.keySet()) : Collections.emptySet();
         this.totalSizeInBytes = sstables.keySet().stream().mapToLong(SSTableReader::uncompressedLength).sum();
     }
@@ -281,7 +299,13 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             long keyCount = SSTableReader.getApproximateKeyCount(Set.of(sstable));
             // If the build fails, only the indexes we were asked to build become non-queryable: the others keep using
             // the Apache Cassandra components, which are only removed once the build has succeeded.
-            indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes, requestedIndexes, txn, keyCount, perIndexComponentsOnly, group.table().metric);
+            // None does for an SSTable that isn't live yet: its failed build fails the operation that was going to
+            // add it (a stream or an import), and the indexes, which don't serve it, are fine. That includes the
+            // failures the writer handles itself (adding a row, completing a segment), which abort it as failures
+            // of the index.
+            indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes,
+                                                         updateViews ? requestedIndexes : Collections.emptySet(),
+                                                         txn, keyCount, perIndexComponentsOnly, group.table().metric);
 
             indexWriter.begin();
 
@@ -332,7 +356,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         {
             if (indexWriter != null)
             {
-                indexWriter.abort(t, true);
+                // The index is only affected if the SSTable is live: for one that isn't yet, the failure fails the
+                // operation that was going to add it (a stream or import), and the index is fine without it. The
+                // writer then neither makes the index non-queryable nor rethrows, and the failure is handled below.
+                indexWriter.abort(t, updateViews);
             }
 
             if (t instanceof InterruptedException)
@@ -352,6 +379,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 else
                 {
                     logger.info(logMessage("Stop requested while building indexes {} on SSTable {}. {}"), indexes, sstable.descriptor, t.getMessage());
+                    // A stop fails the build of SSTables that aren't live yet, and so the operation that was going to
+                    // add them, which can't add them without their indexes.
+                    if (!updateViews)
+                        throw Throwables.unchecked(t);
                     return true;
                 }
             }
@@ -511,15 +542,18 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
         // Register components from the descriptor that owns the writers. The context cache may have been
         // evicted before this point, and a reader lookup would reconstruct a descriptor from the pre-build TOC.
-        sstable.registerComponents(group.activeComponents(indexDescriptor), tracker);
+        // The size of an SSTable that isn't live yet isn't tracked: it's accounted for, components included, when the
+        // SSTable is added to the table.
+        Tracker componentsTracker = updateViews ? tracker : null;
+        sstable.registerComponents(group.activeComponents(indexDescriptor), componentsTracker);
         registered = true;
         Set<StorageAttachedIndex> incomplete;
         try
         {
             if (!replacedComponents.isEmpty())
-                sstable.unregisterComponents(replacedComponents, tracker);
+                sstable.unregisterComponents(replacedComponents, componentsTracker);
             // Our components replace any Apache Cassandra ones now (see withAllIndexes).
-            group.removeApacheComponents(sstable, outstandingReservations.contains(sstable));
+            group.removeApacheComponents(sstable, outstandingReservations.contains(sstable), componentsTracker);
 
             /**
              * During memtable flush, it completes the transaction first which opens the flushed sstable,
@@ -538,8 +572,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         catch (Throwable t)
         {
             // Our components are registered, and may have replaced Apache Cassandra ones that the other indexes we
-            // built used, so none of them can be trusted anymore.
-            existing.forEach(StorageAttachedIndex::makeIndexNonQueryable);
+            // built used, so none of them can be trusted anymore. That's only for a live SSTable: the indexes don't use
+            // one that isn't live yet, whose failure fails the operation that was going to add it.
+            if (updateViews)
+                existing.forEach(StorageAttachedIndex::makeIndexNonQueryable);
             throw t;
         }
         if (!incomplete.isEmpty())

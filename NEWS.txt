@@ -268,6 +268,12 @@ Upgrading
       corruption) replaces all of them for every index of the table, and compaction writes the current format. DROP
       INDEX deletes that index's Apache files. -Dcassandra.sai.read_apache_format=false ignores Apache's files, which
       are then rebuilt like missing ones.
+    - A node that receives SSTables by streaming (repair, rebuild, bootstrap, decommission...) without entire-SSTable
+      streaming, or by nodetool import, builds only the storage-attached indexes those SSTables are missing before
+      adding them. A failure or stop of that build (nodetool stop INDEX_BUILD, a major compaction...) fails the
+      stream or the import, which don't add the SSTables, without making the index non-queryable on the node. Once
+      the SSTables are added, an index still missing some of them is built on them by its initial build if that is
+      running, and is made non-queryable otherwise, until nodetool rebuild_index or a restart.
 
 5.0.9
 =====

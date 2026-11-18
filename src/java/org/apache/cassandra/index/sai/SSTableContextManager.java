@@ -200,6 +200,20 @@ public class SSTableContextManager
         sstableContexts.clear();
     }
 
+    /**
+     * Forgets the cached descriptors of those of the specified SSTables that aren't tracked, i.e. that have no
+     * {@link SSTableContext}. An index can be built on SSTables before they are added to the table, which may never
+     * happen: their descriptors are loaded again if they are.
+     */
+    void forgetUntrackedDescriptors(Collection<SSTableReader> sstables)
+    {
+        for (SSTableReader sstable : sstables)
+        {
+            if (!sstableContexts.containsKey(sstable))
+                sstableDescriptors.remove(sstable);
+        }
+    }
+
     @SuppressWarnings("resource")
     private void remove(SSTableReader sstable)
     {

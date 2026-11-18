@@ -696,7 +696,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             }
             else
             {
-                buildSSTableAttachedIndexesBlocking(sstables);
+                buildMissingSSTableAttachedIndexes(sstables);
                 builds++;
             }
         }
@@ -747,6 +747,32 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         finally
         {
             lock.unlock();
+        }
+    }
+
+    /**
+     * Builds the missing SSTable-attached indexes of each group, see
+     * {@link Index.Group#buildMissingSSTableAttachedIndexes}.
+     */
+    public void buildMissingSSTableAttachedIndexes(Collection<SSTableReader> sstables)
+    {
+        for (Index.Group group : indexGroups.values())
+        {
+            if (group.getIndexes().stream().anyMatch(Index::isSSTableAttached))
+                group.buildMissingSSTableAttachedIndexes(sstables);
+        }
+    }
+
+    /**
+     * Checks the SSTable-attached indexes of each group, see
+     * {@link Index.Group#checkSSTableAttachedIndexesAfterAdding}.
+     */
+    public void checkSSTableAttachedIndexesAfterAdding(Collection<SSTableReader> sstables)
+    {
+        for (Index.Group group : indexGroups.values())
+        {
+            if (group.getIndexes().stream().anyMatch(Index::isSSTableAttached))
+                group.checkSSTableAttachedIndexesAfterAdding(sstables);
         }
     }
 

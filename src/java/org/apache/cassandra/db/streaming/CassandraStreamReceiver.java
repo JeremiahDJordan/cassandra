@@ -299,6 +299,8 @@ public class CassandraStreamReceiver implements StreamReceiver
                 {
                     addLock.unlock();
                 }
+                // An SSTable-attached index created since they were validated or built doesn't cover them.
+                cfs.indexManager.checkSSTableAttachedIndexesAfterAdding(readers);
 
                 //invalidate row and counter cache
                 if (cfs.isRowCacheEnabled() || cfs.metadata().isCounter())
