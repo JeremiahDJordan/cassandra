@@ -107,6 +107,18 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - Storage-attached indexes (SAI) enforce the sai_string_term_size_*, sai_frozen_term_size_* and
+      sai_vector_term_size_* guardrails (CASSANDRA-19493): by default a client write of an indexed string or frozen
+      term over 1KiB gets a warning and one over 8KiB fails, as does a vector over 32KiB, instead of being left
+      out of the index. The failure threshold is also the largest term indexed; a
+      -Dcassandra.sai.max_*_term_size_kb property takes its place if set, or if the threshold is disabled (8KiB by
+      default, vectors unbounded), and client writes over it are rejected. The guardrails don't apply to superusers,
+      internal writes or, with authentication disabled, any client: their oversized terms are written but not indexed.
+      -Dcassandra.sai.validate_max_term_size_at_coordinator=true checks every write against the largest indexed size
+      instead of the guardrails, and =false accepts oversized writes unindexed. An analyzed value whose terms add up
+      to cassandra.sai.max_analyzed_size_kb (8KiB) is accepted unindexed. String, frozen and analyzed terms over 32766
+      bytes are never indexed, and client writes of them are rejected; such terms already on disk (e.g. from Apache
+      Cassandra 5.0) are left out of the index, with a warning, on compaction or index rebuild.
 
 5.0.7
 ======
