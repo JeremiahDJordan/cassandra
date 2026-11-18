@@ -48,48 +48,45 @@ public class ReversedClusteringIndexTest extends SAITester
     @Test
     public void testText()
     {
-        test("text", true, EMPTY_BYTE_BUFFER, "a", "ab", "b");
+        test("text", EMPTY_BYTE_BUFFER, "a", "ab", "b");
     }
 
     @Test
     public void testVarchar()
     {
-        test("varchar", true, EMPTY_BYTE_BUFFER, "a", "ab", "b");
+        test("varchar", EMPTY_BYTE_BUFFER, "a", "ab", "b");
     }
 
     @Test
     public void testAscii()
     {
-        test("ascii", true, EMPTY_BYTE_BUFFER, "a", "ab", "b");
+        test("ascii", EMPTY_BYTE_BUFFER, "a", "ab", "b");
     }
 
     @Test
     public void testBoolean()
     {
-        test("boolean", true, EMPTY_BYTE_BUFFER, false, true);
+        test("boolean", EMPTY_BYTE_BUFFER, false, true);
     }
 
     @Test
     public void testFrozenTuple()
     {
-        // TODO: the index serves != and NOT IN on frozen tuples, but drops the rows with an empty value, and fails
-        //  the read if the excluded value is empty, whatever the clustering order. Only check that ASC and DESC agree.
-        test("frozen<tuple<int, text>>", false, EMPTY_BYTE_BUFFER, tuple(1, "a"), tuple(1, "b"), tuple(2, ""));
+        test("frozen<tuple<int, text>>", EMPTY_BYTE_BUFFER, tuple(1, "a"), tuple(1, "b"), tuple(2, ""));
     }
 
     @Test
     public void testFrozenUDT()
     {
         String udt = createType("CREATE TYPE %s (i int, t text)");
-        // TODO: as for frozen tuples, only check that ASC and DESC agree on != and NOT IN
-        test("frozen<" + udt + '>', false,
+        test("frozen<" + udt + '>',
              EMPTY_BYTE_BUFFER, userType("i", 1, "t", "a"), userType("i", 1, "t", "b"), userType("i", 2, "t", ""));
     }
 
     @Test
     public void testUUID()
     {
-        test("uuid", true,
+        test("uuid",
              UUID.fromString("00000000-0000-1000-8000-000000000001"),
              UUID.fromString("00000000-0000-4000-8000-000000000002"),
              UUID.fromString("ffffffff-ffff-4fff-bfff-ffffffffffff"));
@@ -98,7 +95,7 @@ public class ReversedClusteringIndexTest extends SAITester
     @Test
     public void testTimeUUID()
     {
-        test("timeuuid", true,
+        test("timeuuid",
              UUID.fromString("00000000-0000-1000-8000-000000000001"),
              UUID.fromString("ffffffff-0000-1000-8000-000000000002"),
              UUID.fromString("00000000-ffff-1fff-8000-000000000003"));
@@ -107,13 +104,13 @@ public class ReversedClusteringIndexTest extends SAITester
     @Test
     public void testInt()
     {
-        test("int", true, Integer.MIN_VALUE, -1, 0, 1, Integer.MAX_VALUE);
+        test("int", Integer.MIN_VALUE, -1, 0, 1, Integer.MAX_VALUE);
     }
 
     @Test
     public void testBigint()
     {
-        test("bigint", true, Long.MIN_VALUE, -1L, 0L, 300L, Long.MAX_VALUE);
+        test("bigint", Long.MIN_VALUE, -1L, 0L, 300L, Long.MAX_VALUE);
     }
 
     @Test
@@ -121,7 +118,7 @@ public class ReversedClusteringIndexTest extends SAITester
     {
         // Not infinite values: an SSTable index's row count estimate for a range fails the read on them, whatever the
         // clustering order, because TermsDistribution can't convert them to BigDecimal
-        test("double", true, -1e300d, -1.5d, 0d, 2.25d, 1e300d);
+        test("double", -1e300d, -1.5d, 0d, 2.25d, 1e300d);
     }
 
     // Not tested here: inet, varint and decimal, whose DESC indexes use their base type (CASSANDRA-20100); see
@@ -130,14 +127,10 @@ public class ReversedClusteringIndexTest extends SAITester
     @Test
     public void testTimestamp()
     {
-        test("timestamp", true, new Date(-1000L), new Date(0L), new Date(1700000000000L));
+        test("timestamp", new Date(-1000L), new Date(0L), new Date(1700000000000L));
     }
 
-    /**
-     * @param notEqualMatchesFiltering whether {@code !=} and {@code NOT IN} must give the same results as filtering,
-     * rather than just the same results for ASC and DESC
-     */
-    private void test(String type, boolean notEqualMatchesFiltering, Object... values)
+    private void test(String type, Object... values)
     {
         String ascIndexed = createIndexedOrPlainTable(type, "ASC", true);
         String descIndexed = createIndexedOrPlainTable(type, "DESC", true);
@@ -150,20 +143,20 @@ public class ReversedClusteringIndexTest extends SAITester
         List<String> failures = new ArrayList<>();
 
         insert(tables, 0, values);
-        checkQueries("memtable", tables, notEqualMatchesFiltering, values, failures);
+        checkQueries("memtable", tables, values, failures);
         flushAll(tables);
-        checkQueries("sstable", tables, notEqualMatchesFiltering, values, failures);
+        checkQueries("sstable", tables, values, failures);
 
         insert(tables, 1, values);
         insert(tables, 2, values[0]);
-        checkQueries("sstable and memtable", tables, notEqualMatchesFiltering, values, failures);
+        checkQueries("sstable and memtable", tables, values, failures);
         flushAll(tables);
-        checkQueries("two sstables", tables, notEqualMatchesFiltering, values, failures);
+        checkQueries("two sstables", tables, values, failures);
 
         compact(KEYSPACE, ascFiltered, descFiltered, ascIndexed, descIndexed);
         for (String table : tables.all)
             assertEquals(table, 1, getColumnFamilyStore(KEYSPACE, table).getLiveSSTables().size());
-        checkQueries("compacted sstable", tables, notEqualMatchesFiltering, values, failures);
+        checkQueries("compacted sstable", tables, values, failures);
 
         assertTrue(String.format("%d failures for type %s:%n%s", failures.size(), type, String.join("\n", failures)),
                    failures.isEmpty());
@@ -193,7 +186,7 @@ public class ReversedClusteringIndexTest extends SAITester
                                       pk, value, pk);
     }
 
-    private void checkQueries(String source, Tables tables, boolean notEqualMatchesFiltering, Object[] values, List<String> failures)
+    private void checkQueries(String source, Tables tables, Object[] values, List<String> failures)
     {
         for (String partition : PARTITION_RESTRICTIONS)
         {
@@ -201,20 +194,20 @@ public class ReversedClusteringIndexTest extends SAITester
             {
                 Object value = values[i];
                 Object next = values[(i + 1) % values.length];
-                checkQuery(source, tables, true, failures, partition + "c = ?", value);
-                checkQuery(source, tables, true, failures, partition + "c IN (?, ?)", value, next);
-                checkQuery(source, tables, notEqualMatchesFiltering, failures, partition + "c != ?", value);
-                checkQuery(source, tables, notEqualMatchesFiltering, failures, partition + "c NOT IN (?, ?)", value, next);
-                checkQuery(source, tables, true, failures, partition + "c > ?", value);
-                checkQuery(source, tables, true, failures, partition + "c >= ?", value);
-                checkQuery(source, tables, true, failures, partition + "c < ?", value);
-                checkQuery(source, tables, true, failures, partition + "c <= ?", value);
-                checkQuery(source, tables, true, failures, partition + "c >= ? AND c < ?", value, next);
+                checkQuery(source, tables, failures, partition + "c = ?", value);
+                checkQuery(source, tables, failures, partition + "c IN (?, ?)", value, next);
+                checkQuery(source, tables, failures, partition + "c != ?", value);
+                checkQuery(source, tables, failures, partition + "c NOT IN (?, ?)", value, next);
+                checkQuery(source, tables, failures, partition + "c > ?", value);
+                checkQuery(source, tables, failures, partition + "c >= ?", value);
+                checkQuery(source, tables, failures, partition + "c < ?", value);
+                checkQuery(source, tables, failures, partition + "c <= ?", value);
+                checkQuery(source, tables, failures, partition + "c >= ? AND c < ?", value, next);
             }
         }
     }
 
-    private void checkQuery(String source, Tables tables, boolean matchesFiltering, List<String> failures, String where, Object... values)
+    private void checkQuery(String source, Tables tables, List<String> failures, String where, Object... values)
     {
         String description = String.format("[%s] WHERE %s with %s", source, where, describe(values));
 
@@ -222,34 +215,21 @@ public class ReversedClusteringIndexTest extends SAITester
         String expected = select(tables.ascFiltered, where, true, values);
         check(failures, description + " ALLOW FILTERING on DESC without index",
               expected, select(tables.descFiltered, where, true, values));
-        String ascIndexed = select(tables.ascIndexed, where, true, values);
-        if (matchesFiltering)
-            check(failures, description + " ALLOW FILTERING on ASC with index", expected, ascIndexed);
-        else
-            expected = ascIndexed;
-        // See the TODO of testFrozenTuple: when only checking that ASC and DESC agree, they may fail alike
+        check(failures, description + " ALLOW FILTERING on ASC with index",
+              expected, select(tables.ascIndexed, where, true, values));
         check(failures, description + " ALLOW FILTERING on DESC with index",
-              expected, select(tables.descIndexed, where, true, values), !matchesFiltering);
+              expected, select(tables.descIndexed, where, true, values));
 
         // Without ALLOW FILTERING, the ASC and DESC indexes support the same queries, with the same results
         check(failures, description + " without ALLOW FILTERING on DESC with index",
               select(tables.ascIndexed, where, false, values),
-              select(tables.descIndexed, where, false, values),
-              !matchesFiltering);
+              select(tables.descIndexed, where, false, values));
     }
 
     private static void check(List<String> failures, String description, String expected, String actual)
     {
-        check(failures, description, expected, actual, false);
-    }
-
-    /**
-     * @param sameFailure whether a query that fails other than by being rejected passes if it fails the same way on
-     * both tables; otherwise it fails, even if it fails with every table
-     */
-    private static void check(List<String> failures, String description, String expected, String actual, boolean sameFailure)
-    {
-        if (!expected.equals(actual) || (expected.startsWith(FAILED) && !sameFailure))
+        // A query that fails other than by being rejected is a failure, even if it fails with every table
+        if (!expected.equals(actual) || expected.startsWith(FAILED))
             failures.add(String.format("%s: expected %s but got %s", description, expected, actual));
     }
 

@@ -82,6 +82,7 @@ import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 import org.apache.lucene.util.automaton.CompiledAutomaton;
 
@@ -948,10 +949,13 @@ public class TrieMemoryIndex extends MemoryIndex
     private long estimateNumRowsInTermRange(@Nullable ByteComparable queryLower, boolean lowerExclusive,
                                             @Nullable ByteComparable queryUpper, boolean upperExclusive)
     {
+        if (isBeforeEmptyTerm(queryUpper, !upperExclusive))
+            return 0;
+        // A null lower bound includes the empty term, the root of the trie
         Trie<PrimaryKeys> subtrie = queryLower == null && queryUpper == null
                                     ? data
-                                    : data.slice(queryLower == null ? ByteComparable.EMPTY : queryLower,
-                                                 queryLower != null && !lowerExclusive,
+                                    : data.slice(queryLower,
+                                                 !lowerExclusive,
                                                  queryUpper,
                                                  queryUpper != null && !upperExclusive);
         long countedRows = 0;
@@ -1079,8 +1083,9 @@ public class TrieMemoryIndex extends MemoryIndex
         }
         else
         {
-            lowerBound = ByteComparable.EMPTY;
-            lowerInclusive = false;
+            // Unbounded: include the empty term (the root of the trie), which literal indexes index
+            lowerBound = null;
+            lowerInclusive = true;
         }
 
         if (expression.upper != null)
@@ -1094,7 +1099,25 @@ public class TrieMemoryIndex extends MemoryIndex
             upperInclusive = false;
         }
 
+        // Nothing sorts before the empty term: a range ending before it, such as the "less than" half of
+        // c != '', is empty, and slicing the trie with it would give the slice an end before its start.
+        if (isBeforeEmptyTerm(upperBound, upperInclusive))
+            return Trie.empty(TypeUtil.byteComparableVersionForTermsData(indexContext.version()));
+
         return data.slice(lowerBound, lowerInclusive, upperBound, upperInclusive);
+    }
+
+    /**
+     * @return whether the given upper bound excludes every term, which is the case of the empty term as an exclusive
+     * upper bound
+     */
+    private boolean isBeforeEmptyTerm(@Nullable ByteComparable upperBound, boolean upperInclusive)
+    {
+        if (upperBound == null || upperInclusive)
+            return false;
+        // The empty value of a non-literal type has no byte-comparable representation (a null source)
+        ByteSource bytes = upperBound.asComparableBytes(TypeUtil.byteComparableVersionForTermsData(indexContext.version()));
+        return bytes == null || bytes.next() == ByteSource.END_OF_STREAM;
     }
 
     @Override
