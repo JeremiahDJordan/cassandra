@@ -195,13 +195,21 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
             }
         }
 
-        BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
-        updateMin(minTimestamp, update.stats().minTimestamp);
-        updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
+        BTreePartitionUpdater updater;
+        try
+        {
+            updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
+        }
+        finally
+        {
+            // addAll can fail after applying the update (in Indexer#finish), so record its columns and stats anyway
+            updateMin(minTimestamp, update.stats().minTimestamp);
+            updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
+            columnsCollector.update(update.columns());
+            statsCollector.update(update.stats());
+            currentOperations.addAndGet(update.operationCount());
+        }
         liveDataSize.addAndGet(initialSize + updater.dataSize);
-        columnsCollector.update(update.columns());
-        statsCollector.update(update.stats());
-        currentOperations.addAndGet(update.operationCount());
         return updater.colUpdateTimeDelta;
     }
 
