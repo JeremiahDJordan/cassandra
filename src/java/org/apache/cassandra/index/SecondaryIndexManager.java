@@ -29,7 +29,6 @@ import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.StringJoiner;
@@ -1520,16 +1519,20 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 try (WriteContext ctx = keyspace.getWriteHandler().createContextForIndexing())
                 {
                     {
-                        Set<Index.Indexer> indexers = indexGroups.values().stream()
-                                                                 .map(g -> g.indexerFor(indexes::contains,
-                                                                                        key,
-                                                                                        partition.columns(),
-                                                                                        nowInSec,
-                                                                                        ctx,
-                                                                                        IndexTransaction.Type.UPDATE,
-                                                                                        null))
-                                                                 .filter(Objects::nonNull)
-                                                                 .collect(Collectors.toSet());
+                        Set<Index.Indexer> indexers = new HashSet<>(indexGroups.size());
+
+                        for (Index.Group g : indexGroups.values())
+                        {
+                            Index.Indexer indexerFor = g.indexerFor(indexes::contains,
+                                                                    key,
+                                                                    partition.columns(),
+                                                                    nowInSec,
+                                                                    ctx,
+                                                                    IndexTransaction.Type.UPDATE,
+                                                                    null);
+                            if (indexerFor != null)
+                                indexers.add(indexerFor);
+                        }
 
                         // Short-circuit empty partitions if static row is processed or isn't read
                         if (!readStatic && partition.isEmpty() && partition.staticRow().isEmpty())
@@ -2011,22 +2014,26 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         if (!hasIndexes())
             return UpdateTransaction.NO_OP;
 
-        Index.Indexer[] indexers = listIndexGroups().stream()
-                                                    .map(g -> g.indexerFor(writableIndexSelector(),
-                                                                           update.partitionKey(),
-                                                                           update.columns(),
-                                                                           nowInSec,
-                                                                           ctx,
-                                                                           IndexTransaction.Type.UPDATE,
-                                                                           memtable))
-                                                    .filter(Objects::nonNull)
-                                                    .toArray(Index.Indexer[]::new);
+        List<Index.Indexer> indexers = new ArrayList<>(indexGroups.size());
 
-        if (indexers.length == 0)
+        for (Index.Group g : indexGroups.values())
+        {
+            Index.Indexer indexer = g.indexerFor(writableIndexSelector(),
+                                                 update.partitionKey(),
+                                                 update.columns(),
+                                                 nowInSec,
+                                                 ctx,
+                                                 IndexTransaction.Type.UPDATE,
+                                                 memtable);
+            if (indexer != null)
+                indexers.add(indexer);
+        }
+
+        if (indexers.isEmpty())
             return UpdateTransaction.NO_OP;
         boolean atomicMemtable = memtable != null && memtable.appliesUpdatesAtomically();
         boolean atomicOnRequest = !atomicMemtable && memtable != null && memtable.appliesUpdatesAtomicallyOnRequest();
-        return new WriteTimeTransaction(baseCfs, atomicMemtable, atomicOnRequest, indexers);
+        return new WriteTimeTransaction(baseCfs, atomicMemtable, atomicOnRequest, indexers.toArray(Index.Indexer[]::new));
     }
 
     private Predicate<Index> writableIndexSelector()
