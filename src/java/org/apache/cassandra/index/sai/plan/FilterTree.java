@@ -22,6 +22,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
+import java.util.Set;
 
 import com.google.common.collect.ListMultimap;
 
@@ -48,7 +49,9 @@ import static org.apache.cassandra.index.sai.plan.Operation.OperationType;
  * 3. Replica filter protecting may fetch data that doesn't match index expressions.
  * <p>
  * If the query can't be strictly filtered on local data (see {@link QueryController#usesStrictFiltering()}) and
- * has index matches on unrepaired data, the intersections are relaxed into unions.
+ * has index matches on unrepaired data, the intersections are relaxed into unions. If all the matches are repaired,
+ * the indexed expressions are still intersected, but the expressions of several unindexed mutable columns, or of
+ * several elements of an unindexed non-frozen collection, are unioned (CASSANDRA-20189).
  */
 public class FilterTree
 {
@@ -58,23 +61,33 @@ public class FilterTree
     private final boolean isStrict;
     private final QueryContext context;
 
+    /** The mutable columns of this node with expressions that aren't served by index scans */
+    private final Set<ColumnMetadata> unindexedColumns;
+
+    /** Lazily computed result of {@link #unindexedMutableTerms()}, as the children are added after construction */
+    private int unindexedMutableTerms = -1;
+
     /**
      * @param operation the operation combining the expressions and the children of this node
      * @param expressions the expressions of this node, by column
      * @param isStrict whether the intersections can be strictly evaluated on local data
      * @param context the context of the query, which tells whether there are index matches on unrepaired data;
      *                it can only be {@code null} if {@code isStrict} is {@code true}
+     * @param unindexedColumns the mutable (non-primary key) columns in {@code expressions} with expressions that
+     *                         aren't served by index scans
      */
     FilterTree(OperationType operation,
                ListMultimap<ColumnMetadata, Expression> expressions,
                boolean isStrict,
-               QueryContext context)
+               QueryContext context,
+               Set<ColumnMetadata> unindexedColumns)
     {
         assert isStrict || context != null : "Non-strict filtering requires a query context";
         this.op = operation;
         this.expressions = expressions;
         this.isStrict = isStrict;
         this.context = context;
+        this.unindexedColumns = unindexedColumns;
     }
 
     void addChild(FilterTree child)
@@ -85,6 +98,10 @@ public class FilterTree
     public boolean isSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
     {
         OperationType localOperator = localOperator();
+
+        if (localOperator == OperationType.AND && !isStrict && unindexedMutableTerms() > 1)
+            return isSatisfiedByIsolatingUnindexed(key, currentCluster, staticRow);
+
         boolean result = localSatisfiedBy(key, currentCluster, staticRow, localOperator);
 
         if (shouldReturnNow(localOperator, result))
@@ -133,23 +150,117 @@ public class FilterTree
             while(filterIterator.hasPrevious())
             {
                 Expression filter = filterIterator.previous();
-
-                if (TypeUtil.isNonFrozenCollection(column.type))
-                {
-                    Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
-                    result = localOperator.apply(result, filter.isSatisfiedBy(valueIterator));
-                }
-                else
-                {
-                    ByteBuffer value = filter.context.getValueOf(key, row, now);
-                    result = localOperator.apply(result, filter.isSatisfiedBy(value));
-                }
+                result = localOperator.apply(result, isSatisfiedBy(key, row, column, filter, now));
 
                 if (shouldReturnNow(localOperator, result))
                     return result;
             }
         }
         return result;
+    }
+
+    /**
+     * Evaluates an intersection that can't be strictly evaluated, when all the index matches are on repaired data.
+     * <p>
+     * Repaired data is consistent across replicas, so the indexed expressions are still intersected. However, the
+     * unindexed mutable columns might have been updated on different replicas, so the expressions on those columns,
+     * and the nested operations restricting those columns, are unioned (CASSANDRA-20189).
+     */
+    private boolean isSatisfiedByIsolatingUnindexed(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
+    {
+        if (currentCluster == null || !currentCluster.isRow())
+            return false;
+
+        final long now = FBUtilities.nowInSeconds();
+        boolean unindexedResult = false;
+
+        for (ColumnMetadata column : expressions.keySet())
+        {
+            Row row = column.kind == Kind.STATIC ? staticRow : (Row) currentCluster;
+            List<Expression> filters = expressions.get(column);
+            boolean isUnindexed = unindexedColumns.contains(column);
+
+            // Once an unindexed column matches, the union of the unindexed columns does too
+            if (isUnindexed && unindexedResult)
+                continue;
+
+            // Reverse iteration to check the NOT_EQ expressions first, as in #localSatisfiedBy
+            ListIterator<Expression> filterIterator = filters.listIterator(filters.size());
+            while (filterIterator.hasPrevious())
+            {
+                boolean matches = isSatisfiedBy(key, row, column, filterIterator.previous(), now);
+                if (isUnindexed)
+                {
+                    unindexedResult = matches;
+                    if (matches)
+                        break;
+                }
+                else if (!matches)
+                {
+                    return false;
+                }
+            }
+        }
+
+        for (FilterTree child : children)
+        {
+            if (!child.restrictsUnindexedMutableColumns())
+            {
+                if (!child.isSatisfiedBy(key, currentCluster, staticRow))
+                    return false;
+            }
+            else if (!unindexedResult)
+            {
+                unindexedResult = child.isSatisfiedBy(key, currentCluster, staticRow);
+            }
+        }
+
+        return unindexedResult;
+    }
+
+    /**
+     * @return the number of terms of this node, if it is an intersection, that restrict mutable columns that aren't
+     * served by index scans: the unindexed columns of the node, each expression on an unindexed non-frozen collection
+     * (its elements can be updated on different replicas), and its children restricting any such column
+     */
+    private int unindexedMutableTerms()
+    {
+        if (unindexedMutableTerms < 0)
+        {
+            int terms = 0;
+            for (ColumnMetadata column : unindexedColumns)
+                terms += TypeUtil.isNonFrozenCollection(column.type) ? expressions.get(column).size() : 1;
+            for (FilterTree child : children)
+            {
+                if (child.restrictsUnindexedMutableColumns())
+                    terms++;
+            }
+            unindexedMutableTerms = terms;
+        }
+        return unindexedMutableTerms;
+    }
+
+    /**
+     * @return {@code true} if this node or any of its descendants restricts a mutable column that isn't served by
+     * index scans, {@code false} otherwise
+     */
+    private boolean restrictsUnindexedMutableColumns()
+    {
+        return unindexedMutableTerms() > 0;
+    }
+
+    private static boolean isSatisfiedBy(DecoratedKey key, Row row, ColumnMetadata column, Expression filter, long now)
+    {
+        if (TypeUtil.isNonFrozenCollection(column.type))
+        {
+            Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
+            return filter.isSatisfiedBy(valueIterator);
+        }
+        else
+        {
+            ByteBuffer value = filter.context.getValueOf(key, row, now);
+            return filter.isSatisfiedBy(value);
+        }
     }
 
     /**

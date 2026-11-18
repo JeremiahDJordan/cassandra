@@ -55,15 +55,16 @@ public class NonStrictIntersectionTest extends SAITester
 {
     private String keyspace;
     private boolean previousNonStrict;
+    private String bIndex;
 
     @Before
     public void setup()
     {
         // With more than one replica, reads at QUORUM need reconciliation at the coordinator
         keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '2'}");
-        createTable(keyspace, "CREATE TABLE %s (k int PRIMARY KEY, a int, b int, c int)");
+        createTable(keyspace, "CREATE TABLE %s (k int PRIMARY KEY, a int, b int, c int, d int)");
         createIndex(keyspace, "CREATE INDEX ON %s(a) USING 'sai'");
-        createIndex(keyspace, "CREATE INDEX ON %s(b) USING 'sai'");
+        bIndex = createIndex(keyspace, "CREATE INDEX ON %s(b) USING 'sai'");
         previousNonStrict = DatabaseDescriptor.getSAINonStrictReplicaFilteringEnabled();
         DatabaseDescriptor.setSAINonStrictReplicaFilteringEnabled(true);
     }
@@ -238,9 +239,73 @@ public class NonStrictIntersectionTest extends SAITester
         assertNonStrictMatches("a = 1 AND b = 3");
     }
 
+    /**
+     * If all the index matches are on repaired data, the indexed columns are intersected, but the restrictions on
+     * several unindexed columns are unioned, as those might have been updated on different replicas (CASSANDRA-20189).
+     */
+    @Test
+    public void testRepairedDataWithUnindexedColumns() throws IOException
+    {
+        insert(1, 1, 1, 7, 0);
+        insert(2, 1, 1, 0, 8);
+        insert(3, 1, 1, 0, 0);
+        insert(4, 2, 1, 7, 8);
+        flush(keyspace);
+        markRepaired();
+
+        // a single unindexed column is intersected with the indexed ones
+        assertNonStrictMatches("a = 1 AND c = 7 ALLOW FILTERING", 1);
+        assertNonStrictMatches("a = 1 AND b = 1 AND c = 7 ALLOW FILTERING", 1);
+
+        // several unindexed columns are unioned, and intersected with the indexed ones
+        assertUnrepairedMatches("a = 1 AND c = 7 AND d = 8 ALLOW FILTERING", false);
+        assertNonStrictMatches("a = 1 AND c = 7 AND d = 8 ALLOW FILTERING", 1, 2);
+        assertStrictMatches("a = 1 AND c = 7 AND d = 8 ALLOW FILTERING");
+        assertNonStrictMatches("a = 1 AND b = 1 AND c = 7 AND d = 8 ALLOW FILTERING", 1, 2);
+
+        // nested operations on unindexed columns are unioned with the unindexed columns
+        assertNonStrictMatches("a = 1 AND c = 7 AND (d = 8 OR d = 9) ALLOW FILTERING", 1, 2);
+        assertNonStrictMatches("a = 1 AND (c = 7 OR c = 9) AND (d = 8 OR d = 9) ALLOW FILTERING", 1, 2);
+
+        // nested operations only on indexed columns are intersected
+        assertNonStrictMatches("a = 1 AND c = 7 AND (b = 2 OR b = 3) ALLOW FILTERING");
+
+        // indexed columns whose index is excluded by the query hints count as unindexed
+        execute("UPDATE " + table() + " SET b = 2 WHERE k = 3");
+        flush(keyspace);
+        markRepaired();
+        assertNonStrictMatches("a = 1 AND b = 2 AND c = 7 ALLOW FILTERING");
+        assertNonStrictMatches("a = 1 AND b = 2 AND c = 7 ALLOW FILTERING WITH excluded_indexes = {" + bIndex + '}', 1, 3);
+    }
+
+    @Test
+    public void testRepairedDataWithUnindexedCollection() throws IOException
+    {
+        createTable(keyspace, "CREATE TABLE %s (k int PRIMARY KEY, a int, s set<int>, m map<int, int>)");
+        createIndex(keyspace, "CREATE INDEX ON %s(a) USING 'sai'");
+        execute("INSERT INTO " + table() + " (k, a, s, m) VALUES (1, 1, {7}, {1: 7})");
+        execute("INSERT INTO " + table() + " (k, a, s, m) VALUES (2, 1, {8}, {2: 8})");
+        execute("INSERT INTO " + table() + " (k, a, s, m) VALUES (3, 1, {0}, {0: 0})");
+        flush(keyspace);
+        markRepaired();
+
+        // the elements of an unindexed collection might have been updated on different replicas, so several
+        // expressions on one such column are unioned
+        assertNonStrictMatches("a = 1 AND s CONTAINS 7 ALLOW FILTERING", 1);
+        assertNonStrictMatches("a = 1 AND s CONTAINS 7 AND s CONTAINS 8 ALLOW FILTERING", 1, 2);
+        assertNonStrictMatches("a = 1 AND m CONTAINS KEY 1 AND m CONTAINS KEY 2 ALLOW FILTERING", 1, 2);
+        assertNonStrictMatches("a = 1 AND m[1] = 7 AND m[2] = 8 ALLOW FILTERING", 1, 2);
+        assertStrictMatches("a = 1 AND s CONTAINS 7 AND s CONTAINS 8 ALLOW FILTERING");
+    }
+
     private void insert(int k, int a, int b, int c)
     {
         execute("INSERT INTO " + table() + " (k, a, b, c) VALUES (?, ?, ?, ?)", k, a, b, c);
+    }
+
+    private void insert(int k, int a, int b, int c, int d)
+    {
+        execute("INSERT INTO " + table() + " (k, a, b, c, d) VALUES (?, ?, ?, ?, ?)", k, a, b, c, d);
     }
 
     private String table()
@@ -268,7 +333,8 @@ public class NonStrictIntersectionTest extends SAITester
      */
     private void assertNonStrictMatches(String where, Integer... expectedKeys)
     {
-        ReadCommand command = command(where + " WITH optimizer_options = {'query_optimization_level': '0'}", ConsistencyLevel.QUORUM);
+        String withoutOptimization = (where.contains(" WITH ") ? " AND" : " WITH") + " optimizer_options = {'query_optimization_level': '0'}";
+        ReadCommand command = command(where + withoutOptimization, ConsistencyLevel.QUORUM);
         assertThat(command.rowFilter().isStrict()).isEqualTo(!command.rowFilter().isMutableIntersection());
         assertThat(localMatches(command)).containsExactly(expectedKeys);
 

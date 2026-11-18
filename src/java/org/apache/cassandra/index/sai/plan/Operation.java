@@ -22,8 +22,10 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ArrayListMultimap;
@@ -37,7 +39,6 @@ import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.IndexContext;
-import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.utils.TreeFormatter;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
@@ -310,6 +311,28 @@ public class Operation
         }
     }
 
+    /**
+     * Returns the mutable (non-primary key) columns of the given expressions with expressions that aren't served by
+     * index scans, either because their column isn't indexed, or because the user-provided hints exclude its index.
+     * Those columns might have been updated on different replicas, whether their indexed counterparts are repaired or
+     * not (CASSANDRA-20189).
+     */
+    private static Set<ColumnMetadata> unindexedColumns(QueryController controller, ListMultimap<ColumnMetadata, Expression> expressions)
+    {
+        Set<ColumnMetadata> unindexed = null;
+        for (Map.Entry<ColumnMetadata, Expression> entry : expressions.entries())
+        {
+            ColumnMetadata column = entry.getKey();
+            if (column.isPrimaryKeyColumn() || controller.isIndexScanned(entry.getValue()))
+                continue;
+
+            if (unindexed == null)
+                unindexed = new HashSet<>();
+            unindexed.add(column);
+        }
+        return unindexed == null ? Collections.emptySet() : unindexed;
+    }
+
     public static abstract class Node
     {
         ListMultimap<ColumnMetadata, Expression> expressionMap;
@@ -340,10 +363,10 @@ public class Operation
         abstract void analyze(QueryController controller);
 
         /**
+         * @param controller the controller of the query
          * @param isStrict whether the intersections can be strictly evaluated (see {@link QueryController#usesStrictFiltering()})
-         * @param context the context of the query, which tells whether there are index matches on unrepaired data
          */
-        abstract FilterTree filterTree(boolean isStrict, QueryContext context);
+        abstract FilterTree filterTree(QueryController controller, boolean isStrict);
 
         abstract Plan.KeysIteration plan(QueryController controller);
 
@@ -421,7 +444,7 @@ public class Operation
         FilterTree buildFilter(QueryController controller, boolean isStrict)
         {
             analyze(controller);
-            return filterTree(isStrict, controller.queryContext());
+            return filterTree(controller, isStrict);
         }
 
         /**
@@ -470,13 +493,13 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree(boolean isStrict, QueryContext context)
+        FilterTree filterTree(QueryController controller, boolean isStrict)
         {
             assert expressionMap != null;
-            var tree = new FilterTree(operationType(), expressionMap, isStrict, context);
+            var tree = new FilterTree(operationType(), expressionMap, isStrict, controller.queryContext(), unindexedColumns(controller, expressionMap));
             for (Node child : children())
                 if (child.canFilter())
-                    tree.addChild(child.filterTree(isStrict, context));
+                    tree.addChild(child.filterTree(controller, isStrict));
             return tree;
         }
 
@@ -560,10 +583,10 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree(boolean isStrict, QueryContext context)
+        FilterTree filterTree(QueryController controller, boolean isStrict)
         {
             assert expressionMap != null;
-            return new FilterTree(OperationType.AND, expressionMap, isStrict, context);
+            return new FilterTree(OperationType.AND, expressionMap, isStrict, controller.queryContext(), unindexedColumns(controller, expressionMap));
         }
 
         public ExpressionNode(RowFilter.Expression expression)
@@ -596,7 +619,7 @@ public class Operation
     public static class EmptyNode extends Node
     {
         // A FilterTree that filters out all rows
-        private static final FilterTree EMPTY_TREE = new FilterTree(OperationType.OR, ArrayListMultimap.create(), true, null);
+        private static final FilterTree EMPTY_TREE = new FilterTree(OperationType.OR, ArrayListMultimap.create(), true, null, Collections.emptySet());
 
         @Override
         boolean canFilter()
@@ -610,7 +633,7 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree(boolean isStrict, QueryContext context)
+        FilterTree filterTree(QueryController controller, boolean isStrict)
         {
             return EMPTY_TREE;
         }

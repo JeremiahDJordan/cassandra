@@ -21,6 +21,7 @@ package org.apache.cassandra.distributed.test.sai;
 import java.io.IOException;
 import java.util.Iterator;
 
+import com.google.common.collect.ImmutableSet;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -229,6 +230,77 @@ public class StrictFilteringTest extends TestBaseImpl
         {
             SAIUtil.setNonStrictReplicaFiltering(CLUSTER.get(1), true);
         }
+    }
+
+    @Test
+    public void testPartialUpdatesOnNonIndexedColumnsAfterRepair()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_non_indexed_columns (k int PRIMARY KEY, a int, b int, c int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_non_indexed_columns(a) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_columns(k, a) VALUES (0, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+        CLUSTER.get(1).nodetoolResult("repair", KEYSPACE).asserts().success();
+        SAIUtil.waitForRepairedSSTables(CLUSTER, KEYSPACE, "partial_updates_non_indexed_columns");
+
+        // insert a split row
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_columns(k, b) VALUES (0, 2) USING TIMESTAMP 2"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_columns(k, c) VALUES (0, 3) USING TIMESTAMP 3"));
+
+        String select = withKeyspace("SELECT * FROM %s.partial_updates_non_indexed_columns WHERE a = 1 AND b = 2 AND c = 3 ALLOW FILTERING");
+        Object[][] initialRows = CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL);
+        assertRows(initialRows, row(0, 1, 2, 3));
+    }
+
+    /**
+     * Like {@link #testPartialUpdatesOnNonIndexedColumnsAfterRepair()}, with DataStax-only query features: a nested
+     * disjunction on unindexed columns, and an indexed column whose index is excluded by the query hints.
+     */
+    @Test
+    public void testPartialUpdatesOnNonIndexedColumnsAfterRepairWithDisjunctionsAndHints()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_non_indexed_or (k int PRIMARY KEY, a int, b int, c int, d int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_non_indexed_or(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX b_idx ON %s.partial_updates_non_indexed_or(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_or(k, a) VALUES (0, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_or(k, a) VALUES (1, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+        CLUSTER.get(1).nodetoolResult("repair", KEYSPACE).asserts().success();
+        SAIUtil.waitForRepairedSSTables(CLUSTER, KEYSPACE, "partial_updates_non_indexed_or");
+
+        // insert split rows, the first one on unindexed columns...
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_or(k, c) VALUES (0, 3) USING TIMESTAMP 2"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_or(k, d) VALUES (0, 4) USING TIMESTAMP 3"));
+
+        // ...and the second one on an unindexed column and on an indexed column whose index the query excludes
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_or(k, b) VALUES (1, 2) USING TIMESTAMP 2"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_or(k, c) VALUES (1, 3) USING TIMESTAMP 3"));
+
+        String select = withKeyspace("SELECT * FROM %s.partial_updates_non_indexed_or WHERE a = 1 AND c = 3 AND (d = 4 OR d = 5) ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 1, null, 3, 4));
+
+        select = withKeyspace("SELECT * FROM %s.partial_updates_non_indexed_or WHERE a = 1 AND b = 2 AND c = 3 ALLOW FILTERING WITH excluded_indexes = {b_idx}");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(1, 1, 2, 3, null));
+    }
+
+    @Test
+    public void testPartialUpdatesOnNonIndexedCollectionAfterRepair()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_non_indexed_collection (k int PRIMARY KEY, a int, s set<int>) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_non_indexed_collection(a) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_collection(k, a) VALUES (0, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+        CLUSTER.get(1).nodetoolResult("repair", KEYSPACE).asserts().success();
+        SAIUtil.waitForRepairedSSTables(CLUSTER, KEYSPACE, "partial_updates_non_indexed_collection");
+
+        // insert a row whose set elements are split between the replicas
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.partial_updates_non_indexed_collection USING TIMESTAMP 2 SET s = s + {2} WHERE k = 0"));
+        CLUSTER.get(2).executeInternal(withKeyspace("UPDATE %s.partial_updates_non_indexed_collection USING TIMESTAMP 3 SET s = s + {3} WHERE k = 0"));
+
+        String select = withKeyspace("SELECT * FROM %s.partial_updates_non_indexed_collection WHERE a = 1 AND s CONTAINS 2 AND s CONTAINS 3 ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 1, ImmutableSet.of(2, 3)));
     }
 
     @Test

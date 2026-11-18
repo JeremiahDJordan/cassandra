@@ -72,7 +72,6 @@ import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
-import org.apache.cassandra.db.filter.IndexHints;
 import org.apache.cassandra.db.filter.OptimizerOptions;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
@@ -635,7 +634,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
     public FilterTree buildFilter()
     {
-        return Operation.Node.buildTree(this, filterOperation()).analyzeTree(this).filterTree(usesStrictFiltering(), queryContext);
+        return Operation.Node.buildTree(this, filterOperation()).analyzeTree(this).filterTree(this, usesStrictFiltering());
     }
 
     private Plan.KeysIteration buildHalfRangeFromInequality(Expression originPredicate, Operator op, Plan.DataScope scope)
@@ -793,14 +792,22 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      */
     private List<Expression> scannableExpressions(Collection<Expression> expressions)
     {
-        IndexHints hints = command.rowFilter().indexHints;
         List<Expression> scannable = new ArrayList<>(expressions.size());
         for (Expression expression : expressions)
         {
-            if (expression.context.isIndexed() && !hints.excludes(expression.context.getIndexName()))
+            if (isIndexScanned(expression))
                 scannable.add(expression);
         }
         return scannable;
+    }
+
+    /**
+     * @return {@code true} if the given expression can be served by an index scan, which requires an index that isn't
+     * excluded by the user-provided hints, {@code false} otherwise
+     */
+    boolean isIndexScanned(Expression expression)
+    {
+        return expression.context.isIndexed() && !command.rowFilter().indexHints.excludes(expression.context.getIndexName());
     }
 
     private void addIndexScans(Plan.Builder builder, Collection<Expression> expressions, Plan.DataScope scope)
