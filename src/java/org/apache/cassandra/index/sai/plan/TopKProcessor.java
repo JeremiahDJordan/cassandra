@@ -325,6 +325,11 @@ public class TopKProcessor
         ByteBuffer value = indexContext.getValueOf(key, row, FBUtilities.nowInSeconds());
         if (value != null)
         {
+            // The replica sends the BM25 score of a row with the row: there is nothing to compute it from here.
+            if (expression.operator() == Operator.BM25)
+                throw new IllegalStateException(indexContext.logMessage("Got row " + row.clustering().toString(command.metadata()) +
+                                                                        " without its BM25 score from the replica"));
+
             if (queryVector == null)
                 queryVector = vts.createFloatVector(TypeUtil.decomposeVector(indexContext, expression.getIndexValue().duplicate()));
             var vector = vts.createFloatVector(TypeUtil.decomposeVector(indexContext, value));
