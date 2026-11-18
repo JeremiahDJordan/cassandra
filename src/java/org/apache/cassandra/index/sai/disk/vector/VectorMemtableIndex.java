@@ -28,6 +28,8 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.ToIntFunction;
@@ -39,6 +41,7 @@ import org.slf4j.LoggerFactory;
 
 import io.github.jbellis.jvector.graph.SearchResult;
 import io.github.jbellis.jvector.util.Bits;
+import io.github.jbellis.jvector.util.RamUsageEstimator;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
@@ -47,7 +50,11 @@ import org.agrona.collections.IntHashSet;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.Cells;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
@@ -66,7 +73,10 @@ import org.apache.cassandra.index.sai.utils.RangeUtil;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.AbstractIterator;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CloseableIterator;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.SortingIterator;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -82,6 +92,12 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     private static final Logger logger = LoggerFactory.getLogger(VectorMemtableIndex.class);
     private static final VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
     public static int GLOBAL_BRUTE_FORCE_ROWS = Integer.MAX_VALUE; // not final so test can inject its own setting
+    // an IndexedCell and its entry in indexedCells (a ConcurrentHashMap node and its slot in the table)
+    private static final long INDEXED_CELL_BYTES = ObjectSizes.measure(new IndexedCell())
+                                                   + RamUsageEstimator.alignObjectSize(RamUsageEstimator.NUM_BYTES_OBJECT_HEADER
+                                                                                       + 3L * RamUsageEstimator.NUM_BYTES_OBJECT_REF
+                                                                                       + Integer.BYTES)
+                                                   + RamUsageEstimator.NUM_BYTES_OBJECT_REF;
 
     private final ColumnQueryMetrics.VectorIndexMetrics columnQueryMetrics;
     private final CassandraOnHeapGraph<PrimaryKey> graph;
@@ -94,11 +110,17 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
 
     private final NavigableSet<PrimaryKey> primaryKeys = new ConcurrentSkipListSet<>();
 
+    // the cell each row is indexed for, see update(DecoratedKey, Clustering, Cell, Memtable, OpOrder.Group)
+    private final ConcurrentMap<PrimaryKey, IndexedCell> indexedCells = new ConcurrentHashMap<>();
+    private final LongAdder indexedCellsBytes = new LongAdder();
+    private final VectorType.VectorSerializer serializer;
+
     public VectorMemtableIndex(IndexContext indexContext, Memtable mt)
     {
         super(indexContext, mt);
         this.columnQueryMetrics = (ColumnQueryMetrics.VectorIndexMetrics) indexContext.getColumnQueryMetrics();
         this.graph = new CassandraOnHeapGraph<>(indexContext, true, mt);
+        this.serializer = (VectorType.VectorSerializer) indexContext.getValidator().getSerializer();
     }
 
     @Override
@@ -129,6 +151,91 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
         writeCount.increment();
         primaryKeys.add(primaryKey);
         return graph.add(value, primaryKey);
+    }
+
+    /**
+     * Indexes the row of a vector on a regular or static column under the vector of the given cell, if the cell
+     * supersedes the cell indexed for that row so far (see {@link Cells#reconcile}); a tombstone or an expired cell
+     * leaves the row indexed under no vector. The cells of a row can arrive in any order and more than once, as an
+     * {@link org.apache.cassandra.db.partitions.AtomicBTreePartition} write passes the row of each merge attempt.
+     *
+     * @param cell the cell of the indexed column of the row, or a tombstone at the time of a deletion of the row
+     */
+    public void update(DecoratedKey key, Clustering clustering, Cell<?> cell, Memtable memtable, OpOrder.Group opGroup)
+    {
+        PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
+
+        long bytesUsed = 0;
+        IndexedCell indexed = indexedCells.get(primaryKey);
+        if (indexed == null)
+        {
+            IndexedCell created = new IndexedCell();
+            indexed = indexedCells.putIfAbsent(primaryKey, created);
+            if (indexed == null)
+            {
+                indexed = created;
+                bytesUsed += INDEXED_CELL_BYTES;
+                indexedCellsBytes.add(INDEXED_CELL_BYTES);
+            }
+        }
+
+        boolean changed = false;
+        synchronized (indexed)
+        {
+            if (indexed.isSupersededBy(cell, serializer))
+            {
+                ByteBuffer value = cell.isLive(FBUtilities.nowInSeconds()) ? cell.buffer() : null;
+                if (value != null && value.remaining() == 0)
+                    value = null;
+
+                VectorFloat<?> oldVector = indexed.vector;
+                VectorFloat<?> newVector = null;
+                if (value != null)
+                {
+                    if (oldVector != null && oldVector.equals(vts.createFloatVector(serializer.deserializeFloatArray(value))))
+                    {
+                        newVector = oldVector;
+                    }
+                    else
+                    {
+                        // add the new vector before removing the old one, so we don't have a window where the row is
+                        // not in the index at all
+                        updateKeyBounds(primaryKey);
+                        primaryKeys.add(primaryKey);
+                        bytesUsed += graph.add(value, primaryKey);
+                        if (oldVector == null)
+                            writeCount.increment();
+                        else
+                            overwriteCount.increment();
+
+                        // the graph ignores an invalid vector during commit log replay, and then keeps the old one
+                        VectorFloat<?> added = graph.vectorForKey(primaryKey);
+                        newVector = added == oldVector ? null : added;
+                        changed = true;
+                    }
+                }
+
+                if (oldVector != null && newVector != oldVector)
+                {
+                    graph.remove(oldVector, primaryKey);
+                    changed = true;
+                }
+
+                // remove primary key if it's no longer indexed
+                if (newVector == null && changed)
+                {
+                    primaryKeys.remove(primaryKey);
+                    if (oldVector != null)
+                        removedCount.increment();
+                }
+
+                indexed.set(cell, newVector);
+            }
+        }
+
+        memtable.markExtraOnHeapUsed(bytesUsed, opGroup);
+        if (changed)
+            onIndexUpdated();
     }
 
     @Override
@@ -492,7 +599,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     @Override
     public long estimatedOnHeapMemoryUsed()
     {
-        return graph.ramBytesUsed();
+        return graph.ramBytesUsed() + indexedCellsBytes.sum();
     }
 
     @Override
@@ -615,5 +722,50 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     public void cleanup()
     {
         graph.cleanup();
+    }
+
+    /**
+     * What the index knows of the cell a row is indexed for: enough to reconcile it with another cell of that row.
+     * Guarded by its own monitor.
+     */
+    private static final class IndexedCell
+    {
+        private boolean isSet;
+        private long timestamp;
+        private int ttl;
+        private long localDeletionTime;
+        // the vector the row is indexed under, the instance held by the graph for the row, or null if none
+        private VectorFloat<?> vector;
+
+        boolean isSupersededBy(Cell<?> cell, VectorType.VectorSerializer serializer)
+        {
+            if (!isSet)
+                return true;
+            if (cell.timestamp() != timestamp)
+                return cell.timestamp() > timestamp;
+
+            // Same timestamp: reconcile as the memtable does, with the vector the row is indexed under as the value.
+            // Only a cell that is not indexed under any vector has a value other than its own here, an empty one.
+            ByteBuffer value = vector == null ? ByteBufferUtil.EMPTY_BYTE_BUFFER : serializer.serializeFloatArray(toFloatArray(vector));
+            Cell<?> current = new BufferCell(cell.column(), timestamp, ttl, localDeletionTime, value, null);
+            return Cells.reconcile(current, cell) != current;
+        }
+
+        void set(Cell<?> cell, VectorFloat<?> vector)
+        {
+            isSet = true;
+            timestamp = cell.timestamp();
+            ttl = cell.ttl();
+            localDeletionTime = cell.localDeletionTime();
+            this.vector = vector;
+        }
+
+        private static float[] toFloatArray(VectorFloat<?> vector)
+        {
+            float[] values = new float[vector.length()];
+            for (int i = 0; i < values.length; i++)
+                values[i] = vector.get(i);
+            return values;
+        }
     }
 }
