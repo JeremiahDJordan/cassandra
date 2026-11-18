@@ -245,6 +245,46 @@ public class IndexBuildDuringCompactionTest extends SAITester
         assertAllRowsFound("w", SSTABLES * LARGE_ROWS_PER_SSTABLE);
     }
 
+    /**
+     * The initial build of an index has selected its sstables when a compaction replaces them and is stopped (as a
+     * cleanup would), restoring them as other readers that the builders can't reference: the build still builds them.
+     */
+    @Test
+    public void testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int, pad blob)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        createIndex(String.format(CREATE_INDEX_TEMPLATE, "v"));
+        waitForTableIndexesQueryable();
+        writeLargeSSTables();
+        DatabaseDescriptor.setSSTablePreemptiveOpenIntervalInMiB(1);
+
+        // Hold the initial build of a new index once it has selected its sstables
+        Injections.Barrier holdBuild = Injections.newBarrier("hold_initial_build_after_selection", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(StorageAttachedIndex.class)
+                                                                        .onMethod("findNonIndexedSSTables")
+                                                                        .atExit())
+                                                 .build();
+        Injections.inject(holdBuild);
+        String index = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "w"));
+        waitForAssert(() -> assertThat(holdBuild.getCount()).isEqualTo(1), 60, TimeUnit.SECONDS);
+
+        // Start a compaction, hold it once it has moved the starts of its sources, and stop it
+        CompletableFuture<Void> compaction = startCompactionHeldOnceStartsAreMoved(cfs);
+        stopCompactions(cfs, compaction);
+
+        // Let the initial build go on
+        holdBuild.countDown();
+        holdBuild.disable();
+        waitForAssert(() -> assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse(), 120, TimeUnit.SECONDS);
+
+        assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
+        assertAllRowsFound("v", SSTABLES * LARGE_ROWS_PER_SSTABLE);
+        assertAllRowsFound("w", SSTABLES * LARGE_ROWS_PER_SSTABLE);
+    }
+
     private CompletableFuture<Void> startCompactionHeldOnceStartsAreMoved(ColumnFamilyStore cfs) throws Throwable
     {
         holdTable = cfs;
