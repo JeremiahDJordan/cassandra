@@ -58,6 +58,8 @@ public class ReadExecutionController implements AutoCloseable
 
     private final Histogram sstablesScannedPerRowRead;
 
+    private boolean mayNeedSkippedCells;
+
     ReadExecutionController(ReadCommand command,
                             OpOrder.Group baseOp,
                             TableMetadata baseMetadata,
@@ -263,6 +265,22 @@ public class ReadExecutionController implements AutoCloseable
     public RepairedDataInfo getRepairedDataInfo()
     {
         return repairedDataInfo;
+    }
+
+    /**
+     * Whether sstables of the read skipped cells that a row merged with memtable data may need, see
+     * {@link ReadCommand#sstableColumnFilter}, since the last call.
+     */
+    boolean takeMayNeedSkippedCells()
+    {
+        boolean value = mayNeedSkippedCells;
+        mayNeedSkippedCells = false;
+        return value;
+    }
+
+    void setMayNeedSkippedCells()
+    {
+        mayNeedSkippedCells = true;
     }
 
     private void addSample()

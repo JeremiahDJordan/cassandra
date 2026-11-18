@@ -997,10 +997,10 @@ public class ColumnFilterRowTest
     }
 
     @Test
-    public void testFilterSkipsFetchedNotQueriedCellsOlderThanRowLiveness()
+    public void testFilterKeepsFetchedNotQueriedCellsOlderThanRowLiveness()
     {
-        // Cells of fetched but not queried columns older than the row's primary key liveness are skipped, as in
-        // sstable reads (see #10657); newer ones are kept with a skipped value.
+        // Cells of fetched but not queried columns are kept with a skipped value, even when they are older than the
+        // row's primary key liveness; see ReadCommand#withoutSkippableCells.
         Row.Builder builder = newBuilder(clustering);
         builder.newRow(clustering);
         builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(TIMESTAMP, FBUtilities.nowInSeconds()));
@@ -1010,25 +1010,25 @@ public class ColumnFilterRowTest
         builder.addCell(cell(v2, cellPath(2), 202, TIMESTAMP + 1));
         Row row = builder.build();
 
-        // v1 is queried: its older cell is kept with its value.
+        // v1 is queried: its older cell is kept with its value, and the v2 cells with a skipped value.
         ColumnFilter queriesV1 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v1).build();
         Row filtered = row.filter(queriesV1, metadata);
         assertNotNull(filtered);
         assertEquals(100, ByteBufferUtil.toInt(filtered.getCell(v1).buffer()));
-        assertNull(filtered.getCell(v2, cellPath(0)));
+        assertEquals(0, filtered.getCell(v2, cellPath(0)).buffer().remaining());
         assertEquals(0, filtered.getCell(v2, cellPath(1)).buffer().remaining());
         assertEquals(0, filtered.getCell(v2, cellPath(2)).buffer().remaining());
-        assertEquals(2, filtered.getComplexColumnData(v2).cellsCount());
+        assertEquals(3, filtered.getComplexColumnData(v2).cellsCount());
 
-        // v2 is queried: all its cells are kept with their values, and the older v1 cell is skipped.
+        // v2 is queried: all its cells are kept with their values, and the older v1 cell with a skipped value.
         ColumnFilter queriesV2 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v2).build();
         filtered = row.filter(queriesV2, metadata);
         assertNotNull(filtered);
-        assertNull(filtered.getCell(v1));
+        assertEquals(0, filtered.getCell(v1).buffer().remaining());
         assertEquals(200, ByteBufferUtil.toInt(filtered.getCell(v2, cellPath(0)).buffer()));
         assertEquals(3, filtered.getComplexColumnData(v2).cellsCount());
 
-        // An active deletion that shadows the row's liveness also removes the cells older than it.
+        // An active deletion that shadows the row's liveness removes it and the cells it shadows.
         filtered = row.filter(queriesV1, DeletionTime.build(TIMESTAMP, LOCAL_DELETION_TIME), false, metadata);
         assertNotNull(filtered);
         assertTrue(filtered.primaryKeyLivenessInfo().isEmpty());
