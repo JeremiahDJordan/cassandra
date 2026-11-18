@@ -17,6 +17,7 @@
 package org.apache.cassandra.index.sai.analyzer;
 
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Map;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -56,14 +57,14 @@ public class AnalyzerEqOperatorSupport
                   "Future versions will remove support for '=' on analyzed indexes. " +
                   "If you want to forbid the use of '=' on analyzed indexes now, " +
                   "please use '%s':'%s' in the index options.",
-                  OPTION, Value.UNSUPPORTED.toString().toLowerCase());
+                  OPTION, Value.UNSUPPORTED.toString().toLowerCase(Locale.US));
 
     public static final String EQ_AMBIGUOUS_ERROR =
     String.format("Column [%%s] equality predicate is ambiguous.  It has both analyzed indexes [%%s] configured with '%s':'%s', " +
                   "and an un-analyzed indexes [%%s].  " +
                   "To avoid ambiguity, drop the analyzed indexes and recreate them with option '%s':'%s', " +
                   "or use index hints to disambiguate, as in SELECT ... WITH included_indexes={%%s}.",
-                  OPTION, Value.MATCH.toString().toLowerCase(), OPTION, Value.UNSUPPORTED.toString().toLowerCase());
+                  OPTION, Value.MATCH.toString().toLowerCase(Locale.US), OPTION, Value.UNSUPPORTED.toString().toLowerCase(Locale.US));
 
 
     public static final String LWT_CONDITION_ON_ANALYZED_WARNING =
@@ -94,7 +95,7 @@ public class AnalyzerEqOperatorSupport
         if (!AbstractAnalyzer.isAnalyzed(options))
             throw new InvalidRequestException(NOT_ANALYZED_ERROR);
 
-        String option = options.get(OPTION).toUpperCase();
+        String option = options.get(OPTION).toUpperCase(Locale.US);
         try
         {
             return Value.valueOf(option);

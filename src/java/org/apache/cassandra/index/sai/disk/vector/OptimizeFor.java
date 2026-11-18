@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.index.sai.disk.vector;
 
+import java.util.Locale;
+
 public enum OptimizeFor
 {
     LATENCY,
@@ -25,6 +27,6 @@ public enum OptimizeFor
 
     public static OptimizeFor fromString(String value)
     {
-        return valueOf(value.toUpperCase());
+        return valueOf(value.toUpperCase(Locale.US));
     }
 }

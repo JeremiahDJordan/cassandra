@@ -19,6 +19,7 @@
 package org.apache.cassandra.index.sai.analyzer;
 
 import java.io.IOException;
+import java.util.Locale;
 import java.util.Map;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -39,7 +40,7 @@ public class JSONAnalyzerParser
 
     public static Pair<Analyzer, LuceneCustomAnalyzerConfig> parse(String json) throws IOException
     {
-        Analyzer analyzer = matchBuiltInAnalzyer(json.toUpperCase());
+        Analyzer analyzer = matchBuiltInAnalzyer(json.toUpperCase(Locale.US));
         if (analyzer != null)
         {
             return Pair.create(analyzer, null);
