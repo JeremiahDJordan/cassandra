@@ -1842,6 +1842,15 @@ transparent_data_encryption_options:
   ## should take precedence over legacy table-backed indexes during reads. Defaults to true (Apache Cassandra:
   ## false); set it to false to prefer legacy indexes.
   # prioritize_over_legacy_index: true
+  #
+  ## Whether the reads this node coordinates that need reconciliation (consistency levels above ONE/LOCAL_ONE with
+  ## more than one replica) and restrict more than one non-primary key column let the replicas relax their filtering,
+  ## and filter the reconciled rows instead, as Apache Cassandra does (CASSANDRA-19018). That finds rows whose columns
+  ## were written to different replicas, which strict filtering misses, but it can make queries whose restrictions
+  ## match many unrepaired rows much more expensive. Reads that can contact a node below messaging version DS 10 are
+  ## relaxed whatever the setting (see NEWS.txt). It can also be changed at runtime with the
+  ## setSAINonStrictReplicaFilteringEnabled operation of the StorageService MBean.
+  # non_strict_replica_filtering_enabled: false
 
 # LIKE restrictions, served by an index or filtered, are rejected while the query can contact a node on a messaging
 # version below DS 21 (the messaging version of 5.0.10), such as Apache Cassandra nodes and DataStax nodes before

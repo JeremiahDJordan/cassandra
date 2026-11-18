@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.db;
 
+import java.io.IOException;
 import java.net.UnknownHostException;
 import java.util.Random;
 
@@ -32,6 +33,8 @@ import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.net.Message;
@@ -46,6 +49,7 @@ import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.net.Verb.*;
 import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -125,6 +129,64 @@ public class ReadCommandVerbHandlerTest
                               .from(peer())
                               .build());
         assertFalse(command.isTrackingRepairedData());
+    }
+
+    /**
+     * Replicas relax the filtering of non-strict reads (CASSANDRA-19018) only for coordinators that ask for it with
+     * the custom message parameter, whatever their messaging version.
+     */
+    @Test
+    public void coordinatorAsksForNonStrictFilteringOnlyWithTheParameter() throws IOException
+    {
+        ReadCommand command = new TrackingSinglePartitionReadCommand(metadata);
+
+        Message<ReadCommand> withoutParam = Message.builder(READ_REQ, command).from(peer()).withId(messageId()).build();
+        assertFalse(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withoutParam));
+        Message<ReadCommand> withParam = ReadCommand.withNonStrictFilteringParam(withoutParam);
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withParam));
+
+        // the parameter goes along with other custom parameters, and survives serialization
+        Message<ReadCommand> withOtherParam = Message.builder(READ_REQ, command).from(peer()).withId(messageId()).withCustomParam("other", new byte[]{ 2 }).build();
+        assertFalse(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withOtherParam));
+        Message<ReadCommand> withBothParams = ReadCommand.withNonStrictFilteringParam(withOtherParam);
+        assertArrayEquals(new byte[]{ 2 }, withBothParams.header.customParams().get("other"));
+        Message<ReadCommand> deserialized = serializeRoundTrip(withBothParams);
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(deserialized));
+        assertArrayEquals(new byte[]{ 2 }, deserialized.header.customParams().get("other"));
+
+        // a read from this node needs the parameter too
+        Message<ReadCommand> fromSelf = Message.builder(READ_REQ, command)
+                                               .from(FBUtilities.getBroadcastAddressAndPort())
+                                               .withId(messageId())
+                                               .build();
+        assertFalse(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(fromSelf));
+        Message<ReadCommand> fromSelfWithParam = ReadCommand.withNonStrictFilteringParam(fromSelf);
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(fromSelfWithParam));
+
+        // a coordinator on a messaging version below DS 10 needs the parameter too
+        MessagingService.instance().versions.set(peer(), MessagingService.VERSION_50);
+        try
+        {
+            assertFalse(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withoutParam));
+            assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withParam));
+        }
+        finally
+        {
+            MessagingService.instance().versions.reset(peer());
+        }
+    }
+
+    private static Message<ReadCommand> serializeRoundTrip(Message<ReadCommand> message) throws IOException
+    {
+        int version = MessagingService.current_version;
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            Message.serializer.serialize(message, out, version);
+            try (DataInputBuffer in = new DataInputBuffer(out.unsafeGetBufferAndFlip(), false))
+            {
+                return Message.serializer.deserialize(in, message.from(), version);
+            }
+        }
     }
 
     @Test (expected = InvalidRequestException.class)

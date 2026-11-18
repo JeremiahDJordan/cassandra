@@ -171,7 +171,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * But later when we assemble the final key iterator according to the optimized Plan, we need those iterators
      * again. In order to avoid recreating them, which would be costly, we just keep them here in this map.
      */
-    private final Multimap<Expression, KeyRangeIterator> keyIterators = ArrayListMultimap.create();
+    private final Multimap<Pair<Expression, Plan.DataScope>, KeyRangeIterator> keyIterators = ArrayListMultimap.create();
 
     private final Map<IndexContext, QueryView> queryViews = new HashMap<>();
 
@@ -237,6 +237,26 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     public ReadCommand command()
     {
         return command;
+    }
+
+    QueryContext queryContext()
+    {
+        return queryContext;
+    }
+
+    /**
+     * Whether the index matches are intersected, and the rows filtered, strictly on local data. A query that needs
+     * reconciliation and restricts several mutable columns (see {@link RowFilter#isStrict()}) can match a row only
+     * after the coordinator merges its partial updates, so its matches on unrepaired data are united (see
+     * {@link #buildNonStrictIntersectionPlan}) and the filter relaxed (CASSANDRA-19018). Ordered queries filter
+     * strictly, and so do the commands of coordinators that don't filter the reconciled rows (see
+     * {@link ReadCommand#isStrictFilteringRequired()}) or don't let replicas relax the filter.
+     */
+    public boolean usesStrictFiltering()
+    {
+        return orderer != null
+               || command.rowFilter().isStrict()
+               || command.isStrictFilteringRequired();
     }
 
     RowFilter.FilterElement filterOperation()
@@ -464,9 +484,15 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     {
         // Remove the ORDER BY filter expression from the filter tree, as it is added below.
         var filterElement = filterOperation().filter(e -> !Orderer.isFilterExpressionOrderer(e));
-        whereKeysPlan = Operation.Node.buildTree(this, filterElement)
-                                      .analyzeTree(this)
-                                      .plan(this);
+        Operation.Node tree = Operation.Node.buildTree(this, filterElement).analyzeTree(this);
+
+        // If the intersections can't be evaluated strictly, find out whether any of the indexed expressions has
+        // matches in unrepaired data before building the plan, as the post-filtering depends on it, and the plan
+        // optimizer might not use the index scans that would tell us.
+        if (!usesStrictFiltering())
+            detectUnrepairedMatches(tree);
+
+        whereKeysPlan = tree.plan(this);
 
         // Because the orderer has a specific queue view
         Plan.KeysIteration keysIterationPlan = whereKeysPlan;
@@ -557,13 +583,19 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     }
 
     /**
-     * Creates an iterator over keys of rows that match the given WHERE predicate.
+     * Creates an iterator over keys of rows that match the given WHERE predicate within the given subset of the
+     * indexed data.
      * Does not cache the iterator!
      */
-    private KeyRangeIterator buildIterator(Expression predicate)
+    private KeyRangeIterator buildIterator(Expression predicate, Plan.DataScope scope)
     {
-        QueryView view = getQueryView(predicate.context);
-        return KeyRangeTermIterator.build(predicate, view, mergeRange, queryContext, false);
+        return buildIterator(predicate, scope, true);
+    }
+
+    private KeyRangeIterator buildIterator(Expression predicate, Plan.DataScope scope, boolean allowSubtraction)
+    {
+        QueryView view = getQueryView(predicate.context).forScope(scope);
+        return KeyRangeTermIterator.build(predicate, view, mergeRange, queryContext, false, allowSubtraction);
     }
 
     /**
@@ -603,24 +635,24 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
     public FilterTree buildFilter()
     {
-        return Operation.Node.buildTree(this, filterOperation()).analyzeTree(this).filterTree();
+        return Operation.Node.buildTree(this, filterOperation()).analyzeTree(this).filterTree(usesStrictFiltering(), queryContext);
     }
 
-    private Plan.KeysIteration buildHalfRangeFromInequality(Expression originPredicate, Operator op)
+    private Plan.KeysIteration buildHalfRangeFromInequality(Expression originPredicate, Operator op, Plan.DataScope scope)
     {
         assert originPredicate.getOp() == Expression.Op.NOT_EQ : "assumes inequality";
         assert originPredicate.lower.value == originPredicate.upper.value : "assumes lower and upper are the same in inequality";
 
         Expression halfRange = new Expression(originPredicate.context);
         halfRange.add(op, originPredicate.lower.value.raw);
-        return buildIndexScanPlan(halfRange);
+        return buildIndexScanPlan(halfRange, scope);
     }
 
     /**
      * Builds the plan of an index scan for the given predicate, which can be a NOT CONTAINS or NOT CONTAINS KEY but
      * not a != (see #buildInequalityPlan).
      */
-    private Plan.KeysIteration buildIndexScanPlan(Expression predicate)
+    private Plan.KeysIteration buildIndexScanPlan(Expression predicate, Plan.DataScope scope)
     {
         assert predicate.getOp() != Expression.Op.NOT_EQ : "inequalities are planned by buildInequalityPlan";
         if (predicate.hasUnindexedEmptyValue())
@@ -632,18 +664,18 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             {
                 // The empty value matches no indexed value, so the negation matches all the keys
                 // (see IndexContext#getNonEqIterator and SSTableIndex#getNonEqIterator).
-                return planFactory.indexScan(predicate, planFactory.tableMetrics.rows);
+                return planFactory.indexScan(predicate, planFactory.tableMetrics.rows, scope);
             }
 
             predicate = predicate.withoutUnindexedEmptyBounds();
             if (predicate == null)
                 return planFactory.nothing;
             if (predicate.getOp() == Expression.Op.RANGE && predicate.lower == null && predicate.upper == null)
-                return planFactory.fullIndexScan(predicate.context);
+                return planFactory.fullIndexScan(predicate.context, scope);
         }
 
-        long matchingRowCount = Math.min(estimateMatchingRowCount(predicate), planFactory.tableMetrics.rows);
-        return planFactory.indexScan(predicate, matchingRowCount);
+        long matchingRowCount = Math.min(estimateMatchingRowCount(predicate, scope), planFactory.tableMetrics.rows);
+        return planFactory.indexScan(predicate, matchingRowCount, scope);
     }
 
     /**
@@ -657,7 +689,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * @param predicate Inequality expression with indexContext
      * @return A plan on the index, which can also result false positives.
      */
-    private Plan.KeysIteration buildInequalityPlan(Expression predicate)
+    private Plan.KeysIteration buildInequalityPlan(Expression predicate, Plan.DataScope scope)
     {
         assert predicate.getOp()== Expression.Op.NOT_EQ : "Only inequality predicate is expected";
 
@@ -667,16 +699,16 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         // and IndexContext#canSubtractMatches).
         if (predicate.context.isNonFrozenCollection())
         {
-            long matchingRowCount = Math.min(estimateMatchingRowCount(predicate), planFactory.tableMetrics.rows);
-            return planFactory.indexScan(predicate, matchingRowCount);
+            long matchingRowCount = Math.min(estimateMatchingRowCount(predicate, scope), planFactory.tableMetrics.rows);
+            return planFactory.indexScan(predicate, matchingRowCount, scope);
         }
 
         if (TypeUtil.supportsRounding(predicate.validator))
-            return planFactory.fullIndexScan(predicate.context);
+            return planFactory.fullIndexScan(predicate.context, scope);
         else
         {
-            Plan.KeysIteration left = buildHalfRangeFromInequality(predicate, Operator.LT);
-            Plan.KeysIteration right = buildHalfRangeFromInequality(predicate, Operator.GT);
+            Plan.KeysIteration left = buildHalfRangeFromInequality(predicate, Operator.LT, scope);
+            Plan.KeysIteration right = buildHalfRangeFromInequality(predicate, Operator.GT, scope);
             return planFactory.union(new ArrayList<>(Arrays.asList(left, right)), true);
         }
     }
@@ -702,37 +734,151 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             return;
         }
 
-        IndexHints hints = command.rowFilter().indexHints;
+        addIndexScans(builder, scannableExpressions(expressions), Plan.DataScope.ALL);
+    }
 
+    /**
+     * Builds a plan for an intersection of expressions that can't be strictly evaluated on this replica (see
+     * {@link #usesStrictFiltering()}): the union of the matches of each expression in memtable indexes and indexes on
+     * unrepaired SSTables, and of the intersection of their matches on repaired SSTables (consistent across replicas)
+     * with the union of the nested operations' plans. That is a superset of the rows matching the intersection, so
+     * the post-filtering must not intersect strictly either (see {@link FilterTree}).
+     */
+    Plan.KeysIteration buildNonStrictIntersectionPlan(Collection<Expression> expressions, List<Plan.KeysIteration> children)
+    {
+        List<Expression> indexed = scannableExpressions(expressions);
+        if (indexed.isEmpty() && children.isEmpty())
+            return planFactory.everything;
+
+        Plan.Builder union = planFactory.unionBuilder();
+        if (hasRepairedSSTableIndexes(indexed))
+        {
+            addIndexScans(union, indexed, Plan.DataScope.UNREPAIRED);
+
+            Plan.Builder repaired = planFactory.intersectionBuilder();
+            addIndexScans(repaired, indexed, Plan.DataScope.REPAIRED);
+            if (!children.isEmpty())
+                repaired.add(planFactory.union(new ArrayList<>(children)));
+            union.add(repaired.build());
+        }
+        else
+        {
+            // All the indexed data is unrepaired. Searching it as such reuses the searches done to detect unrepaired
+            // matches (see #detectUnrepairedMatches).
+            addIndexScans(union, indexed, Plan.DataScope.UNREPAIRED);
+
+            // A nested operation that can't be served by indexes, such as a disjunction restricting an unindexed
+            // column, selects everything. Like the unindexed expressions of this intersection, it can't narrow down
+            // the candidates, and it doesn't need to: a row that matches the intersection after reconciliation
+            // matches any of the other terms on the replica holding their latest values, which returns it, and replica
+            // filtering protection completes it. Only if there is nothing else does the intersection need everything.
+            int terms = indexed.size();
+            for (Plan.KeysIteration child : children)
+            {
+                if (child != planFactory.everything)
+                {
+                    union.add(child);
+                    terms++;
+                }
+            }
+            if (terms == 0)
+                return planFactory.everything;
+        }
+        return union.build();
+    }
+
+    /**
+     * @return the expressions that can be served by index scans, excluding those using indexes that are excluded by
+     * the user-provided hints
+     */
+    private List<Expression> scannableExpressions(Collection<Expression> expressions)
+    {
+        IndexHints hints = command.rowFilter().indexHints;
+        List<Expression> scannable = new ArrayList<>(expressions.size());
         for (Expression expression : expressions)
         {
-            if (expression.context.isIndexed())
+            if (expression.context.isIndexed() && !hints.excludes(expression.context.getIndexName()))
+                scannable.add(expression);
+        }
+        return scannable;
+    }
+
+    private void addIndexScans(Plan.Builder builder, Collection<Expression> expressions, Plan.DataScope scope)
+    {
+        for (Expression expression : expressions)
+        {
+            if (expression.getOp() == Expression.Op.NOT_EQ)
+                builder.add(buildInequalityPlan(expression, scope));
+            else
+                builder.add(buildIndexScanPlan(expression, scope));
+        }
+    }
+
+    private boolean hasRepairedSSTableIndexes(Collection<Expression> expressions)
+    {
+        for (Expression expression : expressions)
+        {
+            if (getQueryView(expression.context).hasRepairedSSTableIndexes())
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * Records in the query context whether any indexed expression of the tree has matches in memtable indexes or in
+     * indexes on unrepaired SSTables; the searches are kept for the execution of the plan. Negations are searched
+     * without subtracting (see {@link IndexContext#canSubtractMatches}): a stale entry could hide a matching key.
+     */
+    private void detectUnrepairedMatches(Operation.Node node)
+    {
+        if (queryContext.hasUnrepairedMatches())
+            return;
+
+        if (node.expressionMap != null)
+        {
+            for (Expression expression : scannableExpressions(node.expressionMap.values()))
             {
-                // Skip the expressions using indexes that are excluded by the user-provided hints
-                if (hints.excludes(expression.context.getIndexName()))
+                // ORDER BY expressions are not filters, and their queries are always strict
+                if (expression.getOp() == Expression.Op.ORDER_BY)
                     continue;
 
-                if (expression.getOp() == Expression.Op.NOT_EQ)
-                    builder.add(buildInequalityPlan(expression));
-                else
-                    builder.add(buildIndexScanPlan(expression));
+                KeyRangeIterator iterator = buildIterator(expression, Plan.DataScope.UNREPAIRED, false);
+                keyIterators.put(Pair.create(expression, Plan.DataScope.UNREPAIRED), iterator);
+
+                // The key count is only an upper bound, so we look for an actual match. The iterator keeps the key it
+                // finds, so it can still be used to execute the plan.
+                if (iterator.hasNext())
+                {
+                    queryContext.markUnrepairedMatches();
+                    return;
+                }
             }
         }
+
+        for (Operation.Node child : node.children())
+            detectUnrepairedMatches(child);
     }
 
     @Override
     public Iterator<? extends PrimaryKey> getKeysFromIndex(Expression predicate)
     {
-        Collection<KeyRangeIterator> rangeIterators = keyIterators.get(predicate);
+        return getKeysFromIndex(predicate, Plan.DataScope.ALL);
+    }
+
+    @Override
+    public Iterator<? extends PrimaryKey> getKeysFromIndex(Expression predicate, Plan.DataScope scope)
+    {
+        Pair<Expression, Plan.DataScope> key = Pair.create(predicate, scope);
+        Collection<KeyRangeIterator> rangeIterators = keyIterators.get(key);
         // This will be non-empty only if we created the iterator as part of the query planning process.
         if (!rangeIterators.isEmpty())
         {
             KeyRangeIterator iterator = rangeIterators.iterator().next();
-            keyIterators.remove(predicate, iterator);  // remove so we never accidentally reuse the same iterator
+            keyIterators.remove(key, iterator);  // remove so we never accidentally reuse the same iterator
             return iterator;
         }
 
-        return buildIterator(predicate);
+        return buildIterator(predicate, scope);
     }
 
     /**
@@ -1165,7 +1311,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
     private void closeUnusedIterators()
     {
-        Iterator<Map.Entry<Expression, KeyRangeIterator>> entries = keyIterators.entries().iterator();
+        Iterator<Map.Entry<Pair<Expression, Plan.DataScope>, KeyRangeIterator>> entries = keyIterators.entries().iterator();
         while (entries.hasNext())
         {
             FileUtils.closeQuietly(entries.next().getValue());
@@ -1250,7 +1396,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * There are no guarantees. The returned value may come with a significant estimation error.
      * You must not rely on this except for query optimization purposes.
      */
-    private long estimateMatchingRowCount(Expression predicate)
+    private long estimateMatchingRowCount(Expression predicate, Plan.DataScope scope)
     {
         if (predicate.hasUnindexedEmptyValue())
         {
@@ -1275,10 +1421,10 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             case PREFIX:
             case AUTOMATON:
                 return (indexFeatureSet.hasTermsHistogram() && optimizerOptions.useTermStatistics())
-                       ? estimateMatchingRowCountUsingHistograms(predicate)
-                       : estimateMatchingRowCountUsingIndex(predicate);
+                       ? estimateMatchingRowCountUsingHistograms(predicate, scope)
+                       : estimateMatchingRowCountUsingIndex(predicate, scope);
             default:
-                return estimateMatchingRowCountUsingIndex(predicate);
+                return estimateMatchingRowCountUsingIndex(predicate, scope);
         }
     }
 
@@ -1286,10 +1432,10 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * Estimates the number of matching rows by consulting the terms histograms on the indexes.
      * This is faster but the histograms are not available on indexes before V6.
      */
-    private long estimateMatchingRowCountUsingHistograms(Expression predicate)
+    private long estimateMatchingRowCountUsingHistograms(Expression predicate, Plan.DataScope scope)
     {
         assert indexFeatureSet.hasTermsHistogram();
-        var queryView = getQueryView(predicate.context);
+        var queryView = getQueryView(predicate.context).forScope(scope);
 
         long rowCount = 0;
         for (MemtableIndex index : queryView.memtableIndexes)
@@ -1331,15 +1477,22 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * Runs the search on the index and returns the size of the iterator.
      * Caches the iterator for future use to avoid doing search twice.
      */
-    private long estimateMatchingRowCountUsingIndex(Expression predicate)
+    private long estimateMatchingRowCountUsingIndex(Expression predicate, Plan.DataScope scope)
     {
+        Pair<Expression, Plan.DataScope> key = Pair.create(predicate, scope);
+
+        // Reuse the iterator if we already built one, e.g. to detect unrepaired matches
+        Collection<KeyRangeIterator> cached = keyIterators.get(key);
+        if (!cached.isEmpty())
+            return cached.iterator().next().getMaxKeys();
+
         // For older indexes we don't have histograms, so we need to construct the iterator
         // and ask for the posting list size.
-        KeyRangeIterator iterator = buildIterator(predicate);
+        KeyRangeIterator iterator = buildIterator(predicate, scope);
 
         // We're not going to consume the iterator here, so memorize it for future uses.
         // It can be used when executing the plan.
-        keyIterators.put(predicate, iterator);
+        keyIterators.put(key, iterator);
         return iterator.getMaxKeys();
     }
 
@@ -1393,7 +1546,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         for (ByteBuffer term : orderer.getQueryTerms())
         {
             Expression termExpression = new Expression(orderer.context).add(Operator.ANALYZER_MATCHES, term);
-            long termMatchingRows = estimateMatchingRowCount(termExpression);
+            long termMatchingRows = estimateMatchingRowCount(termExpression, Plan.DataScope.ALL);
             selectivity *= (double) termMatchingRows / totalRows;
         }
         return Math.min(1.0, selectivity);

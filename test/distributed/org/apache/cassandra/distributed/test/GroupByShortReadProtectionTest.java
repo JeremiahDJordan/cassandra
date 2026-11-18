@@ -21,12 +21,16 @@ package org.apache.cassandra.distributed.test;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.List;
 
 import org.junit.AfterClass;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
@@ -42,6 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Short read protection of GROUP BY queries with a limit or a page size, with replicas that return exactly as many
  * groups as the limit, or reach the limit as a partition starts.
  */
+@RunWith(Parameterized.class)
 public class GroupByShortReadProtectionTest extends TestBaseImpl
 {
     private static final ConsistencyLevel[] ABOVE_ONE = { ConsistencyLevel.QUORUM, ConsistencyLevel.ALL };
@@ -49,6 +54,15 @@ public class GroupByShortReadProtectionTest extends TestBaseImpl
     private static final int[] ALL_NODES = { 1, 2, 3 };
 
     private static Cluster CLUSTER;
+
+    @Parameterized.Parameter
+    public boolean nonStrict;
+
+    @Parameterized.Parameters(name = "nonStrict={0}")
+    public static Collection<Object[]> parameters()
+    {
+        return SAIUtil.nonStrictReplicaFilteringModes();
+    }
 
     @BeforeClass
     public static void setUpCluster() throws IOException
@@ -62,6 +76,14 @@ public class GroupByShortReadProtectionTest extends TestBaseImpl
                                                           .set("range_request_timeout", "60s")
                                                           .with(GOSSIP).with(NETWORK))
                               .start());
+    }
+
+    @Before
+    public void setUp()
+    {
+        SAIUtil.setNonStrictReplicaFiltering(CLUSTER, nonStrict);
+        CLUSTER.schemaChange("DROP KEYSPACE IF EXISTS " + KEYSPACE);
+        init(CLUSTER, 3);
     }
 
     @AfterClass

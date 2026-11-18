@@ -5546,6 +5546,16 @@ public class DatabaseDescriptor
         conf.sai_options.prioritize_over_legacy_index = value;
     }
 
+    public static boolean getSAINonStrictReplicaFilteringEnabled()
+    {
+        return conf.sai_options.non_strict_replica_filtering_enabled;
+    }
+
+    public static void setSAINonStrictReplicaFilteringEnabled(boolean value)
+    {
+        conf.sai_options.non_strict_replica_filtering_enabled = value;
+    }
+
     public static boolean getForceOptimizedIndexStatusFormat()
     {
         return conf.force_optimized_index_status_format;

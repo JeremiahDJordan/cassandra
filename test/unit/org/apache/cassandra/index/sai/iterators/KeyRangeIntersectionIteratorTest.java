@@ -440,6 +440,22 @@ public class KeyRangeIntersectionIteratorTest extends AbstractKeyRangeIteratorTe
         }
     }
 
+    /**
+     * The intersection of a union with partition-only bounds and a row that the union has returns that row.
+     */
+    @Test
+    public void testIntersectionWithUnionOfRangesWithPartitionOnlyBounds()
+    {
+        KeyRangeUnionIterator.Builder union = KeyRangeUnionIterator.builder();
+        union.add(makePartitionBoundedIterator(3, 0, 5, 6));
+        union.add(PrimaryKeyListIterator.create(makeKeyForRegularRow(3, 0), makeKeyForRegularRow(3, 1), makeKeyForRegularRow(3, 2)));
+
+        KeyRangeIntersectionIterator.Builder intersection = KeyRangeIntersectionIterator.builder();
+        intersection.add(union.build());
+        intersection.add(PrimaryKeyListIterator.create(makeKeyForRegularRow(3, 5)));
+        Assert.assertEquals(Arrays.asList(5L), clusterings(intersection.build()));
+    }
+
     private static List<PrimaryKey> intersection(List<List<PrimaryKey>> inputs)
     {
         // Limit the size of the result to avoid test timeouts.

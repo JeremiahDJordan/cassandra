@@ -28,6 +28,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -114,6 +115,7 @@ import org.apache.lucene.util.SloppyMath;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkBindValueSet;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkNotNull;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * A filter on which rows a given query should include or exclude.
@@ -133,6 +135,12 @@ public class RowFilter
     /** The results of {@link #computeMayHavePeersBelowDS10} per keyspace and scope. */
     private static final PeerCheckCache<Boolean> peerChecks = new PeerCheckCache<>(RowFilter::computeMayHavePeersBelowDS10);
 
+    /** How long a node below DS 10 that refused a filter counts for its keyspace (see {@link #markPeersBelowDS10}). */
+    private static final long PEER_MARK_VALIDITY_NANOS = TimeUnit.SECONDS.toNanos(1);
+
+    /** When the last refusal mark of each keyspace expires (see {@link #markPeersBelowDS10}). */
+    private static final ConcurrentMap<String, Long> peerMarks = new ConcurrentHashMap<>();
+
     public static final String DATASTAX_ONLY_FEATURE_ERROR =
     "%s is not supported while the query can contact nodes on a messaging version below DS 10, such as Apache " +
     "Cassandra nodes";
@@ -144,10 +152,29 @@ public class RowFilter
     private Boolean hasStaticExpression;
     private final boolean needsReconciliation;
 
+    /**
+     * Whether replicas may relax this filter if it needs reconciliation and intersects mutable columns (see
+     * {@link #isStrict()}). Coordinators clear it unless non-strict replica filtering is enabled or the nodes the read
+     * can contact may include some below DS 10 (see {@link #withReplicaFilteringStrictness}). It isn't serialized:
+     * filters received from other nodes have it, and the replica decides whether their coordinator lets it relax them
+     * (see {@link org.apache.cassandra.db.ReadCommand#isStrictFilteringRequired()}).
+     */
+    private final boolean relaxable;
+
+    // computed on first use, as reads ask for it several times
+    private Boolean isMutableIntersection;
+
     protected RowFilter(FilterElement root, boolean needsReconciliation, IndexHints indexHints, OptimizerOptions optimizerOptions)
+    {
+        this(root, needsReconciliation, true, indexHints, optimizerOptions);
+    }
+
+    private RowFilter(FilterElement root, boolean needsReconciliation, boolean relaxable, IndexHints indexHints,
+                      OptimizerOptions optimizerOptions)
     {
         this.root = root;
         this.needsReconciliation = needsReconciliation;
+        this.relaxable = relaxable;
         this.indexHints = indexHints;
         this.optimizerOptions = optimizerOptions;
     }
@@ -203,7 +230,29 @@ public class RowFilter
         if (MessagingService.current_version < MessagingService.VERSION_DS_10)
             return true;
 
-        return peerChecks.get(keyspace, consistency);
+        return peerChecks.get(keyspace, consistency) || isMarkedBelowDS10(keyspace);
+    }
+
+    /**
+     * Counts a node below DS 10 for every scope of the given keyspace for a second, whatever its endpoints say: the
+     * node that refused a filter may be one they don't show, such as a pending replacement.
+     */
+    private static void markPeersBelowDS10(String keyspace)
+    {
+        peerMarks.put(keyspace, nanoTime() + PEER_MARK_VALIDITY_NANOS);
+    }
+
+    private static boolean isMarkedBelowDS10(String keyspace)
+    {
+        Long expiresAtNanos = peerMarks.get(keyspace);
+        if (expiresAtNanos == null)
+            return false;
+
+        if (nanoTime() - expiresAtNanos < 0)
+            return true;
+
+        peerMarks.remove(keyspace, expiresAtNanos);
+        return false;
     }
 
     /**
@@ -341,24 +390,81 @@ public class RowFilter
     }
 
     /**
+     * @return this filter for a read that doesn't need reconciliation at the coordinator, such as a top-K read whose
+     * consistency level has been downgraded to ONE/LOCAL_ONE
+     */
+    public RowFilter withoutReconciliation()
+    {
+        return needsReconciliation ? new RowFilter(root, false, relaxable, indexHints, optimizerOptions) : this;
+    }
+
+    /**
      * If this filter belongs to a read that requires reconciliation at the coordinator, and it contains an intersection
      * on two or more non-key (and therefore mutable) columns, we cannot strictly apply it to local, unrepaired rows.
      * When this occurs, we must downgrade the intersection of expressions to a union and leave the coordinator to 
-     * filter strictly before sending results to the client.
+     * filter strictly before sending results to the client. Replicas filter strictly anyway if the coordinator doesn't
+     * let them relax the filter (see {@link #withReplicaFilteringStrictness(String, ConsistencyLevel)}).
      * 
-     * @return true if strict filtering is safe
+     * @return true if replicas apply this filter strictly
      *
      * @see <a href="https://issues.apache.org/jira/browse/CASSANDRA-19018">CASSANDRA-19018</a>
      */
     public boolean isStrict()
     {
-        return !needsReconciliation || !isMutableIntersection();
+        return !needsReconciliation || !relaxable || !isMutableIntersection();
+    }
+
+    /**
+     * Returns this filter for a coordinator, which lets replicas relax it (see {@link #isStrict()}) only if non-strict
+     * replica filtering is enabled (see {@link DatabaseDescriptor#getSAINonStrictReplicaFilteringEnabled()}), or while
+     * the read may contact nodes on a messaging version below DS 10, such as Apache Cassandra nodes, whose replicas
+     * relax it whatever the coordinator says. The decision is made once for the read, and its commands carry it. A
+     * filter made strict can't be sent to such a node (see {@link Serializer#serialize}).
+     *
+     * @param keyspace the keyspace of the queried table
+     * @param consistency the consistency level of the read
+     * @return this filter, or a copy of it that replicas apply strictly
+     */
+    public RowFilter withReplicaFilteringStrictness(String keyspace, ConsistencyLevel consistency)
+    {
+        if (isStrict()
+            || DatabaseDescriptor.getSAINonStrictReplicaFilteringEnabled()
+            || mayHavePeersBelowDS10(keyspace, consistency))
+            return this;
+
+        return new RowFilter(root, needsReconciliation, false, indexHints, optimizerOptions);
+    }
+
+    /**
+     * Returns a copy of this filter that replicas can relax, if the coordinator made it strict and the read can contact
+     * nodes below DS 10, which refuse it (see {@link Serializer#serialize}), or {@code null}.
+     *
+     * @param keyspace the keyspace of the queried table
+     * @param consistency the consistency level of the read
+     * @return a copy of this filter that replicas can relax, or {@code null}
+     */
+    @Nullable
+    public RowFilter relaxableForPeersBelowDS10(String keyspace, ConsistencyLevel consistency)
+    {
+        if (relaxable || !needsReconciliation || !isMutableIntersection()
+            || !mayHavePeersBelowDS10(keyspace, consistency))
+            return null;
+
+        return new RowFilter(root, needsReconciliation, true, indexHints, optimizerOptions);
     }
 
     /**
      * @return true if this filter contains an intersection on either any static column or two regular mutable columns
      */
     public boolean isMutableIntersection()
+    {
+        Boolean cached = isMutableIntersection;
+        if (cached == null)
+            isMutableIntersection = cached = computeIsMutableIntersection();
+        return cached;
+    }
+
+    private boolean computeIsMutableIntersection()
     {
         List<Expression> exprs = expressions();
         Set<ColumnMetadata> columns = null;
@@ -700,7 +806,7 @@ public class RowFilter
         if (root.size() == 1)
             return RowFilter.none();
 
-        return new RowFilter(root.filter(e -> !e.equals(expression)), needsReconciliation, indexHints, optimizerOptions);
+        return new RowFilter(root.filter(e -> !e.equals(expression)), needsReconciliation, relaxable, indexHints, optimizerOptions);
     }
 
     /**
@@ -712,7 +818,7 @@ public class RowFilter
         if (isEmpty())
             return this;
 
-        return new RowFilter(root.filter(e -> !e.column().equals(column) || e.operator() != op || !e.value.equals(value)), needsReconciliation, indexHints, optimizerOptions);
+        return new RowFilter(root.filter(e -> !e.column().equals(column) || e.operator() != op || !e.value.equals(value)), needsReconciliation, relaxable, indexHints, optimizerOptions);
     }
 
     public boolean hasNonKeyExpression()
@@ -755,17 +861,17 @@ public class RowFilter
      */
     public RowFilter withoutDisjunctions()
     {
-        return new RowFilter(root.withoutDisjunctions(), needsReconciliation, indexHints, optimizerOptions);
+        return new RowFilter(root.withoutDisjunctions(), needsReconciliation, relaxable, indexHints, optimizerOptions);
     }
 
     public RowFilter restrict(Predicate<Expression> filter)
     {
-        return new RowFilter(root.filter(filter), needsReconciliation, indexHints, optimizerOptions);
+        return new RowFilter(root.filter(filter), needsReconciliation, relaxable, indexHints, optimizerOptions);
     }
 
     public RowFilter restrictFirstLevel(Predicate<Expression> filter)
     {
-        return new RowFilter(root.filterFirstLevel(filter), needsReconciliation, indexHints, optimizerOptions);
+        return new RowFilter(root.filterFirstLevel(filter), needsReconciliation, relaxable, indexHints, optimizerOptions);
     }
 
     public boolean isEmpty()
@@ -2758,6 +2864,14 @@ public class RowFilter
     {
         public void serialize(RowFilter filter, DataOutputPlus out, int version) throws IOException
         {
+            if (version < MessagingService.VERSION_DS_10
+                && filter.needsReconciliation && !filter.relaxable && filter.isMutableIntersection())
+            {
+                // nodes below DS 10 would relax a filter that the coordinator made strict, so it isn't sent to them
+                markPeersBelowDS10(filter.expressions().get(0).column.ksName);
+                throw serializationRefused(version, "nodes on that version don't apply it strictly");
+            }
+
             out.writeBoolean(false); // Old "is for thrift" boolean
             IndexHints.serializer.serialize(filter.indexHints, out, version); // hints first because the expressions might need them
             FilterElement.serializer.serialize(filter.root, out, version);

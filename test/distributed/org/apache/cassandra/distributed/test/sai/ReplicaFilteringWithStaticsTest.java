@@ -19,10 +19,14 @@
 package org.apache.cassandra.distributed.test.sai;
 
 import java.io.IOException;
+import java.util.Collection;
 
 import org.junit.AfterClass;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
@@ -34,9 +38,19 @@ import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 
+@RunWith(Parameterized.class)
 public class ReplicaFilteringWithStaticsTest extends TestBaseImpl
 {
     private static Cluster CLUSTER;
+
+    @Parameterized.Parameter
+    public boolean nonStrict;
+
+    @Parameterized.Parameters(name = "nonStrict={0}")
+    public static Collection<Object[]> parameters()
+    {
+        return SAIUtil.nonStrictReplicaFilteringModes();
+    }
 
     @BeforeClass
     public static void setUpCluster() throws IOException
@@ -197,6 +211,14 @@ public class ReplicaFilteringWithStaticsTest extends TestBaseImpl
         // node 2 is not included in the first pass query, it will not be available to shadow the logically deleted rows.
         String select = withKeyspace("SELECT ck0, ck1 FROM %s." + table + " WHERE s1 = 42" + (sai ? "" : " ALLOW FILTERING"));
         assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ALL, 1), row(true, 5.0));
+    }
+
+    @Before
+    public void setUp()
+    {
+        SAIUtil.setNonStrictReplicaFiltering(CLUSTER, nonStrict);
+        CLUSTER.schemaChange("DROP KEYSPACE IF EXISTS " + KEYSPACE);
+        init(CLUSTER, 3);
     }
 
     @AfterClass

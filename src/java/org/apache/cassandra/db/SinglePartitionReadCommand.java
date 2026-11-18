@@ -239,11 +239,14 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                                                       ClusteringIndexFilter clusteringIndexFilter)
     {
         // We can skip the indexes if the query is for a specific set of primary keys, there is no ordering,
-        // and there are no hints telling us otherwise.
+        // and there are no hints telling us otherwise. But not if the row filter isn't strict: without an index, the
+        // replicas would apply it strictly, each to its own data, and miss the rows whose columns are on different
+        // replicas, which the coordinator finds by filtering the candidate rows of an index query (CASSANDRA-19018).
         if (CassandraRelevantProperties.SKIP_INDEXES_ON_FULL_PRIMARY_KEYS.getBoolean()
             && clusteringIndexFilter instanceof ClusteringIndexNamesFilter
             && rowFilter.indexHints.included.isEmpty()
-            && !rowFilter.hasOrdering())
+            && !rowFilter.hasOrdering()
+            && rowFilter.isStrict())
             return null;
 
         return findIndexQueryPlan(table, rowFilter);

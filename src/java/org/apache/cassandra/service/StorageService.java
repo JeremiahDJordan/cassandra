@@ -7941,6 +7941,19 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     }
 
     @Override
+    public boolean getSAINonStrictReplicaFilteringEnabled()
+    {
+        return DatabaseDescriptor.getSAINonStrictReplicaFilteringEnabled();
+    }
+
+    @Override
+    public void setSAINonStrictReplicaFilteringEnabled(boolean value)
+    {
+        DatabaseDescriptor.setSAINonStrictReplicaFilteringEnabled(value);
+        logger.info("SAI non-strict replica filtering is now {}", value ? "enabled" : "disabled");
+    }
+
+    @Override
     public boolean getForceOptimizedIndexStatusFormat()
     {
         return DatabaseDescriptor.getForceOptimizedIndexStatusFormat();

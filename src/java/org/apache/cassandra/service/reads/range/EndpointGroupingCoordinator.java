@@ -388,8 +388,9 @@ public class EndpointGroupingCoordinator
             @Override
             public boolean rangeExhausted()
             {
-                // if the range is not fetched by original request or SRP, SRP is needed.
-                return super.rangeExhausted() && (rangeFetched || !singleResultCounter.isDone());
+                // if the range is not fetched by original request or SRP, SRP is needed if the replica stopped at the
+                // limits before getting to it
+                return super.rangeExhausted() && (rangeFetched || !replicaReachedLimits());
             }
         }
     }

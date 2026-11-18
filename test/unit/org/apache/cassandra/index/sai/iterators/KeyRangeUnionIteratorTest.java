@@ -555,6 +555,33 @@ public class KeyRangeUnionIteratorTest extends AbstractKeyRangeIteratorTest
         }
     }
 
+    /**
+     * A key without a clustering, such as a partition-only bound, ties with every row key of its partition: the maximum
+     * of a union with rows of the partition is its largest row, so a union with later rows keeps them in order.
+     */
+    @Test
+    public void testUnionOfRangesWithPartitionOnlyBounds()
+    {
+        for (boolean partitionBoundedFirst : new boolean[]{ true, false })
+        {
+            KeyRangeUnionIterator.Builder inner = KeyRangeUnionIterator.builder();
+            KeyRangeIterator partitionBounded = makePartitionBoundedIterator(3, 0, 5, 6);
+            KeyRangeIterator rows = PrimaryKeyListIterator.create(makeKeyForRegularRow(3, 0),
+                                                                  makeKeyForRegularRow(3, 1),
+                                                                  makeKeyForRegularRow(3, 2));
+            inner.add(partitionBoundedFirst ? partitionBounded : rows);
+            inner.add(partitionBoundedFirst ? rows : partitionBounded);
+            KeyRangeIterator union = inner.build();
+            PrimaryKey maximum = union.getMaximum();
+
+            KeyRangeUnionIterator.Builder outer = KeyRangeUnionIterator.builder();
+            outer.add(union);
+            outer.add(PrimaryKeyListIterator.create(makeKeyForRegularRow(3, 3), makeKeyForRegularRow(3, 7)));
+            Assert.assertEquals(Arrays.asList(0L, 1L, 2L, 3L, 5L, 6L, 7L), clusterings(outer.build()));
+            Assert.assertTrue(maximum + " should be at least row 6", maximum.compareTo(makeKeyForRegularRow(3, 6)) >= 0);
+        }
+    }
+
 
     private static List<PrimaryKey> union(List<List<PrimaryKey>> inputs)
     {

@@ -24,6 +24,8 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 
+import org.junit.After;
+import org.junit.Before;
 import org.junit.Test;
 
 import ch.qos.logback.classic.Level;
@@ -38,6 +40,7 @@ import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.gms.EndpointState;
 import org.apache.cassandra.gms.FailureDetector;
@@ -48,6 +51,7 @@ import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.net.EndpointMessagingVersions;
@@ -64,20 +68,123 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 
 /**
- * Tests which ring members make {@link RowFilter#validateForPeers} reject a DataStax-only query (an OR), depending on
- * what is known of them. Its result is reused until the nodes change.
+ * Tests which nodes that a query can contact make {@link RowFilter#validateForPeers} reject a DataStax-only query (an
+ * OR), and make the coordinator let replicas relax its filters (see {@link RowFilter#withReplicaFilteringStrictness}),
+ * depending on what is known of them. The result of the check is reused until the nodes change.
  */
 public class RowFilterPeerGateTest extends CQLTester
 {
     private static final String TABLE = "CREATE TABLE %s (k int PRIMARY KEY, a int, b int)";
     private static final String OR = "SELECT k FROM %s WHERE a = 1 OR b = 2 ALLOW FILTERING";
 
+    private String replicatedTable;
+    private boolean previousNonStrict;
+
+    @Before
+    public void setup() throws Throwable
+    {
+        previousNonStrict = DatabaseDescriptor.getSAINonStrictReplicaFilteringEnabled();
+        DatabaseDescriptor.setSAINonStrictReplicaFilteringEnabled(false);
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = " +
+                                         "{'class': 'SimpleStrategy', 'replication_factor': '2'}");
+        replicatedTable = keyspace + '.' + createTable(keyspace, TABLE);
+        createTable(TABLE);
+        execute("INSERT INTO %s (k, a, b) VALUES (1, 1, 2)");
+    }
+
+    @After
+    public void restoreNonStrictFiltering()
+    {
+        DatabaseDescriptor.setSAINonStrictReplicaFilteringEnabled(previousNonStrict);
+    }
+
+    /**
+     * The nodes a query can contact are checked again as soon as a node is first seen below DS 10, even if that
+     * doesn't change the minimum known messaging version.
+     */
+    @Test
+    public void testNodeNewlySeenBelowDS10() throws Throwable
+    {
+        // a node below DS 10 that isn't in the ring sets the minimum known version
+        InetAddressAndPort outsider = InetAddressAndPort.getByName("127.0.0.9");
+        InetAddressAndPort peer = InetAddressAndPort.getByName("127.0.0.8");
+        MessagingService.instance().versions.set(outsider, MessagingService.VERSION_50);
+        try
+        {
+            // a ring member whose version isn't known, and that isn't alive, isn't counted
+            addToRing(peer);
+            assertAccepted();
+
+            MessagingService.instance().versions.set(peer, MessagingService.VERSION_50);
+            assertRejected();
+        }
+        finally
+        {
+            StorageService.instance.getTokenMetadata().removeEndpoint(peer);
+            MessagingService.instance().versions.reset(peer);
+            MessagingService.instance().versions.reset(outsider);
+        }
+    }
+
+    /**
+     * A node below DS 10 that refuses a filter while the coordinator checks the nodes a query can contact counts,
+     * although the check, which started before, doesn't see it.
+     */
+    @Test
+    public void testRefusalDuringCheck() throws Throwable
+    {
+        InetAddressAndPort outsider = InetAddressAndPort.getByName("127.0.0.9");
+        Injections.Barrier holdCheck = Injections.newBarrier("hold_peer_check", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(RowFilter.class)
+                                                                        .onMethod("computeMayHavePeersBelowDS10")
+                                                                        .atExit())
+                                                 .build();
+        try
+        {
+            RowFilter strict = rowFilter();
+            assertThat(strict.isStrict()).isTrue();
+            // a node outside the ring seen below DS 10 makes the next query check the nodes
+            MessagingService.instance().versions.set(outsider, MessagingService.VERSION_50);
+            Injections.inject(holdCheck);
+
+            CompletableFuture<RowFilter> checked = CompletableFuture.supplyAsync(this::rowFilter);
+            Util.spinAssertEquals(1L, holdCheck::getCount, 60);
+            assertThatThrownBy(() -> RowFilter.serializer.serialize(strict, new DataOutputBuffer(),
+                                                                     MessagingService.VERSION_50))
+                .isInstanceOf(IncompatibleMessagingVersionException.class);
+            holdCheck.countDown();
+
+            assertThat(checked.get(60, TimeUnit.SECONDS).isStrict()).isFalse();
+            assertStrictness(false);
+        }
+        finally
+        {
+            holdCheck.disable();
+            MessagingService.instance().versions.reset(outsider);
+        }
+    }
+
+    /**
+     * A node below DS 10 that refuses a filter counts for a second, after which the nodes a query can contact decide
+     * again.
+     */
+    @Test
+    public void testRefusalMarkExpires() throws Throwable
+    {
+        RowFilter strict = rowFilter();
+        assertThat(strict.isStrict()).isTrue();
+        assertThatThrownBy(() -> RowFilter.serializer.serialize(strict, new DataOutputBuffer(), MessagingService.VERSION_50))
+            .isInstanceOf(IncompatibleMessagingVersionException.class);
+        assertStrictness(false);
+
+        TimeUnit.MILLISECONDS.sleep(1100);
+        assertStrictness(true);
+    }
+
     @Test
     public void testPeers() throws Throwable
     {
-        createTable(TABLE);
-        execute("INSERT INTO %s (k, a, b) VALUES (1, 1, 2)");
-
         // with gossip enabled, the failure detector logs an error when asked about an endpoint gossip doesn't know
         ListAppender<ILoggingEvent> failureDetectorLog = new ListAppender<>();
         failureDetectorLog.start();
@@ -550,11 +657,29 @@ public class RowFilterPeerGateTest extends CQLTester
     private void assertAccepted()
     {
         assertEquals(1, execute(OR).size());
+        assertStrictness(true);
     }
 
     private void assertRejected()
     {
         assertThatThrownBy(() -> execute(OR)).isInstanceOf(InvalidRequestException.class)
                                              .hasMessageContaining("The OR operator is not supported");
+        assertStrictness(false);
+    }
+
+    /** Asserts whether the coordinator makes a QUORUM filter of several mutable columns strict. */
+    private void assertStrictness(boolean strict)
+    {
+        RowFilter filter = rowFilter();
+        assertThat(filter.needsReconciliation()).isTrue();
+        assertThat(filter.isStrict()).isEqualTo(strict);
+    }
+
+    private RowFilter rowFilter()
+    {
+        String query = "SELECT * FROM " + replicatedTable + " WHERE a = 1 AND b = 2 ALLOW FILTERING";
+        SelectStatement select = (SelectStatement) QueryProcessor.parseStatement(query, ClientState.forInternalCalls());
+        return select.getRowFilter(QueryOptions.forInternalCalls(ConsistencyLevel.QUORUM, Collections.emptyList()),
+                                   ClientState.forInternalCalls());
     }
 }

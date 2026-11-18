@@ -37,6 +37,7 @@ import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.IndexContext;
+import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.utils.TreeFormatter;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
@@ -338,7 +339,11 @@ public class Operation
          */
         abstract void analyze(QueryController controller);
 
-        abstract FilterTree filterTree();
+        /**
+         * @param isStrict whether the intersections can be strictly evaluated (see {@link QueryController#usesStrictFiltering()})
+         * @param context the context of the query, which tells whether there are index matches on unrepaired data
+         */
+        abstract FilterTree filterTree(boolean isStrict, QueryContext context);
 
         abstract Plan.KeysIteration plan(QueryController controller);
 
@@ -409,8 +414,14 @@ public class Operation
         @VisibleForTesting
         FilterTree buildFilter(QueryController controller)
         {
+            return buildFilter(controller, controller.usesStrictFiltering());
+        }
+
+        @VisibleForTesting
+        FilterTree buildFilter(QueryController controller, boolean isStrict)
+        {
             analyze(controller);
-            return filterTree();
+            return filterTree(isStrict, controller.queryContext());
         }
 
         /**
@@ -459,13 +470,13 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree()
+        FilterTree filterTree(boolean isStrict, QueryContext context)
         {
             assert expressionMap != null;
-            var tree = new FilterTree(operationType(), expressionMap);
+            var tree = new FilterTree(operationType(), expressionMap, isStrict, context);
             for (Node child : children())
                 if (child.canFilter())
-                    tree.addChild(child.filterTree());
+                    tree.addChild(child.filterTree(isStrict, context));
             return tree;
         }
 
@@ -494,6 +505,20 @@ public class Operation
         protected Plan.Builder planBuilder(QueryController controller)
         {
             return controller.planFactory.intersectionBuilder();
+        }
+
+        @Override
+        Plan.KeysIteration plan(QueryController controller)
+        {
+            if (controller.usesStrictFiltering())
+                return super.plan(controller);
+
+            // The intersection can't be strictly evaluated on local data (CASSANDRA-19018)
+            List<Plan.KeysIteration> childPlans = new ArrayList<>(children.size());
+            for (Node child : children)
+                if (child.canFilter())
+                    childPlans.add(child.plan(controller));
+            return controller.buildNonStrictIntersectionPlan(expressionMap.values(), childPlans);
         }
 
         @Override
@@ -535,10 +560,10 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree()
+        FilterTree filterTree(boolean isStrict, QueryContext context)
         {
             assert expressionMap != null;
-            return new FilterTree(OperationType.AND, expressionMap);
+            return new FilterTree(OperationType.AND, expressionMap, isStrict, context);
         }
 
         public ExpressionNode(RowFilter.Expression expression)
@@ -571,7 +596,7 @@ public class Operation
     public static class EmptyNode extends Node
     {
         // A FilterTree that filters out all rows
-        private static final FilterTree EMPTY_TREE = new FilterTree(OperationType.OR, ArrayListMultimap.create());
+        private static final FilterTree EMPTY_TREE = new FilterTree(OperationType.OR, ArrayListMultimap.create(), true, null);
 
         @Override
         boolean canFilter()
@@ -585,7 +610,7 @@ public class Operation
         }
 
         @Override
-        FilterTree filterTree()
+        FilterTree filterTree(boolean isStrict, QueryContext context)
         {
             return EMPTY_TREE;
         }

@@ -157,6 +157,22 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     @Nullable
     private final CompleteRows completeRows;
 
+    /**
+     * Returns whether replica filtering protection reads whole partitions of the given command from every replica
+     * before it filters them (see {@link #queryProtectedPartitions}).
+     * <p>
+     * Per-partition and GROUP BY limits need entire partitions: a partition handed over in several pages restarts the
+     * second phase's per-partition count, and GroupMaker expects each partition key once.
+     */
+    static boolean consumesEntirePartitions(ReadCommand command)
+    {
+        return command.limits().isUnlimited()
+               || !command.isLimitedToOnePartition()
+               || command.rowFilter().hasStaticExpression()
+               || command.limits().perPartitionCount() != DataLimits.NO_LIMIT
+               || command.limits().isGroupByLimit();
+    }
+
     ReplicaFilteringProtection(Keyspace keyspace,
                                ReadCommand command,
                                ConsistencyLevel consistency,
@@ -169,13 +185,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     {
         this.keyspace = keyspace;
         this.command = command;
-        // Per-partition and GROUP BY limits need entire partitions: a partition handed over in several pages restarts
-        // the second phase's per-partition count, and GroupMaker expects each partition key once.
-        this.consumeEntirePartitions = command.limits().isUnlimited()
-                                       || !command.isLimitedToOnePartition()
-                                       || command.rowFilter().hasStaticExpression()
-                                       || command.limits().perPartitionCount() != DataLimits.NO_LIMIT
-                                       || command.limits().isGroupByLimit();
+        this.consumeEntirePartitions = consumesEntirePartitions(command);
         this.consistency = consistency;
         this.requestTime = requestTime;
         this.sources = sources;

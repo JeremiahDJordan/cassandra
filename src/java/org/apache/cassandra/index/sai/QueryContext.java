@@ -127,6 +127,13 @@ public class QueryContext
     /** Metrics about the query plan. */
     private PlanInfo queryPlanInfo;
 
+    /**
+     * Whether the local query found index matches in memtables or on unrepaired SSTables, computed only for a filter
+     * that isn't strict. If not, the post-filtering can keep its intersections (see
+     * QueryController#usesStrictFiltering).
+     */
+    private boolean hasUnrepairedMatches = false;
+
     @VisibleForTesting
     public QueryContext()
     {
@@ -137,6 +144,23 @@ public class QueryContext
     {
         this.command = command;
         this.queryStartTimeNanos = MonotonicClock.Global.approxTime.now();
+    }
+
+    /**
+     * @return {@code true} if the local query found index matches in Memtable indexes or in indexes on unrepaired
+     * SSTables, {@code false} otherwise
+     */
+    public boolean hasUnrepairedMatches()
+    {
+        return hasUnrepairedMatches;
+    }
+
+    /**
+     * Records that the local query found index matches in Memtable indexes or in indexes on unrepaired SSTables.
+     */
+    public void markUnrepairedMatches()
+    {
+        hasUnrepairedMatches = true;
     }
 
     public long totalQueryTimeNs()

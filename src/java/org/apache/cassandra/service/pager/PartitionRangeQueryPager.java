@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.service.pager;
 
+import java.nio.ByteBuffer;
 import java.util.StringJoiner;
 
 import org.apache.cassandra.cql3.PageSize;
@@ -40,10 +41,26 @@ public class PartitionRangeQueryPager extends AbstractQueryPager<PartitionRangeR
 
         if (state != null)
         {
-            lastReturnedKey = query.metadata().partitioner.decorateKey(state.partitionKey);
+            lastReturnedKey = query.metadata().partitioner.decorateKey(partitionKey(query, state));
             lastReturnedRow = state.rowMark;
             restoreState(lastReturnedKey, state.remaining, state.remainingInPartition);
         }
+    }
+
+    /**
+     * Returns the key of the last partition returned in the given paging state. A paging state from a
+     * {@link SinglePartitionPager} has no partition key; on a range of a single partition it refers to that partition:
+     * the queries read as a range of their partition are single-partition reads at ONE and LOCAL_ONE.
+     */
+    private static ByteBuffer partitionKey(PartitionRangeReadQuery query, PagingState state)
+    {
+        if (state.partitionKey == null)
+        {
+            DataRange range = query.dataRange();
+            if (range.startKey() instanceof DecoratedKey && range.startKey().equals(range.stopKey()))
+                return ((DecoratedKey) range.startKey()).getKey();
+        }
+        return state.partitionKey;
     }
 
     public PartitionRangeQueryPager(PartitionRangeReadQuery query,

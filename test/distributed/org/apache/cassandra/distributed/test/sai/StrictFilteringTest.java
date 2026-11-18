@@ -21,18 +21,14 @@ package org.apache.cassandra.distributed.test.sai;
 import java.io.IOException;
 import java.util.Iterator;
 
-import org.assertj.core.api.Assertions;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
-import org.junit.Ignore;
 import org.junit.Test;
 
-import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
-import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
 
 import static org.junit.Assert.assertEquals;
 
@@ -43,7 +39,8 @@ import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 
 /**
  * This class contains a small set of hand-crafted tests that document corner cases around how SAI handles
- * resolving partial updates, unrepaired data, and post-index filtering.
+ * resolving partial updates, unrepaired data, and post-index filtering, with non-strict replica filtering enabled
+ * unless a test disables it.
  * 
  * @see <a href="https://issues.apache.org/jira/browse/CASSANDRA-19018">CASSANDRA-19018</a>
  */
@@ -54,35 +51,157 @@ public class StrictFilteringTest extends TestBaseImpl
     @BeforeClass
     public static void setUpCluster() throws IOException
     {
-        CLUSTER = init(Cluster.build(2).withConfig(config -> config.set("hinted_handoff_enabled", false).with(GOSSIP).with(NETWORK)).start());
+        CLUSTER = init(Cluster.build(2).withConfig(config -> SAIUtil.withNonStrictReplicaFiltering(config, true)
+                                                                    .set("hinted_handoff_enabled", false)
+                                                                    .with(GOSSIP).with(NETWORK)).start());
     }
 
     @Test
-    @Ignore("CNDB-9331: Address CC rebase conflicts with CASSANDRA-19018")
-    public void shouldRejectNonStrictIN()
+    public void shouldDegradeToUnionOnSingleStatic()
     {
-        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.reject_in (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
-        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.reject_in(a) USING 'sai'"));
-        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.reject_in(b) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.single_static (pk0 int, ck0 int, ck1 int, s0 int static, v0 int, PRIMARY KEY (pk0, ck0, ck1)) " +
+                                          "WITH read_repair = 'NONE' AND CLUSTERING ORDER BY (ck0 ASC, ck1 DESC)"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.single_static(ck0) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.single_static(s0) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        // To present the coordinator with enough data to find a row match, both replicas must degrade to OR at query
+        // time. The static column match from node 2 and the clustering key match from node 1 must be merged.
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.single_static (pk0, ck0, ck1, s0, v0) VALUES (0, 1, 2, 3, 4)"));
+        CLUSTER.get(1).executeInternal(withKeyspace("UPDATE %s.single_static SET v0 = 5 WHERE pk0 = 0 AND ck0 = 6 AND ck1 = 7"));
+
+        // A static column predicate and ANY other predicate makes strict filtering impossible, as the static match
+        // applies to the entire partition.
+        String select = withKeyspace("SELECT * FROM %s.single_static WHERE s0 = 3 AND ck0 = 6");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 6, 7, 3, 5));
+    }
+
+    /**
+     * IN restrictions are evaluated in the filter tree as disjunctions, so non-strict reads relax them like any other
+     * restriction instead of rejecting the query.
+     */
+    @Test
+    public void testNonStrictIN()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.non_strict_in (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.non_strict_in(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.non_strict_in(b) USING 'sai'"));
         SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
 
         // insert an unrepaired row
-        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.reject_in(k, a) VALUES (0, 1)"));
-        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.reject_in(k, b) VALUES (0, 2)"));
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.non_strict_in(k, a) VALUES (0, 1)"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.non_strict_in(k, b) VALUES (0, 2)"));
 
-        String select = withKeyspace("SELECT * FROM %s.reject_in WHERE a = 1 AND b IN (2, 3) ALLOW FILTERING");
+        String select = withKeyspace("SELECT * FROM %s.non_strict_in WHERE a = 1 AND b IN (2, 3) ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 1, 2));
 
-        // This should fail, as strict filtering is not allowed:
-        Assertions.assertThatThrownBy(() -> CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL))
-                  .hasMessageContaining(String.format(StorageAttachedIndexQueryPlan.UNSUPPORTED_NON_STRICT_OPERATOR, Operator.IN));
-
-        // Repair fixes the split row, although we still only allow the query when reconciliation is not required:
+        // repair fixes the split row
         CLUSTER.get(1).nodetoolResult("repair", KEYSPACE).asserts().success();
         assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ONE), row(0, 1, 2));
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 1, 2));
+    }
+
+    /**
+     * Replicas that can't strictly filter rows return candidate rows that the coordinator must filter after
+     * reconciliation, even when all the replicas agree on those rows. Partition-restricted queries must do that too,
+     * instead of returning the unfiltered rows of a single replica when the digests of the responses match.
+     */
+    @Test
+    public void testPartitionRestrictedWithReplicatedRows()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partition_restricted (k int, c int, a int, b int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partition_restricted(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partition_restricted(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        // rows on both replicas, only one of which matches both restrictions
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partition_restricted(k, c, a, b) VALUES (0, 0, 1, 5)"), ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partition_restricted(k, c, a, b) VALUES (0, 1, 1, 2)"), ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partition_restricted(k, c, a, b) VALUES (0, 2, 3, 2)"), ConsistencyLevel.ALL);
+
+        String select = withKeyspace("SELECT * FROM %s.partition_restricted WHERE k = 0 AND a = 1 AND b = 2");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 1, 1, 2));
+        assertRows(CLUSTER.coordinator(1).execute(select + " LIMIT 1", ConsistencyLevel.ALL), row(0, 1, 1, 2));
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 1, 1, 2));
+
+        // insert a split row in the same partition
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partition_restricted(k, c, a) VALUES (0, 3, 1)"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.partition_restricted(k, c, b) VALUES (0, 3, 2)"));
+
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 1, 1, 2), row(0, 3, 1, 2));
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 1), row(0, 1, 1, 2), row(0, 3, 1, 2));
+    }
+
+    /**
+     * DataStax SAI supports OR in queries, so a split row must also be found when an intersection contains a
+     * disjunction.
+     */
+    @Test
+    public void testPartialUpdatesWithDisjunction()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_or (k int PRIMARY KEY, a int, b int, c int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_or(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_or(b) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_or(c) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        // insert a split row
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_or(k, a) VALUES (0, 1) USING TIMESTAMP 1"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_or(k, b, c) VALUES (0, 2, 4) USING TIMESTAMP 2"));
+
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_or WHERE a = 1 AND (b = 2 OR c = 3)"), ConsistencyLevel.ALL),
+                   row(0, 1, 2, 4));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_or WHERE a = 1 AND (b = 3 OR c = 4)"), ConsistencyLevel.ALL),
+                   row(0, 1, 2, 4));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_or WHERE a = 1 AND (b = 3 OR c = 3)"), ConsistencyLevel.ALL));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_or WHERE (a = 1 AND b = 2) OR c = 3"), ConsistencyLevel.ALL),
+                   row(0, 1, 2, 4));
+    }
+
+    /**
+     * Nested operations that can't use indexes, such as IN or OR on unindexed columns, don't narrow down the
+     * candidates on unrepaired data, but the indexed restrictions still do.
+     */
+    @Test
+    public void testPartialUpdatesWithUnindexedDisjunctions()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_unindexed_or (k int PRIMARY KEY, a int, b int, c int, d int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_unindexed_or(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_unindexed_or(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        // insert a split row
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_unindexed_or(k, a) VALUES (0, 1) USING TIMESTAMP 1"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_unindexed_or(k, c) VALUES (0, 7) USING TIMESTAMP 2"));
+
+        Object[] expected = row(0, 1, null, 7, null);
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_unindexed_or WHERE a = 1 AND c IN (7, 8) ALLOW FILTERING"), ConsistencyLevel.ALL), expected);
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_unindexed_or WHERE a = 1 AND (c = 7 OR d = 8) ALLOW FILTERING"), ConsistencyLevel.ALL), expected);
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_unindexed_or WHERE a = 1 AND (b = 2 OR c = 7) ALLOW FILTERING"), ConsistencyLevel.ALL), expected);
+    }
+
+    /**
+     * A split row must also be found when the intersection contains a negation, which DataStax SAI supports.
+     */
+    @Test
+    public void testPartialUpdatesWithNegation()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_not (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_not(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.partial_updates_not(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnFirstNode(CLUSTER, KEYSPACE);
+
+        // insert a split row, where the stale value of b on node 1 doesn't match the negation, and the live one on
+        // node 2 does, but node 2 doesn't have the value of a
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_not(k, a, b) VALUES (0, 1, 4) USING TIMESTAMP 1"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_not(k, b) VALUES (0, 2) USING TIMESTAMP 2"));
+
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_not WHERE a = 1 AND b != 4"), ConsistencyLevel.ALL),
+                   row(0, 1, 2));
+        assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates_not WHERE a = 1 AND b != 2"), ConsistencyLevel.ALL));
     }
 
     @Test
-    @Ignore("CNDB-9331: Address CC rebase conflicts with CASSANDRA-19018")
     public void testPartialUpdates()
     {
         CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
@@ -97,6 +216,19 @@ public class StrictFilteringTest extends TestBaseImpl
         String select = withKeyspace("SELECT * FROM %s.partial_updates WHERE a = 1 AND b = 2");
         Object[][] initialRows = CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL);
         assertRows(initialRows, row(0, 1, 2));
+
+        // with non-strict replica filtering disabled on the coordinator, the replicas filter strictly and miss the row
+        SAIUtil.setNonStrictReplicaFiltering(CLUSTER.get(1), false);
+        try
+        {
+            assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL));
+            assertRows(CLUSTER.coordinator(1).execute(withKeyspace("SELECT * FROM %s.partial_updates WHERE k = 0 AND a = 1 AND b = 2"), ConsistencyLevel.ALL));
+            assertRows(CLUSTER.coordinator(2).execute(select, ConsistencyLevel.ALL), row(0, 1, 2));
+        }
+        finally
+        {
+            SAIUtil.setNonStrictReplicaFiltering(CLUSTER.get(1), true);
+        }
     }
 
     @Test
@@ -108,6 +240,7 @@ public class StrictFilteringTest extends TestBaseImpl
 
         CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_column(k, a) VALUES (0, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
         CLUSTER.get(1).nodetoolResult("repair", KEYSPACE).asserts().success();
+        SAIUtil.waitForRepairedSSTables(CLUSTER, KEYSPACE, "partial_updates_non_indexed_column");
 
         // insert a split row
         CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.partial_updates_non_indexed_column(k, b) VALUES (0, 2) USING TIMESTAMP 2"));
@@ -170,7 +303,6 @@ public class StrictFilteringTest extends TestBaseImpl
     }
 
     @Test
-    @Ignore("CNDB-9331: Address CC rebase conflicts with CASSANDRA-19018")
     public void testShortReadWithRegularColumns()
     {
         CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_short_read (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
@@ -298,7 +430,6 @@ public class StrictFilteringTest extends TestBaseImpl
     }
 
     @Test
-    @Ignore("CNDB-9331: Address CC rebase conflicts with CASSANDRA-19018")
     public void testShortReadWithStaticColumn()
     {
         CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates_short_read_static (k int, c int, a int, b int static, PRIMARY KEY(k, c)) WITH read_repair = 'NONE'"));
@@ -319,7 +450,6 @@ public class StrictFilteringTest extends TestBaseImpl
     }
 
     @Test
-    @Ignore("CNDB-9331: Address CC rebase conflicts with CASSANDRA-19018")
     public void testTimestampCollision()
     {
         CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.timestamp_collision (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));

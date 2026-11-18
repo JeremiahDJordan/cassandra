@@ -36,8 +36,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * An upgrade from Apache Cassandra 5.0 done one datacenter at a time: dc1 is on this release, dc2 on the Apache
- * Cassandra 5.0 messaging version. The DataStax-only filter features are decided on the nodes the query can contact:
- * a dc1 coordinator accepts OR at the LOCAL_* consistency levels, and not at the others, which can reach dc2.
+ * Cassandra 5.0 messaging version. The DataStax-only filter features, and strict replica filtering, are decided on the
+ * nodes the query can contact: a dc1 coordinator accepts OR, and filters strictly, at the LOCAL_* consistency levels,
+ * and not at the others, which can reach dc2.
  */
 public class DataStaxOnlyFiltersAcrossDatacentersTest extends TestBaseImpl
 {
@@ -61,12 +62,15 @@ public class DataStaxOnlyFiltersAcrossDatacentersTest extends TestBaseImpl
                 for (ConsistencyLevel consistency : new ConsistencyLevel[]{ ConsistencyLevel.LOCAL_ONE, ConsistencyLevel.LOCAL_QUORUM })
                 {
                     assertThat(cluster.coordinator(node).execute(withKeyspace(OR), consistency).length).isEqualTo(2);
+                    assertThat(SAIUtil.isStrict(cluster, node, withKeyspace(INTERSECTION), consistency)).isTrue();
                 }
                 for (ConsistencyLevel consistency : new ConsistencyLevel[]{ ConsistencyLevel.ONE, ConsistencyLevel.QUORUM })
                 {
                     assertThatThrownBy(() -> cluster.coordinator(node).execute(withKeyspace(OR), consistency))
                         .hasMessageContaining(String.format(RowFilter.DATASTAX_ONLY_FEATURE_ERROR, "The OR operator"));
                 }
+                assertThat(SAIUtil.isStrict(cluster, node, withKeyspace(INTERSECTION),
+                                            ConsistencyLevel.QUORUM)).isFalse();
                 assertThat(cluster.coordinator(node).execute(withKeyspace(INTERSECTION), ConsistencyLevel.QUORUM).length).isEqualTo(1);
                 assertThat(cluster.coordinator(node).execute(withKeyspace(INTERSECTION), ConsistencyLevel.LOCAL_QUORUM).length).isEqualTo(1);
             }

@@ -64,6 +64,7 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     private int lastCounted = 0; // last seen recorded # before attempting to fetch more rows
     private int lastFetched = 0; // # rows returned by last attempt to get more (or by the original read command)
     private int lastQueried = 0; // # extra rows requested from the replica last time
+    private int lastBytesCounted = 0; // last seen recorded # of bytes before attempting to fetch more rows
 
     ShortReadRowsProtection(DecoratedKey partitionKey, ReadCommand command, Replica source,
                             Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor,
@@ -169,9 +170,12 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
 
         lastFetched = singleResultCounter.rowsCountedInCurrentPartition() - lastCounted;
         lastCounted = singleResultCounter.rowsCountedInCurrentPartition();
+        int lastFetchedBytes = singleResultCounter.bytesCounted() - lastBytesCounted;
+        lastBytesCounted = singleResultCounter.bytesCounted();
 
-        // getting back fewer rows than we asked for means the partition on the replica has been fully consumed
-        if (lastQueried > 0 && lastFetched < lastQueried)
+        // getting back fewer rows than we asked for means the partition on the replica has been fully consumed, unless
+        // the replica stopped at the byte limit of the request (byte-sized pages or the page weight guardrail)
+        if (lastQueried > 0 && lastFetched < lastQueried && !reachedBytesLimit(lastFetchedBytes))
             return null;
 
         /*
@@ -208,7 +212,11 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
          *
          * See CASSANDRA-13794 for more details.
          */
-        lastQueried = Math.min(command.limits().count(), command.limits().perPartitionCount());
+        int missing = Math.min(command.limits().count(), command.limits().perPartitionCount());
+        lastQueried = ShortReadProtection.fetchSize(command, missing, lastQueried > 0 ? lastQueried : missing);
+        // The request keeps the per-partition limit (see DataLimits#forShortReadRetry), so the replica never returns more
+        // rows than that. Asking for more would make the check above take a full response for the end of the partition.
+        lastQueried = Math.min(lastQueried, command.limits().perPartitionCount());
 
         ColumnFamilyStore.metricsFor(metadata.id).shortReadProtectionRequests.mark();
         Tracing.trace("Requesting {} extra rows from {} for short read protection", lastQueried, source);
@@ -322,6 +330,17 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
             next = null;
             return unfiltered;
         }
+    }
+
+    /**
+     * Whether a replica response of the given size reached the byte limit of the read. The requests of short read
+     * protection keep that limit (see {@link DataLimits#forShortReadRetry}), and the replica stops after the row that
+     * reaches it. The unmerged counter of the replica's responses counts the same rows, so it counts the same bytes.
+     */
+    private boolean reachedBytesLimit(int fetchedBytes)
+    {
+        int bytesLimit = command.limits().bytes();
+        return bytesLimit != DataLimits.NO_LIMIT && fetchedBytes >= bytesLimit;
     }
 
     private SinglePartitionReadCommand makeFetchAdditionalRowsReadCommand(int toQuery)

@@ -1330,6 +1330,11 @@ public interface StorageServiceMBean extends NotificationEmitter
     boolean getPrioritizeSAIOverLegacyIndex();
     void setPrioritizeSAIOverLegacyIndex(boolean value);
 
+    /** @see org.apache.cassandra.config.StorageAttachedIndexOptions#non_strict_replica_filtering_enabled */
+    boolean getSAINonStrictReplicaFilteringEnabled();
+    /** Reads that have started keep the setting they started with. */
+    void setSAINonStrictReplicaFilteringEnabled(boolean value);
+
     boolean getForceOptimizedIndexStatusFormat();
     void setForceOptimizedIndexStatusFormat(boolean value);
 

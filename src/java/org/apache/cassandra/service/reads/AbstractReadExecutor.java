@@ -192,7 +192,10 @@ public abstract class AbstractReadExecutor
     public void executeAsync()
     {
         EndpointsForToken selected = replicaPlan().contacts();
-        EndpointsForToken fullDataRequests = selected.filter(Replica::isFull, initialDataRequestCount);
+        // The coordinator reconciles and filters the rows of all the replicas of reads whose replicas may return rows
+        // that don't match the row filter, so they get no digest requests (see DigestResolver#getData).
+        int dataRequestCount = command.returnsCandidateRows() ? selected.size() : initialDataRequestCount;
+        EndpointsForToken fullDataRequests = selected.filter(Replica::isFull, dataRequestCount);
         makeFullDataRequests(fullDataRequests);
         makeTransientDataRequests(selected.filterLazily(Replica::isTransient));
         makeDigestRequests(selected.filterLazily(r -> r.isFull() && !fullDataRequests.contains(r)));
@@ -343,9 +346,14 @@ public abstract class AbstractReadExecutor
                     // we should only use a SpeculatingReadExecutor if we have an extra replica to speculate against
                     assert extraReplica != null;
 
-                    retryCommand = extraReplica.isTransient()
-                            ? command.copyAsTransientQuery(extraReplica)
-                            : command.copyAsDigestQuery(extraReplica);
+                    // reads whose replicas may return rows that don't match the row filter get no digest requests
+                    // (see DigestResolver#getData)
+                    if (extraReplica.isTransient())
+                        retryCommand = command.copyAsTransientQuery(extraReplica);
+                    else if (command.returnsCandidateRows())
+                        retryCommand = command;
+                    else
+                        retryCommand = command.copyAsDigestQuery(extraReplica);
                 }
                 else
                 {

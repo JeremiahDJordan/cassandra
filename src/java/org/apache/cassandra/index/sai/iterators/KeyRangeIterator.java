@@ -310,21 +310,41 @@ public abstract class KeyRangeIterator extends AbstractGuavaIterator<PrimaryKey>
                b.hasNext() && min.compareTo(b.getMaximum()) <= 0 && b.peek().compareTo(max) <= 0;
     }
 
-    @SuppressWarnings("unchecked")
-    private static <T extends Comparable> T nullSafeMin(T a, T b)
+    private static PrimaryKey nullSafeMin(PrimaryKey a, PrimaryKey b)
     {
         if (a == null) return b;
         if (b == null) return a;
 
-        return a.compareTo(b) > 0 ? b : a;
+        int cmp = a.compareTo(b);
+        if (cmp == 0)
+            return wider(a, b);
+        return cmp > 0 ? b : a;
     }
 
-    @SuppressWarnings("unchecked")
-    private static <T extends Comparable> T nullSafeMax(T a, T b)
+    private static PrimaryKey nullSafeMax(PrimaryKey a, PrimaryKey b)
     {
         if (a == null) return b;
         if (b == null) return a;
 
-        return a.compareTo(b) > 0 ? a : b;
+        int cmp = a.compareTo(b);
+        if (cmp == 0)
+            return wider(a, b);
+        return cmp > 0 ? a : b;
+    }
+
+    /**
+     * The wider of two keys that compare equal, a bound of all the keys it equals: a token-only key is wider than a
+     * key without a clustering, which is wider than a row key. Returns the first one if they are as wide.
+     */
+    private static PrimaryKey wider(PrimaryKey a, PrimaryKey b)
+    {
+        return width(b) > width(a) ? b : a;
+    }
+
+    private static int width(PrimaryKey key)
+    {
+        if (key.isTokenOnly())
+            return 2;
+        return key.hasClustering() ? 0 : 1;
     }
 }

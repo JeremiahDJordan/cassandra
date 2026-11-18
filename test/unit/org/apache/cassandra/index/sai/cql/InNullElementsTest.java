@@ -26,12 +26,14 @@ import org.junit.Test;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.AbstractReadCommandBuilder;
+import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.FilteredPartition;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.serializers.ListSerializer;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Null elements of an IN filter. The coordinators of this version leave them out of the filter or reject them (see
@@ -46,6 +48,9 @@ public class InNullElementsTest extends SAITester
     /**
      * A filter with null elements, as a replica receives it from an Apache Cassandra 5.0 coordinator, on an indexed
      * and on an unindexed column, alone and with a restriction on another index.
+     * <p>
+     * With the other index the filter isn't strict: the replica relaxes it for that coordinator and returns a superset
+     * of the matching rows, while strict filtering, when required, returns exactly the matching rows.
      */
     @Test
     public void testReplicaFilterWithNullElements() throws Throwable
@@ -74,13 +79,25 @@ public class InNullElementsTest extends SAITester
         {
             for (boolean withOtherIndex : new boolean[]{ false, true })
             {
-                AbstractReadCommandBuilder builder = Util.cmd(getCurrentColumnFamilyStore()).filterOn(column, Operator.IN, packed.duplicate());
-                if (withOtherIndex)
-                    builder.filterOn("w", Operator.EQ, 1);
-                Set<Integer> keys = new TreeSet<>();
-                for (FilteredPartition partition : Util.getAll(builder.build()))
-                    keys.add(Int32Type.instance.compose(partition.partitionKey().getKey()));
-                assertEquals(String.format("%s IN %s%s", column, elements, withOtherIndex ? " AND w = 1" : ""), expectedKeys, keys);
+                String filter = String.format("%s IN %s%s", column, elements, withOtherIndex ? " AND w = 1" : "");
+                for (boolean strict : new boolean[]{ true, false })
+                {
+                    AbstractReadCommandBuilder builder = Util.cmd(getCurrentColumnFamilyStore())
+                                                             .filterOn(column, Operator.IN, packed.duplicate());
+                    if (withOtherIndex)
+                        builder.filterOn("w", Operator.EQ, 1);
+                    ReadCommand command = builder.build();
+                    assertEquals(filter, !withOtherIndex, command.rowFilter().isStrict());
+                    if (strict)
+                        command.requireStrictFiltering();
+                    Set<Integer> keys = new TreeSet<>();
+                    for (FilteredPartition partition : Util.getAll(command))
+                        keys.add(Int32Type.instance.compose(partition.partitionKey().getKey()));
+                    if (strict || !withOtherIndex)
+                        assertEquals(filter, expectedKeys, keys);
+                    else
+                        assertTrue(filter + ": " + keys + " should contain " + expectedKeys, keys.containsAll(expectedKeys));
+                }
             }
         }
     }

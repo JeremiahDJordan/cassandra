@@ -86,6 +86,13 @@ public class DigestResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRea
     {
         Collection<Message<ReadResponse>> responses = this.responses.snapshot();
 
+        // The replicas of reads whose row filter isn't strict may return rows that don't match it (CASSANDRA-19018),
+        // so the rows of a single replica can't be returned even if the responses match: they are all data responses
+        // (see AbstractReadExecutor#executeAsync), which are reconciled with short read protection, and filtered with
+        // replica filtering protection.
+        if (command.returnsCandidateRows())
+            return resolveDataResponses(responses);
+
         if (!hasTransientResponse(responses))
         {
             UnfilteredPartitionIterator unfilteredPartitionIterator = dataResponse.payload.makeIterator(command);
@@ -114,6 +121,20 @@ public class DigestResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRea
 
             return dataResolver.resolve();
         }
+    }
+
+    private PartitionIterator resolveDataResponses(Collection<Message<ReadResponse>> responses)
+    {
+        DataResolver<E, P> dataResolver
+                = new DataResolver<>(command, replicaPlan, NoopReadRepair.instance, requestTime, readTracker);
+        for (Message<ReadResponse> response : responses)
+        {
+            // these reads send no digest requests (see AbstractReadExecutor), and resolving fewer responses than the
+            // consistency level needs would be wrong
+            assert !response.payload.isDigestResponse() : "Unexpected digest response from " + response.from() + " to " + command;
+            dataResolver.preprocess(response);
+        }
+        return dataResolver.resolve();
     }
 
     public boolean responsesMatch()

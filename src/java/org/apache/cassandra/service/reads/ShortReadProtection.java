@@ -36,6 +36,36 @@ import org.apache.cassandra.db.transform.Transformation;
  */
 public class ShortReadProtection
 {
+    // the most rows or partitions that a growing request asks a replica for (see fetchSize)
+    static final int MAX_NON_STRICT_FETCH_SIZE = 4096;
+
+    /**
+     * Returns the number of rows or partitions that short read protection should request from a replica. For reads that
+     * grow their requests (see {@link #growsFetches}), each request asks for twice as many as the previous one, up to
+     * {@link #MAX_NON_STRICT_FETCH_SIZE}, and never fewer than are missing, as asking for the missing rows only would
+     * take a round trip per that many rows. Requests keep the byte and per-partition limits of the read.
+     */
+    static int fetchSize(ReadCommand command, int missing, int previous)
+    {
+        if (previous <= 0 || !growsFetches(command))
+            return missing;
+
+        return Math.max(missing, (int) Math.min(MAX_NON_STRICT_FETCH_SIZE, 2L * previous));
+    }
+
+    /**
+     * Whether short read protection grows its requests for the given read (see {@link #fetchSize}): if its row filter
+     * isn't strict, or if it has a row filter and replica filtering protection would read whole partitions from every
+     * replica (this tests the row filter, so reads that skip replica filtering protection grow their requests too).
+     */
+    static boolean growsFetches(ReadCommand command)
+    {
+        if (!command.rowFilter().isStrict())
+            return true;
+
+        return !command.rowFilter().isEmpty() && ReplicaFilteringProtection.consumesEntirePartitions(command);
+    }
+
     public static UnfilteredPartitionIterator extend(UnfilteredPartitionIterator partitions,
                                                      ReadCommand command,
                                                      ShortReadPartitionsProtection protection,

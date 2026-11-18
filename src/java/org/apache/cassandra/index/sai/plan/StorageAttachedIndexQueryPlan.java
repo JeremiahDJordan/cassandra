@@ -248,6 +248,16 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
         return true;
     }
 
+    /**
+     * Replicas relax the filtering of reads whose row filter isn't strict, unless they are top-K queries, which always
+     * filter strictly (see {@code QueryController#usesStrictFiltering}).
+     */
+    @Override
+    public boolean returnsCandidatesForNonStrictFilters()
+    {
+        return !isTopK();
+    }
+
     @Override
     public boolean isTopK()
     {

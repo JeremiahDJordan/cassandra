@@ -1367,6 +1367,19 @@ public interface Index
         }
 
         /**
+         * Returns whether the replicas executing this plan may return rows that don't match the row filter of a read
+         * whose filter isn't strict (see {@link RowFilter#isStrict()}), which the coordinator then has to filter after
+         * reconciling them (CASSANDRA-19018).
+         *
+         * @return {@code true} if the replicas may return such candidate rows, {@code false} if they always apply the
+         * row filter strictly
+         */
+        default boolean returnsCandidatesForNonStrictFilters()
+        {
+            return false;
+        }
+
+        /**
          * @return {@code true} if this plan is a BM25 request, {@code false} otherwise
          */
         default boolean isBM25()

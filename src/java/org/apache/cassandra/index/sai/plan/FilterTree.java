@@ -30,6 +30,7 @@ import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -45,18 +46,35 @@ import static org.apache.cassandra.index.sai.plan.Operation.OperationType;
  * 1. SAI doesn't index tombstones, base data may have been shadowed.
  * 2. SAI indexes partition offset, not all rows in partition match index condition.
  * 3. Replica filter protecting may fetch data that doesn't match index expressions.
+ * <p>
+ * If the query can't be strictly filtered on local data (see {@link QueryController#usesStrictFiltering()}) and
+ * has index matches on unrepaired data, the intersections are relaxed into unions.
  */
 public class FilterTree
 {
     protected final OperationType op;
     protected final ListMultimap<ColumnMetadata, Expression> expressions;
     protected final List<FilterTree> children = new ArrayList<>();
+    private final boolean isStrict;
+    private final QueryContext context;
 
+    /**
+     * @param operation the operation combining the expressions and the children of this node
+     * @param expressions the expressions of this node, by column
+     * @param isStrict whether the intersections can be strictly evaluated on local data
+     * @param context the context of the query, which tells whether there are index matches on unrepaired data;
+     *                it can only be {@code null} if {@code isStrict} is {@code true}
+     */
     FilterTree(OperationType operation,
-               ListMultimap<ColumnMetadata, Expression> expressions)
+               ListMultimap<ColumnMetadata, Expression> expressions,
+               boolean isStrict,
+               QueryContext context)
     {
+        assert isStrict || context != null : "Non-strict filtering requires a query context";
         this.op = operation;
         this.expressions = expressions;
+        this.isStrict = isStrict;
+        this.context = context;
     }
 
     void addChild(FilterTree child)
@@ -66,28 +84,38 @@ public class FilterTree
 
     public boolean isSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
     {
-        boolean result = localSatisfiedBy(key, currentCluster, staticRow);
+        OperationType localOperator = localOperator();
+        boolean result = localSatisfiedBy(key, currentCluster, staticRow, localOperator);
 
-        if (shouldReturnNow(result))
+        if (shouldReturnNow(localOperator, result))
             return result;
 
         for (FilterTree child : children)
         {
-            result = op.apply(result, child.isSatisfiedBy(key, currentCluster, staticRow));
-            if (shouldReturnNow(result))
+            result = localOperator.apply(result, child.isSatisfiedBy(key, currentCluster, staticRow));
+            if (shouldReturnNow(localOperator, result))
                 return result;
         }
 
         return result;
     }
 
-    private boolean localSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
+    /**
+     * @return the operation to evaluate this node with on local data, which is relaxed from AND to OR unless the
+     * coordinator says that strict filtering is safe, or all the index matches are on repaired data
+     */
+    private OperationType localOperator()
+    {
+        return isStrict || !context.hasUnrepairedMatches() ? op : OperationType.OR;
+    }
+
+    private boolean localSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow, OperationType localOperator)
     {
         if (currentCluster == null || !currentCluster.isRow())
             return false;
 
         final long now = FBUtilities.nowInSeconds();
-        boolean result = op == OperationType.AND;
+        boolean result = localOperator == OperationType.AND;
 
         Iterator<ColumnMetadata> columnIterator = expressions.keySet().iterator();
         while(columnIterator.hasNext())
@@ -109,15 +137,15 @@ public class FilterTree
                 if (TypeUtil.isNonFrozenCollection(column.type))
                 {
                     Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
-                    result = op.apply(result, filter.isSatisfiedBy(valueIterator));
+                    result = localOperator.apply(result, filter.isSatisfiedBy(valueIterator));
                 }
                 else
                 {
                     ByteBuffer value = filter.context.getValueOf(key, row, now);
-                    result = op.apply(result, filter.isSatisfiedBy(value));
+                    result = localOperator.apply(result, filter.isSatisfiedBy(value));
                 }
 
-                if (shouldReturnNow(result))
+                if (shouldReturnNow(localOperator, result))
                     return result;
             }
         }
@@ -127,11 +155,13 @@ public class FilterTree
     /**
      * When evaluating an AND expression, if the current result is false, we can return immediately.
      * When evaluating an OR expression, if the current result is true, we can return immediately.
+     * @param operator the operation being evaluated
      * @param result the current result
      * @return true if it is valid to return the current result
      */
-    private boolean shouldReturnNow(boolean result) {
-        return (op == OperationType.AND && !result) || (op == OperationType.OR && result);
+    private static boolean shouldReturnNow(OperationType operator, boolean result)
+    {
+        return (operator == OperationType.AND && !result) || (operator == OperationType.OR && result);
     }
 
     /**

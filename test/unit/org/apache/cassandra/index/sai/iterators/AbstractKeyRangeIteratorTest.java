@@ -286,6 +286,47 @@ public class AbstractKeyRangeIteratorTest extends SaiRandomizedTest
     }
 
     /**
+     * Creates an iterator over the given rows of a partition, whose bounds are the partition only, as those of an
+     * iterator over all the keys of a memtable (see {@code MemtableKeyRangeIterator}).
+     */
+    static KeyRangeIterator makePartitionBoundedIterator(long partitionKey, long... clusterings)
+    {
+        List<PrimaryKey> keys = new ArrayList<>();
+        for (long clustering : clusterings)
+            keys.add(makeKeyForRegularRow(partitionKey, clustering));
+        PrimaryKey bound = TEST_PRIMARY_KEY_FACTORY.createPartitionKeyOnly(decorate(partitionKey));
+        return new KeyRangeIterator(bound, bound, keys.size())
+        {
+            private int next = 0;
+
+            @Override
+            protected PrimaryKey computeNext()
+            {
+                return next < keys.size() ? keys.get(next++) : endOfData();
+            }
+
+            @Override
+            protected void performSkipTo(PrimaryKey nextKey)
+            {
+                while (next < keys.size() && keys.get(next).compareTo(nextKey) < 0)
+                    next++;
+            }
+
+            @Override
+            public void close()
+            {}
+        };
+    }
+
+    static List<Long> clusterings(KeyRangeIterator iterator)
+    {
+        List<Long> clusterings = new ArrayList<>();
+        while (iterator.hasNext())
+            clusterings.add(iterator.next().clustering().bufferAt(0).getLong(0));
+        return clusterings;
+    }
+
+    /**
      * Creates a row-aware primary key with static clustering
      */
     static PrimaryKey makeKeyForStaticRow(long partitionKey)

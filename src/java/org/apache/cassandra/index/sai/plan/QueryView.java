@@ -19,6 +19,7 @@
 package org.apache.cassandra.index.sai.plan;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -49,6 +50,12 @@ public class QueryView implements AutoCloseable
     public final Set<SSTableIndex> sstableIndexes;
     public final Set<MemtableIndex> memtableIndexes;
 
+    /**
+     * The indexes in {@link #sstableIndexes} whose SSTable is repaired, lazily computed once, so that all the decisions
+     * of a query based on the repaired status of the data agree, even if a repair session finalizes concurrently.
+     */
+    private Set<SSTableIndex> repairedSSTableIndexes;
+
     public QueryView(View saiView,
                      ColumnFamilyStore.ViewFragment viewFragment,
                      Set<SSTableIndex> sstableIndexes,
@@ -64,6 +71,51 @@ public class QueryView implements AutoCloseable
     public void close()
     {
         saiView.release();
+    }
+
+    /**
+     * Returns a view of the subset of the indexes in this view that hold data in the given scope. The returned view
+     * shares the references of this view, so it must not be closed, and it is only valid while this view is open.
+     * <p>
+     * Memtable indexes always hold unrepaired data. SSTable indexes hold repaired data if their SSTable was marked
+     * repaired when this view first looked at it; SSTables pending repair count as unrepaired.
+     */
+    public QueryView forScope(Plan.DataScope scope)
+    {
+        switch (scope)
+        {
+            case ALL:
+                return this;
+            case REPAIRED:
+                return new QueryView(saiView, viewFragment, repairedSSTableIndexes(), Collections.emptySet());
+            case UNREPAIRED:
+                Set<SSTableIndex> unrepaired = new HashSet<>(sstableIndexes);
+                unrepaired.removeAll(repairedSSTableIndexes());
+                return new QueryView(saiView, viewFragment, unrepaired, memtableIndexes);
+            default:
+                throw new AssertionError("Unknown scope " + scope);
+        }
+    }
+
+    /**
+     * @return true if this view contains any index on a repaired SSTable
+     */
+    public boolean hasRepairedSSTableIndexes()
+    {
+        return !repairedSSTableIndexes().isEmpty();
+    }
+
+    private Set<SSTableIndex> repairedSSTableIndexes()
+    {
+        if (repairedSSTableIndexes == null)
+        {
+            Set<SSTableIndex> repaired = new HashSet<>();
+            for (SSTableIndex index : sstableIndexes)
+                if (index.getSSTable().isRepaired())
+                    repaired.add(index);
+            repairedSSTableIndexes = repaired;
+        }
+        return repairedSSTableIndexes;
     }
 
     /**

@@ -184,6 +184,13 @@ public abstract class RangeCommandIterator extends AbstractIterator<RowIterator>
         if (command.isDigestQuery())
             return false;
 
+        // A single partition is in a single range, so grouping ranges by endpoint has nothing to gain. Moreover,
+        // endpoint grouping doesn't do read repair, which partition-restricted reads must honor as single-partition
+        // reads do. Those are the partition-restricted SAI queries that replicas can't strictly filter (see
+        // SelectStatement), which are range reads on a single partition.
+        if (command.isLimitedToOnePartition())
+            return false;
+
         // Endpoint grouping is currently only supported by SAI
         Index.QueryPlan queryPlan = command.indexQueryPlan();
         return queryPlan != null && queryPlan.supportsMultiRangeReadCommand();

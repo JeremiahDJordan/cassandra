@@ -137,7 +137,7 @@ public class CoordinatorWarnings
         return map;
     }
 
-    private static void clearState()
+    public static void clearState()
     {
         Map<ReadCommand, WarningsSnapshot> map = STATE.get();
         if (map == null || map == INIT)

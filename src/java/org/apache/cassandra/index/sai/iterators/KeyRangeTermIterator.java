@@ -65,13 +65,23 @@ public class KeyRangeTermIterator extends KeyRangeIterator
     }
 
 
-    @SuppressWarnings("resource")
     public static KeyRangeTermIterator build(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer)
+    {
+        return build(e, view, keyRange, queryContext, defer, true);
+    }
+
+    /**
+     * @param allowSubtraction whether a negative expression may get its keys by subtracting the keys of the rows that
+     *                         match the negated expression from all the keys (see
+     *                         {@link org.apache.cassandra.index.sai.IndexContext#canSubtractMatches})
+     */
+    @SuppressWarnings("resource")
+    public static KeyRangeTermIterator build(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer, boolean allowSubtraction)
     {
         Expression searched = e.withoutUnindexedEmptyBounds();
         KeyRangeIterator rangeIterator = searched == null
                                          ? KeyRangeIterator.empty()
-                                         : buildRangeIterator(searched, view, keyRange, queryContext, defer);
+                                         : buildRangeIterator(searched, view, keyRange, queryContext, defer, allowSubtraction);
         return new KeyRangeTermIterator(rangeIterator, view.sstableIndexes, queryContext);
     }
 
@@ -83,14 +93,14 @@ public class KeyRangeTermIterator extends KeyRangeIterator
         return false;
     }
 
-    private static KeyRangeIterator buildRangeIterator(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer)
+    private static KeyRangeIterator buildRangeIterator(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer, boolean allowSubtraction)
     {
         final List<KeyRangeIterator> tokens = new ArrayList<>(1 + view.sstableIndexes.size());
 
         // A negation subtracts, per source, the keys matching the negated expression; a row that doesn't match is
         // still found through a source holding a fragment of it that doesn't match. Apache-written indexes leave out
         // fragments without live data, so with one of them no source subtracts: the coordinator filters the rows.
-        boolean subtractMatches = e.getOp().isNonEquality() && !hasApacheIndex(view);
+        boolean subtractMatches = allowSubtraction && e.getOp().isNonEquality() && !hasApacheIndex(view);
 
         KeyRangeIterator memtableIterator = e.context.searchMemtable(queryContext, view.memtableIndexes, e, keyRange, subtractMatches);
         if (memtableIterator != null)

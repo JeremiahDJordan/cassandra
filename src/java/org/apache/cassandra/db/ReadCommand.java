@@ -20,7 +20,9 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -134,6 +136,14 @@ public abstract class ReadCommand extends AbstractReadQuery
     protected static final Logger logger = LoggerFactory.getLogger(ReadCommand.class);
     public static final IVersionedSerializer<ReadCommand> serializer = new Serializer();
 
+    /**
+     * The key of the custom message parameter that coordinators add to reads whose row filter isn't strict, to tell the
+     * replicas that they filter the reconciled rows, so that the replicas can relax their filtering (see
+     * {@link ReadCommandVerbHandler#coordinatorAsksForNonStrictFiltering}). Nodes that don't know it ignore it.
+     */
+    public static final String NON_STRICT_FILTERING_PARAM = "ds.sai.nonstrict";
+    private static final byte[] NON_STRICT_FILTERING_PARAM_VALUE = { 1 };
+
     // Expose the active command running so transitive calls can lookup this command.
     // This is useful for a few reasons, but mainly because the CQL query is here.
     private static final FastThreadLocal<ReadCommand> COMMAND = new FastThreadLocal<>();
@@ -146,6 +156,14 @@ public abstract class ReadCommand extends AbstractReadQuery
     private int digestVersion;
 
     private boolean trackWarnings;
+
+    /**
+     * Whether this replica must apply the row filter strictly even when {@link RowFilter#isStrict()} is false, because
+     * the coordinator might not filter the reconciled rows, or doesn't let the replicas relax the filter. This isn't
+     * serialized: commands received from other nodes have it until {@link ReadCommandVerbHandler} finds that their
+     * coordinator asks for non-strict filtering.
+     */
+    private boolean strictFilteringRequired;
 
     protected final DataRange dataRange;
 
@@ -303,6 +321,33 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     /**
+     * Requires this replica to apply the row filter strictly, because the coordinator that sent the command might not
+     * filter the rows after reconciling them (CASSANDRA-19018).
+     */
+    public void requireStrictFiltering()
+    {
+        strictFilteringRequired = true;
+    }
+
+    /**
+     * Lets this replica relax the row filter if it isn't strict, because the coordinator that sent the command asks
+     * for it, and filters the rows after reconciling them (CASSANDRA-19018).
+     */
+    public void allowNonStrictFiltering()
+    {
+        strictFilteringRequired = false;
+    }
+
+    /**
+     * @return {@code true} if this replica must apply the row filter strictly, even if {@link RowFilter#isStrict()}
+     * says it doesn't need to
+     */
+    public boolean isStrictFilteringRequired()
+    {
+        return strictFilteringRequired;
+    }
+
+    /**
      * Index query plan chosen for this query. Can be null.
      *
      * @return index query plan chosen for this query
@@ -312,6 +357,21 @@ public abstract class ReadCommand extends AbstractReadQuery
     public Index.QueryPlan indexQueryPlan()
     {
         return indexQueryPlan;
+    }
+
+    /**
+     * Returns whether the replicas may return rows that don't match the row filter of this command, because the filter
+     * isn't strict (see {@link RowFilter#isStrict()}) and the index query plan relaxes it (CASSANDRA-19018). The
+     * coordinator must then filter the rows after reconciling the responses of all the replicas it reads, so it can't
+     * return the rows of a single replica when the digests of the responses match.
+     *
+     * @return {@code true} if the replicas may return rows that don't match the row filter, {@code false} otherwise
+     */
+    public boolean returnsCandidateRows()
+    {
+        return indexQueryPlan != null
+               && !rowFilter().isStrict()
+               && indexQueryPlan.returnsCandidatesForNonStrictFilters();
     }
 
     /**
@@ -1038,10 +1098,25 @@ public abstract class ReadCommand extends AbstractReadQuery
         if (trackRepairedData)
             flags.add(MessageFlag.TRACK_REPAIRED_DATA);
 
-        return Message.outWithFlags(verb(),
-                                    this,
-                                    requestTime,
-                                    flags);
+        Message<ReadCommand> message = Message.outWithFlags(verb(),
+                                                            this,
+                                                            requestTime,
+                                                            flags);
+        return rowFilter().isStrict() ? message : withNonStrictFilteringParam(message);
+    }
+
+    /**
+     * Adds {@link #NON_STRICT_FILTERING_PARAM} to the custom parameters of the given message, to tell the replicas
+     * that this coordinator filters the reconciled rows of its non-strict reads (see
+     * {@link ReadCommandVerbHandler#coordinatorAsksForNonStrictFiltering}).
+     */
+    @VisibleForTesting
+    static Message<ReadCommand> withNonStrictFilteringParam(Message<ReadCommand> message)
+    {
+        Map<String, byte[]> existing = message.header.customParams();
+        Map<String, byte[]> customParams = existing == null ? new HashMap<>() : new HashMap<>(existing);
+        customParams.put(NON_STRICT_FILTERING_PARAM, NON_STRICT_FILTERING_PARAM_VALUE);
+        return message.withParam(ParamType.CUSTOM_MAP, customParams);
     }
 
     protected abstract boolean intersects(SSTableReader sstable);
@@ -1596,8 +1671,13 @@ public abstract class ReadCommand extends AbstractReadQuery
                 }
             }
 
-            return kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion, acceptsTransient, 
-                                                          metadata, nowInSec, columnFilter, rowFilter, limits, indexQueryPlan);
+            ReadCommand command = kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion,
+                                                                         acceptsTransient, metadata, nowInSec,
+                                                                         columnFilter, rowFilter, limits,
+                                                                         indexQueryPlan);
+            // the filter can't say whether its coordinator lets replicas relax it, see ReadCommandVerbHandler
+            command.requireStrictFiltering();
+            return command;
         }
 
         /**

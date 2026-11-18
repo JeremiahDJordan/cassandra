@@ -1229,7 +1229,8 @@ public class StatementRestrictions
         OptimizerOptions optimizerOptions = selectOptions.parseOptimizerOptions();
 
         RowFilter.Builder filterBuilder = new RowFilter.Builder(needsReconciliation, indexRegistry, indexHints, optimizerOptions);
-        RowFilter rowFilter = filterBuilder.buildFromRestrictions(this, table, options, clientState, annOptions);
+        RowFilter rowFilter = filterBuilder.buildFromRestrictions(this, table, options, clientState, annOptions)
+                                           .withReplicaFilteringStrictness(table.keyspace, options.getConsistency());
 
         if (hasAnnOptions && !rowFilter.hasANN())
             throw new InvalidRequestException(ANN_OPTIONS_WITHOUT_ORDER_BY_ANN);

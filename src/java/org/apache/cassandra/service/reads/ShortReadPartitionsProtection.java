@@ -71,6 +71,7 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
     private DecoratedKey lastPartitionKey; // key of the last observed partition
 
     private boolean partitionsFetched; // whether we've seen any new partitions since iteration start or last moreContents() call
+    private int lastQueried; // # rows requested from the replica last time, by the original read command or by moreContents()
     protected boolean rangeFetched = false; // fetched by original read request or SRP request
 
     private final Dispatcher.RequestTime requestTime;
@@ -90,6 +91,9 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         this.singleResultCounter = singleResultCounter;
         this.mergedResultCounter = mergedResultCounter;
         this.requestTime = requestTime;
+        this.lastQueried = command.limits().count() != DataLimits.NO_LIMIT
+                           ? command.limits().count()
+                           : command.limits().perPartitionCount();
     }
 
     @Override
@@ -206,6 +210,8 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         int toQuery = command.limits().count() != DataLimits.NO_LIMIT
                       ? command.limits().count() - mergedResultCounter.counted()
                       : command.limits().perPartitionCount();
+        toQuery = ShortReadProtection.fetchSize(command, toQuery, lastQueried);
+        lastQueried = toQuery;
 
         ColumnFamilyStore.metricsFor(command.metadata().id).shortReadProtectionRequests.mark();
         Tracing.trace("Requesting {} extra rows from {} for short read protection", toQuery, source);
@@ -222,6 +228,17 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
     public boolean rangeExhausted()
     {
         return !partitionsFetched;
+    }
+
+    /**
+     * Returns whether the replica stopped because it reached the limits of the command, so that it may have more data,
+     * including in ranges it didn't get to (see {@code EndpointGroupingCoordinator.EndpointShortReadResponseProtection}).
+     * Unlike {@link DataLimits.Counter#isDone()}, this counts the GROUP BY group that is still open (see
+     * {@link DataLimits#isReplicaExhausted}).
+     */
+    protected boolean replicaReachedLimits()
+    {
+        return !command.limits().isReplicaExhausted(singleResultCounter);
     }
 
     private UnfilteredPartitionIterator makeAndExecuteFetchAdditionalPartitionReadCommand(int toQuery)

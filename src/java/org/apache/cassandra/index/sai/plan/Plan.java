@@ -111,6 +111,20 @@ abstract public class Plan
 {
     private static final Logger logger = LoggerFactory.getLogger(Plan.class);
 
+    /**
+     * The subset of the indexed data an {@link IndexScan} searches, by repaired status (see
+     * {@link QueryController#usesStrictFiltering()}).
+     */
+    public enum DataScope
+    {
+        /** All the indexed data: Memtable indexes and the indexes of all SSTables. */
+        ALL,
+        /** Only the indexes of repaired SSTables. */
+        REPAIRED,
+        /** Only Memtable indexes and the indexes of unrepaired SSTables. */
+        UNREPAIRED
+    }
+
     @VisibleForTesting
     static DoubleSupplier hitRateSupplier = () -> {
         // cache hit rate with reasonable defaults if we have no data
@@ -917,7 +931,15 @@ abstract public class Plan
 
         protected final long matchingKeysCount;
 
+        /** The subset of the indexed data searched by this scan */
+        protected final DataScope scope;
+
         public IndexScan(Factory factory, int id, Expression predicate, long matchingKeysCount, Access access, Orderer ordering)
+        {
+            this(factory, id, predicate, matchingKeysCount, access, ordering, DataScope.ALL);
+        }
+
+        public IndexScan(Factory factory, int id, Expression predicate, long matchingKeysCount, Access access, Orderer ordering, DataScope scope)
         {
             super(factory, id, access);
             Preconditions.checkArgument(predicate != null || ordering != null,
@@ -926,17 +948,23 @@ abstract public class Plan
                                         || ordering == null
                                         || predicate.getIndexName().equals(ordering.getIndexName()),
                                         "Ordering must use the same index as the predicate");
+            Preconditions.checkArgument(ordering == null || scope == DataScope.ALL,
+                                        "Ordered scans must search all the indexed data");
             this.predicate = predicate;
             // If we match by equality, ordering makes no sense because all term values would be the same.
             this.ordering = (predicate == null || predicate.getOp() != Expression.Op.EQ) ? ordering : null;
             this.matchingKeysCount = matchingKeysCount;
+            this.scope = scope;
         }
 
         @Override
         protected final String title(Redaction redaction)
         {
-            return String.format("of %s (sel: %.9f, step: %.1f)",
-                                 getIndexName(), selectivity(), access.meanDistance());
+            return scope == DataScope.ALL
+                   ? String.format("of %s (sel: %.9f, step: %.1f)",
+                                   getIndexName(), selectivity(), access.meanDistance())
+                   : String.format("of %s (sel: %.9f, step: %.1f, scope: %s)",
+                                   getIndexName(), selectivity(), access.meanDistance(), scope);
         }
 
         @Override
@@ -1052,7 +1080,7 @@ abstract public class Plan
         {
             return (ordering != null)
                 ? executor.getTopKRows(predicate, max(1, round((float) access.expectedAccessCount(factory.tableMetrics.rows))))
-                : executor.getKeysFromIndex(predicate);
+                : executor.getKeysFromIndex(predicate, scope);
         }
 
         public String getIndexName()
@@ -1076,7 +1104,12 @@ abstract public class Plan
     {
         public NumericIndexScan(Factory factory, int id, Expression predicate, long matchingKeysCount, Access access, Orderer ordering)
         {
-            super(factory, id, predicate, matchingKeysCount, access, ordering);
+            this(factory, id, predicate, matchingKeysCount, access, ordering, DataScope.ALL);
+        }
+
+        public NumericIndexScan(Factory factory, int id, Expression predicate, long matchingKeysCount, Access access, Orderer ordering, DataScope scope)
+        {
+            super(factory, id, predicate, matchingKeysCount, access, ordering, scope);
         }
 
         @Override
@@ -1084,7 +1117,7 @@ abstract public class Plan
         {
             return Objects.equals(this.access, access)
                    ? this
-                   : new NumericIndexScan(factory, id, predicate, matchingKeysCount, access, ordering);
+                   : new NumericIndexScan(factory, id, predicate, matchingKeysCount, access, ordering, scope);
         }
     }
 
@@ -1096,7 +1129,12 @@ abstract public class Plan
     {
         public LiteralIndexScan(Factory factory, int id, Expression predicate, long matchingKeysCount, Access access, Orderer ordering)
         {
-            super(factory, id, predicate, matchingKeysCount, access, ordering);
+            this(factory, id, predicate, matchingKeysCount, access, ordering, DataScope.ALL);
+        }
+
+        public LiteralIndexScan(Factory factory, int id, Expression predicate, long matchingKeysCount, Access access, Orderer ordering, DataScope scope)
+        {
+            super(factory, id, predicate, matchingKeysCount, access, ordering, scope);
         }
 
         @Override
@@ -1104,7 +1142,7 @@ abstract public class Plan
         {
             return Objects.equals(this.access, access)
                    ? this
-                   : new LiteralIndexScan(factory, id, predicate, matchingKeysCount, this.access, ordering);
+                   : new LiteralIndexScan(factory, id, predicate, matchingKeysCount, this.access, ordering, scope);
         }
     }
 
@@ -2018,12 +2056,31 @@ abstract public class Plan
          */
         public KeysIteration indexScan(@Nullable Expression predicate, long matchingKeysCount)
         {
+            return indexScan(predicate, matchingKeysCount, DataScope.ALL);
+        }
+
+        /**
+         * Constructs a plan node representing a direct scan of a subset of the indexed data.
+         *
+         * @param predicate         the expression matching the rows that we want to search in the index;
+         *                          this is needed for identifying this node, it doesn't affect the cost
+         * @param matchingKeysCount the number of row keys expected to be returned by the index scan,
+         *                          i.e. keys of rows that match the search predicate
+         * @param scope             the subset of the indexed data to search
+         */
+        public KeysIteration indexScan(@Nullable Expression predicate, long matchingKeysCount, DataScope scope)
+        {
             Preconditions.checkArgument(matchingKeysCount >= 0, "matchingKeyCount must not be negative");
             Preconditions.checkArgument(matchingKeysCount <= tableMetrics.rows, "matchingKeyCount must not exceed totalKeyCount");
-            return indexScan(predicate, matchingKeysCount, null, nextId++);
+            return indexScan(predicate, matchingKeysCount, null, nextId++, scope);
         }
 
         private KeysIteration indexScan(Expression predicate, long matchingKeysCount, Orderer ordering, int id)
+        {
+            return indexScan(predicate, matchingKeysCount, ordering, id, DataScope.ALL);
+        }
+
+        private KeysIteration indexScan(Expression predicate, long matchingKeysCount, Orderer ordering, int id, DataScope scope)
         {
             if (predicate == null && ordering == null)
             {
@@ -2045,15 +2102,20 @@ abstract public class Plan
             Preconditions.checkArgument(matchingKeysCount >= 0, "matchingKeyCount must not be negative");
             Preconditions.checkArgument(matchingKeysCount <= tableMetrics.rows, "matchingKeyCount must not exceed totalKeyCount");
             return predicate.isLiteral()
-                   ? new LiteralIndexScan(this, id, predicate, matchingKeysCount, defaultAccess, null)
-                   : new NumericIndexScan(this, id, predicate, matchingKeysCount, defaultAccess, null);
+                   ? new LiteralIndexScan(this, id, predicate, matchingKeysCount, defaultAccess, null, scope)
+                   : new NumericIndexScan(this, id, predicate, matchingKeysCount, defaultAccess, null, scope);
         }
 
         public KeysIteration fullIndexScan(IndexContext context)
         {
+            return fullIndexScan(context, DataScope.ALL);
+        }
+
+        public KeysIteration fullIndexScan(IndexContext context, DataScope scope)
+        {
             Expression everythingExpression = new Expression(context);
             everythingExpression.operation = Expression.Op.RANGE;
-            return indexScan(everythingExpression, tableMetrics.rows);
+            return indexScan(everythingExpression, tableMetrics.rows, scope);
         }
 
         /**
@@ -2154,7 +2216,7 @@ abstract public class Plan
                 // then we collapse sorting with filtering in a single plan node as the index
                 // is already sorted.
                 IndexScan indexScan = (IndexScan) source;
-                if (indexScan.getIndexName().equals(ordering.getIndexName()))
+                if (indexScan.scope == DataScope.ALL && indexScan.getIndexName().equals(ordering.getIndexName()))
                     return indexScan(indexScan.predicate, indexScan.matchingKeysCount, ordering, id);
             }
 
@@ -2239,6 +2301,15 @@ abstract public class Plan
     public interface Executor
     {
         Iterator<? extends PrimaryKey> getKeysFromIndex(Expression predicate);
+
+        /**
+         * Returns the keys of the rows matching the predicate within the given subset of the indexed data.
+         */
+        default Iterator<? extends PrimaryKey> getKeysFromIndex(Expression predicate, DataScope scope)
+        {
+            Preconditions.checkArgument(scope == DataScope.ALL, "This executor can only search all the indexed data");
+            return getKeysFromIndex(predicate);
+        }
         Iterator<? extends PrimaryKey> getTopKRows(Expression predicate, int softLimit);
         Iterator<? extends PrimaryKey> getTopKRows(KeyRangeIterator keys, int softLimit);
     }

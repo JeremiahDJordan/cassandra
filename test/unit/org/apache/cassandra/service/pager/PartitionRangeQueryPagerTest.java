@@ -90,6 +90,35 @@ public class PartitionRangeQueryPagerTest
     }
 
     /**
+     * Paging states written by a {@link SinglePartitionPager} have no partition key. Coordinators of DataStax releases
+     * before 5.0.10, and all coordinators at ONE/LOCAL_ONE, page partition-restricted index queries that way, and a
+     * client can hand such a state to a coordinator that pages the same query as a range read of the partition. That
+     * read goes on in that partition, after the last returned row.
+     */
+    @Test
+    public void testPagingStateOfSinglePartitionPager()
+    {
+        DecoratedKey key = key(0);
+        PartitionRangeReadCommand command = command(new Bounds<>(key, key));
+
+        for (ProtocolVersion version : new ProtocolVersion[]{ ProtocolVersion.V4, ProtocolVersion.V5, PROTOCOL_VERSION })
+        {
+            // what SinglePartitionPager#state() writes: no partition key, and the mark of the last returned row
+            PagingState.RowMark rowMark = PagingState.RowMark.create(metadata, row(1), version);
+            PagingState state = PagingState.deserialize(new PagingState(null, rowMark, 8, 2).serialize(version), version);
+            assertThat(state.partitionKey).isNull();
+
+            PartitionRangeQueryPager pager = (PartitionRangeQueryPager) command.getPager(state, version);
+            PartitionRangeReadCommand next = (PartitionRangeReadCommand) pager.nextPageReadQuery(PageSize.inRows(1), command.limits());
+            assertThat(next).isNotNull();
+            assertThat(next.dataRange().keyRange()).isEqualTo(new Bounds<>(key, key));
+            assertThat(next.dataRange().isPaging()).isTrue();
+            assertThat(((DataRange.Paging) next.dataRange()).getLastReturned()).isEqualTo(row(1).clustering());
+            assertThat(pager.state().partitionKey).isEqualTo(key.getKey());
+        }
+    }
+
+    /**
      * Paging a range of several partitions goes on after the last returned partition.
      */
     @Test

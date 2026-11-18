@@ -38,6 +38,12 @@ public class StorageAttachedIndexOptions
 
     public volatile boolean prioritize_over_legacy_index = true;
 
+    /**
+     * Whether the reads this node coordinates that need reconciliation and intersect several mutable columns let the
+     * replicas relax their filtering, and filter the reconciled rows instead (CASSANDRA-19018).
+     */
+    public volatile boolean non_strict_replica_filtering_enabled = false;
+
     public void validate()
     {
         if (segment_write_buffer_size == null || segment_write_buffer_size.toMebibytes() > MAXIMUM_SEGMENT_BUFFER_MB)

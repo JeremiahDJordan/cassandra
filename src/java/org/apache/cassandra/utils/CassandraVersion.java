@@ -46,7 +46,7 @@ public class CassandraVersion implements Comparable<CassandraVersion>
     private static final String VERSION_REGEXP = "(?<major>\\d+)\\.(?<minor>\\d+)(\\.(?<patch>\\w+)(\\.(?<hotfix>\\w+))?)?(-(?<prerelease>[-.\\w]+))?([.+](?<build>[.\\w]+))?";
     private static final Pattern PATTERN_WORDS = Pattern.compile("\\w+");
     @VisibleForTesting
-    static final int NO_HOTFIX = -1;
+    public static final int NO_HOTFIX = -1;
 
     private static final Pattern PATTERN = Pattern.compile(VERSION_REGEXP);
 

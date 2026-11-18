@@ -32,7 +32,6 @@ import com.google.common.collect.Lists;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
-import org.junit.Ignore;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
@@ -88,7 +87,9 @@ public class PartialUpdateHandlingTest extends TestBaseImpl
     @BeforeClass
     public static void setUpCluster() throws IOException
     {
-        CLUSTER = init(Cluster.build(NODES).withConfig(config -> config.set("hinted_handoff_enabled", false).with(GOSSIP).with(NETWORK)).start());
+        CLUSTER = init(Cluster.build(NODES).withConfig(config -> SAIUtil.withNonStrictReplicaFiltering(config, true)
+                                                                        .set("hinted_handoff_enabled", false)
+                                                                        .with(GOSSIP).with(NETWORK)).start());
 
         // All parameterized test scenarios share the same table and attached indexes, but write to different partitions
         // that are deleted after each scenario completes.
@@ -221,6 +222,7 @@ public class PartialUpdateHandlingTest extends TestBaseImpl
             }
 
             CLUSTER.get(1).nodetoolResult("repair", KEYSPACE).asserts().success();
+            SAIUtil.waitForRepairedSSTables(CLUSTER, KEYSPACE, specification.tableName());
         }
 
         public void writeUnrepairedRows()
@@ -451,7 +453,6 @@ public class PartialUpdateHandlingTest extends TestBaseImpl
         return parameters;
     }
 
-    @Ignore("CNDB-9331: Address PartialUpdateHandlingTest failures and possible CC rebase conflicts with CASSANDRA-19018")
     @Test
     public void testPartialUpdateResolution()
     {

@@ -17,9 +17,11 @@
  */
 package org.apache.cassandra.db;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
 import org.slf4j.Logger;
@@ -120,6 +122,22 @@ public class ReadCommandVerbHandler implements IVerbHandler<ReadCommand>
         if (message.trackWarnings())
             command.trackWarnings();
 
+        // Replicas can relax the filtering of reads that need reconciliation (see RowFilter#isStrict), but only if the
+        // coordinator asks for it, as it then filters the reconciled rows.
+        if (!command.rowFilter().isStrict())
+        {
+            if (coordinatorAsksForNonStrictFiltering(message))
+            {
+                command.allowNonStrictFiltering();
+            }
+            else
+            {
+                command.requireStrictFiltering();
+                Tracing.trace("Filtering strictly, because coordinator {} doesn't ask for non-strict filtering",
+                              message.from());
+            }
+        }
+
         ReadResponse response;
         long readStartNanos = Clock.Global.nanoTime();
         try (ReadExecutionController controller = command.executionController(message.trackRepairedData());
@@ -178,6 +196,18 @@ public class ReadCommandVerbHandler implements IVerbHandler<ReadCommand>
             Tracing.trace("Discarding partial response to {} (timed out)", message.from());
             MessagingService.instance().metrics.recordDroppedMessage(message, message.elapsedSinceCreated(NANOSECONDS), NANOSECONDS);
         }
+    }
+
+    /**
+     * Whether the coordinator of a read whose row filter isn't strict asks the replicas to relax it with
+     * {@link ReadCommand#NON_STRICT_FILTERING_PARAM}, because it filters the reconciled rows (CASSANDRA-19018). Other
+     * coordinators, including Apache Cassandra's, don't send the parameter and get strict filtering.
+     */
+    @VisibleForTesting
+    static boolean coordinatorAsksForNonStrictFiltering(Message<ReadCommand> message)
+    {
+        Map<String, byte[]> customParams = message.header.customParams();
+        return customParams != null && customParams.containsKey(ReadCommand.NON_STRICT_FILTERING_PARAM);
     }
 
     private void validateTransientStatus(Message<ReadCommand> message)

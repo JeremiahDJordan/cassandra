@@ -95,6 +95,7 @@ import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.PartitionRangeReadQuery;
 import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.ReadQuery;
@@ -122,6 +123,7 @@ import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.view.View;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.ReadFailureException;
 import org.apache.cassandra.exceptions.ReadSizeAbortException;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestFailureReason;
@@ -143,6 +145,8 @@ import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.pager.AggregationQueryPager;
 import org.apache.cassandra.service.pager.PagingState;
 import org.apache.cassandra.service.pager.QueryPager;
+import org.apache.cassandra.service.reads.thresholds.CoordinatorWarnings;
+import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
@@ -483,30 +487,81 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         if (query.limits().isGroupByLimit() && pageSize != null && pageSize.isDefined() && pageSize.getUnit() == PageSize.PageUnit.BYTES)
             throw new InvalidRequestException("Paging in bytes cannot be specified for aggregation queries");
 
-        if (aggregationSpec == null && canSkipPaging(query.limits(), pageSize, query.isTopK()))
+        try
         {
-            rows = execute(query, options, state.getClientState(), selectors, nowInSec, userLimit, userOffset, null, requestTime, unmask);
+            rows = executeQuery(query, cl, state, options, selectors, pageSize, nowInSec, userLimit, userOffset,
+                                aggregationSpec, requestTime, unmask);
         }
-        else
+        catch (ReadFailureException e)
         {
-            QueryPager pager = getPager(query, options);
+            // Nodes below DS 10 refuse a filter that the coordinator made strict when it didn't know of them yet (see
+            // RowFilter#relaxableForPeersBelowDS10). Read again from the same paging state, with a row filter built as
+            // if those nodes were known.
+            ReadQuery retry = externalQuery == null
+                              ? withRelaxableRowFilter(query, options, state.getClientState())
+                              : null;
+            if (retry == null)
+                throw e;
 
-            rows = execute(state,
-                           Pager.forDistributedQuery(pager, cl, state.getClientState()),
-                           options,
-                           selectors,
-                           pageSize,
-                           nowInSec,
-                           userLimit,
-                           userOffset,
-                           aggregationSpec,
-                           requestTime,
-                           unmask);
+            Tracing.trace("Reading again with a row filter that replicas can relax, as nodes below DS 10 refused it");
+            // drop the replica warnings of the refused read; its selectors are replaced below
+            CoordinatorWarnings.clearState();
+            if (options.isReadThresholdsEnabled())
+                retry.trackWarnings();
+            rows = executeQuery(retry, cl, state, options, selection.newSelectors(options), pageSize, nowInSec,
+                                userLimit, userOffset, getAggregationSpec(options), requestTime, unmask);
         }
+
         if (!SchemaConstants.isSystemKeyspace(table.keyspace))
             ClientRequestSizeMetrics.recordReadResponseMetrics(rows, restrictions, selection);
 
         return rows;
+    }
+
+    private ResultMessage.Rows executeQuery(ReadQuery query,
+                                            ConsistencyLevel cl,
+                                            QueryState state,
+                                            QueryOptions options,
+                                            Selectors selectors,
+                                            PageSize pageSize,
+                                            long nowInSec,
+                                            int userLimit,
+                                            int userOffset,
+                                            AggregationSpecification aggregationSpec,
+                                            Dispatcher.RequestTime requestTime,
+                                            boolean unmask)
+    {
+        if (aggregationSpec == null && canSkipPaging(query.limits(), pageSize, query.isTopK()))
+            return execute(query, options, state.getClientState(), selectors, nowInSec, userLimit, userOffset, null,
+                           requestTime, unmask);
+
+        QueryPager pager = getPager(query, options);
+        return execute(state,
+                       Pager.forDistributedQuery(pager, cl, state.getClientState()),
+                       options,
+                       selectors,
+                       pageSize,
+                       nowInSec,
+                       userLimit,
+                       userOffset,
+                       aggregationSpec,
+                       requestTime,
+                       unmask);
+    }
+
+    /**
+     * Returns the given read with a row filter that replicas can relax, if its filter was made strict and the read can
+     * contact nodes below DS 10, or {@code null} otherwise.
+     */
+    @Nullable
+    private ReadQuery withRelaxableRowFilter(ReadQuery query, QueryOptions options, ClientState state)
+    {
+        RowFilter rowFilter = query.rowFilter().relaxableForPeersBelowDS10(table.keyspace, options.getConsistency());
+        if (rowFilter == null)
+            return null;
+
+        return getReadQuery(options, state, query.columnFilter(), rowFilter, query.limits(), query.nowInSec(),
+                            IndexRegistry.obtain(table));
     }
 
     /**
@@ -523,14 +578,16 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
      * page boundaries.
      * <p>
      * Apart from substituting {@code query} for {@link #getQuery(QueryOptions, ClientState, ColumnFilter, long, int, int, int, AggregationSpecification)},
-     * this runs the very same code as {@link #execute(QueryState, QueryOptions, Dispatcher.RequestTime)} — both
+     * this runs the same code as {@link #execute(QueryState, QueryOptions, Dispatcher.RequestTime)} — both
      * delegate to {@link #execute(QueryState, QueryOptions, ReadQuery, Dispatcher.RequestTime)}: consistency
      * validation, guardrails ({@link #validateQueryOptions}, {@code pageSize.guard}), the per-query validation
      * {@code getQuery} applies to the query it builds ({@link ReadQuery#validateSelectOptions(SelectOptions, ClientState)},
      * {@link ReadQuery#maybeValidateIndexes()}), read-threshold tracking
      * ({@link ReadQuery#trackWarnings()}), selection/projection, user {@code LIMIT}/{@code OFFSET}, aggregation,
      * dynamic-data masking, the single-shot fast path when paging can be skipped, read metrics/sensors, and page
-     * continuation via {@link ResultSet.ResultMetadata#setHasMorePages}.
+     * continuation via {@link ResultSet.ResultMetadata#setHasMorePages}. Also, a read that a node below DS 10 refuses
+     * fails, instead of being read again with a row filter that replicas can relax, as the filter is the caller's (see
+     * {@link RowFilter#relaxableForPeersBelowDS10}).
      * <p>
      * Caller contract:
      * <ul>
@@ -587,7 +644,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
                               AggregationSpecification aggregationSpec)
     {
         IndexRegistry indexRegistry = IndexRegistry.obtain(table);
-        RowFilter rowFilter = getRowFilter(options, state, indexRegistry);
+        RowFilter rowFilter = restrictions.getRowFilter(indexRegistry, options, state, selectOptions);
         DataLimits dataLimits = getDataLimits(state, userLimit, perPartitionLimit, userOffset, aggregationSpec);
 
         // Reject the DataStax-only parts of the filter (operators, OR...) while there are nodes that can't
@@ -599,9 +656,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         if (restrictions.isKeyRange() && restrictions.usesSecondaryIndexing() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
             Guardrails.nonPartitionRestrictedIndexQueryEnabled.ensureEnabled(state);
 
-        ReadQuery query = restrictions.isKeyRange()
-                        ? getRangeCommand(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry)
-                        : getSliceCommands(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
+        ReadQuery query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
 
         // Handle additional validation for topK queries
         if (query.isTopK())
@@ -620,6 +675,16 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
                 ConsistencyLevel downgrade = supplied.isDatacenterLocal() ? ConsistencyLevel.LOCAL_ONE : ConsistencyLevel.ONE;
                 options.updateConsistency(downgrade);
                 ClientWarn.instance.warn(String.format(TOPK_CONSISTENCY_LEVEL_WARNING, supplied, downgrade));
+
+                // The row filter was built for the requested consistency level, which needs reconciliation, so it
+                // would ask the replicas to relax their filtering (see RowFilter#isStrict). Build the query again
+                // with the filter of the downgraded consistency level, which doesn't need reconciliation. The
+                // filter is derived from the one we have, so that its validations and guardrails don't run twice.
+                if (rowFilter.needsReconciliation())
+                {
+                    rowFilter = rowFilter.withoutReconciliation();
+                    query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
+                }
             }
 
             // We don't support offset for top-k queries.
@@ -628,6 +693,8 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
             // We don't support aggregation for top-k queries because we don't support paging.
             checkFalse(aggregationSpec != null, TOPK_AGGREGATION_ERROR);
         }
+
+        guardIntersectFiltering(rowFilter, state);
 
         query.validateSelectOptions(selectOptions, state);
 
@@ -841,7 +908,8 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     private void warn(String msg)
     {
         logger.warn(msg);
-        ClientWarn.instance.warn(msg);
+        // once per request, even if the query is read again after a refusal
+        ClientWarn.instance.warn(msg, msg);
     }
 
     private ResultMessage.Rows processResults(PartitionIterator partitions,
@@ -1004,6 +1072,56 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         return restrictions;
     }
 
+    private ReadQuery getReadQuery(QueryOptions options, ClientState state, ColumnFilter columnFilter,
+                                   RowFilter rowFilter, DataLimits limit, long nowInSec,
+                                   IndexRegistry indexRegistry)
+    {
+        if (restrictions.isKeyRange())
+            return getRangeCommand(options, state, columnFilter, rowFilter, limit, nowInSec, indexRegistry);
+
+        // A partition-restricted index query whose replicas relax a non-strict row filter (see RowFilter#isStrict and
+        // RowFilter#withReplicaFilteringStrictness) reads its partition with a range read, which reconciles and filters
+        // the rows of all the replicas at the coordinator: a single-partition read would return the unfiltered rows of
+        // one replica when the digests match. Whether the replicas use an index is decided from the commands, whose
+        // index plan covers nested expressions. Reads of several partitions stay single-partition reads, which don't
+        // compare digests when their replicas may return candidate rows (see ReadCommand#returnsCandidateRows).
+        if (rowFilter.isStrict())
+            return getSliceCommands(options, state, columnFilter, rowFilter, limit, nowInSec, indexRegistry);
+
+        ReadQuery sliceQuery = getSliceCommands(options, state, columnFilter, rowFilter, limit, nowInSec, indexRegistry);
+        if (isSinglePartitionRead(sliceQuery) && (restrictions.usesSecondaryIndexing() || hasIndexQueryPlan(sliceQuery)))
+        {
+            // The range has a single partition, so its per-partition limit is a row limit. It reads the clusterings
+            // of the slice read, so that the clustering restrictions aren't evaluated, and their guardrails checked,
+            // a second time.
+            ClusteringIndexFilter clusteringIndexFilter = ((SinglePartitionReadQuery.Group<?>) sliceQuery).queries.get(0).clusteringIndexFilter();
+            ReadQuery query = getRangeCommand(options, columnFilter, rowFilter, limit, nowInSec, clusteringIndexFilter);
+            if (query instanceof PartitionRangeReadCommand && ((PartitionRangeReadCommand) query).isLimitedToOnePartition())
+            {
+                DataLimits rowLimit = perPartitionLimitAsRowLimit(limit);
+                if (rowLimit != limit)
+                    query = ((PartitionRangeReadCommand) query).withUpdatedLimit(rowLimit);
+            }
+            return query;
+        }
+
+        return sliceQuery;
+    }
+
+    private static boolean isSinglePartitionRead(ReadQuery query)
+    {
+        return query instanceof SinglePartitionReadQuery.Group
+               && ((SinglePartitionReadQuery.Group<?>) query).queries.size() == 1;
+    }
+
+    /**
+     * Returns whether the single-partition read of the given single-partition query group has an index query plan.
+     */
+    private static boolean hasIndexQueryPlan(ReadQuery query)
+    {
+        return ((SinglePartitionReadQuery.Group<?>) query).queries.get(0).indexQueryPlan() != null;
+    }
+
     private ReadQuery getSliceCommands(QueryOptions options, ClientState state, ColumnFilter columnFilter,
                                        RowFilter rowFilter, DataLimits limit, long nowInSec,
                                        IndexRegistry indexRegistry)
@@ -1081,6 +1199,22 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
                             IndexRegistry.EMPTY);
     }
 
+    /**
+     * Returns the limits of a read of a single partition with its per-partition limit folded into its row limit
+     * ({@code PER PARTITION LIMIT p LIMIT l} selects the same rows as {@code LIMIT min(p, l)}), so that replica
+     * filtering protection reads the partition in pages and short read protection can grow its requests. GROUP BY and
+     * DISTINCT limits are left as they are.
+     */
+    @VisibleForTesting
+    static DataLimits perPartitionLimitAsRowLimit(DataLimits limits)
+    {
+        if (limits.perPartitionCount() == NO_LIMIT || limits.isDistinct() || limits.isGroupByLimit())
+            return limits;
+
+        DataLimits rowLimit = DataLimits.cqlLimits(Math.min(limits.count(), limits.perPartitionCount()));
+        return limits.bytes() == NO_LIMIT ? rowLimit : rowLimit.withBytesLimit(limits.bytes());
+    }
+
     private ReadQuery getRangeCommand(QueryOptions options, ClientState state, ColumnFilter columnFilter,
                                       RowFilter rowFilter, DataLimits limit, long nowInSec,
                                       IndexRegistry indexRegistry)
@@ -1089,6 +1223,12 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         if (clusteringIndexFilter == null)
             return ReadQuery.empty(table);
 
+        return getRangeCommand(options, columnFilter, rowFilter, limit, nowInSec, clusteringIndexFilter);
+    }
+
+    private ReadQuery getRangeCommand(QueryOptions options, ColumnFilter columnFilter, RowFilter rowFilter, DataLimits limit,
+                                      long nowInSec, ClusteringIndexFilter clusteringIndexFilter)
+    {
         // The LIMIT provided by the user is the number of CQL row he wants returned.
         // We want to have getRangeSlice to count the number of columns, not the number of keys.
         AbstractBounds<PartitionPosition> keyBounds = restrictions.getPartitionKeyBounds(options);
@@ -1323,23 +1463,24 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
      */
     public RowFilter getRowFilter(QueryOptions options, ClientState state) throws InvalidRequestException
     {
-        IndexRegistry indexRegistry = IndexRegistry.obtain(table);
-        RowFilter filter = restrictions.getRowFilter(indexRegistry, options, state, selectOptions);
-
-        if (filter.needsReconciliation() && filter.isMutableIntersection() && restrictions.needFiltering(table))
-            Guardrails.intersectFilteringQueryEnabled.ensureEnabled(state);
-
-        return filter;
+        return getRowFilter(options, state, IndexRegistry.obtain(table));
     }
 
     public RowFilter getRowFilter(QueryOptions options, ClientState state, IndexRegistry indexRegistry) throws InvalidRequestException
     {
         RowFilter filter = restrictions.getRowFilter(indexRegistry, options, state, selectOptions);
+        guardIntersectFiltering(filter, state);
+        return filter;
+    }
 
+    /**
+     * Warns about, or rejects, filtering queries that intersect multiple mutable columns and need reconciliation at the
+     * coordinator, as they might miss rows that were partially updated on different replicas (CASSANDRA-19489).
+     */
+    private void guardIntersectFiltering(RowFilter filter, ClientState state)
+    {
         if (filter.needsReconciliation() && filter.isMutableIntersection() && restrictions.needFiltering(table))
             Guardrails.intersectFilteringQueryEnabled.ensureEnabled(state);
-
-        return filter;
     }
 
     private ResultSet process(PartitionIterator partitions,

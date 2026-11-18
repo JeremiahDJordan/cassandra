@@ -111,13 +111,24 @@ public class OperationTest extends IndexingSchemaLoader
     public void beforeTest()
     {
         ReadCommand command = PartitionRangeReadCommand.allDataRead(BACKEND.metadata(), FBUtilities.nowInSeconds());
-        controller = new QueryController(BACKEND, command,  V1OnDiskFormat.instance.indexFeatureSet(), new QueryContext(), null);
+        controller = new QueryController(BACKEND, command,  V1OnDiskFormat.instance.indexFeatureSet(),
+                                         contextWithUnrepairedMatches(), null);
 
         command = PartitionRangeReadCommand.allDataRead(CLUSTERING_BACKEND.metadata(), FBUtilities.nowInSeconds());
-        controllerClustering = new QueryController(CLUSTERING_BACKEND, command, V1OnDiskFormat.instance.indexFeatureSet(), new QueryContext(), null);
+        controllerClustering = new QueryController(CLUSTERING_BACKEND, command,
+                                                   V1OnDiskFormat.instance.indexFeatureSet(),
+                                                   contextWithUnrepairedMatches(), null);
 
         command = PartitionRangeReadCommand.allDataRead(STATIC_BACKEND.metadata(), FBUtilities.nowInSeconds());
-        controllerStatic = new QueryController(STATIC_BACKEND, command, V1OnDiskFormat.instance.indexFeatureSet(), new QueryContext(), null);
+        controllerStatic = new QueryController(STATIC_BACKEND, command, V1OnDiskFormat.instance.indexFeatureSet(),
+                                               contextWithUnrepairedMatches(), null);
+    }
+
+    private static QueryContext contextWithUnrepairedMatches()
+    {
+        QueryContext context = new QueryContext();
+        context.markUnrepairedMatches();
+        return context;
     }
 
     @After
@@ -369,22 +380,33 @@ public class OperationTest extends IndexingSchemaLoader
         node.add(new Operation.ExpressionNode(new SimpleExpression(timestamp, Operator.GTE, LongType.instance.decompose(10L))));
         node.add(new Operation.ExpressionNode(new SimpleExpression(age, Operator.EQ, Int32Type.instance.decompose(5))));
 
-        filterTree = node.buildFilter(controller);
+        FilterTree filterTreeStrict = node.buildFilter(controller, true);
+        FilterTree filterTreeNonStrict = node.buildFilter(controller, false);
 
-        row = buildRow(buildCell(age, instance.decompose(6), System.currentTimeMillis()),
-                                  buildCell(timestamp, LongType.instance.decompose(11L), System.currentTimeMillis()));
+        long startTime = System.currentTimeMillis();
+        row = buildRow(buildCell(age, instance.decompose(6), startTime),
+                       buildCell(timestamp, LongType.instance.decompose(11L), startTime + 1));
 
-        Assert.assertFalse(filterTree.isSatisfiedBy(key, row, staticRow));
+        Assert.assertFalse(filterTreeStrict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertTrue(filterTreeNonStrict.isSatisfiedBy(key, row, staticRow)); // matches on timestamp >= 10
 
-        row = buildRow(buildCell(age, instance.decompose(5), System.currentTimeMillis()),
-                                  buildCell(timestamp, LongType.instance.decompose(22L), System.currentTimeMillis()));
+        row = buildRow(buildCell(age, instance.decompose(5), startTime + 2),
+                       buildCell(timestamp, LongType.instance.decompose(22L), startTime + 3));
 
-        Assert.assertTrue(filterTree.isSatisfiedBy(key, row, staticRow));
+        Assert.assertTrue(filterTreeStrict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertTrue(filterTreeNonStrict.isSatisfiedBy(key, row, staticRow));
 
-        row = buildRow(buildCell(age, instance.decompose(5), System.currentTimeMillis()),
-                                  buildCell(timestamp, LongType.instance.decompose(9L), System.currentTimeMillis()));
+        row = buildRow(buildCell(age, instance.decompose(5), startTime + 4),
+                       buildCell(timestamp, LongType.instance.decompose(9L), startTime + 5));
 
-        Assert.assertFalse(filterTree.isSatisfiedBy(key, row, staticRow));
+        Assert.assertFalse(filterTreeStrict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertTrue(filterTreeNonStrict.isSatisfiedBy(key, row, staticRow)); // matches on age = 5
+
+        row = buildRow(buildCell(age, instance.decompose(6), startTime + 6),
+                       buildCell(timestamp, LongType.instance.decompose(9L), startTime + 7));
+
+        Assert.assertFalse(filterTreeStrict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertFalse(filterTreeNonStrict.isSatisfiedBy(key, row, staticRow)); // matches on neither
 
         // operation with internal expressions and right child
         node = new Operation.OrNode();
@@ -439,6 +461,97 @@ public class OperationTest extends IndexingSchemaLoader
         {
             Assert.fail("IllegalStateException should not be thrown when missing column");
         }
+    }
+
+    /**
+     * Non-strict filtering relaxes nested intersections too, and their combination with nested disjunctions, such as
+     * those coming from {@code IN} restrictions (CASSANDRA-19018).
+     */
+    @Test
+    public void testSatisfiedByNonStrictWithNestedOperations()
+    {
+        final ColumnMetadata timestamp = getColumn(UTF8Type.instance.decompose("timestamp"));
+        final ColumnMetadata age = getColumn(UTF8Type.instance.decompose("age"));
+        final ColumnMetadata height = getColumn(UTF8Type.instance.decompose("height"));
+
+        DecoratedKey key = buildKey("0");
+        Row staticRow = buildRow(Clustering.STATIC_CLUSTERING);
+
+        // timestamp >= 10 AND (age = 5 OR age = 6)
+        Operation.Node node = new Operation.AndNode();
+        node.add(new Operation.ExpressionNode(new SimpleExpression(timestamp, Operator.GTE, LongType.instance.decompose(10L))));
+        Operation.Node or = new Operation.OrNode();
+        or.add(new Operation.ExpressionNode(new SimpleExpression(age, Operator.EQ, Int32Type.instance.decompose(5))));
+        or.add(new Operation.ExpressionNode(new SimpleExpression(age, Operator.EQ, Int32Type.instance.decompose(6))));
+        node.add(or);
+
+        FilterTree strict = node.buildFilter(controller, true);
+        FilterTree nonStrict = node.buildFilter(controller, false);
+
+        long now = System.currentTimeMillis();
+        Unfiltered row = buildRow(buildCell(age, instance.decompose(6), now), buildCell(timestamp, LongType.instance.decompose(9L), now));
+        Assert.assertFalse(strict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertTrue(nonStrict.isSatisfiedBy(key, row, staticRow)); // matches on age = 6
+
+        row = buildRow(buildCell(age, instance.decompose(7), now), buildCell(timestamp, LongType.instance.decompose(11L), now));
+        Assert.assertFalse(strict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertTrue(nonStrict.isSatisfiedBy(key, row, staticRow)); // matches on timestamp >= 10
+
+        row = buildRow(buildCell(age, instance.decompose(7), now), buildCell(timestamp, LongType.instance.decompose(9L), now));
+        Assert.assertFalse(strict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertFalse(nonStrict.isSatisfiedBy(key, row, staticRow));
+
+        // timestamp >= 10 OR (age = 5 AND height = 180)
+        node = new Operation.OrNode();
+        node.add(new Operation.ExpressionNode(new SimpleExpression(timestamp, Operator.GTE, LongType.instance.decompose(10L))));
+        Operation.Node and = new Operation.AndNode();
+        and.add(new Operation.ExpressionNode(new SimpleExpression(age, Operator.EQ, Int32Type.instance.decompose(5))));
+        and.add(new Operation.ExpressionNode(new SimpleExpression(height, Operator.EQ, Int32Type.instance.decompose(180))));
+        node.add(and);
+
+        strict = node.buildFilter(controller, true);
+        nonStrict = node.buildFilter(controller, false);
+
+        row = buildRow(buildCell(age, instance.decompose(5), now),
+                       buildCell(height, instance.decompose(170), now),
+                       buildCell(timestamp, LongType.instance.decompose(9L), now));
+        Assert.assertFalse(strict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertTrue(nonStrict.isSatisfiedBy(key, row, staticRow)); // matches on age = 5
+
+        row = buildRow(buildCell(age, instance.decompose(4), now),
+                       buildCell(height, instance.decompose(170), now),
+                       buildCell(timestamp, LongType.instance.decompose(9L), now));
+        Assert.assertFalse(strict.isSatisfiedBy(key, row, staticRow));
+        Assert.assertFalse(nonStrict.isSatisfiedBy(key, row, staticRow));
+    }
+
+    /**
+     * Non-strict filtering doesn't relax intersections if all the index matches are on repaired data, which is
+     * consistent across replicas (CASSANDRA-19018).
+     */
+    @Test
+    public void testSatisfiedByNonStrictWithoutUnrepairedMatches()
+    {
+        final ColumnMetadata timestamp = getColumn(UTF8Type.instance.decompose("timestamp"));
+        final ColumnMetadata age = getColumn(UTF8Type.instance.decompose("age"));
+
+        ReadCommand command = PartitionRangeReadCommand.allDataRead(BACKEND.metadata(), FBUtilities.nowInSeconds());
+        QueryController repairedController = new QueryController(BACKEND, command, V1OnDiskFormat.instance.indexFeatureSet(), new QueryContext(), null);
+
+        Operation.Node node = new Operation.AndNode();
+        node.add(new Operation.ExpressionNode(new SimpleExpression(timestamp, Operator.GTE, LongType.instance.decompose(10L))));
+        node.add(new Operation.ExpressionNode(new SimpleExpression(age, Operator.EQ, Int32Type.instance.decompose(5))));
+        FilterTree nonStrict = node.buildFilter(repairedController, false);
+
+        DecoratedKey key = buildKey("0");
+        Row staticRow = buildRow(Clustering.STATIC_CLUSTERING);
+        long now = System.currentTimeMillis();
+
+        Unfiltered row = buildRow(buildCell(age, instance.decompose(6), now), buildCell(timestamp, LongType.instance.decompose(11L), now));
+        Assert.assertFalse(nonStrict.isSatisfiedBy(key, row, staticRow));
+
+        row = buildRow(buildCell(age, instance.decompose(5), now), buildCell(timestamp, LongType.instance.decompose(11L), now));
+        Assert.assertTrue(nonStrict.isSatisfiedBy(key, row, staticRow));
     }
 
     @Test
@@ -591,6 +704,8 @@ public class OperationTest extends IndexingSchemaLoader
         node.add(new Operation.ExpressionNode(new SimpleExpression(value, Operator.EQ, DoubleType.instance.decompose(30.00))));
 
         Assert.assertFalse(node.buildFilter(controllerStatic).isSatisfiedBy(key, row, staticRow));
+        // without strict filtering, the static row match is enough (CASSANDRA-19018)
+        Assert.assertTrue(node.buildFilter(controllerStatic, false).isSatisfiedBy(key, row, staticRow));
 
         // sensor_type ='PRESSURE' OR value = 24.56
         node = new Operation.OrNode();

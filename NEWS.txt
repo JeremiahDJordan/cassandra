@@ -336,6 +336,40 @@ Upgrading
       CompactionInterruptedException, and its work is discarded. The initial build of the index waits for the
       compaction to stop; if it can't stop within 2 minutes, the build fails on that node, and the index needs
       nodetool rebuild_index there.
+    - SAI queries at consistency levels that need reconciliation (above ONE/LOCAL_ONE, with more than one replica)
+      whose WHERE clause restricts more than one non-primary key column can miss rows whose columns were written to
+      different replicas, as each replica filters strictly on its own data. Apache Cassandra 5.0 finds those rows
+      (CASSANDRA-19018, CASSANDRA-20189), and so do the queries that this release reads non-strictly: those
+      coordinated by a node with `sai_options.non_strict_replica_filtering_enabled: true` in cassandra.yaml (default
+      false; also the setSAINonStrictReplicaFilteringEnabled operation of the StorageService MBean), and, whatever the
+      setting, those that can contact a node below messaging version DS 10, such as an Apache Cassandra node (counted
+      as for the DataStax-only SELECT features above). Their replicas return the rows matching any of those
+      restrictions on unrepaired data, and the coordinator filters the reconciled rows, which costs more the more
+      unrepaired rows the restrictions match beyond the whole WHERE clause. Replicas of this release relax their
+      filtering only for coordinators that ask with the "ds.sai.nonstrict" message parameter, so the reads of earlier
+      DataStax and Apache Cassandra coordinators can miss such rows.
+    - The coordinator caches the candidate rows of the replicas to filter them (replica filtering protection).
+      Queries over several partitions, and queries without a limit or page size, cache whole partitions before
+      filtering them, as in Apache Cassandra, and so do partition-restricted queries with GROUP BY, whatever they
+      filter on, including a single column. On partitions with many more candidate rows than matches, these queries
+      can time out, or fail with OverloadedException once the coordinator caches more than
+      replica_filtering_protection.cached_rows_fail_threshold rows (32000 by default). Other partition-restricted
+      queries with a limit, a page size or a per-partition limit read their partition in steps instead.
+    - To take fewer round trips, short read protection asks the replicas of filtering queries for twice as many rows
+      as the previous time, up to 4096 rows per request whatever their size, and each request also stops at the byte
+      limit of the read, if it has one (a page size in bytes, or the page weight guardrail). This applies to the
+      queries whose candidate rows the coordinator caches by whole partitions, including those that filter on a
+      single column, and to the queries read non-strictly, including ALLOW FILTERING queries on several regular
+      columns without an index or with a legacy index.
+    - Partition-restricted SAI queries of that kind that are read non-strictly are read as range reads of their
+      partition, as in Apache Cassandra (CASSANDRA-19968), including those whose index restrictions are nested in
+      conjunctions and disjunctions, such as k = 0 AND ((a = 1 AND b = 2) OR a = 3). At SERIAL and LOCAL_SERIAL,
+      these range reads don't run Paxos: they read a quorum of replicas, without the linearizability of serial reads.
+      Such queries that restrict several partitions with IN, which is only allowed when their index restrictions are
+      nested in a disjunction, such as k IN (0, 1) AND ((a = 1 AND b = 2) OR a = 3), are single-partition reads that
+      read data from all the replicas they contact, so that the coordinator filters the reconciled rows. Other
+      partition-restricted queries are single-partition reads, with digest reads and speculative retry, which run
+      Paxos at SERIAL and LOCAL_SERIAL. Queries of full primary keys of that kind use the index instead of skipping it.
 
 5.0.9
 =====
