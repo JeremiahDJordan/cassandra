@@ -18,7 +18,9 @@ package org.apache.cassandra.index.sai.cql;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 
 import org.junit.Test;
 
@@ -103,6 +105,49 @@ public class BM25UpdateTest extends SAITester
         assertRanking("memtable");
         flush();
         assertRanking("sstable");
+    }
+
+    /**
+     * The terms of the old values of updated rows, also of rows rewritten after a partition deletion, don't stay in the
+     * index, where BM25 ordering doesn't verify them.
+     */
+    @Test
+    public void testStaleEntries()
+    {
+        for (String memtable : new String[]{ "", " WITH memtable = 'skiplist'" })
+        {
+            createTable("CREATE TABLE %s (pk int PRIMARY KEY, v text, x int)" + memtable);
+            createIndex(ANALYZED_INDEX);
+            // 2: a partition deleted, the same text reinserted, then updated to another
+            execute("INSERT INTO %s (pk, v) VALUES (2, 'apple pie')");
+            execute("DELETE FROM %s WHERE pk = 2");
+            execute("INSERT INTO %s (pk, v) VALUES (2, 'apple pie')");
+            execute("UPDATE %s SET v = 'cherry tart' WHERE pk = 2");
+            // 3: updated to another text
+            execute("INSERT INTO %s (pk, v) VALUES (3, 'apple pie')");
+            execute("UPDATE %s SET v = 'cherry tart' WHERE pk = 3");
+            // 4: updated to fewer occurrences of the word
+            execute("INSERT INTO %s (pk, v) VALUES (4, 'apple apple pie')");
+            execute("UPDATE %s SET v = 'apple' WHERE pk = 4");
+            // 6: a partition deleted, the same text reinserted
+            execute("INSERT INTO %s (pk, v) VALUES (6, 'apple pie')");
+            execute("DELETE FROM %s WHERE pk = 6");
+            execute("INSERT INTO %s (pk, v) VALUES (6, 'apple pie')");
+
+            for (String source : new String[]{ "memtable", "sstable" })
+            {
+                if (source.equals("sstable"))
+                    flush();
+                Set<Integer> apple = new TreeSet<>();
+                for (UntypedResultSet.Row row : execute("SELECT pk FROM %s ORDER BY v BM25 OF 'apple' LIMIT 10"))
+                    apple.add(row.getInt("pk"));
+                assertThat(apple).as(source + memtable).containsExactly(4, 6);
+                Set<Integer> cherry = new TreeSet<>();
+                for (UntypedResultSet.Row row : execute("SELECT pk FROM %s ORDER BY v BM25 OF 'cherry' LIMIT 10"))
+                    cherry.add(row.getInt("pk"));
+                assertThat(cherry).as(source + memtable).containsExactly(2, 3);
+            }
+        }
     }
 
     private void assertRanking(String source)
