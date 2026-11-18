@@ -328,22 +328,47 @@ public class MissingIndexOnAddedSSTablesTest extends SAITester
     }
 
     /**
+     * SSTables that are added without an index while its initial build is running, after it has built the SSTables
+     * handed to it, are built by its last look for SSTables still without the index.
+     */
+    @Test
+    public void testSSTablesAddedAfterHandOffAreBuiltByInitialBuild() throws Throwable
+    {
+        ColumnFamilyStore cfs = addSSTablesAtEndOfInitialBuild("buildSSTablesAddedDuringInitialBuild");
+
+        assertThat(cfs.indexManager.isIndexQueryable(getIndexContexts(KEYSPACE, currentTable()).iterator().next().getIndexName())).isTrue();
+        assertThat(rowsThroughV()).isEqualTo(ROWS);
+    }
+
+    /**
      * SSTables that are added without an index while its initial build is running, but too late for it to build them,
      * make the index non-queryable once the build is over, although the build makes it queryable.
      */
     @Test
     public void testSSTablesAddedAtEndOfInitialBuildMakeIndexNonQueryable() throws Throwable
     {
+        ColumnFamilyStore cfs = addSSTablesAtEndOfInitialBuild("buildSSTablesMissedByInitialBuild");
+        String index = getIndexContexts(KEYSPACE, currentTable()).iterator().next().getIndexName();
+
+        waitForAssert(() -> assertThat(cfs.indexManager.isIndexQueryable(index)).isFalse());
+        assertThatThrownBy(() -> execute("SELECT k FROM %s WHERE v = 0")).hasMessageContaining("INDEX_NOT_AVAILABLE");
+    }
+
+    /**
+     * Adds SSTables without an index while its initial build is held at the exit of the specified method, and returns
+     * once the build is over.
+     */
+    private ColumnFamilyStore addSSTablesAtEndOfInitialBuild(String method) throws Throwable
+    {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
         disableCompaction();
         ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
         Set<SSTableReader> streamed = writeSSTablesNotAdded(0);
 
-        // Hold the initial build once it has built the SSTables handed to it, just before it completes.
         Injections.Barrier holdEndOfBuild = barrier("hold_end_of_initial_build",
                                                     InvokePointBuilder.newInvokePoint()
                                                                       .onClass(StorageAttachedIndex.class)
-                                                                      .onMethod("buildSSTablesAddedDuringInitialBuild")
+                                                                      .onMethod(method)
                                                                       .atExit());
         Injections.inject(holdEndOfBuild);
         String index = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "v"));
@@ -355,9 +380,7 @@ public class MissingIndexOnAddedSSTablesTest extends SAITester
         holdEndOfBuild.countDown();
         holdEndOfBuild.disable();
         waitForAssert(() -> assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse(), 60, TimeUnit.SECONDS);
-
-        waitForAssert(() -> assertThat(cfs.indexManager.isIndexQueryable(index)).isFalse());
-        assertThatThrownBy(() -> execute("SELECT k FROM %s WHERE v = 0")).hasMessageContaining("INDEX_NOT_AVAILABLE");
+        return cfs;
     }
 
     /**
