@@ -120,10 +120,22 @@ public class IndexFileUtils
         return IndexInputReader.create(handle);
     }
 
+    /**
+     * Opens an input over the given file handle, which the input takes ownership of: closing the input closes the
+     * handle, and if the input can't be created, the handle is closed before the error is rethrown.
+     */
     public IndexInputReader openBlockingInput(FileHandle fileHandle)
     {
-        final RandomAccessReader randomReader = fileHandle.createReader();
-        return IndexInputReader.create(randomReader, fileHandle::close);
+        try
+        {
+            final RandomAccessReader randomReader = fileHandle.createReader();
+            return IndexInputReader.create(randomReader, fileHandle::close);
+        }
+        catch (Throwable t)
+        {
+            fileHandle.close();
+            throw t;
+        }
     }
 
     public static ChecksumIndexInput getBufferedChecksumIndexInput(org.apache.lucene.store.IndexInput indexInput, Version version)
