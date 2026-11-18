@@ -77,7 +77,6 @@ import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
-import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 
 public class TrieMemoryIndex extends MemoryIndex
@@ -456,6 +455,9 @@ public class TrieMemoryIndex extends MemoryIndex
                                      ? toBigDecimal(expression.getEncodedUpperBoundByteComparable(version))
                                      : indexUpperBound;
 
+        // A contradictory range, such as v >= 5 AND v < 3, matches nothing
+        if (queryLowerBound.compareTo(queryUpperBound) > 0)
+            return 0;
         if (queryLowerBound.compareTo(indexUpperBound) > 0 || queryUpperBound.compareTo(indexLowerBound) < 0)
             return 0;
         if (queryLowerBound.compareTo(indexUpperBound) == 0 && expression.lower != null && !expression.lower.inclusive)
@@ -518,25 +520,31 @@ public class TrieMemoryIndex extends MemoryIndex
             upperInclusive = false;
         }
 
-        // Nothing sorts before the empty term: a range ending before it, such as the "less than" half of
-        // c != '', is empty, and slicing the trie with it would give the slice an end before its start.
-        if (isBeforeEmptyTerm(upperBound, upperInclusive))
+        if (isEmptyRange(lowerBound, lowerInclusive, upperBound, upperInclusive))
             return Trie.empty(TypeUtil.byteComparableVersionForTermsData(indexContext.version()));
 
         return data.subtrie(lowerBound, lowerInclusive, upperBound, upperInclusive);
     }
 
     /**
-     * @return whether the given upper bound excludes every term, which is the case of the empty term as an exclusive
-     * upper bound
+     * Whether the range of terms is empty (lower bound after upper, or equal with one exclusive), as contradictory
+     * restrictions such as {@code v >= 5 AND v < 3} give: slicing the trie with it fails. A null lower bound is the
+     * empty term.
      */
-    private boolean isBeforeEmptyTerm(@Nullable ByteComparable upperBound, boolean upperInclusive)
+    private boolean isEmptyRange(@Nullable ByteComparable lowerBound, boolean lowerInclusive,
+                                 @Nullable ByteComparable upperBound, boolean upperInclusive)
     {
-        if (upperBound == null || upperInclusive)
+        if (upperBound == null)
             return false;
-        // The empty value of a non-literal type has no byte-comparable representation (a null source)
-        ByteSource bytes = upperBound.asComparableBytes(TypeUtil.byteComparableVersionForTermsData(indexContext.version()));
-        return bytes == null || bytes.next() == ByteSource.END_OF_STREAM;
+        if (lowerBound == null)
+        {
+            lowerBound = ByteComparable.EMPTY;
+            lowerInclusive = true;
+        }
+        // Compare the bounds as the trie does. The empty value of a non-literal type has no byte-comparable
+        // representation (a null source), which sorts before all the others.
+        int cmp = ByteComparable.compare(lowerBound, upperBound, TypeUtil.byteComparableVersionForTermsData(indexContext.version()));
+        return cmp > 0 || (cmp == 0 && !(lowerInclusive && upperInclusive));
     }
 
     public ByteBuffer getMinTerm()
