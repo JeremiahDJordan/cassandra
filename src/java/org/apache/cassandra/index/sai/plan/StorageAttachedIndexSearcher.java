@@ -27,6 +27,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Queue;
@@ -41,6 +42,9 @@ import org.slf4j.LoggerFactory;
 
 import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringBound;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
@@ -48,6 +52,10 @@ import org.apache.cassandra.db.MessageParams;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.monitoring.Monitorable;
@@ -261,6 +269,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
     {
         private final PrimaryKey firstPrimaryKey;
         private final Iterator<DataRange> keyRanges;
+        private final DataRange firstDataRange;
         private AbstractBounds<PartitionPosition> currentKeyRange;
 
         private final KeyRangeIterator operation;
@@ -277,7 +286,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                                 ReadExecutionController executionController)
         {
             this.keyRanges = controller.dataRanges().iterator();
-            this.currentKeyRange = keyRanges.next().keyRange();
+            this.firstDataRange = keyRanges.next();
+            this.currentKeyRange = firstDataRange.keyRange();
 
             this.operation = operation;
             this.filterTree = filterTree;
@@ -306,7 +316,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             // We can't put this code in the constructor because it may throw and the caller
             // may not be prepared for that.
             if (lastKey == null)
-                operation.skipTo(firstPrimaryKey);
+                operation.skipTo(firstSkipTarget());
 
             // Theoretically we wouldn't need this if the caller of computeNext always ran the
             // returned iterators to the completion. Unfortunately, we have no control over the caller behavior here.
@@ -318,6 +328,56 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             return iterator != null
                    ? iteratePartition(iterator)
                    : endOfData();
+        }
+
+        /**
+         * Returns the key to skip to before reading the first key. That's the first key of the first key range, unless
+         * the first key range is a single partition and the query selects only some of its rows. Then it's the first
+         * row the query selects, so that we don't read the keys of all the rows before it. This is what makes later
+         * pages of a paged query within a large partition cheap.
+         */
+        private PrimaryKey firstSkipTarget()
+        {
+            // Only row-aware keys have clusterings. Keys of static rows sort before the keys of regular rows,
+            // so we must not skip past them if the query has static column expressions.
+            ClusteringComparator comparator = command.metadata().comparator;
+            if (!controller.indexFeatureSet().isRowAware()
+                || comparator.size() == 0
+                || firstDataRange.selectsAllPartition()
+                || command.rowFilter().hasStaticExpression())
+                return firstPrimaryKey;
+
+            if (!currentKeyRange.left.equals(currentKeyRange.right) || !(currentKeyRange.left instanceof DecoratedKey))
+                return firstPrimaryKey;
+
+            DecoratedKey partitionKey = (DecoratedKey) currentKeyRange.left;
+            ClusteringIndexFilter filter = firstDataRange.clusteringIndexFilter(partitionKey);
+
+            if (filter instanceof ClusteringIndexSliceFilter)
+            {
+                Slices slices = ((ClusteringIndexSliceFilter) filter).requestedSlices();
+                if (slices.isEmpty())
+                    return firstPrimaryKey;
+
+                // Slices are in clustering order whether the query is reversed or not. The start bound of the first
+                // slice can only be used if it has a value for every clustering column.
+                ClusteringBound<?> start = slices.get(0).start();
+                if (start.size() != comparator.size())
+                    return firstPrimaryKey;
+
+                return keyFactory.create(partitionKey, Clustering.make(start.getBufferArray()));
+            }
+
+            if (filter instanceof ClusteringIndexNamesFilter)
+            {
+                NavigableSet<Clustering<?>> clusterings = ((ClusteringIndexNamesFilter) filter).requestedRows();
+                if (clusterings.isEmpty())
+                    return firstPrimaryKey;
+
+                return keyFactory.create(partitionKey, clusterings.first());
+            }
+
+            return firstPrimaryKey;
         }
 
         /**

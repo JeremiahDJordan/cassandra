@@ -23,6 +23,11 @@ import org.junit.Test;
 
 import org.HdrHistogram.Histogram;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.plan.QueryController;
+import org.apache.cassandra.inject.Injections;
+
+import static org.apache.cassandra.inject.InvokePointBuilder.newInvokePoint;
+import static org.assertj.core.api.Assertions.assertThat;
 
 /**
  * Tests for verifying intra-partition and partition-level skipping optimizations
@@ -36,6 +41,119 @@ import org.apache.cassandra.index.sai.SAITester;
  */
 public class IntraPartitionSkippingTest extends SAITester
 {
+    // the searcher calls QueryController.selects once for each key it reads from the index
+    private final Injections.Counter keysRead = Injections.newCounter("KeysRead")
+                                                          .add(newInvokePoint().onClass(QueryController.class)
+                                                                               .onMethod("selects"))
+                                                          .build();
+
+    /**
+     * A query on a slice of a partition skips to the start of the slice before reading the first key.
+     */
+    @Test
+    public void testSliceFilterSkipsToFirstSelectedRow() throws Throwable
+    {
+        createSingleValuePartition();
+
+        beforeAndAfterFlush(() -> {
+            keysRead.reset();
+            assertRowCount(execute("SELECT * FROM %s WHERE pk = 1 AND ck >= 90 AND val = 'v' ALLOW FILTERING"), 10);
+            // 10 matching keys, plus the first key of the next partition
+            assertThat(keysRead.get()).isLessThanOrEqualTo(11);
+
+            // an exclusive start bound skips to the bound, which isn't selected
+            keysRead.reset();
+            assertRowCount(execute("SELECT * FROM %s WHERE pk = 1 AND ck > 90 AND val = 'v' ALLOW FILTERING"), 9);
+            assertThat(keysRead.get()).isLessThanOrEqualTo(11);
+        });
+    }
+
+    /**
+     * Same as {@link #testSliceFilterSkipsToFirstSelectedRow()} with a descending clustering order: the start of the
+     * slice is its highest clustering.
+     */
+    @Test
+    public void testSliceFilterSkipsToFirstSelectedRowReversed() throws Throwable
+    {
+        createSingleValuePartition("WITH CLUSTERING ORDER BY (ck DESC)");
+
+        beforeAndAfterFlush(() -> {
+            keysRead.reset();
+            assertRowCount(execute("SELECT * FROM %s WHERE pk = 1 AND ck <= 9 AND val = 'v' ALLOW FILTERING"), 10);
+            assertThat(keysRead.get()).isLessThanOrEqualTo(11);
+        });
+    }
+
+    /**
+     * A query on some rows of a partition skips to the first row before reading the first key. The query restricts the
+     * whole primary key, so it only uses the index if a hint tells it to.
+     */
+    @Test
+    public void testNamesFilterSkipsToFirstSelectedRow() throws Throwable
+    {
+        String index = createSingleValuePartition();
+
+        beforeAndAfterFlush(() -> {
+            keysRead.reset();
+            assertRows(execute("SELECT ck FROM %s WHERE pk = 1 AND ck IN (95, 97) AND val = 'v' ALLOW FILTERING WITH included_indexes = {" + index + '}'),
+                       row(95), row(97));
+            // the keys from 95 to the end of the partition (99), plus the first key after them
+            assertThat(keysRead.get()).isLessThanOrEqualTo(6);
+        });
+    }
+
+    /**
+     * Each page of a query on a single partition skips to the first row after the previous page.
+     */
+    @Test
+    public void testPagingSkipsToFirstRowOfPage() throws Throwable
+    {
+        createSingleValuePartition();
+
+        beforeAndAfterFlush(() -> {
+            keysRead.reset();
+            assertThat(executeNetWithPaging("SELECT * FROM %s WHERE pk = 1 AND ck >= 50 AND val = 'v' ALLOW FILTERING", 5).all()).hasSize(50);
+            // without skipping, each of the 10 pages would read all the keys from the start of the partition
+            assertThat(keysRead.get()).isLessThanOrEqualTo(50 + 2 * 11);
+        });
+    }
+
+    /**
+     * The first key range isn't a single partition, so the searcher can't skip within a partition.
+     */
+    @Test
+    public void testNoSkipOnPartitionRange() throws Throwable
+    {
+        createSingleValuePartition();
+
+        beforeAndAfterFlush(() -> {
+            keysRead.reset();
+            assertRowCount(execute("SELECT * FROM %s WHERE ck >= 90 AND val = 'v' ALLOW FILTERING"), 10);
+            assertThat(keysRead.get()).isGreaterThanOrEqualTo(100);
+        });
+    }
+
+    /**
+     * Creates a partition with 100 rows that all have the same indexed value, and counts the keys the searcher reads.
+     */
+    private String createSingleValuePartition() throws Throwable
+    {
+        return createSingleValuePartition("");
+    }
+
+    private String createSingleValuePartition(String tableOptions) throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, val text, PRIMARY KEY (pk, ck)) " + tableOptions);
+        String index = createIndex("CREATE INDEX ON %s(val) USING 'sai'");
+        disableCompaction();
+
+        for (int ck = 0; ck < 100; ck++)
+            execute("INSERT INTO %s (pk, ck, val) VALUES (?, ?, ?)", 1, ck, "v");
+
+        Injections.inject(keysRead);
+        return index;
+    }
+
     @Test
     public void testNameFilterExactMatch() throws Throwable
     {
