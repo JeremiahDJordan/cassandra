@@ -410,6 +410,23 @@ Upgrading
       index, with a warning in the log, like other terms too large to be indexed: queries served by the index don't
       return such a row for restrictions on that entry's key (e.g. m[k] > v, m[k] != v), while the same restriction with
       ALLOW FILTERING on an unindexed column does. Delete or rewrite such entries to make them queryable again.
+    - ORDER BY on a clustering column is rejected with "ORDER BY with 2ndary indexes is not supported." when an
+      index serves restrictions nested in conjunctions and disjunctions, as it is when the index restrictions are at
+      the top level of the WHERE clause, e.g. k = 0 AND ((a = 1 AND b = 2) OR (a = 3 AND b = 4)) ORDER BY c ASC.
+      These queries are rejected when they are executed rather than when they are prepared, and only if the read
+      uses an index: a read of full primary keys whose row filter is strict skips the index (unless
+      cassandra.index.skip_on_full_primary_keys is set to false), so
+      k = 0 AND c IN (0, 1) AND ((a = 1 AND b = 2) OR (a = 3 AND b = 4)) ORDER BY c DESC is accepted, unless it is
+      read non-strictly (at the consistency levels that need reconciliation if the keyspace has more than one
+      replica). Conversely, ORDER BY on a clustering column is accepted when the index restrictions are in a
+      disjunction with a branch that no index supports, which no index can serve, such as
+      k = 0 AND (x = 1 OR a = 1) ORDER BY c DESC with x unindexed.
+    - With the guardrail non_partition_restricted_index_query_enabled set to false, queries that don't restrict the
+      partition key fail when an index serves restrictions nested in conjunctions and disjunctions, such as
+      (a = 1 AND b = 2) OR (a = 3 AND b = 4), as they do when the index restrictions are at the top level of the
+      WHERE clause. Queries whose index restrictions are in a disjunction with a branch that no index supports don't
+      use an index, and are allowed, such as x = 1 OR a = 1 with x unindexed. With the guardrail enabled, its
+      default, all these queries are allowed.
 
 5.0.9
 =====

@@ -181,6 +181,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(SelectStatement.logger, 1, TimeUnit.MINUTES);
     public static final String USAGE_WARNING_PAGE_WEIGHT = "Applied page weight limit of ";
     public static final String TOPK_AGGREGATION_ERROR = "Top-K queries can not be run with aggregation";
+    public static final String ORDER_BY_WITH_INDEX_MESSAGE = "ORDER BY with 2ndary indexes is not supported.";
     public static final String TOPK_CONSISTENCY_LEVEL_ERROR = "Top-K queries can only be run with consistency level ONE/LOCAL_ONE. Consistency level %s was used.";
     public static final String TOPK_CONSISTENCY_LEVEL_WARNING = "Top-K queries can only be run with consistency level ONE " +
                                                                 "/ LOCAL_ONE / NODE_LOCAL. Consistency level %s was requested. " +
@@ -476,6 +477,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         {
             // getQuery(...) validates the query it builds before returning it; do the same for the supplied one.
             query = externalQuery;
+            checkOrderingWithoutIndex(query);
             query.validateSelectOptions(selectOptions, state.getClientState());
             query.maybeValidateIndexes();
         }
@@ -653,10 +655,15 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         if (!table.isVirtual() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
             rowFilter.validateForPeers(table.keyspace, options.getConsistency());
 
-        if (restrictions.isKeyRange() && restrictions.usesSecondaryIndexing() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
+        ReadQuery query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
+
+        // Whether the read uses an index is decided from its index query plan rather than from the restrictions, which
+        // don't say whether an index serves the restrictions nested in disjunctions: it doesn't serve those with a
+        // branch it doesn't support, such as "x = 1 OR (a = 1 AND b = 2)" with x unindexed, which is a filtering read.
+        if (restrictions.isKeyRange() && hasIndexQueryPlan(query) && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
             Guardrails.nonPartitionRestrictedIndexQueryEnabled.ensureEnabled(state);
 
-        ReadQuery query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
+        checkOrderingWithoutIndex(query);
 
         // Handle additional validation for topK queries
         if (query.isTopK())
@@ -1115,11 +1122,34 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     }
 
     /**
-     * Returns whether the single-partition read of the given single-partition query group has an index query plan.
+     * Rejects ORDER BY on clustering columns for a read that uses an index, which can't read in reverse clustering
+     * order. The ordering is rejected at preparation if the top-level restrictions use an index (see
+     * verifyOrderingIsAllowed), and here if a nested one does. Orderings that an index serves, such as ANN, are in the
+     * row filter.
+     */
+    private void checkOrderingWithoutIndex(ReadQuery query)
+    {
+        checkFalse(!parameters.orderings.isEmpty() && !query.rowFilter().hasOrdering() && hasIndexQueryPlan(query),
+                   ORDER_BY_WITH_INDEX_MESSAGE);
+    }
+
+    /**
+     * Returns whether the given read, or any of the single-partition reads that it groups, has an index query plan.
      */
     private static boolean hasIndexQueryPlan(ReadQuery query)
     {
-        return ((SinglePartitionReadQuery.Group<?>) query).queries.get(0).indexQueryPlan() != null;
+        if (query.indexQueryPlan() != null)
+            return true;
+
+        if (query instanceof SinglePartitionReadQuery.Group)
+        {
+            for (SinglePartitionReadQuery partitionQuery : ((SinglePartitionReadQuery.Group<?>) query).queries)
+            {
+                if (partitionQuery.indexQueryPlan() != null)
+                    return true;
+            }
+        }
+        return false;
     }
 
     private ReadQuery getSliceCommands(QueryOptions options, ClientState state, ColumnFilter columnFilter,
@@ -1981,7 +2011,9 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
             if (orderingColumns.values().stream().anyMatch(o -> o.expression.hasNonClusteredOrdering()))
                 return;
 
-            checkFalse(restrictions.usesSecondaryIndexing(), "ORDER BY with 2ndary indexes is not supported.");
+            // Index restrictions nested in conjunctions and disjunctions are checked when the read is built, from its
+            // index query plan (see getQuery)
+            checkFalse(restrictions.usesSecondaryIndexingAtThisLevel(), ORDER_BY_WITH_INDEX_MESSAGE);
             checkFalse(restrictions.isKeyRange(), "ORDER BY is only supported when the partition key is restricted by an EQ or an IN.");
 
             // check that clustering columns are valid
