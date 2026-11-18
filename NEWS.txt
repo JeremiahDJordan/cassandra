@@ -60,6 +60,13 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - Non-analyzed storage-attached indexes (SAI) on text, varchar, ascii, boolean, frozen tuple and frozen UDT
+      columns, and on the elements of collections of those types, now index the empty value written by an update of
+      a row already in the memtable, e.g. UPDATE ... SET v = '' on a row that had another value or none. Earlier
+      versions skipped it, so restrictions such as v = '' missed the row, from the memtable and from the SSTable it
+      was flushed to. If you query such columns for the empty value, rebuild those indexes on each node after
+      upgrading it, with nodetool rebuild_index: the SSTables flushed before the upgrade keep missing such rows until
+      then, or until compacted.
 
 Deprecation
 ---------
