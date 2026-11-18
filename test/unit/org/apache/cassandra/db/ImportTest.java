@@ -45,6 +45,7 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.BootStrapper;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
@@ -817,6 +818,47 @@ public class ImportTest extends CQLTester
                                                                      .build();
             assertTrue(importer.importNewSSTables(options).isEmpty());
             assertEquals(10, execute(String.format("SELECT * FROM %s.%s WHERE d >= 0", KEYSPACE, "sai_test")).size());
+        }
+        finally
+        {
+            execute(String.format("DROP TABLE IF EXISTS %s.%s", KEYSPACE, "sai_test"));
+        }
+    }
+
+    @Test
+    public void requiringSAIIndexesDoesNotLeakSSTableReadersTest() throws Throwable
+    {
+        try
+        {
+            schemaChange(String.format("CREATE TABLE %s.%s (id int primary key, d int)", KEYSPACE, "sai_test"));
+            createIndexAndWait(String.format("CREATE INDEX idx1 ON %s.%s (d) USING 'sai'", KEYSPACE, "sai_test"), "idx1");
+
+            for (int i = 0; i < 10; i++)
+                execute(String.format("INSERT INTO %s.%s (id, d) values (?, ?)", KEYSPACE, "sai_test"), i, i);
+
+            ColumnFamilyStore cfs = getColumnFamilyStore(KEYSPACE, "sai_test");
+            Util.flush(cfs);
+
+            Set<SSTableReader> sstables = cfs.getLiveSSTables();
+            cfs.clearUnsafe();
+
+            File backupDir = moveToBackupDir(sstables);
+
+            // clearUnsafe() doesn't tell the index group, so forget about the SSTables it removed
+            StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+            group.sstableContextManager().clear();
+
+            SSTableImporter importer = new SSTableImporter(cfs);
+            SSTableImporter.Options options = SSTableImporter.Options.options(backupDir.toString())
+                                                                     .copyData(true)
+                                                                     .failOnMissingIndex(true)
+                                                                     .build();
+            assertTrue(importer.importNewSSTables(options).isEmpty());
+            assertEquals(10, execute(String.format("SELECT * FROM %s.%s WHERE d >= 0", KEYSPACE, "sai_test")).size());
+
+            // Checking the SAI components of the SSTables to import must not open them, and so must not leave
+            // descriptors for readers of the source files cached in the index group: only the imported SSTables count.
+            assertEquals(cfs.getLiveSSTables().size(), group.sstableContextManager().getDescriptorCount());
         }
         finally
         {
