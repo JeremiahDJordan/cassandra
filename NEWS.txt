@@ -119,6 +119,12 @@ Upgrading
       and CREATE INDEX as one schema change (e.g. it was down), and after a restart that follows a CREATE INDEX that
       couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes concerned. Older
       versions ignore the content of the marker.
+    - A node that receives SSTables by streaming (repair, rebuild, bootstrap, decommission...) without entire-SSTable
+      streaming, or by nodetool import, builds only the storage-attached indexes those SSTables are missing before
+      adding them. A failure or stop of that build (nodetool stop INDEX_BUILD, a major compaction...) fails the
+      stream or the import, which don't add the SSTables, without making the index non-queryable on the node. Once
+      the SSTables are added, an index still missing some of them is built on them by its initial build if that is
+      running, and is made non-queryable otherwise, until nodetool rebuild_index or a restart.
 
 5.0.7
 ======

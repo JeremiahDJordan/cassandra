@@ -322,7 +322,7 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
                            .make()
                            .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
             new ByteBuddy().rebase(SecondaryIndexManager.class)
-                           .method(named("buildSSTableAttachedIndexesBlocking"))
+                           .method(named("buildMissingSSTableAttachedIndexes"))
                            .intercept(MethodDelegation.to(BuildInterceptor.class))
                            .make()
                            .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
@@ -355,7 +355,7 @@ public class IndexCreatedDuringStreamingTest extends TestBaseImpl
         public static class BuildInterceptor
         {
             @SuppressWarnings("unused")
-            public static void buildSSTableAttachedIndexesBlocking(@FieldValue("baseCfs") ColumnFamilyStore cfs, @SuperCall Callable<Void> zuper) throws Exception
+            public static void buildMissingSSTableAttachedIndexes(@FieldValue("baseCfs") ColumnFamilyStore cfs, @SuperCall Callable<Void> zuper) throws Exception
             {
                 if (cfs.name.equals(failBuildTable))
                     throw new RuntimeException(IndexBuildInterceptor.INJECTED_FAILURE);
