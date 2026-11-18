@@ -548,7 +548,10 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             queryContext.addPostFilteringReadLatency(Clock.Global.nanoTime() - startTimeNanos);
 
             queryContext.addKeysFetched(keys.size());
-            return applyIndexFilter(counted, filterTree);
+            // A read that doesn't need reconciliation drops the rows without live data later anyway, so they mustn't
+            // keep a partition whose static row doesn't match the filter.
+            boolean liveRowsOnly = !command.rowFilter().needsReconciliation();
+            return applyIndexFilter(counted, filterTree, liveRowsOnly, command.nowInSec());
         }
 
         @Override
@@ -761,7 +764,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                 queryContext.addKeysFetched(sourceKeys.size());
 
                 UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
-                UnfilteredRowIterator clusters = applyIndexFilter(counted, filterTree);
+                UnfilteredRowIterator clusters = applyIndexFilter(counted, filterTree, false, nowInSec);
 
                 if (clusters == null)
                     return null;
@@ -888,9 +891,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         }
     }
 
-    private static UnfilteredRowIterator applyIndexFilter(UnfilteredRowIterator partition, FilterTree tree)
+    private static UnfilteredRowIterator applyIndexFilter(UnfilteredRowIterator partition, FilterTree tree, boolean liveRowsOnly, long nowInSec)
     {
-        FilteringPartitionIterator filtered = new FilteringPartitionIterator(partition, tree);
+        FilteringPartitionIterator filtered = new FilteringPartitionIterator(partition, tree, liveRowsOnly, nowInSec);
         if (!filtered.hasNext() && !filtered.matchesStaticRow())
         {
             filtered.close();
@@ -909,8 +912,10 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
         private final DecoratedKey key;
         private final Row staticRow;
+        private final boolean liveRowsOnly;
+        private final long nowInSec;
 
-        public FilteringPartitionIterator(UnfilteredRowIterator partition, FilterTree filter)
+        public FilteringPartitionIterator(UnfilteredRowIterator partition, FilterTree filter, boolean liveRowsOnly, long nowInSec)
         {
             super(partition.metadata(),
                   partition.partitionKey(),
@@ -924,6 +929,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             this.filter = filter;
             this.key = partition.partitionKey();
             this.staticRow = partition.staticRow();
+            this.liveRowsOnly = liveRowsOnly;
+            this.nowInSec = nowInSec;
         }
 
         public boolean matchesStaticRow()
@@ -939,6 +946,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                 Unfiltered row = rows.next();
 
                 if (!row.isRow() || ((Row)row).isStatic())
+                    continue;
+
+                if (liveRowsOnly && !((Row) row).hasLiveData(nowInSec, metadata().enforceStrictLiveness()))
                     continue;
 
                 if (filter.isSatisfiedBy(key, row, staticRow))
