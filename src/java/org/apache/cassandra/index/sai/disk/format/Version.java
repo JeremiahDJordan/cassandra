@@ -99,6 +99,8 @@ public class Version implements Comparable<Version>
 
     public static final Version EARLIEST = AA;
     public static final Version VECTOR_EARLIEST = BA;
+    // Indexes before this version map terms to partitions rather than rows (see IndexFeatureSet#isRowAware)
+    public static final Version ROW_AWARE_EARLIEST = BA;
     public static final Version JVECTOR_EARLIEST = CA;
     public static final Version BM25_EARLIEST = EC;
     public static final Version LATEST = ALL.get(0);
