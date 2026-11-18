@@ -143,6 +143,26 @@ public class Operation
                     {
                         perColumn.add(new Expression(indexContext).add(e.operator(), ByteBuffer.allocate(0)));
                     }
+                    else if (e.operator() == Operator.NOT_CONTAINS || e.operator() == Operator.NOT_CONTAINS_KEY)
+                    {
+                        // The negation of a value of several terms is one expression holding all of them, not one
+                        // per term: those would be ANDed, excluding the rows holding any of the terms
+                        List<ByteBuffer> terms = remainingTerms(analyzer);
+                        Expression negation = new Expression(indexContext).add(e.operator(), terms.get(0));
+                        perColumn.add(terms.size() == 1 ? negation : negation.addAllTerms(terms));
+                    }
+                    else if (e.operator() == Operator.CONTAINS || e.operator() == Operator.CONTAINS_KEY)
+                    {
+                        // One expression per term, so that the index intersects the rows of the terms (in a
+                        // disjunction too, see buildExpression), but each of them accepts only an element holding all
+                        // the terms: the rows holding the terms in different elements don't hold the value
+                        List<ByteBuffer> terms = remainingTerms(analyzer);
+                        for (ByteBuffer term : terms)
+                        {
+                            Expression expression = new Expression(indexContext).add(e.operator(), term);
+                            perColumn.add(terms.size() == 1 ? expression : expression.addAllTerms(terms));
+                        }
+                    }
                     else
                     {
                         // The hasNext implementation has a side effect, so we need to call next before calling hasNext
@@ -239,6 +259,17 @@ public class Operation
         {
             analyzer.end();
         }
+    }
+
+    private static List<ByteBuffer> remainingTerms(AbstractAnalyzer analyzer)
+    {
+        List<ByteBuffer> terms = new ArrayList<>();
+        do
+        {
+            terms.add(analyzer.next().duplicate());
+        }
+        while (analyzer.hasNext());
+        return terms;
     }
 
     private static int getPriority(org.apache.cassandra.cql3.Operator op)
@@ -351,10 +382,12 @@ public class Operation
                 return node;
             }
             else if (isDisjunction && (expression.operator() == Operator.ANALYZER_MATCHES ||
-                                       expression.operator() == Operator.EQ && controller.getContext(expression).isAnalyzed()))
+                                       (expression.operator() == Operator.EQ ||
+                                        expression.operator() == Operator.CONTAINS ||
+                                        expression.operator() == Operator.CONTAINS_KEY) && controller.getContext(expression).isAnalyzed()))
             {
                 // In case of having a tokenizing query_analyzer (such as NGram) with OR, we need to split the
-                // expression into multiple expressions and intersect them.
+                // expression into multiple expressions and intersect them (for CONTAINS, see analyzeGroup).
                 // The additional node in case of no tokenization will be taken care of in Plan.Factory#intersection()
                 OperatorNode node = new AndNode();
                 node.add(new ExpressionNode(expression));
