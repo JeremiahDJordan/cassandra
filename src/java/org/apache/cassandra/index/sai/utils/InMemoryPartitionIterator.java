@@ -65,7 +65,9 @@ public class InMemoryPartitionIterator implements PartitionIterator
                 currentRows = new ArrayList<>(1);
             }
 
-            currentRows.add(row);
+            // A static row stands for a partition with only static content, so the partition has no rows
+            if (!row.isStatic())
+                currentRows.add(row);
         }
 
         partitions.add(new InMemoryRowIterator(command, currentPartitionInfo, currentRows));

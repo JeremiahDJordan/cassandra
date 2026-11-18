@@ -489,12 +489,13 @@ public class VectorColumnPositionsTest extends VectorTester.Versioned
         execute(insert, row(4, 40, 1));
         execute(insert, row(5, 50, 1)); // this one does not have a static row
         beforeAndAfterFlush(() -> {
-            // query with ANN only
-            assertRows(execute("SELECT k FROM %s ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(2), row(3), row(4));
+            // query with ANN only, every row of a partition has the score of its static vector
+            assertRows(execute("SELECT k FROM %s ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(1), row(2), row(2), row(3), row(4));
+            assertRows(execute("SELECT k, c FROM %s ORDER BY s ANN OF [0.1, 0.1] LIMIT 3"), row(1, 10), row(1, 11), row(2, 20));
 
             // query with hybrid search
-            assertRows(execute("SELECT k FROM %s WHERE v>=0 ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(2), row(3), row(4));
-            assertRows(execute("SELECT k FROM %s WHERE v=0 ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(2));
+            assertRows(execute("SELECT k FROM %s WHERE v>=0 ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(1), row(2), row(2), row(3), row(4));
+            assertRows(execute("SELECT k FROM %s WHERE v=0 ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(1), row(2), row(2));
             assertRows(execute("SELECT k FROM %s WHERE v>0 ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(3), row(4));
         });
 
@@ -502,14 +503,14 @@ public class VectorColumnPositionsTest extends VectorTester.Versioned
         insert = "INSERT INTO %s (k, s) VALUES (?, ?)";
         execute(insert, row(1, vector(0.1f, 0.5f)));
         beforeAndAfterFlush(() -> {
-            assertRows(execute("SELECT k FROM %s ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(2), row(3), row(4), row(1));
+            assertRows(execute("SELECT k FROM %s ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(2), row(2), row(3), row(4), row(1), row(1));
         });
 
         // update the worst vector to make it the best
         insert = "INSERT INTO %s (k, s) VALUES (?, ?)";
         execute(insert, row(1, vector(0.1f, 0.1f)));
         beforeAndAfterFlush(() -> {
-            assertRows(execute("SELECT k FROM %s ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(2), row(3), row(4));
+            assertRows(execute("SELECT k FROM %s ORDER BY s ANN OF [0.1, 0.1] LIMIT 10"), row(1), row(1), row(2), row(2), row(3), row(4));
         });
     }
 

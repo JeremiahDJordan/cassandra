@@ -1221,6 +1221,24 @@ public class VectorTypeTest extends VectorTester.VersionedWithChecksums
         assertRows(execute(select), row);
     }
 
+    /** ANN on a static vector column returns every row of the partitions (CASSANDRA-20086). */
+    @Test
+    public void testStaticVectorColumnIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, val vector<float, 2> static, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (pk, ck, val) VALUES (0, 1, [1,0])");
+        execute("INSERT INTO %s (pk, ck)      VALUES (0, 2)");
+        execute("INSERT INTO %s (pk, ck, val) VALUES (1, 3, [0,-1])");
+        execute("INSERT INTO %s (pk, ck, val) VALUES (2, 4, [0,1])");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT ck FROM %s ORDER BY val ANN OF [0,1] LIMIT 3"), row(4), row(1), row(2));
+            assertRows(execute("SELECT ck FROM %s ORDER BY val ANN OF [0,1] LIMIT 2"), row(4), row(1));
+        });
+    }
+
     /**
      * A hybrid query matching many keys: the planner picks the strategy, only the result is checked (CASSANDRA-20086).
      */
