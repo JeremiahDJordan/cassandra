@@ -144,7 +144,7 @@ public class QueryView implements AutoCloseable
                 // These are already referenced because they are referenced by the same view we just referenced.
                 for (var index : saiView.getIndexes())
                 {
-                    if (!indexInRange(index))
+                    if (!indexInRange(index, range))
                         continue;
                     sstableIndexes.add(index);
                     sstableReaders.add(index.getSSTable());
@@ -184,7 +184,7 @@ public class QueryView implements AutoCloseable
         // statistics on that; it looks like it was only used to check bounds overlap, so computing
         // an actual global bounds should be an improvement.  But computing global bounds as an intersection
         // of individual bounds is messy because you can end up with more than one range.
-        private boolean indexInRange(SSTableIndex index)
+        static boolean indexInRange(SSTableIndex index, AbstractBounds<PartitionPosition> range)
         {
             SSTableReader sstable = index.getSSTable();
             if (range instanceof Bounds && range.left.equals(range.right) && (!range.left.isMinimum()) && range.left instanceof DecoratedKey)
