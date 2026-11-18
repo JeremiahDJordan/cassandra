@@ -241,4 +241,49 @@ public class BlobIndexTest extends SAITester
                 .hasMessage(String.format(StorageAttachedIndex.BLOB_INDEX_UNSUPPORTED_BY_NODES_MESSAGE,
                                           column, Collections.singleton(peer.address)));
     }
+
+    /**
+     * An index on a DESC blob clustering column returns the same rows as filtering.
+     */
+    @Test
+    public void testDescClusteringColumn() throws Throwable
+    {
+        String indexed = createTable("CREATE TABLE %s (k int, c blob, PRIMARY KEY (k, c)) WITH CLUSTERING ORDER BY (c DESC)");
+        createIndex("CREATE INDEX ON %s(c) USING 'sai'");
+        String unindexed = createTable("CREATE TABLE %s (k int, c blob, PRIMARY KEY (k, c)) WITH CLUSTERING ORDER BY (c DESC)");
+
+        for (String table : new String[]{ indexed, unindexed })
+        {
+            for (int k = 0; k < 2; k++)
+            {
+                for (String c : new String[]{ "0x", "0x00", "0x0001", "0x80", "0xff", "0xff00" })
+                    execute(String.format("INSERT INTO %s.%s (k, c) VALUES (%d, %s)", KEYSPACE, table, k, c));
+            }
+        }
+
+        for (int pass = 0; pass < 2; pass++)
+        {
+            for (String where : new String[]{ "c = 0x", "c = 0x00", "c IN (0x, 0xff)", "k = 0 AND c = 0x" })
+            {
+                assertRowsIgnoringOrder(execute(String.format("SELECT k, c FROM %s.%s WHERE %s", KEYSPACE, indexed, where)),
+                                        rows(unindexed, where));
+            }
+
+            // != and ranges aren't served by the index: they're filtered, with the same rows as without the index
+            assertInvalidMessage(String.format(StatementRestrictions.HAS_UNSUPPORTED_INDEX_RESTRICTION_MESSAGE_SINGLE, "c"),
+                                 String.format("SELECT k, c FROM %s.%s WHERE c != 0x00", KEYSPACE, indexed));
+            for (String where : new String[]{ "c != 0x00", "c != 0x", "c > 0x00", "c < 0x01" })
+            {
+                assertRowsIgnoringOrder(execute(String.format("SELECT k, c FROM %s.%s WHERE %s ALLOW FILTERING", KEYSPACE, indexed, where)),
+                                        rows(unindexed, where));
+            }
+
+            flush(KEYSPACE, indexed, unindexed);
+        }
+    }
+
+    private Object[][] rows(String table, String where)
+    {
+        return getRows(execute(String.format("SELECT k, c FROM %s.%s WHERE %s ALLOW FILTERING", KEYSPACE, table, where)));
+    }
 }

@@ -1093,7 +1093,7 @@ public class IndexContext
         AbstractType<?> validator = getValidator();
         if (operator == Expression.Op.IN)
             return true;
-        if (operator != Expression.Op.EQ && EQ_ONLY_TYPES.contains(validator)) return false;
+        if (operator != Expression.Op.EQ && TypeUtil.isIn(validator, EQ_ONLY_TYPES)) return false;
         // RANGE only applicable to non-literal indexes
         return (operator != null) && !(TypeUtil.isLiteral(validator) && operator == Expression.Op.RANGE);
     }
