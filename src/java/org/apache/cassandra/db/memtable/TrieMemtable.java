@@ -494,7 +494,9 @@ public class TrieMemtable extends AbstractShardedMemtable
                 finally
                 {
                     minTimestamp = Math.min(minTimestamp, update.stats().minTimestamp);
-                    minLocalDeletionTime = Math.min(minLocalDeletionTime, update.stats().minLocalDeletionTime);
+                    // EncodingStats uses a synthetic epoch for no local deletion time
+                    if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+                        minLocalDeletionTime = Math.min(minLocalDeletionTime, update.stats().minLocalDeletionTime);
                     liveDataSize += updater.dataSize;
                     currentOperations += update.operationCount();
 
