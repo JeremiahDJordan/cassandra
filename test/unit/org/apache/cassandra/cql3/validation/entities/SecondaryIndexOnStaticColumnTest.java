@@ -214,4 +214,68 @@ public class SecondaryIndexOnStaticColumnTest extends CQLTester
         assertEmpty(execute("SELECT id, company FROM %s WHERE home = " + addressString));
         assertRows(execute("SELECT id, company FROM %s WHERE home = " + newAddressString), row(1, companyName));
     }
+
+    /**
+     * A single-partition query with an index on a static column must return the rows selected by its clustering
+     * restriction, and every page of these rows when paged.
+     */
+    @Test
+    public void testIndexOnStaticColumnWithClusteringRestriction() throws Throwable
+    {
+        for (String using : new String[]{ "", " USING 'StorageAttachedIndex'" })
+        {
+            String create = using.isEmpty() ? "CREATE INDEX" : "CREATE CUSTOM INDEX";
+            createTable("CREATE TABLE %s (pk int, c int, s int static, l list<int> static, PRIMARY KEY (pk, c))");
+            createIndex(create + " ON %s (s)" + using);
+            createIndex(create + " ON %s (l)" + using);
+
+            for (int pk = 0; pk < 3; pk++)
+            {
+                int s = pk == 1 ? 2 : 1;
+                for (int c = 1; c <= 4; c++)
+                    execute("INSERT INTO %s (pk, c, s, l) VALUES (?, ?, ?, ?)", pk, c, s, list(s));
+            }
+
+            beforeAndAfterFlush(() -> {
+                for (String index : new String[]{ "s = 1", "l CONTAINS 1" })
+                {
+                    assertStaticIndexQuery("pk = 0 AND " + index,
+                                           row(0, 1), row(0, 2), row(0, 3), row(0, 4));
+                    assertStaticIndexQuery("pk = 0 AND " + index + " AND c = 3",
+                                           row(0, 3));
+                    assertStaticIndexQuery("pk = 0 AND c = 3 AND " + index,
+                                           row(0, 3));
+                    assertStaticIndexQuery("pk = 0 AND " + index + " AND c > 1",
+                                           row(0, 2), row(0, 3), row(0, 4));
+                    assertStaticIndexQuery("pk = 0 AND " + index + " AND c IN (1, 3, 4)",
+                                           row(0, 1), row(0, 3), row(0, 4));
+                    assertStaticIndexQuery("pk = 0 AND " + index + " AND c >= 2 AND c < 4",
+                                           row(0, 2), row(0, 3));
+                    assertStaticIndexQuery("pk = 0 AND " + index + " AND c > 1 LIMIT 2",
+                                           row(0, 2), row(0, 3));
+                    assertStaticIndexQuery("pk = 0 AND " + index + " PER PARTITION LIMIT 3",
+                                           row(0, 1), row(0, 2), row(0, 3));
+                    assertStaticIndexQuery("pk = 1 AND " + index + " AND c = 3");
+                    assertStaticIndexQuery(index + " AND c > 2",
+                                           row(0, 3), row(0, 4), row(2, 3), row(2, 4));
+                }
+            });
+        }
+    }
+
+    private void assertStaticIndexQuery(String where, Object[]... rows) throws Throwable
+    {
+        String query = "SELECT pk, c FROM %s WHERE " + where;
+        // Without a partition key restriction, the clustering restriction needs filtering.
+        if (where.startsWith("pk "))
+            assertRowsWithPaging(query, rows);
+        assertRowsWithPaging(query + " ALLOW FILTERING", rows);
+    }
+
+    private void assertRowsWithPaging(String query, Object[]... rows) throws Throwable
+    {
+        assertRows(execute(query), rows);
+        for (int pageSize = 1; pageSize <= 3; pageSize++)
+            assertRowsNet(executeNetWithPaging(query, pageSize), rows);
+    }
 }
