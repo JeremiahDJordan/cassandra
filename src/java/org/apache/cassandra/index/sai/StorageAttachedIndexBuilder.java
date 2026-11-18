@@ -46,7 +46,6 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 
-import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.TimeUUID;
 import org.slf4j.Logger;
@@ -76,11 +75,11 @@ import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.view.View;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.KeyReader;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.SSTableWatcher;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.RandomAccessReader;
-import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.schema.DroppedColumn;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -509,7 +508,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             if (indexes.isEmpty())
                 return false;
 
-            try (RandomAccessReader dataFile = sstable.openDataReader(ReadPattern.SEQUENTIAL);
+            try (RandomAccessReader dataFile = sstable.openDataReaderForScan();
                  LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.INDEX_BUILD, sstable))
             {
                 boolean numberEmptyStaticRows;
@@ -1058,9 +1057,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     {
         long previousBytesRead = 0;
 
-        try (KeyIterator keys = sstable.keyIterator())
+        try (KeyReader keys = sstable.keyReaderForScan())
         {
-            while (keys.hasNext())
+            while (!keys.isExhausted())
             {
                 if (isStopRequested())
                 {
@@ -1068,8 +1067,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                     throw new CompactionInterruptedException(getProgress(), trigger());
                 }
 
-                DecoratedKey key = keys.next();
-                long position = sstable.getPosition(key, SSTableReader.Operator.EQ);
+                DecoratedKey key = sstable.decorateKey(keys.key());
+                long position = keys.dataPosition();
 
                 indexWriter.startPartition(key, position, position);
 
@@ -1094,7 +1093,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                         indexWriter.nextUnfilteredCluster(partition.next());
                 }
 
-                long bytesRead = keys.getBytesRead();
+                long bytesRead = keys.advance() ? keys.dataPosition() : sstable.uncompressedLength();
                 bytesProcessed += bytesRead - previousBytesRead;
                 previousBytesRead = bytesRead;
             }
@@ -1118,17 +1117,17 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
         OnDiskFormat format = components.onDiskFormat();
         PrimaryKey.Factory keyFactory = format.newPrimaryKeyFactory(metadata.comparator);
-        try (KeyIterator keys = sstable.keyIterator();
+        try (KeyReader keys = sstable.keyReaderForScan();
              PrimaryKeyMap.Factory mapFactory = format.newPrimaryKeyMapFactory(components, keyFactory, sstable);
              PrimaryKeyMap map = mapFactory.newPerSSTablePrimaryKeyMap())
         {
-            while (keys.hasNext())
+            for (; !keys.isExhausted(); keys.advance())
             {
                 if (isStopRequested())
                     throw new CompactionInterruptedException(getProgress(), trigger());
 
-                DecoratedKey key = keys.next();
-                dataFile.seek(sstable.getPosition(key, SSTableReader.Operator.EQ));
+                DecoratedKey key = sstable.decorateKey(keys.key());
+                dataFile.seek(keys.dataPosition());
                 ByteBufferUtil.readWithShortLength(dataFile); // key
                 try (SSTableIdentityIterator partition = SSTableIdentityIterator.create(sstable, dataFile, key))
                 {

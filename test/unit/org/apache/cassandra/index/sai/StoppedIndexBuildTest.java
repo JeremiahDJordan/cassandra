@@ -240,7 +240,7 @@ public class StoppedIndexBuildTest extends SAITester
         holdBuilders(InvokePointBuilder.newInvokePoint()
                                        .onClass(StorageAttachedIndexBuilder.class)
                                        .onMethod("numbersEmptyStaticRows")
-                                       .atInvoke("staticRow"));
+                                       .atInvoke("advance"));
         CompletableFuture<Throwable> rebuild = rebuildAsync(cfs, v);
         waitForBuildersHeld();
         stop(cfs, nodetoolStop);

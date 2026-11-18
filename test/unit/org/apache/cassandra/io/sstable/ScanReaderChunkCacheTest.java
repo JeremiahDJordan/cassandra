@@ -52,8 +52,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Compaction, verification, key iteration for a scan and filter rebuilds read sstables with scan readers, which bypass
- * the chunk cache; range reads and the other key readers use it. Index files are read through the chunk
+ * Compaction, verification, key iteration for a scan, filter rebuilds and index builds read sstables with scan readers,
+ * which bypass the chunk cache; range reads and the other key readers use it. Index files are read through the chunk
  * cache too (standard access mode), and the table has partitions with and without a row index entry.
  */
 @RunWith(Parameterized.class)
@@ -187,6 +187,36 @@ public class ScanReaderChunkCacheTest extends CQLTester
     }
 
     @Test
+    public void testIndexBuildBypassesChunkCache()
+    {
+        createIndex("CREATE CUSTOM INDEX ON %s(ck) USING 'StorageAttachedIndex'");
+        assertEquals(0, ChunkCache.instance.sizeOfFile(sstable.getDataFile()));
+        assertEquals(0, ChunkCache.instance.sizeOfFile(indexFile()));
+    }
+
+    @Test
+    public void testIndexBuildOverExistingComponentsWithStaticColumnBypassesChunkCache()
+    {
+        // the second build reads the sstable to find how the existing per-SSTable components number empty static rows
+        createTable("CREATE TABLE %s (pk int, ck int, s int static, v int, b blob, PRIMARY KEY (pk, ck)) " +
+                    "WITH compression = {'class': 'LZ4Compressor', 'chunk_length_in_kb': 16}");
+        ColumnFamilyStore table = getCurrentColumnFamilyStore();
+        table.disableAutoCompaction();
+        for (int pk = 0; pk < 400; pk++)
+            execute("INSERT INTO %s (pk, ck, s, v, b) VALUES (?, ?, ?, ?, ?)", pk, 0, pk, pk, ByteBuffer.wrap(new byte[200]));
+        flush();
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        SSTableReader reader = table.getLiveSSTables().iterator().next();
+        assertEquals(format, reader.descriptor.version.format);
+        ChunkCache.instance.invalidateFileNow(reader.getDataFile());
+        ChunkCache.instance.invalidateFileNow(indexFile(reader));
+
+        createIndex("CREATE CUSTOM INDEX ON %s(ck) USING 'StorageAttachedIndex'");
+        assertEquals(0, ChunkCache.instance.sizeOfFile(reader.getDataFile()));
+        assertEquals(0, ChunkCache.instance.sizeOfFile(indexFile(reader)));
+    }
+
+    @Test
     public void testRangeReadUsesChunkCache()
     {
         readAll(sstable.partitionIterator(ColumnFilter.all(sstable.metadata()),
@@ -197,8 +227,13 @@ public class ScanReaderChunkCacheTest extends CQLTester
 
     private File indexFile()
     {
-        return sstable.descriptor.fileFor(format instanceof BigFormat ? BigFormat.Components.PRIMARY_INDEX
-                                                                      : BtiFormat.Components.ROW_INDEX);
+        return indexFile(sstable);
+    }
+
+    private File indexFile(SSTableReader reader)
+    {
+        return reader.descriptor.fileFor(format instanceof BigFormat ? BigFormat.Components.PRIMARY_INDEX
+                                                                     : BtiFormat.Components.ROW_INDEX);
     }
 
     private static int readAll(KeyReader reader) throws IOException
