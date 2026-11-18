@@ -19,13 +19,18 @@
 package org.apache.cassandra.distributed.test.sai;
 
 import java.net.InetSocketAddress;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
+import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
+import net.bytebuddy.implementation.FixedValue;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
@@ -39,9 +44,11 @@ import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.virtual.ColumnIndexesSystemView;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.MessagingService;
 import org.assertj.core.util.Streams;
 import org.awaitility.core.ConditionTimeoutException;
 
+import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.awaitility.Awaitility.await;
 
 public class SAIUtil
@@ -264,5 +271,22 @@ public class SAIUtil
             assert status == Index.Status.BUILD_FAILED
                 : "Index " + index + " not failed on node " + nodeAddress + " (status = " + status + ')';
         });
+    }
+
+    /**
+     * Returns an instance initializer that makes the given nodes speak the given messaging version.
+     */
+    public static BiConsumer<ClassLoader, Integer> pinMessagingVersion(int version, int... nodes)
+    {
+        return (classLoader, node) -> {
+            if (Arrays.stream(nodes).anyMatch(n -> n == node))
+            {
+                new ByteBuddy().rebase(MessagingService.class)
+                               .method(named("currentVersion"))
+                               .intercept(FixedValue.value(version))
+                               .make()
+                               .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+            }
+        };
     }
 }

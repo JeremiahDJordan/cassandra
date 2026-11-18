@@ -42,6 +42,7 @@ import org.apache.cassandra.concurrent.ExecutorFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.ExecutorUtils;
@@ -332,7 +333,9 @@ public class Nodes
          */
         public IPeerInfo update(InetAddressAndPort peer, UnaryOperator<PeerInfo> update, boolean blocking, boolean force)
         {
-            return internalMap.compute(peer, (key, existingPeerInfo) -> {
+            AtomicReference<PeerInfo> previous = new AtomicReference<>();
+            PeerInfo updatedInfo = internalMap.compute(peer, (key, existingPeerInfo) -> {
+                previous.set(existingPeerInfo);
                 PeerInfo updated = existingPeerInfo == null
                                    ? update.apply(new PeerInfo().setPeerAddressAndPort(peer))
                                    : update.apply(existingPeerInfo.duplicate()); // since we operate on mutable objects, we don't want to let the update function to operate on the live object
@@ -346,6 +349,14 @@ public class Nodes
                 save(existingPeerInfo, updated, blocking, force);
                 return updated;
             });
+
+            // the peers and their datacenter are read by the checks of the nodes that the reads can contact
+            PeerInfo previousInfo = previous.get();
+            if (previousInfo == null
+                || previousInfo.isRemoved()
+                || !Objects.equals(previousInfo.getDataCenter(), updatedInfo.getDataCenter()))
+                PeerCheckCache.peersChanged();
+            return updatedInfo;
         }
 
         /**
@@ -363,6 +374,8 @@ public class Nodes
                 removed.set(existingPeerInfo);
                 return hard ? null : existingPeerInfo;
             });
+            if (removed.get() != null)
+                PeerCheckCache.peersChanged();
             return removed.get();
         }
 
@@ -422,6 +435,7 @@ public class Nodes
         {
             logger.trace("Loading peers...");
             nodesPersistence.loadPeers().forEach(info -> internalMap.compute(info.getPeerAddressAndPort(), (key, existingPeerInfo) -> info));
+            PeerCheckCache.peersChanged();
             if (logger.isTraceEnabled())
                 logger.trace("Loaded peers: {}", internalMap.values().stream().collect(Collectors.toList()));
             return this;

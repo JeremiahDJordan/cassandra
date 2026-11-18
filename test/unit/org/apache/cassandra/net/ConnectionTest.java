@@ -35,6 +35,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.function.ToLongFunction;
@@ -59,6 +60,7 @@ import io.netty.channel.ChannelPromise;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.db.commitlog.CommitLog;
+import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.exceptions.UnknownColumnException;
 import org.apache.cassandra.io.IVersionedAsymmetricSerializer;
@@ -496,6 +498,128 @@ public class ConnectionTest
                                 .error    ( 0,  0)
                                 .check();
         });
+    }
+
+    /**
+     * The loss of the connection while a large message is written is handled like a timeout by the request callback,
+     * as the request may succeed if tried again: it is not a failure to serialize the message for the peer's version.
+     */
+    @Test
+    public void testLargeMessageConnectionResetFailsCallbackAsTimeout() throws Throwable
+    {
+        doTestManual(Settings.LARGE, (settings, inboundSockets, outbound, endpoint) -> {
+            inboundSockets.open().sync();
+            int size = LARGE_MESSAGE_THRESHOLD * 16;
+            unsafeSetSerializer(Verb._TEST_1, () -> new IVersionedSerializer<Object>()
+            {
+                public void serialize(Object o, DataOutputPlus out, int version) throws IOException
+                {
+                    for (int i = 0; i < size; i++)
+                    {
+                        // the peer goes away while the large message is being written to the network
+                        if (i == size / 4)
+                        {
+                            try
+                            {
+                                inboundSockets.close().get(30L, SECONDS);
+                            }
+                            catch (Exception e)
+                            {
+                                throw new RuntimeException(e);
+                            }
+                        }
+                        out.writeByte(i);
+                    }
+                }
+
+                public Object deserialize(DataInputPlus in, int version) throws IOException
+                {
+                    in.skipBytesFully(size);
+                    return noPayload;
+                }
+
+                public long serializedSize(Object o, int version)
+                {
+                    return size;
+                }
+            });
+            unsafeSetHandler(Verb._TEST_1, () -> msg -> {});
+
+            Assert.assertEquals(RequestFailureReason.TIMEOUT, failureReasonOf(outbound, endpoint));
+        });
+    }
+
+    /**
+     * A message that fails to serialize is handled like a timeout by the request callback, unless it can't be
+     * serialized for the messaging version of the peer, in which case the request fails right away (see
+     * {@link RequestCallbacks#onFailedSerialize}).
+     */
+    @Test
+    public void testSerializeErrorFailureReason() throws Throwable
+    {
+        test((inbound, outbound, endpoint) -> {
+            for (boolean incompatible : new boolean[]{ false, true })
+            {
+                unsafeSetSerializer(Verb._TEST_1, () -> new IVersionedSerializer<Object>()
+                {
+                    public void serialize(Object o, DataOutputPlus out, int version) throws IOException
+                    {
+                        if (incompatible)
+                            throw new IncompatibleMessagingVersionException("can't serialize for version " + version);
+                        throw new IOException();
+                    }
+
+                    public Object deserialize(DataInputPlus in, int version) throws IOException
+                    {
+                        in.readByte();
+                        return null;
+                    }
+
+                    public long serializedSize(Object o, int version)
+                    {
+                        return 1;
+                    }
+                });
+                unsafeSetHandler(Verb._TEST_1, () -> msg -> {});
+
+                Assert.assertEquals(incompatible ? RequestFailureReason.UNKNOWN : RequestFailureReason.TIMEOUT,
+                                    failureReasonOf(outbound, endpoint));
+            }
+        });
+    }
+
+    /** Sends a _TEST_1 message expiring in a minute and returns the reason its request callback fails with. */
+    private static RequestFailureReason failureReasonOf(OutboundConnection outbound, InetAddressAndPort endpoint) throws Exception
+    {
+        CountDownLatch done = new CountDownLatch(1);
+        AtomicReference<RequestFailureReason> reason = new AtomicReference<>();
+        Message<?> message = Message.builder(Verb._TEST_1, new Object())
+                                    .withExpiresAt(nanoTime() + SECONDS.toNanos(60L))
+                                    .build();
+        MessagingService.instance().callbacks.addWithExpiration(new RequestCallback<Object>()
+        {
+            @Override
+            public void onFailure(InetAddressAndPort from, RequestFailureReason failureReason)
+            {
+                reason.set(failureReason);
+                done.countDown();
+            }
+
+            @Override
+            public boolean invokeOnFailure()
+            {
+                return true;
+            }
+
+            @Override
+            public void onResponse(Message<Object> msg)
+            {
+                throw new IllegalStateException("Unexpected response");
+            }
+        }, message, endpoint);
+        outbound.enqueue(message);
+        Assert.assertTrue(done.await(30L, SECONDS));
+        return reason.get();
     }
 
     @Test

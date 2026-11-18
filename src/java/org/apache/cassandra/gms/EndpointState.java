@@ -335,13 +335,19 @@ public class EndpointState
     @VisibleForTesting
     public void markAlive()
     {
+        boolean wasAlive = isAlive;
         isAlive = true;
+        if (!wasAlive)
+            PeerCheckCache.peersChanged();
     }
 
     @VisibleForTesting
     public void markDead()
     {
+        boolean wasAlive = isAlive;
         isAlive = false;
+        if (wasAlive)
+            PeerCheckCache.peersChanged();
     }
 
     public boolean isStateEmpty()
