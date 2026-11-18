@@ -46,6 +46,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.base.Predicate;
 import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
@@ -197,12 +198,16 @@ public class StorageAttachedIndex implements Index
 
                                 // If this is not a full manual index rebuild we can skip SSTables that already have an
                                 // attached index. Otherwise, we override any pre-existent index.
-                                Collection<SSTableReader> ss = sstablesToRebuild;
+                                // A compaction result opened early is still being written, with its index
+                                // components, by the compaction, which adds it when it completes: never build it.
+                                Collection<SSTableReader> ss = sstablesToRebuild.stream()
+                                                                                .filter(s -> s.openReason != SSTableReader.OpenReason.EARLY)
+                                                                                .collect(Collectors.toList());
                                 if (!isFullRebuild)
                                 {
-                                    ss = sstablesToRebuild.stream()
-                                                          .filter(s -> !IndexDescriptor.isIndexBuildCompleteOnDisk(s, indexContext))
-                                                          .collect(Collectors.toList());
+                                    ss = ss.stream()
+                                           .filter(s -> !IndexDescriptor.isIndexBuildCompleteOnDisk(s, indexContext))
+                                           .collect(Collectors.toList());
                                 }
 
                                 targets.put(sai, ss);
@@ -312,6 +317,14 @@ public class StorageAttachedIndex implements Index
      * created again with the same name reuses.
      */
     public static final Object SAME_NAME_FILES_LOCK = new Object();
+
+    /**
+     * The compactions that the initial build of an index stops, and waits for, before it selects the sstables to build:
+     * those that rewrite sstables, with writers that may have been created without the index. Major compactions aren't
+     * in {@link OperationType#REWRITES_SSTABLES}, which other code uses.
+     */
+    private static final Predicate<OperationType> COMPACTIONS_STOPPED_BY_INITIAL_BUILD =
+        type -> OperationType.REWRITES_SSTABLES.apply(type) || type == OperationType.MAJOR_COMPACTION;
 
     private static final Set<String> VALID_OPTIONS = ImmutableSet.of(NonTokenizingOptions.CASE_SENSITIVE,
                                                                      NonTokenizingOptions.NORMALIZE,
@@ -1152,10 +1165,12 @@ public class StorageAttachedIndex implements Index
         if (vectorVersionError != null)
             throw new FeatureNeedsIndexRebuildException(vectorVersionError);
 
-        // stop in-progress compaction tasks to prevent compacted sstables not being indexed.
+        // Stop in-progress compaction tasks, and wait for them to stop, to prevent compacted sstables not being indexed:
+        // their writers were created without this index, and their results could be added after the sstables to build
+        // are selected below.
         logger.debug(indexContext.logMessage("Stopping active compactions to make sure all sstables are indexed after initial build."));
         CompactionManager.instance.interruptCompactionFor(Collections.singleton(baseCfs.metadata()),
-                                                          OperationType.REWRITES_SSTABLES,
+                                                          COMPACTIONS_STOPPED_BY_INITIAL_BUILD,
                                                           Predicates.alwaysTrue(),
                                                           true,
                                                           TableOperation.StopTrigger.INDEX_BUILD);
@@ -1644,7 +1659,9 @@ public class StorageAttachedIndex implements Index
      */
     private synchronized List<SSTableReader> findNonIndexedSSTables(ColumnFamilyStore baseCfs, StorageAttachedIndexGroup group, boolean validate)
     {
-        Set<SSTableReader> sstables = baseCfs.getLiveSSTables();
+        // The canonical set: the sources of a running compaction as they were, rather than the readers whose starts it
+        // has moved (which can't be built, as their first keys aren't readable) or its results opened early.
+        Set<SSTableReader> sstables = Sets.newHashSet(baseCfs.getSSTables(SSTableSet.CANONICAL));
 
         // Initialize the SSTable indexes w/ valid existing components (the startup fast path may already have loaded
         // some of them)...
@@ -1664,6 +1681,11 @@ public class StorageAttachedIndex implements Index
         for (SSTableReader sstable : sstablesNotInView(sstables))
         {
             if (sstable.isMarkedCompacted())
+                continue;
+
+            // A compaction result opened early is still being written, with its index components, by the compaction,
+            // which adds it when it completes: it isn't missing, and can't be built.
+            if (sstable.openReason == SSTableReader.OpenReason.EARLY)
                 continue;
 
             // The view doesn't contain the SSTable after the load above. If its components are still complete on

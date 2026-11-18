@@ -86,6 +86,15 @@ public class SSTableContextManager
                 continue;
             }
 
+            if (sstable.openReason == SSTableReader.OpenReason.EARLY)
+            {
+                // A compaction result opened early may still be writing its index components, and the
+                // compaction adds the final reader, equal to this one: a descriptor loaded now would be cached,
+                // incomplete, for it.
+                logger.debug("Skipped tracking sstable {} because it's opened early", sstable);
+                continue;
+            }
+
             IndexDescriptor indexDescriptor = getOrLoadIndexDescriptor(sstable, indices);
             var perSSTableComponents = indexDescriptor.perSSTableComponents();
             if (!perSSTableComponents.isComplete())
@@ -240,6 +249,10 @@ public class SSTableContextManager
     IndexDescriptor getOrLoadIndexDescriptor(SSTableReader sstable, Set<StorageAttachedIndex> indices)
     {
         Set<IndexContext> requested = contexts(indices);
+        // A compaction result opened early may not have all its index components yet, and the final reader that the
+        // compaction adds is equal to it: whoever asks for its descriptor, it must not be cached (see update).
+        if (sstable.openReason == SSTableReader.OpenReason.EARLY)
+            return IndexDescriptor.load(sstable, requested);
         return sstableDescriptors.compute(sstable, (k, existing) -> {
             // load for the 1st time
             if (existing == null)
