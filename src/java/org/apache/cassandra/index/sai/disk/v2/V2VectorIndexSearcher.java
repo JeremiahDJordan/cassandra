@@ -557,7 +557,7 @@ public class V2VectorIndexSearcher extends IndexSearcher
                     // we find one at least as large as the ceiling key
                     if (preferSeqScanToBsearch)
                     {
-                        int keysToSkip = 1; // We already know that the PK at index i is not equal to the ceiling PK.
+                        int keysToSkip = 1; // The PK at index i isn't in this sstable, so it isn't the ceiling row.
                         int cmp = 1; // Need to initialize. The value is irrelevant.
                         for ( ; i + keysToSkip < keysInRange.size(); keysToSkip++)
                         {
@@ -568,21 +568,31 @@ public class V2VectorIndexSearcher extends IndexSearcher
                         }
                         comparisonsSavedByBsearch.update(keysToSkip - (int) ceil(logBase2(keysInRange.size() - i)));
                         i += keysToSkip;
-                        ceilingPrimaryKeyMatchesKeyInRange = cmp == 0;
+                        ceilingPrimaryKeyMatchesKeyInRange = cmp == 0 && isSameRow(keysInRange.get(i), ceilingPrimaryKey);
                     }
                     else
                     {
                         // Use a sublist to only search the remaining primary keys in range.
-                        List<PrimaryKey> keysRemaining = keysInRange.subList(i, keysInRange.size());
+                        // The PK at index i isn't in this sstable, so start after it (it can compare equal to the
+                        // ceiling key when that is the key of the static row of its partition).
+                        List<PrimaryKey> keysRemaining = keysInRange.subList(i + 1, keysInRange.size());
                         int nextIndexForCeiling = Collections.binarySearch(keysRemaining, ceilingPrimaryKey);
                         if (nextIndexForCeiling < 0)
+                        {
                             // We got the inversion of the insertion point. Invert it to get the insertion point.
                             nextIndexForCeiling = ~nextIndexForCeiling;
+                        }
                         else
-                            ceilingPrimaryKeyMatchesKeyInRange = true;
+                        {
+                            // Several keys can compare equal to the ceiling key (see isSameRow): go to the first, so
+                            // that none of them is skipped.
+                            while (nextIndexForCeiling > 0 && keysRemaining.get(nextIndexForCeiling - 1).compareTo(ceilingPrimaryKey) == 0)
+                                nextIndexForCeiling--;
+                            ceilingPrimaryKeyMatchesKeyInRange = isSameRow(keysRemaining.get(nextIndexForCeiling), ceilingPrimaryKey);
+                        }
 
-                        comparisonsSavedByBsearch.update(nextIndexForCeiling - (int) ceil(logBase2(keysRemaining.size())));
-                        i += nextIndexForCeiling;
+                        comparisonsSavedByBsearch.update(nextIndexForCeiling + 1 - (int) ceil(logBase2(keysRemaining.size() + 1)));
+                        i += nextIndexForCeiling + 1;
                     }
 
                     // update our estimate
@@ -617,6 +627,15 @@ public class V2VectorIndexSearcher extends IndexSearcher
             }
         }
         return segmentOrdinalPairs;
+    }
+
+    /**
+     * Whether two keys are the keys of the same row: a static key compares equal to the row keys of its partition, but
+     * matching a row key to the static row's row id would lose the row.
+     */
+    private static boolean isSameRow(PrimaryKey a, PrimaryKey b)
+    {
+        return a.compareTo(b) == 0 && a.hasClustering() == b.hasClustering();
     }
 
     public static double logBase2(double number) {
