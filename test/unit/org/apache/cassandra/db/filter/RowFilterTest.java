@@ -19,6 +19,7 @@
 package org.apache.cassandra.db.filter;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.Test;
@@ -167,6 +168,46 @@ public class RowFilterTest
         builder.add(t, Operator.EQ, ByteBufferUtil.EMPTY_BYTE_BUFFER);
         filter = builder.build();
         assertTrue(filter.isMutableIntersection());
+    }
+
+    @Test
+    public void testHasStaticExpression()
+    {
+        TableMetadata metadata = TableMetadata.builder("testks", "testcf")
+                                              .addPartitionKeyColumn("pk", Int32Type.instance)
+                                              .addClusteringColumn("ck", Int32Type.instance)
+                                              .addStaticColumn("s", Int32Type.instance)
+                                              .addRegularColumn("r", Int32Type.instance)
+                                              .build();
+        ColumnMetadata s = metadata.getColumn(new ColumnIdentifier("s", true));
+        ColumnMetadata r = metadata.getColumn(new ColumnIdentifier("r", true));
+        ByteBuffer one = Int32Type.instance.decompose(1);
+
+        RowFilter filter = RowFilter.builder(false).build();
+        assertFalse(filter.hasStaticExpression());
+        assertFalse(filter.hasStaticExpression());
+
+        RowFilter.Builder builder = RowFilter.builder(false);
+        builder.add(r, Operator.EQ, one);
+        filter = builder.build();
+        assertFalse(filter.hasStaticExpression());
+        assertFalse(filter.hasStaticExpression());
+
+        builder = RowFilter.builder(false);
+        builder.add(r, Operator.EQ, one);
+        RowFilter.Expression staticExpression = builder.add(s, Operator.EQ, one);
+        filter = builder.build();
+        assertTrue(filter.hasStaticExpression());
+        assertTrue(filter.hasStaticExpression());
+        assertFalse(filter.without(staticExpression).hasStaticExpression());
+
+        // a static expression in a nested disjunction
+        RowFilter.Expression regularExpression = new RowFilter.SimpleExpression(r, Operator.EQ, one, null, null);
+        RowFilter.FilterElement disjunction = new RowFilter.FilterElement(true, List.of(staticExpression, regularExpression), List.of());
+        RowFilter.FilterElement root = new RowFilter.FilterElement(false, List.of(), List.of(disjunction));
+        filter = new RowFilter(root, false, IndexHints.NONE, OptimizerOptions.NONE);
+        assertTrue(filter.hasStaticExpression());
+        assertTrue(filter.hasStaticExpression());
     }
 
     /**

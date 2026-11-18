@@ -113,6 +113,8 @@ public class RowFilter
     public final FilterElement root;
     public final IndexHints indexHints;
     public final OptimizerOptions optimizerOptions;
+    // computed on first use, as reads ask for it for each partition
+    private Boolean hasStaticExpression;
     private final boolean needsReconciliation;
 
     protected RowFilter(FilterElement root, boolean needsReconciliation, IndexHints indexHints, OptimizerOptions optimizerOptions)
@@ -435,6 +437,14 @@ public class RowFilter
     }
 
     public boolean hasStaticExpression()
+    {
+        Boolean cached = hasStaticExpression;
+        if (cached == null)
+            hasStaticExpression = cached = computeHasStaticExpression();
+        return cached;
+    }
+
+    private boolean computeHasStaticExpression()
     {
         for (Expression e : expressions())
             if (e.column().isStatic())
