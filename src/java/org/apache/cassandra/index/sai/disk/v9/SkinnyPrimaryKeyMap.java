@@ -253,6 +253,25 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
     }
 
     @Override
+    public long ceilingOfToken(PrimaryKey key)
+    {
+        // The first row of the token, without reading the keys of its rows, which are in the order of their keys.
+        return lookupRowId(key, rowIdToTokenArray::ceilingIndex, (k, rowId) -> rowId);
+    }
+
+    @Override
+    public boolean isBefore(long sstableRowId, PrimaryKey key)
+    {
+        if (key.isTokenOnly())
+            return false;
+        if (key instanceof PrimaryKeyWithSource && ((PrimaryKeyWithSource) key).getSourceSstableId().equals(sstableId))
+            return false;
+
+        return rowIdToTokenArray.get(sstableRowId) == key.token().getLongValue()
+               && comparePartitionKey(sstableRowId, key) < 0;
+    }
+
+    @Override
     public void close()
     {
         FileUtils.closeQuietly(Arrays.asList(partitionKeyCursor, rowIdToTokenArray, rowIdToPartitionIdArray));

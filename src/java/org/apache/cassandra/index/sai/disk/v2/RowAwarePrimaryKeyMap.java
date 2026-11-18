@@ -279,6 +279,34 @@ public class RowAwarePrimaryKeyMap implements PrimaryKeyMap
     }
 
     @Override
+    public long ceilingOfToken(PrimaryKey key)
+    {
+        if (clusteringComparator.size() > 0 || hasRowIdOf(key))
+            return ceiling(key);
+
+        // The first row of the token, without reading the keys of its rows, which are in the order of their keys.
+        return rowIdToToken.ceilingIndex(key.token().getLongValue());
+    }
+
+    @Override
+    public boolean isBefore(long sstableRowId, PrimaryKey key)
+    {
+        if (clusteringComparator.size() > 0)
+            return false;
+
+        if (hasRowIdOf(key))
+            return sstableRowId < ((PrimaryKeyWithSource) key).getSourceRowId();
+
+        return rowIdToToken.get(sstableRowId) == key.token().getLongValue()
+               && primaryKeyFromRowId(sstableRowId).compareTo(key) < 0;
+    }
+
+    private boolean hasRowIdOf(PrimaryKey key)
+    {
+        return key instanceof PrimaryKeyWithSource && ((PrimaryKeyWithSource) key).getSourceSstableId().equals(sstableId);
+    }
+
+    @Override
     public long floor(PrimaryKey key)
     {
         return cursor.floor(key::asComparableBytesMaxPrefix);
