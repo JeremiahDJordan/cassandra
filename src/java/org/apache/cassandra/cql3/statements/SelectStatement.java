@@ -590,6 +590,12 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         RowFilter rowFilter = getRowFilter(options, state, indexRegistry);
         DataLimits dataLimits = getDataLimits(state, userLimit, perPartitionLimit, userOffset, aggregationSpec);
 
+        // Reject the DataStax-only parts of the filter (operators, OR...) while there are nodes that can't
+        // deserialize them, such as Apache Cassandra nodes during an upgrade. Local tables are never sent to them.
+        // Other queries that only run locally (e.g. internal ones) are rejected too, as where they run isn't known here.
+        if (!table.isVirtual() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
+            rowFilter.validateForPeers(table.keyspace, options.getConsistency());
+
         if (restrictions.isKeyRange() && restrictions.usesSecondaryIndexing() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
             Guardrails.nonPartitionRestrictedIndexQueryEnabled.ensureEnabled(state);
 

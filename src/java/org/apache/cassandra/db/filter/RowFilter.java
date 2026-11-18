@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -37,6 +38,7 @@ import com.google.common.base.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.LikePatterns;
 import org.apache.cassandra.cql3.Operator;
@@ -46,6 +48,7 @@ import org.apache.cassandra.cql3.restrictions.Restrictions;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.cql3.statements.SelectOptions;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.Keyspace;
@@ -74,19 +77,30 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
+import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.InvalidPatternException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.sai.analyzer.LuceneAnalyzer;
 import org.apache.cassandra.index.sai.utils.GeoUtil;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
+import org.apache.cassandra.locator.IEndpointSnitch;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.nodes.IPeerInfo;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.lucene.util.SloppyMath;
@@ -109,6 +123,13 @@ public class RowFilter
 
     public static final Serializer serializer = new Serializer();
     public static final RowFilter NONE = new RowFilter(FilterElement.NONE, false, IndexHints.NONE, OptimizerOptions.NONE);
+
+    /** The results of {@link #computeMayHavePeersBelowDS10} per keyspace and scope. */
+    private static final PeerCheckCache<Boolean> peerChecks = new PeerCheckCache<>(RowFilter::computeMayHavePeersBelowDS10);
+
+    public static final String DATASTAX_ONLY_FEATURE_ERROR =
+    "%s is not supported while the query can contact nodes on a messaging version below DS 10, such as Apache " +
+    "Cassandra nodes";
 
     public final FilterElement root;
     public final IndexHints indexHints;
@@ -139,6 +160,106 @@ public class RowFilter
     public List<Expression> expressions()
     {
         return root.traversedExpressions();
+    }
+
+    /**
+     * Rejects this filter if it has a part that only DataStax nodes read the same way (see {@link
+     * #dataStaxOnlyFeature()}) while a node that the read can contact is, or may be, on a messaging version below
+     * {@link MessagingService#VERSION_DS_10}: known to be below it, or alive with an unknown version. LIKE isn't
+     * rejected here, but the serializers refuse it to such nodes. This doesn't know whether the query is sent to other
+     * nodes, so queries that only run locally are rejected too.
+     *
+     * @throws InvalidRequestException if this filter uses a DataStax-only feature and such a node may be contacted
+     */
+    public void validateForPeers(String keyspace, ConsistencyLevel consistency)
+    {
+        if (root.isAlwaysTrue())
+            return;
+
+        // checking the peers is usually cheaper than going through the filter
+        if (!mayHavePeersBelowDS10(keyspace, consistency))
+            return;
+
+        String feature = root.dataStaxOnlyFeature(false);
+        if (feature != null)
+            throw new InvalidRequestException(String.format(DATASTAX_ONLY_FEATURE_ERROR, feature));
+    }
+
+    /**
+     * Whether this node, or a node of the given keyspace that a read at the given consistency level can contact (those
+     * of this node's datacenter at LOCAL_ONE, LOCAL_QUORUM and LOCAL_SERIAL, every node in the ring otherwise), is or
+     * may be below DS 10. The endpoints are checked again after a change of the nodes (see {@link PeerCheckCache}).
+     */
+    private static boolean mayHavePeersBelowDS10(String keyspace, ConsistencyLevel consistency)
+    {
+        if (MessagingService.current_version < MessagingService.VERSION_DS_10)
+            return true;
+
+        return peerChecks.get(keyspace, consistency);
+    }
+
+    /**
+     * Whether the given node is a known, non-removed peer (see {@link Nodes}) that the failure detector considers
+     * alive. The failure detector is only asked about known peers, as it reports an error for unknown endpoints.
+     */
+    private static boolean isAlive(InetAddressAndPort endpoint)
+    {
+        IPeerInfo peer = Nodes.peers().get(endpoint);
+        return peer != null && !peer.isRemoved() && IFailureDetector.instance.isAlive(endpoint);
+    }
+
+    private static boolean computeMayHavePeersBelowDS10(String keyspace, @Nullable String datacenter)
+    {
+        MessagingService messaging = MessagingService.instance();
+        InetAddressAndPort self = FBUtilities.getBroadcastAddressAndPort();
+        TokenMetadata tokenMetadata = StorageService.instance.getTokenMetadataForKeyspace(keyspace);
+        IEndpointSnitch snitch = DatabaseDescriptor.getEndpointSnitch();
+        for (InetAddressAndPort endpoint : tokenMetadata.getAllEndpoints())
+        {
+            if (endpoint.equals(self) || (datacenter != null && !datacenter.equals(snitch.getDatacenter(endpoint))))
+                continue;
+
+            if (messaging.hasConnectionWithVersionNotMatching(endpoint,
+                                                              version -> version >= MessagingService.VERSION_DS_10))
+                return true;
+
+            Integer version = messaging.versions.getRawIfKnown(endpoint);
+            if (version != null)
+            {
+                if (version < MessagingService.VERSION_DS_10)
+                    return true;
+            }
+            else if (isAlive(endpoint))
+            {
+                // A live node of unknown version may be an Apache node: count it as one, which is the safe side for
+                // this check (there's no opt-out); a down one can't be sent a read anyway.
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The exception a serializer throws when the filter has the given DataStax-only feature, which a node on the given
+     * messaging version can't read (see {@link #validateForPeers}).
+     */
+    private static IncompatibleMessagingVersionException incompatibleVersion(int version, String feature)
+    {
+        String error = String.format(DATASTAX_ONLY_FEATURE_ERROR, feature);
+        String message = String.format("Cannot serialize a row filter for messaging version %d: %s", version, error);
+        return new IncompatibleMessagingVersionException(message);
+    }
+
+    /**
+     * Returns a description of the first part of this filter that nodes on a messaging version below
+     * {@link MessagingService#VERSION_DS_10}, such as Apache Cassandra 5.0 nodes, can't deserialize or evaluate the
+     * same way, or {@code null} if there is none: see {@link Expression#dataStaxOnlyFeature(Expression)}, plus
+     * disjunctions (OR) and nested restrictions, which aren't serialized for those nodes.
+     */
+    @Nullable
+    public String dataStaxOnlyFeature()
+    {
+        return root.dataStaxOnlyFeature(true);
     }
 
     /**
@@ -777,6 +898,23 @@ public class RowFilter
             return expressions;
         }
 
+        @Nullable
+        private String dataStaxOnlyFeature(boolean includeLike)
+        {
+            // nodes below DS 10 don't know about disjunctions, nor nested elements, which are not serialized for them
+            if (isDisjunction || !children.isEmpty())
+                return "The OR operator";
+
+            for (Expression expression : expressions)
+            {
+                String feature = Expression.dataStaxOnlyFeature(expression, includeLike);
+                if (feature != null)
+                    return feature;
+            }
+
+            return null;
+        }
+
         private List<Expression> traversedExpressions()
         {
             List<Expression> allExpressions = new ArrayList<>(expressions);
@@ -964,10 +1102,21 @@ public class RowFilter
 
         public static class Serializer
         {
+            /**
+             * Refuses to serialize disjunctions and nested elements for nodes below DS 10, which would read a
+             * different filter (see {@link RowFilter#validateForPeers}). Only checked by {@link #serialize}, as for
+             * expressions (see Expression.Serializer#checkSerializable).
+             */
+            private static void checkSerializable(FilterElement operation, int version)
+            {
+                boolean hasDisjunctions = operation.isDisjunction || !operation.children.isEmpty();
+                if (version < MessagingService.VERSION_DS_10 && hasDisjunctions)
+                    throw incompatibleVersion(version, "The OR operator");
+            }
+
             public void serialize(FilterElement operation, DataOutputPlus out, int version) throws IOException
             {
-                assert (!operation.isDisjunction && operation.children().isEmpty()) || version >= MessagingService.VERSION_DS_10 :
-                "Attempting to serialize a disjunct row filter to a node that doesn't support disjunction";
+                checkSerializable(operation, version);
 
                 out.writeUnsignedVInt32(operation.expressions.size());
                 for (Expression expr : operation.expressions)
@@ -1049,6 +1198,79 @@ public class RowFilter
         }
 
         protected abstract Kind kind();
+
+        /**
+         * Returns a description of the given expression if nodes on a messaging version below
+         * {@link MessagingService#VERSION_DS_10}, such as Apache Cassandra 5.0 nodes, can't deserialize it or would
+         * evaluate it differently, or {@code null} if they can use it. LIKE counts only if {@code includeLike}.
+         */
+        @Nullable
+        public static String dataStaxOnlyFeature(Expression expression, boolean includeLike)
+        {
+            if (expression.kind() == Kind.VECTOR_RADIUS || expression.operator() == Operator.BOUNDED_ANN)
+                return "GEO_DISTANCE";
+
+            Operator operator = expression.operator();
+            if (operator == null)
+                return null;
+
+            if (expression.kind() == Kind.MAP_COMPARISON && operator != Operator.EQ)
+                return String.format("The %s operator on a map entry", operator);
+
+            if (operator.isLike())
+                return includeLike ? "The LIKE operator" : null;
+
+            if (operator == Operator.ANALYZER_MATCHES)
+                return isAnalyzedEquality(expression.column()) ? null : "The : operator (and = on an analyzed index)";
+
+            if (!operator.isDataStaxOnly())
+                return null;
+
+            switch (operator)
+            {
+                case ORDER_BY_ASC:
+                case ORDER_BY_DESC:
+                    return "ORDER BY on a non-clustering column";
+                case BM25:
+                    return "ORDER BY BM25";
+                default:
+                    return String.format("The %s operator", operator);
+            }
+        }
+
+        /**
+         * Whether an analyzer match ({@code :}) on the given column is the analyzed equality that {@code =} is on
+         * Apache Cassandra 5.0's analyzed indexes: every index of the column that supports it has a non-tokenizing
+         * analyzer, no index_analyzer or query_analyzer, and supports {@code =}; and the column isn't a non-frozen
+         * collection.
+         */
+        public static boolean isAnalyzedEquality(ColumnMetadata column)
+        {
+            TableMetadata table = Schema.instance.getTableMetadata(column.ksName, column.cfName);
+            if (table == null)
+                return false;
+
+            // a match on a (non-frozen) collection is a CONTAINS, which = isn't
+            if (column.type.isMultiCell())
+                return false;
+
+            boolean found = false;
+            for (Index index : IndexRegistry.obtain(table).listIndexes())
+            {
+                if (!index.dependsOn(column) || !index.supportsExpression(column, Operator.ANALYZER_MATCHES))
+                    continue;
+
+                // The index must serve = itself, as the same analyzed equality: not with an analyzer, which Apache
+                // Cassandra 5.0 doesn't have, nor with equals_behaviour_when_analyzed: unsupported.
+                Map<String, String> options = index.getIndexMetadata().options;
+                if (options.containsKey(LuceneAnalyzer.INDEX_ANALYZER)
+                    || options.containsKey(LuceneAnalyzer.QUERY_ANALYZER)
+                    || !index.supportsExpression(column, Operator.EQ))
+                    return false;
+                found = true;
+            }
+            return found;
+        }
 
         protected final ColumnMetadata column;
         protected final Operator operator;
@@ -1299,8 +1521,42 @@ public class RowFilter
 
         public static class Serializer
         {
+            /**
+             * Refuses to serialize the DataStax-only parts of a filter (see {@link #dataStaxOnlyFeature(Expression,
+             * boolean)}) for nodes below DS 10, which would fail to deserialize them or read something else. The
+             * coordinator normally rejects such queries first (see {@link RowFilter#validateForPeers}), but it may not
+             * know the version of a node yet. The read then fails for that replica, right away.
+             * <p>
+             * This is only checked by {@link #serialize}, never by {@link #serializedSize}: a messaging connection
+             * handles a failed serialization by computing the size of the message again, which must not fail too.
+             */
+            private static void checkSerializable(Expression expression, int version)
+            {
+                if (version >= MessagingService.VERSION_DS_10)
+                    return;
+
+                String feature = dataStaxOnlyFeature(expression, true);
+                if (feature != null)
+                    throw incompatibleVersion(version, feature);
+            }
+
+            /**
+             * The operator to serialize for the given expression: for nodes below DS 10, an analyzer match that is an
+             * analyzed equality (see {@link #isAnalyzedEquality}) is sent as the equality those nodes evaluate the
+             * same way.
+             */
+            private static Operator wireOperator(Expression expression, int version)
+            {
+                if (version < MessagingService.VERSION_DS_10
+                    && expression.operator == Operator.ANALYZER_MATCHES
+                    && isAnalyzedEquality(expression.column))
+                    return Operator.EQ;
+                return expression.operator;
+            }
+
             public void serialize(Expression expression, DataOutputPlus out, int version) throws IOException
             {
+                checkSerializable(expression, version);
                 out.writeByte(expression.kind().getVal());
 
                 // Custom expressions include neither a column or operator, but all
@@ -1319,7 +1575,7 @@ public class RowFilter
                 }
 
                 ByteBufferUtil.writeWithShortLength(expression.column.name.bytes, out);
-                expression.operator.writeTo(out);
+                wireOperator(expression, version).writeTo(out);
 
                 switch (expression.kind())
                 {

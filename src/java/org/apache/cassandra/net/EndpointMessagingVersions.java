@@ -22,11 +22,14 @@ import java.util.Collections;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
+import javax.annotation.Nullable;
+
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.utils.NoSpamLogger;
 
@@ -36,6 +39,7 @@ import org.apache.cassandra.utils.NoSpamLogger;
 public class EndpointMessagingVersions
 {
     public volatile int minClusterVersion = MessagingService.current_version;
+
     private static final Logger logger = LoggerFactory.getLogger(EndpointMessagingVersions.class);
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 60L, TimeUnit.SECONDS);
 
@@ -60,15 +64,19 @@ public class EndpointMessagingVersions
 
         Integer v = versions.put(endpoint, version);
         minClusterVersion = Collections.min(versions.values());
+        if (v == null || v != version)
+            PeerCheckCache.peersChanged();
         return v == null ? version : v;
     }
 
     public void reset(InetAddressAndPort endpoint)
     {
         logger.trace("Resetting version for {}", endpoint);
-        versions.remove(endpoint);
+        Integer v = versions.remove(endpoint);
         if (!versions.values().isEmpty())
             minClusterVersion = Collections.min(versions.values());
+        if (v != null)
+            PeerCheckCache.peersChanged();
     }
 
     /**
@@ -102,6 +110,16 @@ public class EndpointMessagingVersions
         if (v == null)
             throw new IllegalStateException("getRawVersion() was called without checking knowsVersion() result first");
         return v;
+    }
+
+    /**
+     * Returns the messaging-version exactly as announced by the given endpoint, {@code null} if it isn't known: a single
+     * lookup, unlike {@link #knows} then {@link #getRaw}, which can race with {@link #reset}.
+     */
+    @Nullable
+    public Integer getRawIfKnown(InetAddressAndPort endpoint)
+    {
+        return versions.get(endpoint);
     }
 
     public boolean knows(InetAddressAndPort endpoint)
