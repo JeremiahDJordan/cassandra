@@ -540,18 +540,27 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         {
             long startTimeNanos = Clock.Global.nanoTime();
             UnfilteredRowIterator partition = controller.getPartition(keys, executionController);
-            UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
-            queryContext.checkpoint();
+            try
+            {
+                UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
+                queryContext.checkpoint();
 
-            // Note that we record the duration of the read after post-filtering, which actually
-            // materializes the rows from disk.
-            queryContext.addPostFilteringReadLatency(Clock.Global.nanoTime() - startTimeNanos);
+                // Note that we record the duration of the read after post-filtering, which actually
+                // materializes the rows from disk.
+                queryContext.addPostFilteringReadLatency(Clock.Global.nanoTime() - startTimeNanos);
 
-            queryContext.addKeysFetched(keys.size());
-            // If there is an unresolved static expression during RFP, completion reads to silent replicas will
-            // fetch entire partitions. If we don't return range tombstones in this initial read, there may not be
-            // enough information at the coordinator for RFP to shadow logically deleted rows from those replicas.
-            return applyIndexFilter(counted, filterTree, command.rowFilter().hasStaticExpression());
+                queryContext.addKeysFetched(keys.size());
+                // If there is an unresolved static expression during RFP, completion reads to silent replicas will
+                // fetch entire partitions. If we don't return range tombstones in this initial read, there may not be
+                // enough information at the coordinator for RFP to shadow logically deleted rows from those replicas.
+                return applyIndexFilter(counted, filterTree, command.rowFilter().hasStaticExpression());
+            }
+            catch (Throwable t)
+            {
+                // The partition isn't returned, so nothing else will close it. This happens when the query times out.
+                FileUtils.closeQuietly(partition);
+                throw t;
+            }
         }
 
         @Override
