@@ -20,6 +20,7 @@ package org.apache.cassandra.index.sai;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -632,7 +633,8 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 ScheduledExecutors.optionalTasks.execute(() -> removeReplacedApacheComponents(sstable));
         }
 
-        Optional<Set<SSTableContext>> optValid = contextManager.update(removed, added, validate, indices);
+        Map<StorageAttachedIndex, Set<SSTableReader>> unloadable = new HashMap<>();
+        Optional<Set<SSTableContext>> optValid = contextManager.update(removed, added, validate, indices, unloadable);
         if (optValid.isEmpty())
         {
             // This means at least one sstable had invalid per-sstable components, so mark all indexes non-queryable.
@@ -652,6 +654,31 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 index.makeIndexNonQueryable();
                 incomplete.add(index);
             }
+        }
+
+        // Indexes with complete components on an SSTable that can't be loaded, as its per-SSTable components are
+        // incomplete (see SSTableContextManager#update). Those that still have the SSTable in their view (now that the
+        // views are updated) go on serving it from the components they have open: that is every other index of the
+        // table while a full rebuild of one index rewrites the per-SSTable components, when something loads the
+        // SSTables of the table (e.g. the initial build of a new index). Those that don't can't serve it, so they
+        // can't stay queryable: their rebuild (rebuild_index, or the initial build at the next start) brings them back.
+        for (Map.Entry<StorageAttachedIndex, Set<SSTableReader>> entry : unloadable.entrySet())
+        {
+            StorageAttachedIndex index = entry.getKey();
+            View view = index.getIndexContext().getView();
+            List<Descriptor> missing = entry.getValue()
+                                            .stream()
+                                            .filter(sstable -> !view.containsSSTableIndex(sstable.descriptor))
+                                            .map(sstable -> sstable.descriptor)
+                                            .collect(Collectors.toList());
+            if (missing.isEmpty())
+                continue;
+            logger.warn(index.getIndexContext().logMessage("Index has complete components on {} SSTable(s) whose per-SSTable index " +
+                                                           "components are incomplete, so it can't serve them: making it " +
+                                                           "non-queryable until it is rebuilt (nodetool rebuild_index {} {} {}): {}"),
+                        missing.size(), baseCfs.keyspace.getName(), baseCfs.name, index.getIndexContext().getIndexName(),
+                        missing.stream().limit(10).collect(Collectors.toList()));
+            index.makeIndexNonQueryable();
         }
         return incomplete;
     }

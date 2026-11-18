@@ -464,6 +464,85 @@ public class StoppedIndexBuildTest extends SAITester
         assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("v"));
     }
 
+    /**
+     * A full rebuild of v stopped inside its writer leaves its SSTables without per-SSTable components; when they are
+     * loaded again, w can't load them and doesn't stay queryable without them.
+     */
+    @Test
+    public void testSSTablesLoadedAgainAfterAStoppedFullRebuild() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        String v = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        String w = createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
+        writeSSTables();
+
+        holdBuilders("indexPartitions");
+        CompletableFuture<Throwable> rebuild = rebuildAsync(cfs, v);
+        waitForBuildersHeld();
+        stop(cfs, true);
+        holdBuilders = false;
+        assertNotNull("the stopped rebuild must fail", rebuild.get(180, TimeUnit.SECONDS));
+        Injections.deleteAll();
+        waitForIndexBuildsToSettle();
+        assertFalse(cfs.indexManager.isIndexQueryable(v));
+
+        // an operation that has read all of the SSTables (and so taken them out of the live set) aborts
+        LifecycleTransaction compaction = cfs.getTracker().tryModify(cfs.getLiveSSTables(), OperationType.COMPACTION);
+        assertNotNull(compaction);
+        compaction.originals().forEach(compaction::obsolete);
+        compaction.checkpoint();
+        compaction.abort();
+        assertThat(cfs.getLiveSSTables()).hasSize(SSTABLES);
+
+        assertTrue("w must not be queryable without some of its SSTables",
+                   !cfs.indexManager.isIndexQueryable(w) || rows("w") == SSTABLES * ROWS_PER_SSTABLE);
+
+        // rebuilding them brings them back
+        cfs.indexManager.rebuildIndexesBlocking(Set.of(v, w));
+        assertTrue(cfs.indexManager.isIndexQueryable(v));
+        assertTrue(cfs.indexManager.isIndexQueryable(w));
+        assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("v"));
+        assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("w"));
+    }
+
+    /**
+     * While a full rebuild of v has deleted the per-SSTable components of its SSTables, a load of the SSTables (here by
+     * the initial build of a new index) can't load them, but w still has them in its view and stays queryable.
+     */
+    @Test
+    public void testOtherIndexStaysQueryableWhenSSTablesAreLoadedDuringAFullRebuild() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int, x int)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        String v = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        String w = createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
+        writeSSTables();
+
+        holdBuilders("indexPartitions");
+        CompletableFuture<Throwable> rebuild = rebuildAsync(cfs, v);
+        waitForBuildersHeld();
+
+        // the initial build of x loads the SSTables of the table, and then waits for the index build threads
+        String x = createIndexAsync("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        waitForAssert(() -> assertTrue(cfs.indexManager.isIndexBuilding(x)), 120, TimeUnit.SECONDS);
+        Thread.sleep(1000);
+        assertTrue("w serves all its SSTables, and must stay queryable", cfs.indexManager.isIndexQueryable(w));
+        assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("w"));
+
+        holdBuilders = false;
+        assertThat(rebuild.get(180, TimeUnit.SECONDS)).isNull();
+        Injections.deleteAll();
+        waitForAssert(() -> assertTrue(cfs.indexManager.isIndexQueryable(x)), 120, TimeUnit.SECONDS);
+        waitForIndexBuildsToSettle();
+        assertTrue(cfs.indexManager.isIndexQueryable(v));
+        assertTrue("w must still be queryable", cfs.indexManager.isIndexQueryable(w));
+        assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("v"));
+        assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("w"));
+    }
+
     private void truncateWhileBuildersAreHeld(ColumnFamilyStore cfs) throws Exception
     {
         CompletableFuture<Void> truncate = CompletableFuture.runAsync(cfs::truncateBlockingWithoutSnapshot);

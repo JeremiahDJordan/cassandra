@@ -1342,6 +1342,19 @@ public class IndexContext
 
             var perSSTableComponents = context.usedPerSSTableComponents();
             var perIndexComponents = perSSTableComponents.indexDescriptor().perIndexComponents(this);
+            if (!perSSTableComponents.isComplete() && perIndexComponents.isComplete())
+            {
+                // Our components are complete, but the per-SSTable components they go with are gone since the context
+                // was created (without immutable components, a full rebuild of another index deletes them before it
+                // writes them again): we can't serve the SSTable, and must not stay queryable without it (see
+                // SSTableContextManager#update for the same when the context is created).
+                logger.warn(logMessage("The per-SSTable index components of SSTable {} are gone (a full rebuild of another index " +
+                                       "deletes them, without immutable components), so the index can't serve it: it is " +
+                                       "non-queryable until it is rebuilt (nodetool rebuild_index {} {} {})"),
+                            context.descriptor(), keyspace, table, getIndexName());
+                invalid.add(context);
+                return;
+            }
             if (!perSSTableComponents.isComplete() || !perIndexComponents.isComplete())
             {
                 logger.debug(logMessage("An on-disk index build for SSTable {} has not completed (per-index components={})."), context.descriptor(), perIndexComponents.all());
