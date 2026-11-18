@@ -650,7 +650,7 @@ public class UnfilteredSerializer
         if (helper.includes(column))
         {
             Cell<byte[]> cell = Cell.serializer.deserialize(in, rowLiveness, column, header, helper, ByteArrayAccessor.instance);
-            if (helper.includes(cell) && !helper.isDropped(cell, false))
+            if (helper.includes(cell, rowLiveness) && !helper.isDropped(cell, false))
                 builder.addCell(cell);
         }
         else
@@ -683,7 +683,7 @@ public class UnfilteredSerializer
             while (--count >= 0)
             {
                 Cell<byte[]> cell = Cell.serializer.deserialize(in, rowLiveness, column, header, helper, ByteArrayAccessor.instance);
-                if (helper.includes(cell) && !helper.isDropped(cell, true))
+                if (helper.includes(cell, rowLiveness) && !helper.isDropped(cell, true))
                     builder.addCell(cell);
             }
 

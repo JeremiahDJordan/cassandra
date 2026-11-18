@@ -38,6 +38,7 @@ import org.slf4j.LoggerFactory;
 import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.config.*;
 import org.apache.cassandra.db.filter.*;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.transform.BasePartitions;
 import org.apache.cassandra.db.transform.BaseRows;
 import org.apache.cassandra.exceptions.QueryCancelledException;
@@ -76,6 +77,7 @@ import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.ObjectSizes;
 import org.apache.cassandra.utils.TimeUUID;
+import org.apache.cassandra.utils.btree.BTree;
 
 import static com.google.common.collect.Iterables.any;
 import static com.google.common.collect.Iterables.filter;
@@ -451,11 +453,13 @@ public abstract class ReadCommand extends AbstractReadQuery
             }
 
             UnfilteredPartitionIterator iterator = (null == searcher) ? queryStorage(cfs, executionController) : searcher.search(executionController);
+            // The commands of a SinglePartitionReadQuery.Group share the controller.
+            boolean mayNeedSkippedCells = executionController.takeMayNeedSkippedCells();
             iterator = RTBoundValidator.validate(iterator, Stage.MERGED, false);
 
             try
             {
-                iterator = withoutSkippableCells(iterator);
+                iterator = withoutSkippableCells(iterator, cfs, executionController, mayNeedSkippedCells);
                 iterator = withQuerySizeTracking(iterator);
                 iterator = maybeSlowDownForTesting(iterator);
                 iterator = withQueryCancellation(iterator);
@@ -865,6 +869,49 @@ public abstract class ReadCommand extends AbstractReadQuery
     protected abstract void appendCQLWhereClause(StringBuilder sb);
 
     /**
+     * The filter of the sstables of a read. When none of the sstables can hold a primary key liveness info that is not
+     * live (no TTL, or nothing expired or deleted at {@code nowInSec}), the primary key liveness info of each row
+     * merged from them is live, or is shadowed by a deletion that also shadows the cells older than it.
+     * {@link #withoutSkippableCells} then removes from the merged rows the fetched but not queried simple cells older
+     * than the primary key liveness info of their row in any source, so the sstables can skip them.
+     * <p>
+     * Memtable data can bring a liveness info that is not live, so the sstables of a read with memtable data only
+     * skip those cells if the caller reads again each merged row that has one, as {@link #withoutSkippableCells}
+     * does for {@link #queryStorage}. They don't when a memtable holds expired or deleted data, as many rows could
+     * then be read again.
+     *
+     * @param memtables the memtables whose data the read merges with the sstables, those that have data for the
+     * partition for a single partition read
+     */
+    ColumnFilter sstableColumnFilter(List<SSTableReader> sstables, Iterable<Memtable> memtables, ReadExecutionController controller)
+    {
+        ColumnFilter filter = columnFilter();
+        if (filter.allFetchedColumnsAreQueried() || controller.isTrackingRepairedStatus())
+            return filter;
+
+        for (SSTableReader sstable : sstables)
+        {
+            int maxTTL = sstable.getMaxTTL();
+            // a view's expired liveness info is never live, whatever its local expiration time
+            if (maxTTL == LivenessInfo.EXPIRED_LIVENESS_TTL
+                || (maxTTL != LivenessInfo.NO_TTL && sstable.getMinLocalDeletionTime() <= nowInSec()))
+                return filter;
+        }
+
+        boolean withMemtableData = false;
+        for (Memtable memtable : memtables)
+        {
+            if (memtable.getMinLocalDeletionTime() <= nowInSec())
+                return filter;
+            withMemtableData = true;
+        }
+
+        if (withMemtableData)
+            controller.setMayNeedSkippedCells();
+        return filter.withNotQueriedCellsOlderThanRowDropped();
+    }
+
+    /**
      * Removes the cells of the columns that are fetched but not queried (see {@link ColumnFilter}) and that are older
      * than the primary key liveness info of their row. A live cell is removed only when that info is live: the row
      * exists without the cell and its value is not returned (CASSANDRA-10657). A cell that is not live (a tombstone or
@@ -873,8 +920,21 @@ public abstract class ReadCommand extends AbstractReadQuery
      * live (an expired TTL), and the older live cells are then what keeps the row alive. For complex columns, the cells
      * outside the sub-selection of a queried column are removed as above, and of a column that is not queried, only
      * the cells that are not live are removed.
+     * <p>
+     * A merged row whose primary key liveness info is not live is first read again from all its sources when the
+     * sstables of the read skipped cells that it may need (see {@link #sstableColumnFilter}). That read adds to the
+     * table's sstables per read histogram and top partition samples, also when this command is a range read.
      */
-    private UnfilteredPartitionIterator withoutSkippableCells(UnfilteredPartitionIterator iterator)
+    @VisibleForTesting
+    UnfilteredPartitionIterator withoutSkippableCells(UnfilteredPartitionIterator iterator)
+    {
+        return withoutSkippableCells(iterator, null, null, false);
+    }
+
+    private UnfilteredPartitionIterator withoutSkippableCells(UnfilteredPartitionIterator iterator,
+                                                              @Nullable ColumnFamilyStore cfs,
+                                                              @Nullable ReadExecutionController executionController,
+                                                              boolean mayNeedSkippedCells)
     {
         ColumnFilter columnFilter = columnFilter();
         if (columnFilter.allFetchedColumnsAreQueried())
@@ -882,12 +942,16 @@ public abstract class ReadCommand extends AbstractReadQuery
 
         long nowInSec = nowInSec();
         boolean enforceStrictLiveness = metadata().enforceStrictLiveness();
+        boolean rereadsRows = mayNeedSkippedCells && !enforceStrictLiveness;
 
         class WithoutSkippableCells extends Transformation<UnfilteredRowIterator>
         {
+            DecoratedKey partitionKey;
+
             @Override
             protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
             {
+                partitionKey = partition.partitionKey();
                 return Transformation.apply(partition, this);
             }
 
@@ -898,7 +962,19 @@ public abstract class ReadCommand extends AbstractReadQuery
                 if (liveness.isEmpty())
                     return row;
 
+                if (rereadsRows && !liveness.isLive(nowInSec))
+                {
+                    row = reread(row);
+                    liveness = row.primaryKeyLivenessInfo();
+                    if (liveness.isEmpty())
+                        return row;
+                }
+
                 long timestamp = liveness.timestamp();
+                // Only the cells older than the primary key liveness info are removed.
+                if (!hasCellOlderThan(row, timestamp))
+                    return row;
+
                 boolean isLive = enforceStrictLiveness || liveness.isLive(nowInSec);
                 return row.transformAndFilter(cd -> {
                     ColumnMetadata column = cd.column();
@@ -918,12 +994,46 @@ public abstract class ReadCommand extends AbstractReadQuery
                 });
             }
 
+            // The row read again from all its sources, by name, so that the sstables keep the cells this row may need.
+            private Row reread(Row row)
+            {
+                ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(FBUtilities.singleton(row.clustering(), metadata().comparator), false);
+                SinglePartitionReadCommand command = SinglePartitionReadCommand.create(metadata(), nowInSec, partitionKey, columnFilter, filter);
+                try (UnfilteredRowIterator partition = command.queryMemtableAndDisk(cfs, executionController))
+                {
+                    while (partition.hasNext())
+                    {
+                        Unfiltered unfiltered = partition.next();
+                        if (unfiltered.isRow())
+                            return (Row) unfiltered;
+                    }
+                }
+                return row;
+            }
+
             private boolean isSkippable(Cell<?> cell, long rowTimestamp, boolean isRowLivenessLive)
             {
                 return cell.timestamp() < rowTimestamp && (isRowLivenessLive || !cell.isLive(nowInSec));
             }
         }
         return Transformation.apply(iterator, new WithoutSkippableCells());
+    }
+
+    private static boolean hasCellOlderThan(Row row, long timestamp)
+    {
+        return row.accumulate(ReadCommand::stopAtColumnDataOlderThan, timestamp) == BTree.STOP_SENTINEL_VALUE;
+    }
+
+    private static long stopAtColumnDataOlderThan(ColumnData data, long timestamp)
+    {
+        if (data.column().isSimple())
+            return stopAtCellOlderThan((Cell<?>) data, timestamp);
+        return ((ComplexColumnData) data).accumulate(ReadCommand::stopAtCellOlderThan, timestamp);
+    }
+
+    private static long stopAtCellOlderThan(Cell<?> cell, long timestamp)
+    {
+        return cell.timestamp() < timestamp ? BTree.STOP_SENTINEL_VALUE : timestamp;
     }
 
     // Skip purgeable tombstones. We do this because it's safe to do (post-merge of the memtable and sstable at least), it
