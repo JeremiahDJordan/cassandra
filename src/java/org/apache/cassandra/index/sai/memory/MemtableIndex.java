@@ -19,6 +19,7 @@
 package org.apache.cassandra.index.sai.memory;
 
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import javax.annotation.Nullable;
@@ -72,6 +73,18 @@ public interface MemtableIndex extends MemtableOrdering
 
     void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup);
     void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup);
+
+    /** Removes a value the memtable no longer holds for a row (see {@link IndexContext#removeRowData}); not a write. */
+    default void remove(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, Memtable memtable, OpOrder.Group opGroup)
+    {
+        update(key, clustering, oldValue, null, memtable, opGroup);
+    }
+
+    /** Removes values the memtable no longer holds for a row (see {@link IndexContext#removeRowData}); not a write. */
+    default void remove(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Memtable memtable, OpOrder.Group opGroup)
+    {
+        update(key, clustering, oldValues, Collections.emptyIterator(), memtable, opGroup);
+    }
 
     KeyRangeIterator search(QueryContext queryContext, Expression expression, AbstractBounds<PartitionPosition> keyRange);
 

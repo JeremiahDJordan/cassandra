@@ -942,6 +942,17 @@ public class StorageAttachedIndex implements Index
             // Initialize the memtable index to ensure proper SAI views of the data
             indexContext.initializeMemtableIndex(mt);
         }
+
+        /**
+         * Removes the values the memtable removed for the row without writing anything in their place (e.g. a trie
+         * memtable on a range or partition deletion), so that a row written again doesn't keep the old values in the
+         * index. Only the removed values: the row may still exist (see {@link Index.Indexer#removeRowData}).
+         */
+        @Override
+        public void removeRowData(Row oldRowData)
+        {
+            indexContext.removeRowData(key, oldRowData, mt, CassandraWriteContext.fromContext(writeContext).getGroup());
+        }
     }
 
     protected static abstract class IndexerAdapter implements Indexer
