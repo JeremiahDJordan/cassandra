@@ -53,19 +53,19 @@ public class AnalyzedContainsTest extends SAITester
     @Test
     public void testList() throws Throwable
     {
-        checkContains("list<text>", "v", "CONTAINS", "NOT CONTAINS", true, elements -> list((Object[]) elements));
+        checkContains("list<text>", "v", "CONTAINS", "NOT CONTAINS", elements -> list((Object[]) elements));
     }
 
     @Test
     public void testSet() throws Throwable
     {
-        checkContains("set<text>", "v", "CONTAINS", "NOT CONTAINS", true, elements -> set((Object[]) elements));
+        checkContains("set<text>", "v", "CONTAINS", "NOT CONTAINS", elements -> set((Object[]) elements));
     }
 
     @Test
     public void testMapValues() throws Throwable
     {
-        checkContains("map<int, text>", "VALUES(v)", "CONTAINS", "NOT CONTAINS", true, elements -> {
+        checkContains("map<int, text>", "VALUES(v)", "CONTAINS", "NOT CONTAINS", elements -> {
             Object[] entries = new Object[elements.length * 2];
             for (int i = 0; i < elements.length; i++)
             {
@@ -79,8 +79,7 @@ public class AnalyzedContainsTest extends SAITester
     @Test
     public void testMapKeys() throws Throwable
     {
-        // TODO: without the row with no map, whose filtering fails (NullPointerException in RowFilter.containsKey)
-        checkContains("map<text, int>", "KEYS(v)", "CONTAINS KEY", "NOT CONTAINS KEY", false, elements -> {
+        checkContains("map<text, int>", "KEYS(v)", "CONTAINS KEY", "NOT CONTAINS KEY", elements -> {
             Object[] entries = new Object[elements.length * 2];
             for (int i = 0; i < elements.length; i++)
             {
@@ -128,11 +127,8 @@ public class AnalyzedContainsTest extends SAITester
         }
     }
 
-    /**
-     * @param withoutCollection whether to include the row without a collection
-     */
     private void checkContains(String type, String target, String contains, String notContains,
-                               boolean withoutCollection, Function<String[], Object> maker) throws Throwable
+                               Function<String[], Object> maker) throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v " + type + ", x int, t text, vec vector<float, 2>)");
         createIndex("CREATE CUSTOM INDEX ON %s(" + target + ") USING 'StorageAttachedIndex' " +
@@ -143,8 +139,6 @@ public class AnalyzedContainsTest extends SAITester
         for (int i = 0; i < ELEMENTS.length; i++)
         {
             int k = i + 1;
-            if (ELEMENTS[i].length == 0 && !withoutCollection)
-                continue;
             if (ELEMENTS[i].length == 0)
                 execute("INSERT INTO %s (k, x, t, vec) VALUES (?, 0, 'word', [1.0, 1.0])", k);
             else
@@ -162,7 +156,7 @@ public class AnalyzedContainsTest extends SAITester
             String c = "v " + contains + " 'Johann Strauss'";
             String n = "v " + notContains + " 'Johann Strauss'";
             Set<Integer> matching = keys(1, 4);
-            Set<Integer> others = withoutCollection ? keys(2, 3, 5, 6, 7, 8) : keys(2, 3, 5, 6, 8);
+            Set<Integer> others = keys(2, 3, 5, 6, 7, 8);
             String ann = " ORDER BY vec ANN OF [1.0, 1.0] LIMIT 20";
             String bm25 = " ORDER BY t BM25 OF 'word' LIMIT 20";
             for (boolean internal : new boolean[]{ true, false })

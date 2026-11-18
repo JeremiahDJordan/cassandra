@@ -1908,7 +1908,11 @@ public class RowFilter
             {
                 if (analyzer != null)
                 {
-                    for (Cell<?> cell : row.getComplexColumnData(column))
+                    // A row without the map has no keys
+                    ComplexColumnData complexData = row.getComplexColumnData(column);
+                    if (complexData == null)
+                        return false;
+                    for (Cell<?> cell : complexData)
                     {
                         if (!cell.isLive(nowInSec))
                             continue;

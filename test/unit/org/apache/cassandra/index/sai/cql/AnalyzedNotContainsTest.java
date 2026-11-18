@@ -26,6 +26,7 @@ import org.junit.Test;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.index.sai.SAITester;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -48,19 +49,19 @@ public class AnalyzedNotContainsTest extends SAITester
     @Test
     public void testList() throws Throwable
     {
-        checkNotContains("list<text>", "v", "CONTAINS", "NOT CONTAINS", true, elements -> list((Object[]) elements));
+        checkNotContains("list<text>", "v", "CONTAINS", "NOT CONTAINS", elements -> list((Object[]) elements));
     }
 
     @Test
     public void testSet() throws Throwable
     {
-        checkNotContains("set<text>", "v", "CONTAINS", "NOT CONTAINS", true, elements -> set((Object[]) elements));
+        checkNotContains("set<text>", "v", "CONTAINS", "NOT CONTAINS", elements -> set((Object[]) elements));
     }
 
     @Test
     public void testMapValues() throws Throwable
     {
-        checkNotContains("map<int, text>", "VALUES(v)", "CONTAINS", "NOT CONTAINS", true, elements -> {
+        checkNotContains("map<int, text>", "VALUES(v)", "CONTAINS", "NOT CONTAINS", elements -> {
             Object[] entries = new Object[elements.length * 2];
             for (int i = 0; i < elements.length; i++)
             {
@@ -74,8 +75,7 @@ public class AnalyzedNotContainsTest extends SAITester
     @Test
     public void testMapKeys() throws Throwable
     {
-        // TODO: without the row with no map, whose filtering fails (NullPointerException in RowFilter.containsKey)
-        checkNotContains("map<text, int>", "KEYS(v)", "CONTAINS KEY", "NOT CONTAINS KEY", false, elements -> {
+        checkNotContains("map<text, int>", "KEYS(v)", "CONTAINS KEY", "NOT CONTAINS KEY", elements -> {
             Object[] entries = new Object[elements.length * 2];
             for (int i = 0; i < elements.length; i++)
             {
@@ -87,10 +87,28 @@ public class AnalyzedNotContainsTest extends SAITester
     }
 
     /**
-     * @param withoutCollection whether to include the row without a collection
+     * A non-tokenizing analyzer on map keys, and a row without a map.
      */
+    @Test
+    public void testCaseInsensitiveMapKeys() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v map<text, text>, x int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(KEYS(v)) USING 'StorageAttachedIndex' WITH OPTIONS = { 'case_sensitive': 'false' }");
+        execute("INSERT INTO %s (k, v) VALUES (1, {'Johann': 'x'})");
+        execute("INSERT INTO %s (k, v) VALUES (2, {'Claude': 'x'})");
+        execute("INSERT INTO %s (k, x) VALUES (3, 0)");
+        for (String source : new String[]{ "memtable", "sstable" })
+        {
+            if (source.equals("sstable"))
+                flush();
+            assertEquals(source, "[1]", select("SELECT k FROM %s WHERE v CONTAINS KEY 'johann'").toString());
+            assertEquals(source, "[2, 3]", select("SELECT k FROM %s WHERE v NOT CONTAINS KEY 'johann'").toString());
+            assertEquals(source, "[2, 3]", select("SELECT k FROM %s WHERE v NOT CONTAINS KEY 'johann' ALLOW FILTERING").toString());
+        }
+    }
+
     private void checkNotContains(String type, String target, String contains, String notContains,
-                                  boolean withoutCollection, Function<String[], Object> maker) throws Throwable
+                                  Function<String[], Object> maker) throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v " + type + ", x int)");
         createIndex("CREATE CUSTOM INDEX ON %s(" + target + ") USING 'StorageAttachedIndex' " +
@@ -99,8 +117,6 @@ public class AnalyzedNotContainsTest extends SAITester
         for (int i = 0; i < ELEMENTS.length; i++)
         {
             int k = i + 1;
-            if (ELEMENTS[i].length == 0 && !withoutCollection)
-                continue;
             all.add(k);
             if (ELEMENTS[i].length == 0)
                 execute("INSERT INTO %s (k, x) VALUES (?, 0)", k);
@@ -127,12 +143,11 @@ public class AnalyzedNotContainsTest extends SAITester
             }
 
             // A row matches if one of its elements holds both words
-            String seven = withoutCollection ? ", 7" : "";
             check(failures, source, "SELECT k FROM %s WHERE v " + contains + " 'Johann Strauss'", "[1, 4]");
-            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann Strauss'", "[2, 3, 5, 6" + seven + ']');
-            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'johann johann'", "[5, 6" + seven + ']');
-            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann'", "[5, 6" + seven + ']');
-            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann Sebastian Bach'", "[1, 3, 4, 5, 6" + seven + ']');
+            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann Strauss'", "[2, 3, 5, 6, 7]");
+            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'johann johann'", "[5, 6, 7]");
+            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann'", "[5, 6, 7]");
+            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann Sebastian Bach'", "[1, 3, 4, 5, 6, 7]");
         }
         assertTrue(String.format("%d failures for %s:%n%s", failures.size(), type, String.join("\n", failures)), failures.isEmpty());
     }
