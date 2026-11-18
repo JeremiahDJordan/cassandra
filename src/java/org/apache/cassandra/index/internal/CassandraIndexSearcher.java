@@ -94,6 +94,16 @@ public abstract class CassandraIndexSearcher implements Index.Searcher
             ByteBuffer pk = sprc.partitionKey().getKey();
             ClusteringIndexFilter filter = sprc.clusteringIndexFilter();
 
+            // An index on a static column has a single entry per partition, whose clustering only holds the
+            // partition key, so it can't be restricted by the clustering filter of the command. That filter is
+            // applied when reading the base partition of the entry instead.
+            if (index.indexedColumn.isStatic())
+            {
+                Slice slice = Slice.make(makeIndexBound(pk, BufferClusteringBound.BOTTOM),
+                                         makeIndexBound(pk, BufferClusteringBound.TOP));
+                return new ClusteringIndexSliceFilter(Slices.with(index.getIndexComparator(), slice), false);
+            }
+
             if (filter instanceof ClusteringIndexNamesFilter)
             {
                 if (index instanceof CollectionValueIndex)
