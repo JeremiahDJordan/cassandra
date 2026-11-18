@@ -52,6 +52,7 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.guardrails.GuardrailViolatedException;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.guardrails.GuardrailsConfig;
 import org.apache.cassandra.db.guardrails.MaxThreshold;
@@ -145,6 +146,14 @@ public class IndexContext
     public static final String ANALYZED_VALUE_NOT_INDEXED_WARNING =
     "The analyzed terms of the value of column %s add up to %s, which reaches the limit of %s " +
     "(cassandra.sai.max_analyzed_size_kb): the value is written, but not indexed by %s.";
+
+    private static final String CANONICAL_SIZE_NOTE =
+    "%s The size is that of the value in canonical form, which is what the index holds; the value is %d bytes as " +
+    "written.";
+
+    private static final String CANONICAL_SIZE_WARNING =
+    "The size given for the value of column '%s' by the %s guardrail, %d bytes, is that of its canonical form, " +
+    "which is what the index holds; the value is %d bytes as written.";
 
     private static final String MAP_ENTRY_OVERSIZE_LOG_MESSAGE =
     "Can't add an entry of map column {} to its ENTRIES index: {}.";
@@ -406,6 +415,21 @@ public class IndexContext
     }
 
     /**
+     * The term this index holds for the given value: {@link TypeUtil#asIndexBytes}, or the value as written for a
+     * literal whose canonical form doesn't fit {@link #maxTermSize()} or the sstable index writers while the value as
+     * written does (queries search both forms, see {@link Expression#withUncanonicalizedBounds}).
+     */
+    public ByteBuffer asIndexTerm(ByteBuffer value)
+    {
+        ByteBuffer term = TypeUtil.asIndexBytes(value, getValidator());
+        if (term == value || term == null || !isLiteral())
+            return term;
+
+        long maxTermSize = maxTermSize();
+        return !fitsMaxTermSize(term, maxTermSize) && fitsMaxTermSize(value, maxTermSize) ? value : term;
+    }
+
+    /**
      * Returns the maximum size of the terms of a vector index, see {@link #maxTermSize()}.
      */
     public static long maxVectorTermSize()
@@ -466,9 +490,12 @@ public class IndexContext
     /**
      * Applies the term size guardrail of this index to the terms of the given row written by a client mutation: warns
      * the client about terms over its warning threshold, and rejects the mutation if a term is over its failure
-     * threshold, so that the write doesn't succeed without being fully indexed (CASSANDRA-19493).
+     * threshold, so that the write doesn't succeed without being fully indexed (CASSANDRA-19493). A term whose size is
+     * checked in canonical form (see {@link #asSizeCheckedTerm}) and differs from the value's as written gets a note
+     * saying so, in the rejection or in a client warning after the guardrail's.
      *
-     * @throws org.apache.cassandra.db.guardrails.GuardrailViolatedException if a term is over the failure threshold
+     * @throws GuardrailViolatedException if a term is over the failure threshold
+     * @throws InvalidRequestException if a term is over the maximum term size while under the failure threshold
      */
     private void guardTermSizeForRow(DecoratedKey key, Row row, @Nullable ClientState state)
     {
@@ -489,11 +516,58 @@ public class IndexContext
         }
     }
 
+    /**
+     * The value as the index holds it, for the term size checks of a client write: a literal in canonical form (see
+     * {@link TypeUtil#asIndexBytes}), which can be larger than as written; other values as written.
+     */
+    private ByteBuffer asSizeCheckedTerm(ByteBuffer cellBuffer)
+    {
+        return isLiteral() ? TypeUtil.asIndexBytes(cellBuffer, getValidator()) : cellBuffer;
+    }
+
     private void guardTermSizeForCell(@Nullable ByteBuffer cellBuffer, @Nullable ClientState state)
     {
         if (cellBuffer == null || cellBuffer.remaining() == 0)
             return;
 
+        ByteBuffer term = asSizeCheckedTerm(cellBuffer);
+        if (term.remaining() == cellBuffer.remaining())
+        {
+            guardTermSize(term, state);
+            return;
+        }
+
+        try
+        {
+            guardTermSize(term, state);
+        }
+        catch (InvalidRequestException e)
+        {
+            throw withCanonicalSizeNote(e, cellBuffer);
+        }
+
+        // the guardrail's warning gives the size of the term: say so in a warning of its own, which an application
+        // may log on its own line
+        if (termSizeGuardrail.warnsOn(term.remaining(), state))
+            ClientWarn.instance.warn(String.format(CANONICAL_SIZE_WARNING, getColumnName(), termSizeGuardrail.name,
+                                                   term.remaining(), cellBuffer.remaining()));
+    }
+
+    /**
+     * The given rejection of a value whose term is checked in canonical form (see {@link #asSizeCheckedTerm}), with a
+     * note saying that the size it gives is that form's, which differs from the value's as written, and the given
+     * rejection as its cause. A guardrail's rejection stays a {@link GuardrailViolatedException}.
+     */
+    private static InvalidRequestException withCanonicalSizeNote(InvalidRequestException e, ByteBuffer value)
+    {
+        String message = String.format(CANONICAL_SIZE_NOTE, e.getMessage(), value.remaining());
+        return e instanceof GuardrailViolatedException
+               ? ((GuardrailViolatedException) e).withMessage(message)
+               : new InvalidRequestException(message, e);
+    }
+
+    private void guardTermSize(ByteBuffer cellBuffer, @Nullable ClientState state)
+    {
         // Only literal and vector terms have a max term size: the others are indexed with a fixed size (see
         // TypeUtil#asIndexBytes), whatever the size of the value, so only the guardrail applies to them.
         long maxTermSize = maxTermSize();
@@ -572,6 +646,25 @@ public class IndexContext
         if (cellBuffer == null || cellBuffer.remaining() == 0)
             return;
 
+        ByteBuffer term = asSizeCheckedTerm(cellBuffer);
+        if (term.remaining() == cellBuffer.remaining())
+        {
+            validateTermSizes(analyzer, key, term);
+            return;
+        }
+
+        try
+        {
+            validateTermSizes(analyzer, key, term);
+        }
+        catch (InvalidRequestException e)
+        {
+            throw withCanonicalSizeNote(e, cellBuffer);
+        }
+    }
+
+    private void validateTermSizes(AbstractAnalyzer analyzer, DecoratedKey key, ByteBuffer cellBuffer)
+    {
         analyzer.reset(cellBuffer);
         try
         {
@@ -1143,9 +1236,9 @@ public class IndexContext
 
     /**
      * Logs that the given map entry isn't indexed, because its key or its value is too large to be part of an entry
-     * term (see {@link TypeUtil#isIndexableMapEntry(Cell)}). Client writes of such entries are rejected (see
-     * {@link #validateIndexableMapEntries(Row)}), but those written otherwise, or before that validation, still
-     * reach the index, which leaves them out like other oversized terms.
+     * term (see {@link TypeUtil#fitsMapEntryTerm(Cell)}). Client writes of such entries are
+     * rejected (see {@link #validateIndexableMapEntries(Row)}), but those written otherwise, or before that
+     * validation, still reach the index, which leaves them out like other oversized terms.
      */
     private void logUnindexableMapEntry(Cell<?> cell)
     {
@@ -1153,27 +1246,37 @@ public class IndexContext
     }
 
     /**
-     * Describes what is too large in the given map entry for an entries index: e.g. "its key is 65536 bytes, more than
-     * the 65534 bytes an entry key can hold".
+     * Describes what is too large in the given map entry for this entries index: e.g. "its key is 65536 bytes, more
+     * than the 65534 bytes an entry key can hold". The sizes are those the index holds (see
+     * {@link TypeUtil#mapEntryKeySize}), with the written size when it differs.
      */
-    private static String describeOversizedMapEntry(Cell<?> cell)
+    private String describeOversizedMapEntry(Cell<?> cell)
     {
         List<String> parts = new ArrayList<>(2);
-        int keySize = cell.path().get(0).remaining();
+        int keySize = TypeUtil.mapEntryKeySize(cell, validator);
         if (keySize > TypeUtil.MAX_MAP_ENTRY_KEY_SIZE)
-            parts.add(String.format("its key is %d bytes, more than the %d bytes an entry key can hold",
-                                    keySize, TypeUtil.MAX_MAP_ENTRY_KEY_SIZE));
-        int valueSize = cell.valueSize();
+            parts.add(String.format("its key is %s, more than the %d bytes an entry key can hold",
+                                    describeSize(keySize, cell.path().get(0).remaining()),
+                                    TypeUtil.MAX_MAP_ENTRY_KEY_SIZE));
+        int valueSize = TypeUtil.mapEntryValueSize(cell, validator);
         if (valueSize > TypeUtil.MAX_MAP_ENTRY_VALUE_SIZE)
-            parts.add(String.format("its value is %d bytes, more than the %d bytes an entry value can hold",
-                                    valueSize, TypeUtil.MAX_MAP_ENTRY_VALUE_SIZE));
+            parts.add(String.format("its value is %s, more than the %d bytes an entry value can hold",
+                                    describeSize(valueSize, cell.valueSize()),
+                                    TypeUtil.MAX_MAP_ENTRY_VALUE_SIZE));
         return String.join(", and ", parts);
+    }
+
+    private static String describeSize(int indexedSize, int writtenSize)
+    {
+        return indexedSize == writtenSize
+               ? indexedSize + " bytes"
+               : String.format("%d bytes in canonical form (%d bytes as written)", indexedSize, writtenSize);
     }
 
     /**
      * Rejects a write of a map entry that an entries index can't hold: its key over
-     * {@link TypeUtil#MAX_MAP_ENTRY_KEY_SIZE} or its value over {@link TypeUtil#MAX_MAP_ENTRY_VALUE_SIZE} bytes. Not a
-     * size limit a guardrail or property can change.
+     * {@link TypeUtil#MAX_MAP_ENTRY_KEY_SIZE} or its value over {@link TypeUtil#MAX_MAP_ENTRY_VALUE_SIZE} bytes in
+     * canonical form (see {@link TypeUtil#isIndexableMapEntry}). Not a size limit a guardrail or property can change.
      *
      * @param row a row of a client mutation, possibly the static row, or {@code null}
      */
@@ -1188,7 +1291,7 @@ public class IndexContext
 
         for (Cell<?> cell : data)
         {
-            if (!cell.isTombstone() && !TypeUtil.isIndexableMapEntry(cell))
+            if (!cell.isTombstone() && !TypeUtil.isIndexableMapEntry(cell, validator))
                 throw new InvalidRequestException(String.format(MAP_ENTRY_OVERSIZE_ERROR_MESSAGE,
                                                                 column.name,
                                                                 getIndexName(),

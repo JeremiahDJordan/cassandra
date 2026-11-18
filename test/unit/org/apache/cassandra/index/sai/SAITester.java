@@ -89,10 +89,12 @@ import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
 import org.apache.cassandra.index.sai.plan.StorageAttachedIndexSearcher;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.ResourceLeakDetector;
+import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -969,15 +971,20 @@ public class SAITester extends CQLTester
     }
 
     /**
-     * Returns the partition keys (int column pk) of the rows of the query, sorted.
+     * Returns the values of the int column (pk by default) of the rows of the query, sorted.
      */
-    protected List<Integer> keys(String query)
+    protected List<Integer> keys(String column, String query)
     {
         List<Integer> keys = new ArrayList<>();
         for (UntypedResultSet.Row row : execute(query))
-            keys.add(row.getInt("pk"));
+            keys.add(row.getInt(column));
         keys.sort(Integer::compareTo);
         return keys;
+    }
+
+    protected List<Integer> keys(String query)
+    {
+        return keys("pk", query);
     }
 
     protected void assertKeys(String query, Integer... expected)
@@ -991,6 +998,19 @@ public class SAITester extends CQLTester
                          .add(newInvokePoint().onClass(invokeClass).onMethod(method))
                          .add(newActionBuilder().actions().doThrow(exception, quote("Injected failure!")))
                          .build();
+    }
+
+    /** Makes {@code TypeUtil.canonicalize} return its argument, to write the terms of an earlier version. */
+    protected static Injection injectTermsAsWritten(String name) throws Throwable
+    {
+        Injection injection = Injections.newCustom(name)
+                                        .add(InvokePointBuilder.newInvokePoint().onClass(TypeUtil.class)
+                                                               .onMethod("canonicalize").atEntry())
+                                        .add(ActionBuilder.newActionBuilder().actions().doReturn("$1"))
+                                        .build();
+        Injections.inject(injection);
+        injection.enable();
+        return injection;
     }
 
     protected int snapshot(String snapshotName) throws IOException
