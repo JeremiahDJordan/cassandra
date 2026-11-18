@@ -245,6 +245,9 @@ public class SSTableIndex implements Comparable<SSTableIndex>
     //
     // keys k such that row(k) not contains v = (all keys) \ (keys k such that row(k) contains v)
     //
+    // For an index on a static column, all keys are the keys of the static rows of all partitions, which match the
+    // whole partitions, including those with only a static row and those without one.
+    //
     // Note that rows in other indexes are not matched, so this can return false positives,
     // but they are not a problem as post-filtering would get rid of them.
     // The keys matched in other indexes cannot be safely subtracted
@@ -408,6 +411,6 @@ public class SSTableIndex implements Comparable<SSTableIndex>
 
     protected final KeyRangeIterator allSSTableKeys(AbstractBounds<PartitionPosition> keyRange) throws IOException
     {
-        return PrimaryKeyMapIterator.create(sstableContext, keyRange);
+        return PrimaryKeyMapIterator.create(sstableContext, keyRange, indexContext.getDefinition().isStatic());
     }
 }
