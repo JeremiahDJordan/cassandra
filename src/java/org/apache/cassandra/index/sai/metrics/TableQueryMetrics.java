@@ -213,6 +213,12 @@ public class TableQueryMetrics
         public final Counter totalQueriesCompleted;
 
         /**
+         * Row count estimates that failed, for which the query planner assumed that all the rows of the index match
+         * instead of failing the query. Non-zero means a bug in the estimation.
+         */
+        public final Counter totalEstimateFailures;
+
+        /**
          * Aggregated metrics about the query plans, {@code null} if not enbaled in
          * {@link CassandraRelevantProperties#SAI_QUERY_PLAN_METRICS_ENABLED}.
          */
@@ -239,6 +245,7 @@ public class TableQueryMetrics
             totalCellsReturned = Metrics.counter(createMetricName("TotalCellsReturned"));
             totalQueriesCompleted = Metrics.counter(createMetricName("TotalQueriesCompleted"));
             totalQueryTimeouts = Metrics.counter(createMetricName("TotalQueryTimeouts"));
+            totalEstimateFailures = Metrics.counter(createMetricName("TotalEstimateFailures"));
             queryPlanMetrics = (CassandraRelevantProperties.SAI_QUERY_PLAN_METRICS_ENABLED.getBoolean())
                                  ? new QueryPlanMetrics()
                                  : null;
@@ -253,6 +260,7 @@ public class TableQueryMetrics
             }
 
             totalQueriesCompleted.inc();
+            totalEstimateFailures.inc(snapshot.estimatesFailed);
             totalKeysFetched.inc(snapshot.keysFetched);
             totalPartitionsFetched.inc(snapshot.partitionsFetched);
             totalPartitionsReturned.inc(snapshot.partitionsReturned);
