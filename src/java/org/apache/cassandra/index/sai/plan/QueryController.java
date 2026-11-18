@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
@@ -63,10 +64,13 @@ import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.IndexHints;
 import org.apache.cassandra.db.filter.OptimizerOptions;
@@ -77,7 +81,9 @@ import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredSource;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
@@ -99,8 +105,10 @@ import org.apache.cassandra.index.sai.utils.PrimaryKeyWithSortKey;
 import org.apache.cassandra.index.sai.utils.RowWithSource;
 import org.apache.cassandra.index.sai.utils.RangeUtil;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.CloseableIterator;
@@ -755,7 +763,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     {
         try
         {
-            var primaryKeys = materializeKeys(source);
+            var primaryKeys = expandPartitionKeys(materializeKeys(source));
             if (primaryKeys.isEmpty())
             {
                 FileUtils.closeQuietly(source);
@@ -800,6 +808,106 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             primaryKeys.add(next);
         }
         return primaryKeys;
+    }
+
+    /**
+     * The ordering indexes need a key per row, but a key without a clustering (of a static row, from an index on a
+     * static or partition key column) stands for its whole partition. This replaces the keys of every partition with
+     * such a key by the keys of its rows that have a value for the ordered column in the ordering index's memtables
+     * and sstables. The keys of a partition are adjacent, since they are sorted by partition first.
+     */
+    private List<PrimaryKey> expandPartitionKeys(List<PrimaryKey> keys)
+    {
+        TableMetadata table = cfs.metadata();
+        ColumnMetadata orderedColumn = orderer.context.getDefinition();
+        // Only row-aware keys of the static rows of a table with clustering columns lack a clustering. (An index on a
+        // static column orders static rows, so their keys are the ones it needs.)
+        if (!indexFeatureSet.isRowAware()
+            || table.clusteringColumns().isEmpty()
+            || !table.hasStaticColumns()
+            || orderedColumn.isStatic())
+            return keys;
+
+        List<PrimaryKey> expanded = null;
+        ColumnFilter columnFilter = null;
+        int start = 0;
+        while (start < keys.size())
+        {
+            DecoratedKey partitionKey = keys.get(start).partitionKey();
+            boolean wholePartition = false;
+            int end = start;
+            while (end < keys.size() && keys.get(end).partitionKey().equals(partitionKey))
+                wholePartition |= !keys.get(end++).hasClustering();
+
+            if (wholePartition && expanded == null)
+            {
+                expanded = new ArrayList<>(keys.subList(0, start));
+                // every row has a value for a primary key column, which no cell holds
+                columnFilter = orderedColumn.isPrimaryKeyColumn()
+                               ? ColumnFilter.all(table)
+                               : ColumnFilter.selection(RegularAndStaticColumns.of(orderedColumn));
+            }
+
+            if (wholePartition)
+            {
+                int size = expanded.size();
+                addRowKeys(partitionKey, orderedColumn, columnFilter, expanded);
+                // A partition without rows has the value of a partition key column in its static row alone
+                if (expanded.size() == size && orderedColumn.isPartitionKey())
+                {
+                    for (int i = start; i < end; i++)
+                    {
+                        if (!keys.get(i).hasClustering())
+                        {
+                            expanded.add(keys.get(i));
+                            break;
+                        }
+                    }
+                }
+            }
+            else if (expanded != null)
+                expanded.addAll(keys.subList(start, end));
+            start = end;
+        }
+        return expanded == null ? keys : expanded;
+    }
+
+    private void addRowKeys(DecoratedKey partitionKey, ColumnMetadata orderedColumn, ColumnFilter columnFilter, List<PrimaryKey> keys)
+    {
+        QueryView view = getQueryView(orderer.context);
+        NavigableSet<Clustering<?>> clusterings = new TreeSet<>(cfs.metadata().comparator);
+        for (Memtable memtable : view.viewFragment.memtables)
+            addClusterings(memtable, partitionKey, orderedColumn, columnFilter, clusterings, queryContext);
+        for (SSTableReader sstable : view.viewFragment.sstables)
+            addClusterings(sstable, partitionKey, orderedColumn, columnFilter, clusterings, queryContext);
+
+        for (Clustering<?> clustering : clusterings)
+            keys.add(primaryKeyFactory().create(partitionKey, clustering));
+    }
+
+    private static void addClusterings(UnfilteredSource source,
+                                       DecoratedKey partitionKey,
+                                       ColumnMetadata orderedColumn,
+                                       ColumnFilter columnFilter,
+                                       NavigableSet<Clustering<?>> clusterings,
+                                       QueryContext queryContext)
+    {
+        try (UnfilteredRowIterator rows = source.rowIterator(partitionKey, Slices.ALL, columnFilter, false, SSTableReadsListener.NOOP_LISTENER))
+        {
+            // a memtable returns null for a partition it doesn't have
+            while (rows != null && rows.hasNext())
+            {
+                // reading a wide partition can take a while, so stop if the query timed out or was aborted
+                queryContext.checkpoint();
+                Unfiltered unfiltered = rows.next();
+                if (!unfiltered.isRow())
+                    continue;
+                // Rows without a value for the ordered column in this source can't be ordered by it from this source.
+                Row row = (Row) unfiltered;
+                if (orderedColumn.isPrimaryKeyColumn() || row.getCell(orderedColumn) != null)
+                    clusterings.add(row.clustering());
+            }
+        }
     }
 
     private CloseableIterator<PrimaryKeyWithSortKey> getTopKRows(List<PrimaryKey> sourceKeys, int softLimit)
