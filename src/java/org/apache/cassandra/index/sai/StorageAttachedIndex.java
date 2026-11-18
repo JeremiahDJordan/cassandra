@@ -137,6 +137,7 @@ public class StorageAttachedIndex implements Index
     private static final Logger logger = LoggerFactory.getLogger(StorageAttachedIndex.class);
 
     private static final boolean VALIDATE_TERMS_AT_COORDINATOR = SAI_VALIDATE_TERMS_AT_COORDINATOR.getBoolean();
+    private static final boolean ENDPOINT_GROUPING_ENABLED = RANGE_READ_ENDPOINT_GROUPING_ENABLED.getBoolean();
 
     private static class StorageAttachedIndexBuildingSupport implements IndexBuildingSupport
     {
@@ -830,7 +831,7 @@ public class StorageAttachedIndex implements Index
         // this node, and so is a top-k one. A single-partition read, or without endpoint grouping a range read, served
         // by this node's replica alone isn't serialized, and works with larger values.
         boolean serialized = command instanceof PartitionRangeReadCommand
-                             && (RANGE_READ_ENDPOINT_GROUPING_ENABLED.getBoolean() || command.isTopK());
+                             && (ENDPOINT_GROUPING_ENABLED || command.isTopK());
         if (serialized)
             validateSerializedValueSizes(command.rowFilter().root());
         validateMapEntrySizes(command.rowFilter().root());
