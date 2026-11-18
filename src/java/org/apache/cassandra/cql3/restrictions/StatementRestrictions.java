@@ -989,6 +989,20 @@ public class StatementRestrictions
         return false;
     }
 
+    /**
+     * Checks if the secondary index needs to be queried for the restrictions of this level, not counting the
+     * restrictions nested in it, unlike {@link #usesSecondaryIndexing()}. Whether an index serves the nested
+     * restrictions depends on the shape of the tree (an index can't serve a disjunction with a branch that it doesn't
+     * support, such as "x = 1 OR (a = 1 AND b = 2)" with x unindexed), which only the index query plan of the read
+     * says.
+     *
+     * @return {@code true} if the secondary index needs to be queried for these restrictions, {@code false} otherwise
+     */
+    public boolean usesSecondaryIndexingAtThisLevel()
+    {
+        return usesSecondaryIndexing;
+    }
+
     public boolean hasPartitionKeyRestrictions()
     {
         return !partitionKeyRestrictions.isEmpty();

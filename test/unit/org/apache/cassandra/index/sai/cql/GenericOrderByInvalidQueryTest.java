@@ -50,6 +50,71 @@ public class GenericOrderByInvalidQueryTest extends SAITester
         requireNetwork();
     }
 
+    /**
+     * ORDER BY on a clustering column is rejected when the read uses an index, whatever the nesting of its
+     * restrictions.
+     */
+    @Test
+    public void cannotOrderByClusteringWithNestedIndexRestrictions()
+    {
+        createTable("CREATE TABLE %s (k int, c int, a int, b int, x int, PRIMARY KEY (k, c))");
+        createIndex("CREATE CUSTOM INDEX ON %s(a) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(b) USING 'StorageAttachedIndex'");
+
+        for (String where : new String[]{ "k = 0 AND a = 1 AND b = 2",
+                                          "k = 0 AND (a = 1 OR b = 2)",
+                                          "k = 0 AND ((a = 1 AND b = 2) OR (a = 7 AND b = 7))",
+                                          "k = 0 AND c > 0 AND ((a = 1 AND b = 2) OR (a = 7 AND b = 7))",
+                                          "k = 0 AND x = 1 AND ((a = 1 AND b = 2) OR (a = 7 AND b = 7))",
+                                          "k IN (0, 1) AND ((a = 1 AND b = 2) OR a = 7)" })
+        {
+            for (String order : new String[]{ "ASC", "DESC" })
+                assertInvalidMessage(SelectStatement.ORDER_BY_WITH_INDEX_MESSAGE,
+                                     "SELECT * FROM %s WHERE " + where + " ORDER BY c " + order + " ALLOW FILTERING");
+        }
+    }
+
+    /**
+     * ORDER BY on a clustering column is allowed when no index serves the read, as with a disjunction with a branch
+     * that no index supports, at any depth: the rows are in the requested order. A read of full primary keys skips the
+     * index too (see CassandraRelevantProperties#SKIP_INDEXES_ON_FULL_PRIMARY_KEYS).
+     */
+    @Test
+    public void canOrderByClusteringWhenNoIndexServesTheRestrictions() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, a int, b int, x int, PRIMARY KEY (k, c))");
+        createIndex("CREATE CUSTOM INDEX ON %s(a) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(b) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (k, c, a, b, x) VALUES (0, 0, 0, 0, 1)");
+        execute("INSERT INTO %s (k, c, a, b, x) VALUES (0, 1, 1, 2, 0)");
+        execute("INSERT INTO %s (k, c, a, b, x) VALUES (0, 2, 1, 5, 0)");
+        execute("INSERT INTO %s (k, c, a, b, x) VALUES (0, 3, 0, 0, 0)");
+        execute("INSERT INTO %s (k, c, a, b, x) VALUES (1, 0, 1, 2, 1)");
+
+        Object[][] queries = {
+            { "k = 0 AND (x = 1 OR a = 1)", new int[]{ 0, 1, 2 } },
+            { "k = 0 AND (x = 1 OR (a = 1 AND b = 2))", new int[]{ 0, 1 } },
+            { "k = 0 AND (x = 1 OR (a = 1 AND (b = 2 OR b = 9)))", new int[]{ 0, 1 } },
+            { "k = 0 AND c >= 0 AND (x = 1 OR (a = 1 AND b = 2))", new int[]{ 0, 1 } },
+            { "k = 0 AND c IN (0, 1, 2) AND ((a = 1 AND b = 2) OR (a = 7 AND b = 7))", new int[]{ 1 } },
+        };
+        beforeAndAfterFlush(() -> {
+            for (Object[] query : queries)
+            {
+                int[] clusterings = (int[]) query[1];
+                Object[][] ascending = new Object[clusterings.length][];
+                Object[][] descending = new Object[clusterings.length][];
+                for (int i = 0; i < clusterings.length; i++)
+                {
+                    ascending[i] = row(clusterings[i]);
+                    descending[clusterings.length - 1 - i] = row(clusterings[i]);
+                }
+                assertRows(execute("SELECT c FROM %s WHERE " + query[0] + " ORDER BY c ASC ALLOW FILTERING"), ascending);
+                assertRows(execute("SELECT c FROM %s WHERE " + query[0] + " ORDER BY c DESC ALLOW FILTERING"), descending);
+            }
+        });
+    }
+
     @Test
     public void cannotOrderVarintColumn()
     {
