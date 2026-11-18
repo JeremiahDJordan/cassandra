@@ -1,7 +1,7 @@
-// LLP NEED TO CHECK FOR C* 5.0
-ifeval::["{evalproduct}" == "dse"]
-* Strings or Numerics: `LIKE`, `OR`, `IN`
-endif::[]
-ifeval::["{evalproduct}" != "dse"]
-* Strings or Numerics: `LIKE`
-endif::[]
+* Strings, `boolean`, `uuid`, `blob` and frozen collections: `!=`, `NOT IN` and the range operators `<`, `>`,
+`<=`, `>=`
+* Frozen collections: `IN` of several values
+* Frozen tuples and user-defined types: the range operators
+* Strings with an `index_analyzer`: `LIKE`
+
+These are evaluated with `ALLOW FILTERING`, as on columns without an index.

@@ -1,9 +1,17 @@
-// LLP CHECK FOR C* 5.0
-ifeval::["{evalproduct}" == "dse"]
-* Numerics: `=`, `<`, `>`, `<=`, `>=`, `AND`
-* Strings: `=`, `CONTAINS`, `CONTAINS KEY`, `AND`
-endif::[]
-ifeval::["{evalproduct}" != "dse"]
-* Numerics: `=`, `<`, `>`, `<=`, `>=`, `AND`
-* Strings: `=`, `CONTAINS`, `CONTAINS KEY`, `AND`
-endif::[]
+* Numerics (`tinyint`, `smallint`, `int`, `bigint`, `varint`, `float`, `double`, `decimal`), `date`, `time`,
+`timestamp`, `timeuuid` and `inet`: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IN`, `NOT IN`
+* Strings (`text`, `varchar`, `ascii`): `=`, `IN`, and, without an `index_analyzer`, `LIKE` with the `%` and `_`
+wildcards (for example `LIKE 'ab%'`, `LIKE '%bc'` or `LIKE '%b%'`)
+* Strings with the `case_sensitive`, `normalize`, `ascii` or `index_analyzer` options: also `:`, which matches any
+term the analyzer makes of a value, and `ORDER BY ... BM25 OF`
+* `boolean`, `uuid` and `blob`: `=`, `IN`
+* Frozen collections indexed with `FULL`: `=`
+* Frozen tuples and user-defined types: `=`, `!=`, `IN`, `NOT IN`
+* Lists and sets: `CONTAINS`, `NOT CONTAINS`
+* Maps: `CONTAINS KEY`, `NOT CONTAINS KEY` (`KEYS` index), `CONTAINS`, `NOT CONTAINS` (`VALUES` index), and
+`map[key] = value`, `!=`, `<`, `>`, `<=`, `>=` (`ENTRIES` index)
+* Vectors: `ORDER BY ... ANN OF`, and `GEO_DISTANCE(column, [latitude, longitude]) <` or `<=` with the
+`euclidean` similarity function
+* `ORDER BY ... ASC` and `DESC` on a regular column with a non-analyzed index, except `decimal`, `varint`, `inet`
+and collections
+* `AND`, `OR` and parentheses to combine these restrictions

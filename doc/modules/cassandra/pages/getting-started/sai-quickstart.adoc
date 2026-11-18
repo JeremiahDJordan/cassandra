@@ -84,6 +84,8 @@ Use the CQLSH `SELECT` command to submit queries.
 ====
 The supported query operators for tables with SAI indexes:
 include::cassandra:partial$sai/supported-query-operators-list.adoc[]
+
+The operators that SAI indexes don't serve:
 include::cassandra:partial$sai/notSupportedOperators.adoc[]
 ====
 
