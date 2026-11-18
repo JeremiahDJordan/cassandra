@@ -60,6 +60,7 @@ import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.cql.VectorTester;
+import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.index.sai.plan.Orderer;
 import org.apache.cassandra.index.sai.utils.PrimaryKeyWithScore;
@@ -305,6 +306,49 @@ public class VectorMemtableIndexTest extends SAITester
         {
             VectorMemtableIndex.GLOBAL_BRUTE_FORCE_ROWS = maxBruteForceRows;
         }
+    }
+
+    @Test
+    public void preFlushWithRowIdClaimedByTwoVectorsTest()
+    {
+        // A key in the postings of two vectors: both vectors claim the row id, and only the vector of the row keeps it.
+        CassandraOnHeapGraph<Integer> graph = new CassandraOnHeapGraph<>(indexContext, false, null);
+        ByteBuffer stale = randomVectorSerialized();
+        ByteBuffer current = randomVectorSerialized();
+        ByteBuffer other = randomVectorSerialized();
+        graph.add(stale, 0);
+        graph.add(stale, 1);
+        graph.add(current, 0);
+        graph.add(other, 2);
+
+        assertTrue(graph.preFlush(key -> key, key -> current));
+        assertEquals(List.of(1), graph.rowIdsOf(stale));
+        assertEquals(List.of(0), graph.rowIdsOf(current));
+        assertEquals(List.of(2), graph.rowIdsOf(other));
+    }
+
+    /**
+     * Two racing first writes of a key on a skip-list memtable, the callback of the newer one first: the key stays
+     * under the newer vector.
+     */
+    @Test
+    public void racingFirstWritesOnSkipListMemtableTest()
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, val vector<float, 2>) WITH memtable = 'skiplist'");
+        VectorType<Float> type = VectorType.getInstance(FloatType.instance, 2);
+        ColumnFamilyStore store = getCurrentColumnFamilyStore();
+        VectorMemtableIndex index = new VectorMemtableIndex(SAITester.createIndexContext("index", type, store), store.getCurrentMemtable());
+        DecoratedKey key = store.getPartitioner().decorateKey(Int32Type.instance.decompose(1));
+        ByteBuffer v1 = type.decompose(List.of(1.0f, 1.0f));
+        ByteBuffer v2 = type.decompose(List.of(2.0f, 2.0f));
+
+        index.index(key, Clustering.EMPTY, v2.duplicate(), store.getCurrentMemtable(), new OpOrder().start());
+        index.index(key, Clustering.EMPTY, v1.duplicate(), store.getCurrentMemtable(), new OpOrder().start());
+        index.update(key, Clustering.EMPTY, (ByteBuffer) null, (ByteBuffer) null, store.getCurrentMemtable(), new OpOrder().start());
+
+        // the key is under both vectors; the flush keeps it under the vector of its row
+        assertEquals(1, index.getGraph().keysOf(v2).size());
+        assertEquals(1, index.getGraph().keysOf(v1).size());
     }
 
     @Test

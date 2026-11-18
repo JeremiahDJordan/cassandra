@@ -23,10 +23,13 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
@@ -70,6 +73,8 @@ import io.github.jbellis.jvector.vector.VectorUtil;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
+import org.agrona.collections.Int2ObjectHashMap;
+import org.agrona.collections.IntArrayList;
 import org.agrona.collections.IntHashSet;
 import org.apache.cassandra.db.compaction.CompactionSSTable;
 import org.apache.cassandra.db.marshal.VectorType;
@@ -91,6 +96,7 @@ import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter;
 import org.apache.cassandra.index.sai.disk.v5.V5VectorPostingsWriter.Structure;
 import org.apache.cassandra.index.sai.disk.vector.VectorCompression.CompressionType;
 import org.apache.cassandra.index.sai.metrics.ColumnQueryMetrics;
+import org.apache.cassandra.index.sai.metrics.IndexMetrics;
 import org.apache.cassandra.index.sai.utils.PrimaryKeyWithSortKey;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
 import org.apache.cassandra.io.util.File;
@@ -99,6 +105,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CloseableIterator;
+import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.lucene.util.StringHelper;
 
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
@@ -120,6 +127,8 @@ public class CassandraOnHeapGraph<T> implements Accountable
 
     // We use the metable reference for easier tracing.
     private final String source;
+    private final String indexName;
+    private final Optional<IndexMetrics> indexMetrics;
     private final ColumnQueryMetrics.VectorIndexMetrics columnQueryMetrics;
     private final ConcurrentVectorValues vectorValues;
     private final GraphIndexBuilder builder;
@@ -146,6 +155,8 @@ public class CassandraOnHeapGraph<T> implements Accountable
      */
     public CassandraOnHeapGraph(IndexContext context, boolean forSearching, Memtable memtable)
     {
+        this.indexName = context.getIndexName();
+        this.indexMetrics = context.getIndexMetrics();
         this.source = memtable == null
                       ? "null"
                       : memtable.getClass().getSimpleName() + '@' + Integer.toHexString(memtable.hashCode());
@@ -313,6 +324,25 @@ public class CassandraOnHeapGraph<T> implements Accountable
         return postingsByOrdinal.get(node).getPostings();
     }
 
+    /**
+     * @return the row ids of the given vector, computed by {@link #preFlush}
+     */
+    @VisibleForTesting
+    public IntArrayList rowIdsOf(ByteBuffer term)
+    {
+        return postingsMap.get(vts.createFloatVector(serializer.deserializeFloatArray(term))).getRowIds();
+    }
+
+    /**
+     * @return the keys in the postings of the given vector, empty if the graph doesn't have the vector
+     */
+    @VisibleForTesting
+    public Collection<T> keysOf(ByteBuffer term)
+    {
+        VectorPostings<T> postings = postingsMap.get(vts.createFloatVector(serializer.deserializeFloatArray(term)));
+        return postings == null ? List.of() : postings.getPostings();
+    }
+
     public VectorFloat<?> vectorForKey(T key)
     {
         if (vectorsByKey == null)
@@ -402,18 +432,84 @@ public class CassandraOnHeapGraph<T> implements Accountable
      * <p>
      * This is split out from flush per se because of (3); we don't want to flush empty
      * index segments, but until we do (1) and (2) we don't know if the segment is empty.
+     * <p>
+     * For graphs where each key has one vector (built from sstable rows).
      */
     public boolean preFlush(ToIntFunction<T> postingTransformer)
     {
-        var it = postingsMap.entrySet().iterator();
-        while (it.hasNext()) {
-            var entry = it.next();
-            var vp = entry.getValue();
+        return preFlush(postingTransformer, key -> {
+            throw new IllegalStateException("The row id of " + key + " is claimed by more than one vector");
+        });
+    }
+
+    /**
+     * Same as {@link #preFlush(ToIntFunction)}, for a graph where a row id can be claimed by more than one vector.
+     *
+     * @param currentValue the indexed value of the flushed row of the key, or null; only called for the row ids claimed
+     *                     by more than one vector
+     */
+    public boolean preFlush(ToIntFunction<T> postingTransformer, Function<T, ByteBuffer> currentValue)
+    {
+        for (VectorPostings<T> vp : postingsMap.values())
             vp.computeRowIds(postingTransformer);
+
+        removeStaleRowIds(postingTransformer, currentValue);
+
+        for (VectorPostings<T> vp : postingsMap.values())
+        {
             if (vp.isEmpty() || vp.shouldAppendDeletedOrdinal())
                 deletedOrdinals.add(vp.getOrdinal());
         }
         return deletedOrdinals.size() < builder.getGraph().size();
+    }
+
+    /**
+     * The postings writers need each row id to belong to one vector at most (V5VectorPostingsWriter and
+     * V2VectorPostingsWriter fail the flush otherwise): keep a row id that several vectors claim (a key in the
+     * postings of several vectors) only in the postings of the vector the row has.
+     */
+    private void removeStaleRowIds(ToIntFunction<T> postingTransformer, Function<T, ByteBuffer> currentValue)
+    {
+        BitSet claimed = new BitSet();
+        IntHashSet claimedMoreThanOnce = new IntHashSet();
+        for (VectorPostings<T> vp : postingsMap.values())
+        {
+            IntArrayList rowIds = vp.getRowIds();
+            for (int i = 0; i < rowIds.size(); i++)
+            {
+                int rowId = rowIds.getInt(i);
+                if (claimed.get(rowId))
+                    claimedMoreThanOnce.add(rowId);
+                else
+                    claimed.set(rowId);
+            }
+        }
+        if (claimedMoreThanOnce.isEmpty())
+            return;
+
+        // the postings of the vector that the row of each of those row ids has, if any
+        Int2ObjectHashMap<Optional<VectorPostings<T>>> currentPostings = new Int2ObjectHashMap<>();
+        for (VectorPostings<T> vp : postingsMap.values())
+        {
+            for (T key : vp.getPostings())
+            {
+                int rowId = postingTransformer.applyAsInt(key);
+                if (rowId < 0 || !claimedMoreThanOnce.contains(rowId))
+                    continue;
+                Optional<VectorPostings<T>> current = currentPostings.computeIfAbsent(rowId, r -> {
+                    ByteBuffer value = currentValue.apply(key);
+                    if (value == null || value.remaining() == 0)
+                        return Optional.empty();
+                    return Optional.ofNullable(postingsMap.get(vts.createFloatVector(serializer.deserializeFloatArray(value))));
+                });
+                if (current.orElse(null) != vp)
+                    vp.removeRowId(rowId);
+            }
+        }
+        indexMetrics.ifPresent(m -> m.memtableIndexFlushVectorRowIdConflicts.inc(claimedMoreThanOnce.size()));
+        NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES,
+                         "Flushing vector index {} ({}) found {} row ids claimed by more than one vector; kept each under the vector of its row",
+                         indexName, source, claimedMoreThanOnce.size());
     }
 
     public SegmentMetadata.ComponentMetadataMap flush(IndexComponents.ForWrite perIndexComponents) throws IOException
