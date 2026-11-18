@@ -661,10 +661,11 @@ public class TypeUtil
 
     /**
      * @return {@code true} if the empty values of the given type should be excluded from indexing, {@code false} otherwise.
+     * The answer is the same for a reversed type (a {@code DESC} clustering column) as for its base type.
      */
     public static boolean skipsEmptyValue(AbstractType<?> type)
     {
-        return !type.allowsEmpty() || !isLiteral(type);
+        return !baseType(type).allowsEmpty() || !isLiteral(type);
     }
 
     /**
