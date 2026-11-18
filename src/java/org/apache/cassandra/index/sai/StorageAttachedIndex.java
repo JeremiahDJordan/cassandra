@@ -233,17 +233,34 @@ public class StorageAttachedIndex implements Index
                         reserved.forEach(s -> s.streamRebuildState().endRebuild());
 
                         // For debugging, list the SSTables that are blocking this rebuild because they are not in a
-                        // NORMAL state (a zero-copy stream is in flight). Cap the list so the message stays bounded.
-                        String blockedSSTables = targets.values().stream()
-                                                        .flatMap(Collection::stream)
-                                                        .distinct()
-                                                        .filter(s -> s.streamRebuildState().state() != SSTableStreamRebuildState.State.NORMAL)
-                                                        .map(s -> s.descriptor.toString())
+                        // NORMAL state: a zero-copy stream is in flight, or another build holds them (e.g. the other
+                        // builders of a rebuild that has just failed, which go on after it has returned). Their states
+                        // are read once, after the failed reservation: whatever held the SSTable may have let go of it
+                        // since. Cap the list so the message stays bounded.
+                        Map<SSTableReader, SSTableStreamRebuildState.State> blocked = new LinkedHashMap<>();
+                        targets.values().stream().flatMap(Collection::stream).distinct().forEach(s -> {
+                            SSTableStreamRebuildState.State state = s.streamRebuildState().state();
+                            if (state != SSTableStreamRebuildState.State.NORMAL)
+                                blocked.put(s, state);
+                        });
+                        String reason;
+                        if (blocked.containsValue(SSTableStreamRebuildState.State.ZCS_STREAMING))
+                            reason = "Cannot build SAI index while entire SSTable streaming is in progress. ";
+                        else if (!blocked.isEmpty())
+                            reason = "Cannot build SAI index while another index build holds some of its SSTables (e.g. the " +
+                                     "builders of a rebuild that has just failed, which go on for a while after it has " +
+                                     "returned): retry once it is done. ";
+                        else
+                            reason = "Cannot build SAI index: an entire SSTable stream or another index build held one of its " +
+                                     "SSTables until just now: retry. ";
+                        String blockedSSTables = blocked.entrySet()
+                                                        .stream()
+                                                        .map(e -> e.getKey().descriptor + " (" + e.getValue() + ')')
                                                         .limit(MAX_LOGGED_SSTABLES)
                                                         .collect(Collectors.joining(", "));
-                        throw new RuntimeException(String.format(
-                            "Cannot build SAI index while entire SSTable streaming is in progress. " +
-                            "Blocked sstable(s) (up to %d shown): %s", MAX_LOGGED_SSTABLES, blockedSSTables));
+                        throw new RuntimeException(reason + String.format("Couldn't reserve %s.", sstable.descriptor) +
+                                                   (blocked.isEmpty() ? "" : String.format(" Blocked sstable(s) (up to %d shown): %s",
+                                                                                           MAX_LOGGED_SSTABLES, blockedSSTables)));
                     }
                 }
             }

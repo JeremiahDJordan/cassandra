@@ -26,7 +26,11 @@ import org.junit.Test;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.index.SecondaryIndexBuilder;
+import org.apache.cassandra.inject.ActionBuilder;
+import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.SSTableStreamRebuildState;
 import org.apache.cassandra.io.sstable.format.SSTableStreamRebuildState.State;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -185,6 +189,68 @@ public class StreamRebuildCoordinationTest extends SAITester
             assertEquals(State.REBUILDING, sstable.streamRebuildState().state());
         builder.onNotExecuted();
         for (SSTableReader sstable : all)
+            assertEquals(State.NORMAL, sstable.streamRebuildState().state());
+    }
+
+    /**
+     * A rebuild that can't reserve an SSTable because another build holds it (e.g. the other builders of a rebuild that
+     * has just failed) says so, rather than blame a stream.
+     */
+    @Test
+    public void reservationHeldByAnotherBuildIsReportedAsSuch()
+    {
+        StorageAttachedIndex sai = createIndexedTableWithSSTables(2);
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        List<SSTableReader> live = new ArrayList<>(cfs.getLiveSSTables());
+        SSTableReader held = live.get(0);
+        assertTrue(held.streamRebuildState().tryBeginRebuild());
+        try
+        {
+            assertThatThrownBy(() -> sai.getBuildTaskSupport()
+                                        .getIndexBuildTask(cfs, Collections.singleton(sai), live, true))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("Cannot build SAI index while another index build holds some of its SSTables")
+                .hasMessageContaining("Couldn't reserve " + held.descriptor)
+                .hasMessageContaining(held.descriptor + " (REBUILDING)")
+                .hasMessageNotContaining("streaming");
+            for (SSTableReader sstable : live.subList(1, live.size()))
+                assertEquals(State.NORMAL, sstable.streamRebuildState().state());
+        }
+        finally
+        {
+            held.streamRebuildState().endRebuild();
+        }
+    }
+
+    /**
+     * A reservation that fails with nothing holding the SSTable any more is reported as such, not blamed on an index
+     * build or a stream.
+     */
+    @Test
+    public void reservationHeldUntilJustNowIsReportedAsSuch() throws Throwable
+    {
+        StorageAttachedIndex sai = createIndexedTableWithSSTables(2);
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        List<SSTableReader> live = new ArrayList<>(cfs.getLiveSSTables());
+
+        ActionBuilder returnFalse = ActionBuilder.newActionBuilder();
+        returnFalse.actions().doReturn("false");
+        Injections.inject(Injections.newCustom("reservation_fails")
+                                    .add(InvokePointBuilder.newInvokePoint()
+                                                           .onClass(SSTableStreamRebuildState.class)
+                                                           .onMethod("tryBeginRebuild")
+                                                           .atEntry())
+                                    .add(returnFalse)
+                                    .build());
+        assertThatThrownBy(() -> sai.getBuildTaskSupport()
+                                    .getIndexBuildTask(cfs, Collections.singleton(sai), live, true))
+            .isInstanceOf(RuntimeException.class)
+            .hasMessageContaining("held one of its SSTables until just now")
+            .hasMessageContaining("Couldn't reserve ")
+            .hasMessageNotContaining("another index build holds")
+            .hasMessageNotContaining("streaming is in progress")
+            .hasMessageNotContaining("Blocked sstable(s)");
+        for (SSTableReader sstable : live)
             assertEquals(State.NORMAL, sstable.streamRebuildState().state());
     }
 }
