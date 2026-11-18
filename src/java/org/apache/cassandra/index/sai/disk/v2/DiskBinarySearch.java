@@ -47,7 +47,8 @@ public class DiskBinarySearch
     }
 
     /**
-     * Similar to searchInt but returns index of a value greater or equal to the target, -1 if not found.
+     * Similar to searchInt but returns the index of the first value greater than or equal to the target, or -1 if every
+     * value is less than the target. (Despite the name, that is the ceiling of the target.)
      */
     public static long searchFloor(long low, long high, int target, LongIntFunction f)
     {
@@ -59,13 +60,11 @@ public class DiskBinarySearch
         assert high < Long.MAX_VALUE >> 2 : "high is too large to avoid potential overflow: " + high;
         assert low < high : "low must be less than high: " + low + " >= " + high;
 
-        int value = Integer.MIN_VALUE;
-        long i = low;
-
+        long end = high;
         while (low < high)
         {
-            i = low + (high - low) / 2;
-            value = f.apply(i);
+            long i = low + (high - low) / 2;
+            int value = f.apply(i);
 
             if (target == value)
                 return i;
@@ -75,7 +74,8 @@ public class DiskBinarySearch
             else
                 high = i;
         }
-        return floorSearch && value >= target ? i : -1;
+        // low is the index of the first value greater than the target, which the loop may not have read
+        return floorSearch && low < end ? low : -1;
     }
 
 }
