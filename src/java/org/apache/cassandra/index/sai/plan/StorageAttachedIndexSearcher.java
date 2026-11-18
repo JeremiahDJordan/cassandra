@@ -491,7 +491,11 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
             lastKey = firstKey;
             threadLocalNextKeys.add(firstKey);
-            fillNextSelectedKeysInPartition(firstKey.partitionKey(), threadLocalNextKeys);
+            // A key without a clustering (e.g. the key of a static row) reads its whole partition, and every other
+            // key of that partition would be skipped as equal to it, so don't walk them now: for a wide partition,
+            // that would read all its keys before returning its first row, even if a LIMIT only needs a few rows.
+            if (firstKey.hasClustering())
+                fillNextSelectedKeysInPartition(firstKey.partitionKey(), threadLocalNextKeys);
             return threadLocalNextKeys;
         }
 
