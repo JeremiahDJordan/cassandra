@@ -354,7 +354,9 @@ Upgrading
       filter on, including a single column. On partitions with many more candidate rows than matches, these queries
       can time out, or fail with OverloadedException once the coordinator caches more than
       replica_filtering_protection.cached_rows_fail_threshold rows (32000 by default). Other partition-restricted
-      queries with a limit, a page size or a per-partition limit read their partition in steps instead.
+      queries with a limit, a page size or a per-partition limit read their partition in steps instead. Replica
+      filtering protection can also read a whole partition from a replica whose static row is older than the other
+      replicas', even when that replica's index already returned the matching rows.
     - To take fewer round trips, short read protection asks the replicas of filtering queries for twice as many rows
       as the previous time, up to 4096 rows per request whatever their size, and each request also stops at the byte
       limit of the read, if it has one (a page size in bytes, or the page weight guardrail). This applies to the
