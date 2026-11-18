@@ -269,7 +269,7 @@ public abstract class SortedTableVerifier<R extends SSTableReaderWithFilter> imp
     {
         List<Range<Token>> ownedRanges = Collections.emptyList();
         outputHandler.debug("Checking that all tokens are owned by the current node");
-        try (KeyIterator iter = sstable.keyIterator())
+        try (KeyIterator iter = sstable.keyIteratorForScan())
         {
             ownedRanges = Range.normalize(tokenLookup.apply(sstable.getKeyspaceName()));
             if (ownedRanges.isEmpty())
@@ -321,7 +321,7 @@ public abstract class SortedTableVerifier<R extends SSTableReaderWithFilter> imp
     {
         outputHandler.output("Extended Verify requested, proceeding to inspect values");
 
-        try (KeyReader indexIterator = sstable.keyReader())
+        try (KeyReader indexIterator = sstable.keyReaderForScan())
         {
             if (indexIterator.dataPosition() != sstable.getDataFileSliceDescriptor().dataStart)
                 markAndThrow(new RuntimeException("First row position from index != 0: " + indexIterator.dataPosition()));
@@ -437,7 +437,7 @@ public abstract class SortedTableVerifier<R extends SSTableReaderWithFilter> imp
 
     private void deserializeIndex(SSTableReader sstable) throws IOException
     {
-        try (KeyReader it = sstable.keyReader())
+        try (KeyReader it = sstable.keyReaderForScan())
         {
             ByteBuffer last = it.key();
             while (it.advance()) last = it.key(); // no-op, just check if index is readable

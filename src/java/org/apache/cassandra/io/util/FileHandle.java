@@ -173,6 +173,11 @@ public class FileHandle extends SharedCloseableImpl
         return createReader(limiter, true, sliceDescriptor.dataStart, ReadPattern.SEQUENTIAL);
     }
 
+    public RandomAccessReader createReaderForScan(long position)
+    {
+        return createReader(null, true, position, ReadPattern.SEQUENTIAL);
+    }
+
     public RandomAccessReader createReader(ReadPattern accessPattern)
     {
         return createReader(null, accessPattern);
