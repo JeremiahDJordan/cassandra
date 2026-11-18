@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.index.sai.utils;
 
+import java.util.Comparator;
 import java.util.function.Supplier;
 
 import io.github.jbellis.jvector.util.Accountable;
@@ -44,6 +45,18 @@ import static org.apache.cassandra.db.ClusteringPrefix.Kind.STATIC_CLUSTERING;
  */
 public interface PrimaryKey extends Comparable<PrimaryKey>, Accountable, ByteComparable
 {
+    /**
+     * The natural order, but with the key of a static row before the row keys of its partition, which it otherwise
+     * compares equal to (hash collections don't merge the forms of a static key either). For collections that must
+     * tell them apart; token-only keys compare as in the natural order.
+     */
+    Comparator<PrimaryKey> STATIC_BEFORE_ROWS = (a, b) -> {
+        int cmp = a.compareTo(b);
+        if (cmp != 0 || a.isTokenOnly() || b.isTokenOnly())
+            return cmp;
+        return Boolean.compare(a.hasClustering(), b.hasClustering());
+    };
+
     /**
      * A factory for creating {@link PrimaryKey} instances
      */

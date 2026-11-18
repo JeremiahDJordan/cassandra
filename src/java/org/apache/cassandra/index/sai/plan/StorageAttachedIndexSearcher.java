@@ -27,9 +27,13 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.NavigableSet;
 import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Queue;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
@@ -41,6 +45,7 @@ import org.slf4j.LoggerFactory;
 
 import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
@@ -556,7 +561,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         private final int nowInSec;
         private final CountFetchedTransformation fetchedRowsCounter;
 
-        private final HashSet<PrimaryKey> processedKeys;
+        // The keys of the rows returned so far, told apart from the key of a static row (see PrimaryKey#STATIC_BEFORE_ROWS)
+        private final TreeSet<PrimaryKey> processedKeys;
         private final Queue<UnfilteredRowIterator> pendingRows;
 
         // Null indicates we are not sending the synthetic score column to the coordinator
@@ -566,9 +572,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         // Whether the ordered column is static, in which case each key selects all the rows of its partition
         private final boolean isOrderedColumnStatic;
 
-        // Whether the ordered column is a partition key column, in which case a partition with only a static row
-        // matches the ordering on its own
-        private final boolean isOrderedColumnPartitionKey;
+        // Whether the ordered column is a primary key column, which no cell holds, so the liveness of a row tells a
+        // stale key
+        private final boolean isOrderedColumnPrimaryKey;
 
         // The limit requested by the query. We cannot load more than softLimit rows in bulk because we only want
         // to fetch the topk rows where k is the limit. However, we allow the iterator to fetch more rows than the
@@ -586,8 +592,15 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         // Whether we materialize one key at a time, to return the rows in score order: see fillPendingRows
         private final boolean oneKeyAtATime;
 
-        // The number of partition iterators returned. Each has a single row unless the ordered column is static, but
-        // it's only used when materializing several keys at a time, so not in that case.
+        // Whether the partition is the unit (the ordered column is in the partition key of a table with clustering
+        // columns): the first key of a partition gives its rows (see readPartitionUnit)
+        private final boolean isPartitionUnit;
+        // The partitions read so far, if the partition is the unit
+        @Nullable
+        private final Set<DecoratedKey> processedPartitions;
+
+        // The number of partition iterators returned. Each has a single row unless the ordered column is static or in
+        // the partition key, but it's only used when materializing several keys at a time, so not in those cases.
         private int returnedPartitionCount = 0;
 
         private ScoreOrderedResultRetriever(CloseableIterator<PrimaryKeyWithSortKey> scoredPrimaryKeyIterator,
@@ -612,7 +625,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             this.nowInSec = nowInSec;
             this.fetchedRowsCounter = new CountFetchedTransformation(queryContext, nowInSec);
 
-            this.processedKeys = new HashSet<>(limit);
+            this.processedKeys = new TreeSet<>(PrimaryKey.STATIC_BEFORE_ROWS);
             this.pendingRows = new ArrayDeque<>(limit);
             this.softLimit = limit;
             this.maxRowsPerPartition = Math.min(limit, controller.command().limits().perPartitionCount());
@@ -624,9 +637,11 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             var isScoreFetched = controller.command().columnFilter().fetchesExplicitly(tempColumn);
             this.syntheticScoreColumn = isScoreFetched ? tempColumn : null;
             this.isOrderedColumnStatic = orderedColumn.isStatic();
-            this.isOrderedColumnPartitionKey = orderedColumn.isPartitionKey();
-            this.rowsByPartition = !isOrderedColumnStatic && maxRowsPerPartition < softLimit ? new HashMap<>() : null;
-            this.oneKeyAtATime = isOrderedColumnStatic || rowsByPartition != null;
+            this.isOrderedColumnPrimaryKey = orderedColumn.isPrimaryKeyColumn();
+            this.isPartitionUnit = orderedColumn.isPartitionKey() && !controller.metadata().clusteringColumns().isEmpty();
+            this.processedPartitions = isPartitionUnit ? new HashSet<>() : null;
+            this.rowsByPartition = !isOrderedColumnStatic && !isPartitionUnit && maxRowsPerPartition < softLimit ? new HashMap<>() : null;
+            this.oneKeyAtATime = isOrderedColumnStatic || rowsByPartition != null || isPartitionUnit;
         }
 
         @Override
@@ -645,13 +660,14 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
          */
         private void fillPendingRows()
         {
-            // Group PKs by source sstable/memtable
-            var groupedKeys = new HashMap<PrimaryKey, List<PrimaryKeyWithSortKey>>();
-            // We always want to get at least 1. A batch of keys is materialized in primary key order, not score order,
-            // which is only fine if all its rows make it to the results. So we go one key at a time when a key can give
-            // several rows (a static ordered column), or with a per-partition limit lower than the limit, where only
-            // the best rows of each partition are kept and full partitions are skipped unread (that can scan the whole
-            // ordering index).
+            // Group PKs by source sstable/memtable. Keep the key of a static row apart from the keys of the rows, and
+            // merge its copies from several sources (see PrimaryKey#STATIC_BEFORE_ROWS).
+            var groupedKeys = new TreeMap<PrimaryKey, List<PrimaryKeyWithSortKey>>(PrimaryKey.STATIC_BEFORE_ROWS);
+            // We always want to get at least 1. A batch of keys is materialized in primary key order, not score
+            // order, which is only fine if all its rows make it to the results. So we go one key at a time when a
+            // key can give several rows (a static ordered column, or a partition key one: see readPartitionUnit),
+            // or with a per-partition limit lower than the limit, where only the best rows of each partition are
+            // kept and full partitions are skipped unread (that can scan the whole ordering index).
             int rowsToRetrieve = oneKeyAtATime ? 1 : Math.max(1, softLimit - returnedPartitionCount);
             // We want to get the first unique `rowsToRetrieve` keys to materialize
             // Don't pass the priority queue here because it is more efficient to add keys in bulk
@@ -726,7 +742,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             while (scoredPrimaryKeyIterator.hasNext())
             {
                 var key = scoredPrimaryKeyIterator.next();
-                if (isInRange(key.partitionKey()) && controller.selects(key) && !isPartitionFull(key.partitionKey()))
+                if (isInRange(key.partitionKey()) && controller.selects(key) && !isPartitionFull(key.partitionKey())
+                    && (processedPartitions == null || !processedPartitions.contains(key.partitionKey())))
                     return key;
                 // Skipped keys aren't read, so nothing else notices that the query has timed out. With a
                 // per-partition limit this loop can go through every key of the index (a few wide partitions, or
@@ -766,6 +783,10 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
          */
         public UnfilteredRowIterator readAndValidatePartition(PrimaryKey pk, List<PrimaryKeyWithSortKey> sourceKeys)
         {
+            // The partitions read so far tell the keys to skip then, rather than processedKeys
+            if (isPartitionUnit)
+                return readPartitionUnit(pk, sourceKeys);
+
             // If we've already processed the key, we can skip it. Because the score ordered iterator does not
             // deduplicate rows, we could see dupes if a row is in the ordering index multiple times. This happens
             // in the case of dupes and of overwrites.
@@ -808,15 +829,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                 {
                     processedKeys.add(pk);
                     boolean enforceStrictLiveness = partition.metadata().enforceStrictLiveness();
-                    List<Unfiltered> rows = new ArrayList<>();
-                    // No more than maxRowsPerPartition rows of a single partition can be in the results. Deleted rows
-                    // don't count, so we skip them.
-                    while (clusters.hasNext() && rows.size() < maxRowsPerPartition)
-                    {
-                        Unfiltered unfiltered = clusters.next();
-                        if (unfiltered.isRow() && ((Row) unfiltered).hasLiveData(nowInSec, enforceStrictLiveness))
-                            rows.add(unfiltered);
-                    }
+                    List<Unfiltered> rows = liveRows(clusters, enforceStrictLiveness);
                     // If no row is live, only the static row can be returned, if it satisfies the filter on its own.
                     // A deleted row can satisfy a clustering restriction, but the partition doesn't match then.
                     if (rows.isEmpty() && !filterTree.isSatisfiedBy(partition.partitionKey(), staticRow, staticRow))
@@ -824,17 +837,17 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                     return new PrimaryKeyIterator(partition, staticRow, rows, validStaticKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
                 }
 
+                // A primary key column has no cell to tell a stale key with (isIndexDataValid accepts any row), so the
+                // row has to be live.
+                if (isOrderedColumnPrimaryKey)
+                    return readPrimaryKeyOrderedPartition(pk, partition, staticRow, clusters, validStaticKey);
+
                 // If there are no regular rows, return the static row only. That can only be a match when the ordered
-                // column is a partition key column: an index on a regular or clustering column has no key for a
+                // column is a partition key column (handled above): an index on a regular column has no key for a
                 // partition without rows, and the filter, which has the ordering expression, doesn't match the static
-                // row on its own. A stale key mustn't take a slot of the partition.
+                // row on its own.
                 if (!clusters.hasNext())
-                {
-                    if (!isOrderedColumnPartitionKey)
-                        return null;
-                    countReturnedRow(partition.partitionKey());
-                    return new PrimaryKeyIterator(partition, staticRow, Collections.emptyList(), validStaticKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
-                }
+                    return null;
 
                 var row = clusters.next();
                 if (!row.isRangeTombstoneMarker())
@@ -857,6 +870,81 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             }
         }
 
+        /**
+         * Reads the row of a key when the ordered column is a clustering column, or a partition key column of a table
+         * without clustering columns: the key gives its row if it is live. The index has keys for rows that were
+         * deleted or expired since, or that only ever had tombstones.
+         */
+        private UnfilteredRowIterator readPrimaryKeyOrderedPartition(PrimaryKey pk,
+                                                                     UnfilteredRowIterator partition,
+                                                                     Row staticRow,
+                                                                     UnfilteredRowIterator clusters,
+                                                                     PrimaryKeyWithSortKey sourceKey)
+        {
+            boolean enforceStrictLiveness = partition.metadata().enforceStrictLiveness();
+            while (clusters.hasNext())
+            {
+                Unfiltered unfiltered = clusters.next();
+                if (unfiltered.isRow() && ((Row) unfiltered).hasLiveData(nowInSec, enforceStrictLiveness))
+                {
+                    processedKeys.add(pk);
+                    countReturnedRow(partition.partitionKey());
+                    return new PrimaryKeyIterator(partition, staticRow, Collections.singletonList(unfiltered), sourceKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
+                }
+            }
+            return null;
+        }
+
+        /**
+         * Reads the partition of a key when the ordered column is in the partition key of a table with clustering
+         * columns: its live rows the query selects, up to the limits, or else its static row if it is live and
+         * satisfies the filter on its own. The first key of the partition gives them; the others are skipped.
+         */
+        private UnfilteredRowIterator readPartitionUnit(PrimaryKey pk, List<PrimaryKeyWithSortKey> sourceKeys)
+        {
+            DecoratedKey partitionKey = pk.partitionKey();
+            if (!processedPartitions.add(partitionKey))
+                return null;
+
+            // With filter-then-sort, only the rows the keys given to the ordering stand for can satisfy the query, so
+            // read those by their clusterings when the controller has them. Otherwise, a key without a clustering
+            // reads what the command selects in the partition.
+            NavigableSet<Clustering<?>> candidates = controller.candidateClusterings(partitionKey);
+            PrimaryKey partitionLevelKey = pk.hasClustering() ? pk.forStaticRow() : pk;
+            try (UnfilteredRowIterator partition = candidates == null
+                                                   ? controller.getPartition(partitionLevelKey, view, executionController)
+                                                   : controller.getPartition(partitionKey, candidates, view, executionController))
+            {
+                queryContext.checkpoint();
+                queryContext.addKeysFetched(sourceKeys.size());
+
+                Row staticRow = partition.staticRow();
+                UnfilteredRowIterator clusters = applyIndexFilter(fetchedRowsCounter.apply(partition), filterTree);
+                if (clusters == null)
+                    return null;
+
+                boolean enforceStrictLiveness = partition.metadata().enforceStrictLiveness();
+                List<Unfiltered> rows = liveRows(clusters, enforceStrictLiveness);
+                if (rows.isEmpty() && (!staticRow.hasLiveData(nowInSec, enforceStrictLiveness)
+                                       || !filterTree.isSatisfiedByStaticRow(partitionKey, staticRow)))
+                    return null;
+                return new PrimaryKeyIterator(partition, staticRow, rows, sourceKeys.get(0), syntheticScoreColumn, controller.getOrderer(), nowInSec);
+            }
+        }
+
+        // No more than maxRowsPerPartition rows of a partition can be in the results; deleted rows don't count.
+        private List<Unfiltered> liveRows(UnfilteredRowIterator clusters, boolean enforceStrictLiveness)
+        {
+            List<Unfiltered> rows = new ArrayList<>();
+            while (clusters.hasNext() && rows.size() < maxRowsPerPartition)
+            {
+                Unfiltered unfiltered = clusters.next();
+                if (unfiltered.isRow() && ((Row) unfiltered).hasLiveData(nowInSec, enforceStrictLiveness))
+                    rows.add(unfiltered);
+            }
+            return rows;
+        }
+
         @Override
         public TableMetadata metadata()
         {
@@ -874,8 +962,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
             /**
              * @param content the rows of the partition, which all have the sort value of {@code primaryKeyWithSortKey}.
-             *                There can only be more than one if the ordered column is static. It is empty if only the
-             *                static row is returned.
+             *                There can only be more than one if the ordered column is static, or in the partition
+             *                key of a table with clustering columns (the first key of a partition gives its rows, see
+             *                readPartitionUnit). It is empty if only the static row is returned.
              */
             public PrimaryKeyIterator(UnfilteredRowIterator partition,
                                       Row staticRow,
