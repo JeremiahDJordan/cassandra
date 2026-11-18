@@ -38,6 +38,8 @@ import org.assertj.core.api.Assertions;
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
+import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 
 /**
  * Tests the availabilty of features in different versions of the SAI on-disk format in a multinode, multiversion cluster.
@@ -206,6 +208,83 @@ public abstract class FeaturesVersionSupportTester extends TestBaseImpl
                       .hasMessageContaining(String.format(QueryController.INDEX_VERSION_DOES_NOT_SUPPORT_BM25, index));
         }
         cluster.get(1).runOnInstance(() -> org.apache.cassandra.index.sai.SAIUtil.setCurrentVersion(Version.LATEST));
+    }
+
+    /**
+     * Test that ordering by an index on a table with clustering columns is supported with on-disk format versions from
+     * {@link Version#ROW_AWARE_EARLIEST}. Older versions index partitions rather than rows, so they should reject these
+     * queries with {@link RequestFailureReason#FEATURE_NEEDS_INDEX_REBUILD} errors, whether the other indexes of the
+     * query match any rows or not. Tables without clustering columns are supported with all versions.
+     */
+    @Test
+    public void testOrdering()
+    {
+        // only the default keyspace, whose second node uses the tested version: tables in every keyspace make the debug
+        // reference leak detector too slow to stop when the cluster is closed
+        testOrdering(KEYSPACE, version);
+    }
+
+    private void testOrdering(String keyspace, Version version)
+    {
+        cluster.schemaChange("CREATE TABLE " + keyspace + ".wide (pk int, c int, val int, a int, PRIMARY KEY(pk, c))");
+        cluster.schemaChange("CREATE CUSTOM INDEX wide_val_idx ON " + keyspace + ".wide(val) USING 'StorageAttachedIndex'");
+        cluster.schemaChange("CREATE CUSTOM INDEX wide_a_idx ON " + keyspace + ".wide(a) USING 'StorageAttachedIndex'");
+        cluster.schemaChange("CREATE TABLE " + keyspace + ".skinny (pk int PRIMARY KEY, val int, a int)");
+        cluster.schemaChange("CREATE CUSTOM INDEX skinny_val_idx ON " + keyspace + ".skinny(val) USING 'StorageAttachedIndex'");
+        cluster.schemaChange("CREATE CUSTOM INDEX skinny_a_idx ON " + keyspace + ".skinny(a) USING 'StorageAttachedIndex'");
+        SAIUtil.waitForIndexQueryableOnAllNodes(cluster, keyspace);
+
+        // Enough partitions to have data in both nodes. The values of a partition decrease with the clustering. The
+        // queries select the ordered column, which the in-JVM coordinator returns anyway.
+        ICoordinator coordinator = cluster.coordinator(1);
+        for (int pk = 0; pk < 10; pk++)
+        {
+            coordinator.execute("INSERT INTO " + keyspace + ".skinny (pk, val, a) VALUES (?, ?, ?)", ALL, pk, 9 - pk, pk % 2);
+            for (int c = 0; c < 4; c++)
+                coordinator.execute("INSERT INTO " + keyspace + ".wide (pk, c, val, a) VALUES (?, ?, ?, ?)", ALL, pk, c, pk * 10 + 3 - c, c % 2);
+        }
+        cluster.forEach(node -> node.flush(keyspace));
+
+        String orderQuery = "SELECT pk, c, val FROM " + keyspace + ".wide ORDER BY val ASC LIMIT 3";
+        String hybridQuery = "SELECT pk, c, val FROM " + keyspace + ".wide WHERE a = 0 ORDER BY val ASC LIMIT 3";
+        String noMatchQuery = "SELECT pk, c, val FROM " + keyspace + ".wide WHERE a = 7 ORDER BY val ASC LIMIT 3";
+
+        if (version.onOrAfter(Version.ROW_AWARE_EARLIEST))
+        {
+            assertRows(coordinator.execute(orderQuery, ALL), row(0, 3, 0), row(0, 2, 1), row(0, 1, 2));
+            assertRows(coordinator.execute(hybridQuery, ALL), row(0, 2, 1), row(0, 0, 3), row(1, 2, 11));
+            assertRows(coordinator.execute(noMatchQuery, ALL));
+        }
+        else
+        {
+            for (String query : new String[]{ orderQuery, hybridQuery, noMatchQuery })
+                Assertions.assertThatThrownBy(() -> coordinator.execute(query, ALL))
+                          .hasMessageContaining(RequestFailureReason.FEATURE_NEEDS_INDEX_REBUILD.name());
+        }
+
+        // Tables without clustering columns are supported in all versions
+        assertRows(coordinator.execute("SELECT pk, val FROM " + keyspace + ".skinny ORDER BY val ASC LIMIT 3", ALL), row(9, 0), row(8, 1), row(7, 2));
+        assertRows(coordinator.execute("SELECT pk, val FROM " + keyspace + ".skinny WHERE a = 0 ORDER BY val ASC LIMIT 2", ALL), row(8, 1), row(6, 3));
+
+        // Test with the coordinator also using the tested version.
+        // In this case the query will fail with a meaningful error message, instead of generic per-node error codes.
+        String versionString = version.toString();
+        cluster.get(1).runOnInstance(() -> org.apache.cassandra.index.sai.SAIUtil.setCurrentVersion(Version.parse(versionString), VERSIONS_PER_KEYSPACE));
+        if (version.onOrAfter(Version.ROW_AWARE_EARLIEST))
+        {
+            assertRows(coordinator.execute(orderQuery, ALL), row(0, 3, 0), row(0, 2, 1), row(0, 1, 2));
+        }
+        else
+        {
+            for (String query : new String[]{ orderQuery, hybridQuery, noMatchQuery })
+                Assertions.assertThatThrownBy(() -> coordinator.execute(query, ALL))
+                          .hasMessageContaining("Ordering with index wide_val_idx isn't supported on table " + keyspace + ".wide")
+                          .hasMessageContaining("Those versions index partitions rather than rows");
+        }
+        cluster.get(1).runOnInstance(() -> org.apache.cassandra.index.sai.SAIUtil.setCurrentVersion(Version.LATEST));
+
+        cluster.schemaChange("DROP TABLE " + keyspace + ".wide");
+        cluster.schemaChange("DROP TABLE " + keyspace + ".skinny");
     }
 
     /**
