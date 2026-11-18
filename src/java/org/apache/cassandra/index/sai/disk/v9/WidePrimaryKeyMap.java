@@ -253,6 +253,19 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
             return ~rowId;
     }
 
+    // A skip into a partition seeks its clustering instead of passing its rows one by one.
+    @Override
+    public long ceilingOfToken(PrimaryKey key)
+    {
+        return ceiling(key);
+    }
+
+    @Override
+    public boolean isBefore(long sstableRowId, PrimaryKey key)
+    {
+        return false;
+    }
+
     /**
      * Returns the row ID of the greatest primary key less than or equal to the given key.
      * Returns -1 if no such key exists (i.e., the given key is less than all keys in the map).

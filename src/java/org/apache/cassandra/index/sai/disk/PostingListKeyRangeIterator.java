@@ -170,7 +170,7 @@ public class PostingListKeyRangeIterator extends KeyRangeIterator
         long segmentRowId;
         if (needsSkipping)
         {
-            long targetSstableRowId = primaryKeyMap.ceiling(skipToKey);
+            long targetSstableRowId = primaryKeyMap.ceilingOfToken(skipToKey);
             // skipToKey is larger than max token in token file
             if (targetSstableRowId < 0)
             {
@@ -178,6 +178,12 @@ public class PostingListKeyRangeIterator extends KeyRangeIterator
             }
             int targetSegmentRowId = Math.toIntExact(targetSstableRowId - searcherContext.getSegmentRowIdOffset());
             segmentRowId = postingList.advance(targetSegmentRowId);
+            // ceilingOfToken can be an earlier row of the token of skipToKey: pass the postings before skipToKey
+            while (segmentRowId != PostingList.END_OF_STREAM
+                   && primaryKeyMap.isBefore(segmentRowId + searcherContext.getSegmentRowIdOffset(), skipToKey))
+            {
+                segmentRowId = postingList.nextPosting();
+            }
             needsSkipping = false;
         }
         else
