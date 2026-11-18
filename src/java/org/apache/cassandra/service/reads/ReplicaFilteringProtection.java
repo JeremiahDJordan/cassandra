@@ -617,7 +617,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             if (groupBy)
             {
                 // The filter has no static expression, so this is what the coordinator filter does with the row
-                if (!filtersRows || command.rowFilter().root().isSatisfiedBy(command.metadata(), key, row, command.nowInSec()))
+                if (!filtersRows || command.rowFilter().root().isSatisfiedBy(command.metadata(), key, row, Rows.EMPTY_STATIC_ROW, command.nowInSec()))
                     counter.countRow(row);
                 return;
             }
