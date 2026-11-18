@@ -739,9 +739,10 @@ public class TrieMemoryIndex extends MemoryIndex
         }
 
         /**
-         * tailSet(nextKey) would skip past the STATIC key of the target partition, which matches the whole partition:
-         * skip to it if the set holds it and we haven't returned it. Not when the set has no STATIC key for that
-         * partition: an index on a partition key holds STATIC and WIDE keys.
+         * tailSet(nextKey) would skip past the STATIC key of the target partition, which sorts first (see
+         * PrimaryKey#STATIC_BEFORE_ROWS) and matches the whole partition: skip to it if the set holds it and we
+         * haven't returned it. Not when the set has no STATIC key for that partition: an index on a partition key
+         * holds STATIC and WIDE keys.
          */
         private PrimaryKey maybeSkipToStaticKey(PrimaryKey nextKey)
         {

@@ -24,10 +24,10 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListSet;
@@ -118,7 +118,9 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     // (minimum, maximum) of the indexed keys, replaced as a whole by updateKeyBounds(); null until a key is indexed
     private volatile KeyBounds keyBounds;
 
-    private final NavigableSet<PrimaryKey> primaryKeys = new ConcurrentSkipListSet<>();
+    // With a vector in a partition key column the static row and the rows of a partition are all indexed: keep their
+    // keys apart (a static key compares equal to the row keys of its partition)
+    private final NavigableSet<PrimaryKey> primaryKeys = new ConcurrentSkipListSet<>(PrimaryKey.STATIC_BEFORE_ROWS);
 
     // the cell each row is indexed for, see update(DecoratedKey, Clustering, Cell, Memtable, OpOrder.Group)
     private final ConcurrentMap<PrimaryKey, IndexedCell> indexedCells = new ConcurrentHashMap<>();
@@ -462,7 +464,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
 
         assert orderer.isANN() : "Only ANN is supported for vector search, received " + orderer;
         // Compute the keys that exist in the current memtable and their corresponding graph ordinals
-        var keysInGraph = new HashSet<PrimaryKey>();
+        var keysInGraph = new TreeSet<PrimaryKey>(PrimaryKey.STATIC_BEFORE_ROWS);
         var relevantOrdinals = new IntHashSet();
 
         var keysInRange = PrimaryKeyListUtil.getKeysInRange(keys, bounds.minimum, bounds.maximum);
