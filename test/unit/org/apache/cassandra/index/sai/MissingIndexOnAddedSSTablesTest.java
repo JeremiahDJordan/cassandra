@@ -33,6 +33,8 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.compaction.CompactionInterruptedException;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.v1.SSTableIndexWriter;
@@ -359,6 +361,235 @@ public class MissingIndexOnAddedSSTablesTest extends SAITester
     }
 
     /**
+     * An index dropped and recreated with the same name while the initial build of the dropped one runs: the end of
+     * that build doesn't make the new index look idle while its own initial build runs.
+     */
+    @Test
+    public void testIndexRecreatedWhileDroppedIndexBuilds() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Set<SSTableReader> streamed = writeSSTablesNotAdded(0);
+        writeRows(100);
+
+        // Hold the initial build of the first index once it has started building its SSTable, and drop the index...
+        Injections.Barrier holdDroppedBuild = barrier("hold_dropped_index_build",
+                                                      InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(StorageAttachedIndexBuilder.class)
+                                                                        .onMethod("indexSSTable"));
+        Injections.Barrier holdNewBuild = barrier("hold_recreated_index_build",
+                                                  InvokePointBuilder.newInvokePoint()
+                                                                    .onClass(StorageAttachedIndexBuilder.class)
+                                                                    .onMethod("build"));
+        Injections.inject(holdDroppedBuild);
+        try
+        {
+            String index = createIndexAsync("CREATE CUSTOM INDEX recreated_idx ON %s(v) USING 'StorageAttachedIndex'");
+            waitForAssert(() -> assertThat(holdDroppedBuild.getCount()).isEqualTo(1));
+            dropIndex("DROP INDEX %s." + index);
+
+            // ...recreate it (its initialization task queues behind the one of the dropped index)...
+            Injections.inject(holdNewBuild);
+            createIndexAsync("CREATE CUSTOM INDEX recreated_idx ON %s(v) USING 'StorageAttachedIndex'");
+            assertThat(cfs.indexManager.isIndexBuilding(index)).isTrue();
+
+            // ...let the build of the dropped index end, and hold the initial build of the new index once it has
+            // selected its SSTables: the new index is still being built.
+            release(holdDroppedBuild);
+            waitForAssert(() -> assertThat(holdNewBuild.getCount()).isEqualTo(1), 60, TimeUnit.SECONDS);
+            assertThat(cfs.indexManager.isIndexBuilding(index)).describedAs("new index building after the dropped index's build ended").isTrue();
+
+            // SSTables added without the new index while its build runs are handed to that build.
+            cfs.addSSTables(streamed, OperationType.STREAM);
+            cfs.indexManager.checkSSTableAttachedIndexesAfterAdding(streamed);
+            release(holdNewBuild);
+            waitForAssert(() -> assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse(), 60, TimeUnit.SECONDS);
+
+            assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
+            assertThat(execute("SELECT k FROM %s")).hasSize(2 * ROWS);
+            assertThat(rowsThroughV()).isEqualTo(2 * ROWS);
+        }
+        finally
+        {
+            release(holdDroppedBuild);
+            release(holdNewBuild);
+        }
+    }
+
+    /**
+     * A build of an index that has been dropped and replaced by another one with the same name does nothing, and doesn't
+     * leave the replacement looking as building (or a rebuild of it would be rejected as concurrent with that build).
+     */
+    @Test
+    public void testBuildOfReplacedIndexDoesNotLeaveReplacementBuilding() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        writeRows(0);
+        String index = createIndex("CREATE CUSTOM INDEX replaced_idx ON %s(v) USING 'StorageAttachedIndex'");
+        waitForTableIndexesQueryable();
+        Index replaced = cfs.indexManager.getIndexByName(index);
+        dropIndex("DROP INDEX %s." + index);
+        createIndex("CREATE CUSTOM INDEX replaced_idx ON %s(v) USING 'StorageAttachedIndex'");
+        waitForTableIndexesQueryable();
+        assertThat(cfs.indexManager.getIndexByName(index)).isNotSameAs(replaced);
+
+        Injections.Counter builds = builderCounter("replaced_index_builds");
+        Injections.inject(builds);
+        for (boolean isFullRebuild : new boolean[]{ false, true })
+        {
+            cfs.indexManager.buildIndexesBlocking(cfs.getLiveSSTables(), Collections.singleton(replaced), isFullRebuild);
+            assertThat(builds.get()).isZero();
+            assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse();
+            assertThat(cfs.indexManager.needsFullRebuild(index)).isFalse();
+        }
+
+        cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(index));
+        assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
+        assertThat(rowsThroughV()).isEqualTo(ROWS);
+    }
+
+    /**
+     * A build of the only SAI index of the table, which was dropped before the build marks it as building: the build
+     * does nothing, and the index created again with the same name is built.
+     */
+    @Test
+    public void testBuildOfDroppedLastIndexDoesNotLeaveNameBuilding() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        writeRows(0);
+        String index = createIndex("CREATE CUSTOM INDEX dropped_idx ON %s(v) USING 'StorageAttachedIndex'");
+        waitForTableIndexesQueryable();
+        Index dropped = cfs.indexManager.getIndexByName(index);
+        dropIndex("DROP INDEX %s." + index);
+
+        Injections.Counter builds = builderCounter("dropped_index_builds");
+        Injections.inject(builds);
+        cfs.indexManager.buildIndexesBlocking(cfs.getLiveSSTables(), Collections.singleton(dropped), true);
+        assertThat(builds.get()).isZero();
+        assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse();
+        assertThat(cfs.indexManager.needsFullRebuild(index)).isFalse();
+
+        createIndex("CREATE CUSTOM INDEX dropped_idx ON %s(v) USING 'StorageAttachedIndex'");
+        waitForTableIndexesQueryable();
+        assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse();
+        cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(index));
+        assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
+        assertThat(rowsThroughV()).isEqualTo(ROWS);
+    }
+
+    /**
+     * A full rebuild of two indexes takes them before the first one is dropped and created again with the same name,
+     * and marks them as building while the new index builds: the rebuild builds the other index, and the new index is
+     * built.
+     */
+    @Test
+    public void testRebuildOfDroppedAndOtherIndexBuildsOtherIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        writeRows(0);
+        createIndex("CREATE CUSTOM INDEX recreated_idx ON %s(v) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX other_idx ON %s(w) USING 'StorageAttachedIndex'");
+        waitForTableIndexesQueryable();
+
+        // Hold a full rebuild of both indexes before it marks them as building...
+        Injections.Barrier holdRebuild = barrier("hold_rebuild_with_replacement",
+                                                 InvokePointBuilder.newInvokePoint()
+                                                                   .onClass(SecondaryIndexManager.class)
+                                                                   .onMethod("buildIndexesBlocking")
+                                                                   .atEntry());
+        Injections.Counter builds = builderCounter("rebuild_with_replacement_builds");
+        Injections.Barrier holdNewBuild = barrier("hold_replacement_initial_build",
+                                                  InvokePointBuilder.newInvokePoint()
+                                                                    .onClass(StorageAttachedIndex.class)
+                                                                    .onMethod("findNonIndexedSSTables"));
+        Injections.inject(holdRebuild, builds);
+        try
+        {
+            CompletableFuture<Void> rebuild = CompletableFuture.runAsync(() -> rebuildIndexes("recreated_idx", "other_idx"));
+            waitForAssert(() -> assertThat(holdRebuild.getCount()).isEqualTo(1));
+
+            // ...drop the first index and create it again, holding its initial build...
+            dropIndex("DROP INDEX %s.recreated_idx");
+            Injections.inject(holdNewBuild);
+            createIndexAsync("CREATE CUSTOM INDEX recreated_idx ON %s(v) USING 'StorageAttachedIndex'");
+            waitForAssert(() -> assertThat(holdNewBuild.getCount()).isEqualTo(1));
+
+            // ...and let the rebuild go on, then the initial build.
+            assertThat(rebuild.isDone()).isFalse();
+            release(holdRebuild);
+            rebuild.get(60, TimeUnit.SECONDS);
+            assertThat(builds.get()).isPositive();
+            assertThat(cfs.indexManager.isIndexBuilding("recreated_idx")).isTrue();
+            release(holdNewBuild);
+            waitForAssert(() -> assertThat(cfs.indexManager.isIndexBuilding("recreated_idx")).isFalse(), 60, TimeUnit.SECONDS);
+
+            for (String index : new String[]{ "recreated_idx", "other_idx" })
+            {
+                assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse();
+                assertThat(cfs.indexManager.needsFullRebuild(index)).isFalse();
+                assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
+            }
+            assertThat(rowsThroughV()).isEqualTo(ROWS);
+            assertThat(execute("SELECT k FROM %s WHERE w = 0").size() + execute("SELECT k FROM %s WHERE w = 1").size()).isEqualTo(ROWS);
+        }
+        finally
+        {
+            release(holdRebuild);
+            release(holdNewBuild);
+        }
+    }
+
+    /**
+     * A full rebuild of two indexes takes them before the first one is dropped: the rebuild builds the other index.
+     */
+    @Test
+    public void testRebuildOfDroppedAndOtherIndexWithoutReplacementBuildsOtherIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        writeRows(0);
+        createIndex("CREATE CUSTOM INDEX dropped_idx ON %s(v) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX other_idx ON %s(w) USING 'StorageAttachedIndex'");
+        waitForTableIndexesQueryable();
+
+        Injections.Barrier holdRebuild = barrier("hold_rebuild_without_replacement",
+                                                 InvokePointBuilder.newInvokePoint()
+                                                                   .onClass(SecondaryIndexManager.class)
+                                                                   .onMethod("buildIndexesBlocking")
+                                                                   .atEntry());
+        Injections.Counter builds = builderCounter("rebuild_without_replacement_builds");
+        Injections.inject(holdRebuild, builds);
+        try
+        {
+            CompletableFuture<Void> rebuild = CompletableFuture.runAsync(() -> rebuildIndexes("dropped_idx", "other_idx"));
+            waitForAssert(() -> assertThat(holdRebuild.getCount()).isEqualTo(1));
+            dropIndex("DROP INDEX %s.dropped_idx");
+            assertThat(rebuild.isDone()).isFalse();
+            release(holdRebuild);
+            rebuild.get(60, TimeUnit.SECONDS);
+            assertThat(builds.get()).isPositive();
+
+            for (String index : new String[]{ "dropped_idx", "other_idx" })
+            {
+                assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse();
+                assertThat(cfs.indexManager.needsFullRebuild(index)).isFalse();
+            }
+            assertThat(cfs.indexManager.isIndexQueryable("other_idx")).isTrue();
+            assertThat(execute("SELECT k FROM %s WHERE w = 0").size() + execute("SELECT k FROM %s WHERE w = 1").size()).isEqualTo(ROWS);
+        }
+        finally
+        {
+            release(holdRebuild);
+        }
+    }
+
+    /**
      * A build that is stopped (nodetool stop INDEX_BUILD) fails, so that the SSTables aren't added without the index,
      * and doesn't affect the index, which doesn't need them.
      */
@@ -572,6 +803,19 @@ public class MissingIndexOnAddedSSTablesTest extends SAITester
     private int rowsThroughV()
     {
         return execute("SELECT k FROM %s WHERE v = 0").size() + execute("SELECT k FROM %s WHERE v = 1").size();
+    }
+
+    private static void release(Injections.Barrier barrier)
+    {
+        barrier.countDown();
+        barrier.disable();
+    }
+
+    private static Injections.Counter builderCounter(String name)
+    {
+        return Injections.newCounter(name)
+                         .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("build"))
+                         .build();
     }
 
     private static Injections.Barrier barrier(String name, InvokePointBuilder at)
