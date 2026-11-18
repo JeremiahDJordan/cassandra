@@ -67,6 +67,11 @@ public class MapEntriesDecimalLegacyTest extends SAITester
         assertKeys("SELECT pk FROM %s WHERE w[1] = -1.5", 2);
         assertKeys("SELECT pk FROM %s WHERE w[1] = 1.25", 4);
         assertKeys("SELECT pk FROM %s WHERE w[1] > 2.5", 3);
+        // the inequality is a full index scan before version DB: it doesn't depend on how the entries were written
+        assertKeys("SELECT pk FROM %s WHERE k[2.5] != 1", 2, 3, 4);
+        assertKeys("SELECT pk FROM %s WHERE k[7] != 1", 0, 1, 2, 4);
+        assertKeys("SELECT pk FROM %s WHERE k[-1.5] != 1", 0, 1, 3, 4);
+        assertKeys("SELECT pk FROM %s WHERE w[1] != 2.5", 2, 3, 4);
 
         // A compaction writes the index with the current version, in canonical form: every scale finds every entry.
         enableCompaction();
@@ -80,5 +85,7 @@ public class MapEntriesDecimalLegacyTest extends SAITester
         assertKeys("SELECT pk FROM %s WHERE w[1] = 2.50", 0, 1);
         assertKeys("SELECT pk FROM %s WHERE w[1] = 7.00", 3);
         assertKeys("SELECT pk FROM %s WHERE w[1] >= 2.500", 0, 1, 3);
+        assertKeys("SELECT pk FROM %s WHERE k[2.50] != 1", 2, 3, 4);
+        assertKeys("SELECT pk FROM %s WHERE w[1] != 2.50", 2, 3, 4);
     }
 }

@@ -68,7 +68,7 @@ public class MapEntriesLargeKeyRangeTest extends SAITester.Versioned
         beforeAndAfterFlush(() -> {
             for (int i = 0; i < keys.length; i++)
             {
-                for (String op : new String[]{ ">", ">=", "<", "<=", "=" })
+                for (String op : new String[]{ ">", ">=", "<", "<=", "=", "!=" })
                 {
                     for (String value : new String[]{ "'a'", "'b'", "'c'" })
                     {
