@@ -36,7 +36,8 @@ import static org.junit.Assert.assertTrue;
 public class AnalyzedNotContainsTest extends SAITester
 {
     private static final String[] VALUES = { "Johann Strauss", "Strauss Johann", "Johann", "johann johann", "Bach",
-                                              "Johann Sebastian Bach", "Richard Strauss", "Debussy", "Strauss Debussy" };
+                                              "Johann Sebastian Bach", "Richard Strauss", "Debussy", "Strauss Debussy",
+                                              "" };
     // The elements of the collections of the rows 1 to 7 (7 has no collection)
     private static final String[][] ELEMENTS = { { "Johann Strauss" },
                                                  { "Richard Strauss", "Johann Sebastian Bach" },
@@ -148,6 +149,9 @@ public class AnalyzedNotContainsTest extends SAITester
             check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'johann johann'", "[5, 6, 7]");
             check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann'", "[5, 6, 7]");
             check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " 'Johann Sebastian Bach'", "[1, 3, 4, 5, 6, 7]");
+            // The analyzer makes no term of '': no element holds it, even the empty one, which has no term either
+            check(failures, source, "SELECT k FROM %s WHERE v " + contains + " ''", "[]");
+            check(failures, source, "SELECT k FROM %s WHERE v " + notContains + " ''", "[1, 2, 3, 4, 5, 6, 7]");
         }
         assertTrue(String.format("%d failures for %s:%n%s", failures.size(), type, String.join("\n", failures)), failures.isEmpty());
     }
