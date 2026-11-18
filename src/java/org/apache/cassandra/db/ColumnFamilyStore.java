@@ -689,18 +689,22 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             this.strategyContainer.disable();
         }
 
-        // create the private ColumnFamilyStores for the secondary column indexes
         indexManager = new SecondaryIndexManager(this);
-        for (IndexMetadata info : metadata.get().indexes)
-        {
-            initialBuilds.add(indexManager.addIndex(info, true));
-        }
 
+        // The metrics must exist before the indexes are added: adding an index can start its initial build, which
+        // records metrics, and SAI loads (and may invalidate, which updates the tracked size of) the index components
+        // of the SSTables right away when the node starts. The index manager is created first, as some gauges read it.
         metric = new TableMetrics(this, memtableMetrics);
 
         if (data.loadsstables && sstables != null)
         {
             data.updateInitialSSTableSize(sstables);
+        }
+
+        // create the private ColumnFamilyStores for the secondary column indexes
+        for (IndexMetadata info : metadata.get().indexes)
+        {
+            initialBuilds.add(indexManager.addIndex(info, true));
         }
 
         if (registerBookeeping)
