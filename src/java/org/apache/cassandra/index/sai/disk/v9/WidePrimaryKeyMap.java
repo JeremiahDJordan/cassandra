@@ -179,15 +179,27 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
         }
 
         // Find the partition using the token array for initial lookup
-        long rowId = rowIdToTokenArray.indexOf(key.token().getLongValue());
+        long token = key.token().getLongValue();
+        long rowId = rowIdToTokenArray.indexOf(token);
         if (key.isTokenOnly() || rowId < 0)
             return rowId;
         // If we have skipped a token (shouldn't happen with indexOf, but check for safety)
-        if (rowIdToTokenArray.get(rowId) != key.token().getLongValue())
+        if (rowIdToTokenArray.get(rowId) != token)
             return rowId;
 
-        // Handle token collisions by comparing partition keys using partitionKeyCursor
-        rowId = tokenCeilingCollisionDetection(key, rowId);
+        // rowId is the first row of the first partition with the token: look for the key's partition from there
+        int partitionCmp;
+        while ((partitionCmp = comparePartitionKey(rowId, key)) < 0)
+        {
+            rowId = jumpToNextPartitionStart(rowId);
+            if (rowId >= rowIdToTokenArray.length())
+                return Long.MIN_VALUE;
+            if (rowIdToTokenArray.get(rowId) != token)
+                return ~rowId;
+        }
+        // The partition of the key is not here: the first row of the next partition is the ceiling
+        if (partitionCmp > 0)
+            return ~rowId;
         if (key.clustering().isEmpty())
             return rowId;
 
@@ -268,7 +280,9 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
         {
             // If the key is a prefix (token-only or partition-only), 
             // the floor is the *greatest* row ID associated with this prefix.
-            if (key.isTokenOnly() || key.clustering().isEmpty())
+            if (key.isTokenOnly())
+                return lastRowOfToken(rowId);
+            if (key.clustering().isEmpty())
                 return startOfNextPartition(rowId) - 1;
 
             // If STATIC CLUSTERING, then rowID is the last row in the matching partition.
@@ -321,6 +335,16 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
     {
         long partitionSize = partitionIdToSizeArray.get(rowIdToPartitionIdArray.get(partitionStartRowId));
         return partitionSize == -1 ? rowIdToPartitionIdArray.length() : partitionStartRowId + partitionSize;
+    }
+
+    // Returns the last rowId of the last partition with the token of the partition starting at the supplied rowId
+    private long lastRowOfToken(long partitionStartRowId)
+    {
+        long token = rowIdToTokenArray.get(partitionStartRowId);
+        long nextPartitionStart = jumpToNextPartitionStart(partitionStartRowId);
+        while (nextPartitionStart < rowIdToTokenArray.length() && rowIdToTokenArray.get(nextPartitionStart) == token)
+            nextPartitionStart = jumpToNextPartitionStart(nextPartitionStart);
+        return nextPartitionStart - 1;
     }
 
     // Returns the first rowId of the next partition or the number of rows if supplied rowId is in the last partition

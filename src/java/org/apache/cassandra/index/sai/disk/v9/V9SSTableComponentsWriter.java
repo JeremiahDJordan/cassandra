@@ -26,7 +26,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.sai.disk.PerSSTableWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
@@ -48,7 +47,8 @@ public class V9SSTableComponentsWriter implements PerSSTableWriter
      * The blocks should not be too small and not be too large.
      * See {@link KeyStoreWriter} for details on how this affects index size and performance.
      */
-    private static final int DEFAULT_PARTITION_BLOCK_SHIFT = 4;
+    @VisibleForTesting
+    public static final int DEFAULT_PARTITION_BLOCK_SHIFT = 4;
 
     /**
      * Default block shift value for clustering keys.
@@ -76,7 +76,7 @@ public class V9SSTableComponentsWriter implements PerSSTableWriter
     private final KeyStoreWriter partitionKeysWriter;
     private final KeyStoreWriter clusteringKeysWriter;
 
-    private Token prevToken = null;
+    private DecoratedKey prevKey = null;
     private long partitionId = -1;
     // This is used to record the number of rows in each partition
     private long partitionRowCount = 0;
@@ -139,12 +139,15 @@ public class V9SSTableComponentsWriter implements PerSSTableWriter
     {
         if (partitionId >= 0)
         {
-            if (prevToken.compareTo(partitionKey.getToken()) >= 0)
-                throw new IllegalArgumentException("Partition keys must be in ascending token order");
+            // SSTable order: by token, then by key for distinct keys that share a token. The row ID lookups of the
+            // primary key maps rely on it.
+            if (prevKey.compareTo(partitionKey) >= 0)
+                throw new IllegalArgumentException(String.format("Partition keys must be in ascending order, " +
+                                                                 "but %s follows %s", partitionKey, prevKey));
 
             partitionSizeWriter.add(partitionRowCount);
         }
-        prevToken = partitionKey.getToken();
+        prevKey = partitionKey;
 
         partitionId++;
         partitionRowCount = 0;

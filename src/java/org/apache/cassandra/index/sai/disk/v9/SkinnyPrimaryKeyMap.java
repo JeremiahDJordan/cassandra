@@ -48,6 +48,7 @@ import org.apache.cassandra.io.sstable.SSTableId;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
@@ -209,11 +210,12 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
 
     /**
      * Common implementation for row ID lookup operations that handles PrimaryKeyWithSource optimization
-     * and token collision detection.
+     * and token collisions.
      *
      * @param key                the primary key to lookup
      * @param tokenLookup        function to perform the initial token-based lookup
-     * @param collisionDetection function to handle token collisions
+     * @param collisionDetection function that finds the row of the key among the rows that have its token: it gets
+     *                           the row ID the token lookup found
      * @return the row ID
      */
     protected long lookupRowId(PrimaryKey key,
@@ -229,14 +231,13 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
         long rowId = tokenLookup.applyAsLong(key.token().getLongValue());
         if (key.isTokenOnly() || rowId < 0)
             return rowId;
-        // The first index might not have been the correct match in the case of token collisions.
         return collisionDetection.apply(key, rowId);
     }
 
     @Override
     public long exactRowIdOrInvertedCeiling(PrimaryKey key)
     {
-        return lookupRowId(key, rowIdToTokenArray::indexOf, this::tokenCeilingCollisionDetection);
+        return lookupRowId(key, rowIdToTokenArray::indexOf, this::tokenCollisionDetection);
     }
 
     @Override
@@ -257,47 +258,56 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
         FileUtils.closeQuietly(Arrays.asList(partitionKeyCursor, rowIdToTokenArray, rowIdToPartitionIdArray));
     }
 
-    /**
-     * Generic token collision detection that handles both ceiling and floor operations.
-     * Look for token collision if the adjacent token in the token array matches the
-     * current token. If we find a collision, we need to compare the partition key instead.
-     *
-     * @param key the key to search for
-     * @param rowId      the initial row ID from token lookup
-     * @param direction  1 for ceiling (forward search), -1 for floor (backward search)
-     * @return the adjusted row ID after collision detection
-     */
-    private long tokenCollisionDetection(PrimaryKey key, long rowId, int direction)
+    // rowId is the first row with the token of the key, whose rows are in the order of their partition keys
+    private long tokenCollisionDetection(PrimaryKey key, long rowId)
     {
-        assert direction == 1 || direction == -1 : "Direction must be 1 (ceiling) or -1 (floor)";
-
-        long tokenValue = key.token().getLongValue();
-        long nextRowId = rowId + direction;
-
-        // Look for collisions while we haven't reached the boundaries and tokens match
-        while (nextRowId >= 0 && nextRowId < rowIdToTokenArray.length() && tokenValue == rowIdToTokenArray.get(nextRowId))
+        long token = key.token().getLongValue();
+        long rowCount = rowIdToTokenArray.length();
+        while (rowId < rowCount && rowIdToTokenArray.get(rowId) == token)
         {
-            // For ceiling: check if the partition key at current rowId is >= lookup key
-            // For floor: check if the partition key at current rowId is <= lookup key
-            int comparison = readPartitionKey(rowId).compareTo(key.partitionKey());
-            if ((direction == 1 && comparison >= 0) || (direction == -1 && comparison <= 0))
+            int cmp = comparePartitionKey(rowId, key);
+            if (cmp == 0)
                 return rowId;
-
-            rowId = nextRowId;
-            nextRowId = rowId + direction;
+            if (cmp > 0)
+                return ~rowId;
+            rowId++;
         }
-        // Note: We would normally expect to get here without going into the while loop
+        return rowId < rowCount ? ~rowId : Long.MIN_VALUE;
+    }
+
+    // rowId is the first row with a token greater than or equal to the token of the key
+    private long tokenCeilingCollisionDetection(PrimaryKey key, long rowId)
+    {
+        long token = key.token().getLongValue();
+        long rowCount = rowIdToTokenArray.length();
+        while (rowId < rowCount && rowIdToTokenArray.get(rowId) == token)
+        {
+            if (comparePartitionKey(rowId, key) >= 0)
+                return rowId;
+            rowId++;
+        }
+        return rowId < rowCount ? rowId : -1;
+    }
+
+    // rowId is the last row with a token less than or equal to the token of the key
+    private long tokenFloorCollisionDetection(PrimaryKey key, long rowId)
+    {
+        long token = key.token().getLongValue();
+        while (rowId >= 0 && rowIdToTokenArray.get(rowId) == token)
+        {
+            if (comparePartitionKey(rowId, key) <= 0)
+                return rowId;
+            rowId--;
+        }
         return rowId;
     }
 
-    protected long tokenCeilingCollisionDetection(PrimaryKey primaryKey, long rowId)
+    /**
+     * Compares the partition key of a row with the partition key of the given key, which must have the same token.
+     */
+    protected int comparePartitionKey(long sstableRowId, PrimaryKey key)
     {
-        return tokenCollisionDetection(primaryKey, rowId, 1);
-    }
-
-    protected long tokenFloorCollisionDetection(PrimaryKey primaryKey, long rowId)
-    {
-        return tokenCollisionDetection(primaryKey, rowId, -1);
+        return ByteBufferUtil.compareUnsigned(readPartitionKeyBytes(sstableRowId), key.partitionKey().getKey());
     }
 
     protected PrimaryKey supplier(long sstableRowId)
@@ -307,6 +317,12 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
 
     protected DecoratedKey readPartitionKey(long sstableRowId)
     {
+        ByteBuffer keyBuffer = readPartitionKeyBytes(sstableRowId);
+        return new BufferDecoratedKey(partitioner.getToken(keyBuffer), keyBuffer);
+    }
+
+    private ByteBuffer readPartitionKeyBytes(long sstableRowId)
+    {
         long partitionId = rowIdToPartitionIdArray.get(sstableRowId);
         ByteSource.Peekable peekable = ByteSource.peekable(partitionKeyCursor.seekToPointId(partitionId).asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION));
 
@@ -314,7 +330,6 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
 
         assert keyBytes != null : "Primary key from map did not contain a partition key";
 
-        ByteBuffer keyBuffer = ByteBuffer.wrap(keyBytes);
-        return new BufferDecoratedKey(partitioner.getToken(keyBuffer), keyBuffer);
+        return ByteBuffer.wrap(keyBytes);
     }
 }
