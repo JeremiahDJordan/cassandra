@@ -977,7 +977,38 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                futures.add(failed);
                                return;
                            }
-                           List<ListenableFuture<?>> builderFutures = builders.stream().map(CompactionManager.instance::submitIndexBuild).collect(Collectors.toList());
+                           List<ListenableFuture<?>> builderFutures = new ArrayList<>(builders.size());
+                           try
+                           {
+                               for (SecondaryIndexBuilder builder : builders)
+                                   builderFutures.add(CompactionManager.instance.submitIndexBuild(builder));
+                           }
+                           catch (Throwable t)
+                           {
+                               // Submitting a builder threw (a rejection gives a cancelled future instead): that
+                               // builder and those after it never run, so release what they reserved and mark
+                               // these indexes failed now; the builders already submitted run on, without a
+                               // callback.
+                               if (sstableBuild != null)
+                                   sstableBuildsInProgress.remove(sstableBuild);
+                               for (SecondaryIndexBuilder notSubmitted : builders.subList(builderFutures.size(), builders.size()))
+                               {
+                                   try
+                                   {
+                                       notSubmitted.onNotExecuted();
+                                   }
+                                   catch (Throwable t2)
+                                   {
+                                       t.addSuppressed(t2);
+                                   }
+                               }
+                               logAndMarkIndexesFailed(groupedIndexes, t, false);
+                               unbuiltIndexes.addAll(groupedIndexes);
+                               SettableFuture<Object> failed = SettableFuture.create();
+                               Futures.whenAllComplete(builderFutures).run(() -> failed.setException(t), ImmediateExecutor.INSTANCE);
+                               futures.add(failed);
+                               return;
+                           }
                            final SettableFuture<Object> build = SettableFuture.create();
                            Futures.addCallback(Futures.allAsList(builderFutures), new FutureCallback<Object>()
                            {
