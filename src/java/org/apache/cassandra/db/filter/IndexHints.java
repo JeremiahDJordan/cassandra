@@ -663,7 +663,7 @@ public class IndexHints
                 return;
 
             int n = indexes.size();
-            assert n < Short.MAX_VALUE : TOO_MANY_INDEXES_ERROR + n;
+            assert n <= Short.MAX_VALUE : TOO_MANY_INDEXES_ERROR + n;
 
             out.writeVInt32(n);
             for (IndexMetadata index : indexes)
