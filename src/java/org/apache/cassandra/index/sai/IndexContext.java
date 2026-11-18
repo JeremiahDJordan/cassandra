@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.index.sai;
 
+import java.io.EOFException;
 import java.nio.ByteBuffer;
 import java.util.Collection;
 import java.util.Collections;
@@ -82,6 +83,7 @@ import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.index.sai.view.IndexViewManager;
 import org.apache.cassandra.index.sai.view.View;
+import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -92,6 +94,7 @@ import org.apache.cassandra.utils.MonotonicClock;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.lucene.index.CorruptIndexException;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_ANALYZED_SIZE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_FROZEN_TERM_SIZE;
@@ -1042,12 +1045,44 @@ public class IndexContext
             }
             catch (Throwable e)
             {
+                // Components that pass validation but turn out to be corrupt when loaded are invalidated, so the
+                // index is rebuilt for this SSTable. Other failures say nothing about the components: the SSTable is
+                // left out of the view, and the initial build fails (see StorageAttachedIndex#findNonIndexedSSTables).
+                if (!(e instanceof Error) && isCorruption(e))
+                {
+                    try
+                    {
+                        perIndexComponents.invalidate(context.sstable, cfs.getTracker());
+                    }
+                    catch (Throwable t)
+                    {
+                        e.addSuppressed(t);
+                    }
+                }
                 logger.error(logMessage("Failed to update per-column components for SSTable {}"), context.descriptor(), e);
                 invalid.add(context);
             }
         });
 
         return Pair.create(valid, invalid);
+    }
+
+    /**
+     * @return whether the failure to open index components, or one of its causes, means they are corrupt: a
+     * {@link CorruptIndexException}, an {@link EOFException} (truncated) or a {@link CorruptSSTableException}
+     */
+    private static boolean isCorruption(Throwable failure)
+    {
+        for (Throwable t = failure; t != null; t = t.getCause())
+        {
+            if (t instanceof CorruptIndexException
+                || t instanceof EOFException
+                || t instanceof CorruptSSTableException)
+                return true;
+            if (t.getCause() == t)
+                break;
+        }
+        return false;
     }
 
     /**
