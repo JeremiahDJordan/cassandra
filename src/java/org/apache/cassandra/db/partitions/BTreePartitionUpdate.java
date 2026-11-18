@@ -19,11 +19,13 @@ package org.apache.cassandra.db.partitions;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.Iterators;
 import com.google.common.primitives.Ints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +34,7 @@ import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionInfo;
 import org.apache.cassandra.db.DeletionTime;
+import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.MutableDeletionInfo;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
@@ -107,7 +110,8 @@ public class BTreePartitionUpdate extends AbstractBTreePartition implements Part
     public static BTreePartitionUpdate fullPartitionDelete(TableMetadata metadata, DecoratedKey key, long timestamp, long nowInSec)
     {
         MutableDeletionInfo deletionInfo = new MutableDeletionInfo(timestamp, nowInSec);
-        BTreePartitionData holder = new BTreePartitionData(RegularAndStaticColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+        EncodingStats stats = new EncodingStats(timestamp, nowInSec, LivenessInfo.NO_TTL);
+        BTreePartitionData holder = new BTreePartitionData(RegularAndStaticColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, stats);
         return new BTreePartitionUpdate(metadata, key, holder, deletionInfo, false);
     }
 
@@ -124,6 +128,10 @@ public class BTreePartitionUpdate extends AbstractBTreePartition implements Part
     public static BTreePartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row, Row staticRow)
     {
         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        Row nonNullStaticRow = staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow;
+        EncodingStats stats = EncodingStats.Collector.collect(nonNullStaticRow,
+                                                              row == null ? Collections.emptyIterator() : Iterators.singletonIterator(row),
+                                                              deletionInfo);
         BTreePartitionData holder = new BTreePartitionData(
             new RegularAndStaticColumns(
                 staticRow == null ? Columns.NONE : Columns.from(staticRow),
@@ -131,8 +139,8 @@ public class BTreePartitionUpdate extends AbstractBTreePartition implements Part
             ),
             row == null ? BTree.empty() : BTree.singleton(row),
             deletionInfo,
-            staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow,
-            EncodingStats.NO_STATS
+            nonNullStaticRow,
+            stats
         );
         return new BTreePartitionUpdate(metadata, key, holder, deletionInfo, false);
     }

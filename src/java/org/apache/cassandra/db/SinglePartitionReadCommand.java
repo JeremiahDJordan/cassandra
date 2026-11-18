@@ -58,6 +58,7 @@ import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -1020,6 +1021,9 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 if (iter == null)
                     continue;
 
+                // Memtable data is always considered unrepaired
+                controller.updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+
                 UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable))
                                                                        : iter;
                 result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false),
@@ -1065,6 +1069,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 {
                     if (!iter.partitionLevelDeletion().isLive())
                     {
+                        if (!sstable.isRepaired())
+                            controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
                         result = add(UnfilteredRowIterators.noRowsIterator(iter.metadata(),
                                                                            iter.partitionKey(),
                                                                            Rows.EMPTY_STATIC_ROW,
@@ -1122,7 +1128,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
     private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, boolean isRepaired, ReadExecutionController controller)
     {
-        if (!isRepaired)
+        // EncodingStats uses a synthetic epoch for no local deletion time
+        if (!isRepaired && iter.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
             controller.updateMinOldestUnrepairedTombstone(iter.stats().minLocalDeletionTime);
 
         int maxRows = Math.max(filter.requestedRows().size(), 1);
