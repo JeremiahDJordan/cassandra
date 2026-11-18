@@ -965,6 +965,15 @@ public enum CassandraRelevantProperties
     /** Whether to validate terms that will be SAI indexed at the coordinator */
     SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR("cassandra.sai.validate_max_term_size_at_coordinator"),
 
+    /**
+     * Whether a partial SAI index build (one that doesn't rebuild every index of the table, e.g. the initial build of an
+     * index created on an existing table, or the build of the indexes missing on streamed or imported SSTables)
+     * validates the checksums of the complete per-SSTable components it would otherwise reuse, and if they fail,
+     * rewrites them and rebuilds every index of the SSTable, as Apache Cassandra does (CASSANDRA-18490). On by
+     * default; it reads all the per-SSTable components of every SSTable built.
+     */
+    SAI_VALIDATE_PER_SSTABLE_CHECKSUM_ON_PARTIAL_BUILD("cassandra.sai.validate_per_sstable_checksum_on_partial_build", "true"),
+
     /** Whether to validate terms that will be SAI indexed at the coordinator */
     SAI_VALIDATE_TERMS_AT_COORDINATOR("cassandra.sai.validate_terms_at_coordinator", "true"),
 

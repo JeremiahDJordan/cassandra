@@ -39,6 +39,7 @@ import org.apache.cassandra.utils.TimeUUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.compaction.CompactionInterruptedException;
 import org.apache.cassandra.db.compaction.OperationType;
@@ -81,12 +82,14 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     // make sure only one builder can write to per sstable files when multiple storage-attached indexes are created simultaneously.
     private static final Map<SSTableReader, CountDownLatch> inProgress = Maps.newConcurrentMap();
 
-    // Held by a build that rebuilds every index of an SSTable (Apache components replaced, see withAllIndexes) until
-    // it has published them; the other builders of the SSTable wait.
+    // Held by a build that rebuilds every index of an SSTable (Apache components replaced, or corrupt per-SSTable
+    // components rewritten, see withAllIndexes) until it has published them; the other builders of the SSTable wait.
     private static final Map<SSTableReader, CountDownLatch> rebuildingAllIndexes = Maps.newConcurrentMap();
 
     /**
-     * @return whether a build is replacing the components written by Apache Cassandra of the provided SSTable
+     * @return whether a build is replacing the components written by Apache Cassandra of the provided SSTable, or
+     * rewriting its per-SSTable components after they failed checksum validation: either way, it rebuilds every index
+     * of the SSTable, and owns its components until it has published them (see rebuildingAllIndexes)
      */
     static boolean isRebuildingAllIndexesOf(SSTableReader sstable)
     {
@@ -240,6 +243,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         // the indexes we were asked to build, without the ones we also rebuild with them (see withAllIndexes)
         Set<StorageAttachedIndex> requestedIndexes = indexes;
         CountDownLatch replacingApache = null;
+        // set when we rewrite per-SSTable components that failed checksum validation (see hasCorruptPerSSTableComponents)
+        CountDownLatch rewritingCorrupt = null;
         registered = false;
         boolean succeeded = false;
 
@@ -262,11 +267,19 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 }
 
                 indexDescriptor = group.descriptorFor(sstable);
-                perSSTableFileLock = shouldWritePerSSTableFiles(sstable, indexDescriptor, replacedComponents);
+                boolean corruptPerSSTable = hasCorruptPerSSTableComponents(indexDescriptor);
+                perSSTableFileLock = shouldWritePerSSTableFiles(sstable, indexDescriptor, replacedComponents, corruptPerSSTable);
                 if (perSSTableFileLock != null && hasApacheComponents(indexDescriptor.perSSTableComponents()))
                 {
                     replacingApache = CountDownLatch.newCountDownLatch(1);
                     rebuildingAllIndexes.put(sstable, replacingApache);
+                }
+                else if (perSSTableFileLock != null && corruptPerSSTable)
+                {
+                    // Like for the Apache components above, the other builders of the SSTable wait for us, as we rebuild
+                    // all of its indexes
+                    rewritingCorrupt = CountDownLatch.newCountDownLatch(1);
+                    rebuildingAllIndexes.put(sstable, rewritingCorrupt);
                 }
                 // Either we write the per-SSTable components, or they are ours (complete, or being written by
                 // another builder, as usual). Otherwise, another builder has just got the latch to replace the
@@ -284,6 +297,18 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 Set<StorageAttachedIndex> others = Sets.difference(indexes, requestedIndexes);
                 if (!others.isEmpty())
                     SSTableWatcher.instance.onIndexBuild(sstable, others);
+            }
+            else if (rewritingCorrupt != null)
+            {
+                // The per-SSTable components failed checksum validation, and every index of the SSTable uses them:
+                // rebuild all of them on the rewritten ones. They were all reading corrupt components, so they are all
+                // treated as requested: a failure of the build makes them all non-queryable.
+                indexes = withAllIndexes(indexes, indexDescriptor,
+                                         "per-SSTable components are rewritten after failing checksum validation");
+                Set<StorageAttachedIndex> others = Sets.difference(indexes, requestedIndexes);
+                if (!others.isEmpty())
+                    SSTableWatcher.instance.onIndexBuild(sstable, others);
+                requestedIndexes = indexes;
             }
 
             // If we were unable to get the per-SSTable file lock it means that the
@@ -410,6 +435,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 rebuildingAllIndexes.remove(sstable);
                 replacingApache.decrement();
             }
+            if (rewritingCorrupt != null)
+            {
+                rebuildingAllIndexes.remove(sstable);
+                rewritingCorrupt.decrement();
+            }
         }
     }
 
@@ -428,11 +458,14 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
      * if the per sstable index files are already created, not need to write it again, unless it's full rebuild.
      * if not created, try to acquire a lock, so only one builder will generate per sstable index files
      */
-    private CountDownLatch shouldWritePerSSTableFiles(SSTableReader sstable, IndexDescriptor indexDescriptor, Set<Component> replacedComponents)
+    private CountDownLatch shouldWritePerSSTableFiles(SSTableReader sstable, IndexDescriptor indexDescriptor,
+                                                      Set<Component> replacedComponents, boolean corrupt)
     {
         // if per-table files are incomplete or checksum failed during full rebuild, or if they were written by Apache
-        // Cassandra (we never write new components in that format, see IndexDescriptor#versionForNewComponents).
-        if (!indexDescriptor.perSSTableComponents().isComplete() || isFullRebuild || hasApacheComponents(indexDescriptor.perSSTableComponents()))
+        // Cassandra (we never write new components in that format, see IndexDescriptor#versionForNewComponents), or if
+        // they failed checksum validation during a partial build (see hasCorruptPerSSTableComponents).
+        if (!indexDescriptor.perSSTableComponents().isComplete() || isFullRebuild
+            || hasApacheComponents(indexDescriptor.perSSTableComponents()) || corrupt)
         {
             CountDownLatch latch = CountDownLatch.newCountDownLatch(1);
             if (inProgress.putIfAbsent(sstable, latch) == null)
@@ -442,6 +475,25 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             }
         }
         return null;
+    }
+
+    /**
+     * Whether our complete per-SSTable components, which a partial build would reuse, fail checksum validation, when
+     * {@link CassandraRelevantProperties#SAI_VALIDATE_PER_SSTABLE_CHECKSUM_ON_PARTIAL_BUILD} is set (the default). Not
+     * for a full rebuild, which rewrites them anyway.
+     */
+    private boolean hasCorruptPerSSTableComponents(IndexDescriptor indexDescriptor)
+    {
+        if (isFullRebuild || !CassandraRelevantProperties.SAI_VALIDATE_PER_SSTABLE_CHECKSUM_ON_PARTIAL_BUILD.getBoolean())
+            return false;
+
+        IndexComponents.ForRead perSSTable = indexDescriptor.perSSTableComponents();
+        if (!perSSTable.isComplete() || perSSTable.version().isApache() || perSSTable.isValid(true))
+            return false;
+
+        logger.warn(indexDescriptor.logMessage("Per-SSTable index components failed checksum validation: rewriting them, " +
+                                               "and rebuilding every index of the SSTable"));
+        return true;
     }
 
     /**

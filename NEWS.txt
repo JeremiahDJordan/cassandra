@@ -165,6 +165,14 @@ New features
       indexed blob term. Frozen collections of blobs keep sai_frozen_term_size, and map entries with a blob key or
       value sai_string_term_size. Blob terms have no system property of their own: if set,
       -Dcassandra.sai.max_string_term_size_kb sets their maximum size too, as it does for strings. (CASSANDRA-20012)
+    - A storage-attached index (SAI) build that doesn't rebuild every index of the table (the initial build of an
+      index created on an existing table, or the build of the indexes missing on streamed or imported sstables)
+      validates the checksums of the per-SSTable index files it would otherwise reuse, and if they fail, rewrites them
+      and rebuilds every index of that sstable, as Apache Cassandra does (CASSANDRA-18490). This reads all the
+      per-SSTable index files of each sstable such a build covers.
+      -Dcassandra.sai.validate_per_sstable_checksum_on_partial_build=false turns it off, which keeps the previous
+      behaviour: those files are then only checksum-validated when the sstable is loaded at startup, streamed or
+      imported, and a full rebuild (nodetool rebuild_index) always rewrites them.
 
 Upgrading
 ---------
