@@ -55,6 +55,7 @@ public final class PrimaryKeyMapIterator extends KeyRangeIterator
     private final PrimaryKeyMap keys;
     private final KeyFilter filter;
     private long currentRowId;
+    private PrimaryKey lastKey;
 
 
     private PrimaryKeyMapIterator(PrimaryKeyMap keys, PrimaryKey min, PrimaryKey max, long startRowId, KeyFilter filter)
@@ -102,6 +103,10 @@ public final class PrimaryKeyMapIterator extends KeyRangeIterator
     @Override
     protected void performSkipTo(PrimaryKey nextKey)
     {
+        // Never go back: a key without clustering (e.g. a static key) compares equal to every key of its partition.
+        if (lastKey != null && lastKey.compareTo(nextKey) >= 0)
+            return;
+
         this.currentRowId = keys.ceiling(nextKey);
     }
 
@@ -113,6 +118,7 @@ public final class PrimaryKeyMapIterator extends KeyRangeIterator
             PrimaryKey key = keys.primaryKeyFromRowId(currentRowId++, getMinimum(), getMaximum());
             if (filter == KeyFilter.KEYS_WITH_CLUSTERING && !key.hasClustering())
                 continue;
+            lastKey = key;
             return key;
         }
         return endOfData();
