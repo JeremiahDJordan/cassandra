@@ -162,6 +162,9 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
             // make the changes in this order so we don't have a window where the row is not in the index at all
             if (newRemaining > 0)
             {
+                // the row may not have had a vector before, so its key may not be in primaryKeys yet, which key
+                // restricted searches use
+                primaryKeys.add(primaryKey);
                 graph.add(newValue, primaryKey);
                 overwriteCount.increment();
             }
