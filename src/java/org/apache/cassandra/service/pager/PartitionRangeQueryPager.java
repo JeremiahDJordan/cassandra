@@ -86,15 +86,16 @@ public class PartitionRangeQueryPager extends AbstractQueryPager<PartitionRangeR
             pageRange = fullRange;
             limits = limits.forPaging(pageSize);
         }
-        // if the last key was the one of the end of the range we know that we are done
-        else if (lastReturnedKey.equals(fullRange.keyRange().right) && remainingInPartition() == 0 && lastReturnedRow == null)
+        // If the last key is the (inclusive) end of the range, and we don't want more rows from it, we are done:
+        // the range of a single partition includes its last key, so going on would wrap around the whole ring.
+        else if (lastReturnedKey.equals(fullRange.keyRange().right) && !includeLastKey())
         {
             return null;
         }
         else
         {
             // We want to include the last returned key only if we haven't achieved our per-partition limit, otherwise, don't bother.
-            boolean includeLastKey = remainingInPartition() > 0 && lastReturnedRow != null;
+            boolean includeLastKey = includeLastKey();
             AbstractBounds<PartitionPosition> bounds = makeKeyBounds(lastReturnedKey, includeLastKey);
             if (includeLastKey)
             {
@@ -109,6 +110,11 @@ public class PartitionRangeQueryPager extends AbstractQueryPager<PartitionRangeR
         }
 
         return query.withUpdatedLimitsAndDataRange(limits, pageRange);
+    }
+
+    private boolean includeLastKey()
+    {
+        return remainingInPartition() > 0 && lastReturnedRow != null;
     }
 
     protected void recordLast(DecoratedKey key, Row last)
