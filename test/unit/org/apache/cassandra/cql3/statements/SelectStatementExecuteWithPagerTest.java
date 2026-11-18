@@ -30,9 +30,11 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.PageSize;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.ReadQuery;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.pager.PagingState;
 import org.apache.cassandra.transport.Dispatcher;
@@ -348,6 +350,28 @@ public class SelectStatementExecuteWithPagerTest extends CQLTester
         QueryOptions opts = options(PageSize.inRows(2), null);
         assertThrows(NullPointerException.class,
                      () -> select.executeWithReadQuery(QueryState.forInternalCalls(), opts, null, NOW));
+    }
+
+    @Test
+    public void orderByIsRejectedForQueryWithIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, a int, b int, PRIMARY KEY (k, c))");
+        createIndex("CREATE INDEX ON %s(a) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(b) USING 'sai'");
+        execute("INSERT INTO %s (k, c, a, b) VALUES (0, 0, 1, 2)");
+        execute("INSERT INTO %s (k, c, a, b) VALUES (0, 1, 3, 4)");
+
+        // An index serves the nested restrictions, so the read can't return the rows in reverse clustering order.
+        String where = "WHERE k = 0 AND ((a = 1 AND b = 2) OR (a = 3 AND b = 4))";
+        SelectStatement unordered = parseSelect("SELECT k, c FROM %s " + where);
+        SelectStatement ordered = parseSelect("SELECT k, c FROM %s " + where + " ORDER BY c DESC");
+        QueryOptions opts = options(PageSize.inRows(10), null);
+        ReadQuery query = unordered.getQuery(opts, FBUtilities.nowInSeconds());
+
+        assertEquals(2, unordered.executeWithReadQuery(QueryState.forInternalCalls(), opts, query, NOW).result.size());
+        InvalidRequestException e = assertThrows(InvalidRequestException.class,
+                                                 () -> ordered.executeWithReadQuery(QueryState.forInternalCalls(), opts, query, NOW));
+        assertEquals(SelectStatement.ORDER_BY_WITH_INDEX_MESSAGE, e.getMessage());
     }
 
     // --- (pk, ck) pair helpers -------------------------------------------------
