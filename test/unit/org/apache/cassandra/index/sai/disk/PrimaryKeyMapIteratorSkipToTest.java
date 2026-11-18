@@ -17,6 +17,8 @@
 package org.apache.cassandra.index.sai.disk;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.junit.Test;
 
@@ -33,6 +35,7 @@ import org.apache.cassandra.index.sai.utils.PrimaryKey;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class PrimaryKeyMapIteratorSkipToTest extends SAITester
 {
@@ -69,6 +72,46 @@ public class PrimaryKeyMapIteratorSkipToTest extends SAITester
             iterator.skipTo(staticKey);
             assertFalse(iterator.hasNext());
         }
+    }
+
+    /**
+     * For an index on a static column, the scan returns the key of the static row of every partition, which matches
+     * the whole partition: of a partition with rows and a static row, with only a static row, and with only rows.
+     */
+    @Test
+    public void testStaticKeys() throws IOException
+    {
+        createTable("CREATE TABLE %s (k int, c int, s int static, v int, PRIMARY KEY (k, c))");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (k, c, s, v) VALUES (0, 1, 0, 0)");
+        execute("INSERT INTO %s (k, c, v) VALUES (0, 2, 0)");
+        execute("INSERT INTO %s (k, s) VALUES (1, 0)");
+        execute("INSERT INTO %s (k, c, v) VALUES (2, 1, 0)");
+        flush();
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        SSTableIndex sstableIndex = getIndexContext(index).getView().getIndexes().iterator().next();
+        PrimaryKey.Factory factory = sstableIndex.getIndexContext().keyFactory();
+        PartitionPosition min = cfs.getPartitioner().getMinimumToken().minKeyBound();
+        AbstractBounds<PartitionPosition> all = new Range<>(min, min);
+
+        List<Integer> partitions = new ArrayList<>();
+        try (KeyRangeIterator iterator = PrimaryKeyMapIterator.create(sstableIndex.getSSTableContext(), all, true))
+        {
+            PrimaryKey first = iterator.next();
+            assertTrue(first.isStaticRow());
+            partitions.add(Int32Type.instance.compose(first.partitionKey().getKey()));
+            // the rows of the partition of the key we returned are behind
+            iterator.skipTo(factory.create(first.partitionKey(), Clustering.make(Int32Type.instance.decompose(1))));
+            while (iterator.hasNext())
+            {
+                PrimaryKey key = iterator.next();
+                assertTrue(key.isStaticRow());
+                partitions.add(Int32Type.instance.compose(key.partitionKey().getKey()));
+            }
+        }
+        partitions.sort(null);
+        assertEquals(List.of(0, 1, 2), partitions);
     }
 
     private static int clustering(PrimaryKey key)

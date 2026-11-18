@@ -475,6 +475,9 @@ public class IndexContext
     //
     // keys k such that row(k) not contains v = (all keys) \ (keys k such that row(k) contains v)
     //
+    // For an index on a static column, all keys are the keys of the static rows of all partitions, which match the
+    // whole partitions, including those with only a static row and those without one.
+    //
     // Note that rows in other indexes are not matched, so this can return false positives,
     // but they are not a problem as post-filtering would get rid of them.
     // The keys matched in other indexes cannot be safely subtracted
@@ -548,7 +551,7 @@ public class IndexContext
             for (MemtableIndex memtableIndex : memtables)
             {
                 Memtable memtable = memtableIndex.getMemtable();
-                KeyRangeIterator memtableIterator = new MemtableKeyRangeIterator(memtable, primaryKeyFactory, keyRange);
+                KeyRangeIterator memtableIterator = new MemtableKeyRangeIterator(memtable, primaryKeyFactory, keyRange, getDefinition().isStatic());
                 builder.add(memtableIterator);
             }
 
