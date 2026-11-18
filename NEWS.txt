@@ -123,8 +123,11 @@ cluster that mixes it with this version. All but the last affect which schemas a
     - Vector types may only have float elements: vector<int, N> and other non-float vectors are rejected ("vectors
       may only use float"), which Apache Cassandra 5.0 accepts. Start every node with
       -Dcassandra.float_only_vectors=false to accept them, e.g. before upgrading from an Apache Cassandra 5.0 cluster
-      whose schema has them. Apache Cassandra 5.0 only allows SAI indexes on float vectors; don't create one on a
-      non-float vector here either.
+      whose schema has them. As in Apache Cassandra 5.0, CREATE INDEX of an SAI index on a non-float vector is
+      rejected ("SAI ANN indexes are only allowed on vector columns with float elements"). An existing such index,
+      created by an earlier DataStax version, is kept and doesn't block other schema changes (Apache Cassandra 5.0
+      checks it on every change of the table), but SAI reads the bytes of its vectors as floats (and fails on
+      variable-length elements), so its results are meaningless: drop it.
     - New vector types may have at most 8192 dimensions: the vector_dimensions_fail_threshold guardrail defaults to
       8192, whatever the guardrails profile, while Apache Cassandra 5.0 disables it (-1). Like any guardrail, it is
       checked when a table or type is created or altered by a user it applies to (not a superuser), so existing

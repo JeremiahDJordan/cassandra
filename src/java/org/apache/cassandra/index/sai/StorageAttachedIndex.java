@@ -69,6 +69,7 @@ import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
@@ -137,6 +138,7 @@ public class StorageAttachedIndex implements Index
      * component length is an unsigned short, and 0xFFFF is reserved for the first one (the static prefix).
      */
     public static final int MAX_COMPOSITE_FIRST_COMPONENT_SIZE = FBUtilities.MAX_UNSIGNED_SHORT - 1;
+    public static final String VECTOR_NON_FLOAT_ERROR = "SAI ANN indexes are only allowed on vector columns with float elements";
     public static final String BLOB_INDEX_UNSUPPORTED_BY_NODES_MESSAGE =
     "Cannot create a storage-attached index on the blob values of column %s while there are nodes on a messaging " +
     "version below DS 21 (5.0.10): nodes %s don't support it";
@@ -345,6 +347,24 @@ public class StorageAttachedIndex implements Index
                                              target.right,
                                              config,
                                              baseCfs);
+    }
+
+    /**
+     * Rejects the creation of an index on vectors whose elements aren't floats ({@link #VECTOR_NON_FLOAT_ERROR}). Such
+     * columns only exist with {@code -Dcassandra.float_only_vectors=false}. Only checked when the index is created, so
+     * that an index created on such a column by an earlier version keeps working and doesn't block schema changes.
+     */
+    public static void validateVectorElementType(TableMetadata table, IndexMetadata index)
+    {
+        // This runs before validateOptions (see CreateIndexStatement), which reports invalid targets
+        String targetColumn = index.options.get(IndexTarget.TARGET_OPTION_NAME);
+        Pair<ColumnMetadata, IndexTarget.Type> target = targetColumn == null ? null : TargetParser.parse(table, targetColumn);
+        if (target == null)
+            return;
+
+        AbstractType<?> type = TypeUtil.cellValueType(target.left, target.right);
+        if (type.isVector() && !(((VectorType<?>) type).elementType instanceof FloatType))
+            throw new InvalidRequestException(VECTOR_NON_FLOAT_ERROR);
     }
 
     /**
