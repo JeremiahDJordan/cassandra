@@ -24,6 +24,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MBeanWrapper;
@@ -49,6 +50,21 @@ public abstract class AbstractShardedMemtable extends AbstractAllocatorMemtable
     private static int autoShardCount()
     {
         return 4 * FBUtilities.getAvailableProcessors();
+    }
+
+    /// Aborts the index transaction of an update that failed with `cause`, which the caller is about to rethrow. A
+    /// failure of the abort is added to `cause` as suppressed, so that it does not replace it.
+    static void abortIndexTransaction(UpdateTransaction indexer, Throwable cause)
+    {
+        try
+        {
+            indexer.abort();
+        }
+        catch (Throwable t)
+        {
+            if (t != cause)
+                cause.addSuppressed(t);
+        }
     }
 
     // The boundaries for the keyspace as they were calculated when the memtable is created.
