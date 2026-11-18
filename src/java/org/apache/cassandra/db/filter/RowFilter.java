@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -66,12 +67,15 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
+import org.apache.cassandra.db.rows.Rows;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.InvalidPatternException;
@@ -263,19 +267,26 @@ public class RowFilter
 
     protected Transformation<BaseRowIterator<?>> filter(TableMetadata metadata, long nowInSec)
     {
+        if (root.hasMixedDisjunction())
+            return filterWithStaticRow(metadata, nowInSec);
+
         FilterElement partitionLevelOperation = root.partitionLevelTree();
         FilterElement rowLevelOperation = root.rowLevelTree();
 
-        final boolean filterNonStaticColumns = !rowLevelOperation.isEmpty();
+        // A tree can have children without expressions, e.g. after SAI removed the expressions it handles from a
+        // disjunction. Those are always satisfied, so they don't make a partition without matching rows a non-match.
+        final boolean filterNonStaticColumns = rowLevelOperation.hasExpressions();
 
         return new Transformation<>()
         {
             DecoratedKey pk;
+            boolean hasMatchingRow;
 
             @Override
             protected BaseRowIterator<?> applyToPartition(BaseRowIterator<?> partition)
             {
                 pk = partition.partitionKey();
+                hasMatchingRow = false;
 
                 // Short-circuit all partitions that won't match based on static and partition keys
                 if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow(), nowInSec))
@@ -288,13 +299,12 @@ public class RowFilter
                                               ? Transformation.apply((UnfilteredRowIterator) partition, this)
                                               : Transformation.apply((RowIterator) partition, this);
 
-                if (filterNonStaticColumns && !iterator.hasNext())
-                {
-                    iterator.close();
-                    return null;
-                }
+                // hasNext() reads ahead the first content that passes the filter: the usual partition, where that
+                // is a row, is returned as it is
+                if (!filterNonStaticColumns || (iterator.hasNext() && hasMatchingRow))
+                    return iterator;
 
-                return iterator;
+                return withRowsOrNull(iterator);
             }
 
             @Override
@@ -310,9 +320,146 @@ public class RowFilter
                 if (!rowLevelOperation.isSatisfiedBy(metadata, pk, purged, nowInSec))
                     return null;
 
+                hasMatchingRow = true;
                 return row;
             }
         };
+    }
+
+    /**
+     * The filter for a tree with a disjunction of expressions on static columns and expressions on other columns,
+     * such as {@code v = 1 OR s = 2}. Such a tree can't be split into a partition-level tree, checked against the
+     * static row, and a row-level tree, checked against each row, because a row satisfies the disjunction if either
+     * side does, not only if both do. So each row is checked against the whole tree, taking the values of static
+     * columns from the static row. A partition without matching rows is kept, for its static row, only if its static
+     * row alone satisfies the tree, as for a partition without rows. This is how SAI's {@code FilterTree} evaluates
+     * the same tree on the replicas.
+     */
+    private Transformation<BaseRowIterator<?>> filterWithStaticRow(TableMetadata metadata, long nowInSec)
+    {
+        return new Transformation<>()
+        {
+            DecoratedKey pk;
+            Row staticRow;
+
+            @Override
+            protected BaseRowIterator<?> applyToPartition(BaseRowIterator<?> partition)
+            {
+                pk = partition.partitionKey();
+                // The static row is purged when the read doesn't need reconciliation, so that a deleted or expired
+                // element of a static collection doesn't count as an element.
+                staticRow = partition.staticRow();
+                if (!needsReconciliation())
+                {
+                    staticRow = staticRow.purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
+                    if (staticRow == null)
+                        staticRow = Rows.EMPTY_STATIC_ROW;
+                }
+
+                BaseRowIterator<?> iterator = partition instanceof UnfilteredRowIterator
+                                              ? Transformation.apply((UnfilteredRowIterator) partition, this)
+                                              : Transformation.apply((RowIterator) partition, this);
+
+                if (root.isSatisfiedByStaticRow(metadata, pk, staticRow, nowInSec))
+                    return iterator;
+
+                return withRowsOrNull(iterator);
+            }
+
+            @Override
+            public Row applyToRow(Row row)
+            {
+                // If we purge deletions when reconciliation is required, we hide information replica filtering
+                // protection would require to filter rows that are no longer matches are the coordinator.
+                Row purged = needsReconciliation() ? row : row.purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
+
+                if (purged == null)
+                    return null;
+
+                if (!root.isSatisfiedBy(metadata, pk, purged, staticRow, nowInSec))
+                    return null;
+
+                return row;
+            }
+        };
+    }
+
+    /**
+     * Returns the given filtered partition if it has rows, or closes it and returns {@code null} if it doesn't.
+     * <p>
+     * The range tombstone markers of an unfiltered partition aren't rows, so the partition doesn't have rows just
+     * because it has more contents: the markers before its first row are read ahead, and returned before that row, or
+     * dropped with the partition if it has no rows. Otherwise a partition whose rows all fail the filter, but which has a range deletion, would be returned with its
+     * static row, although that row doesn't satisfy the filter either.
+     *
+     * @param partition a partition filtered by this filter
+     * @return the partition, or {@code null} if it has no rows
+     */
+    @Nullable
+    private static BaseRowIterator<?> withRowsOrNull(BaseRowIterator<?> partition)
+    {
+        if (partition instanceof UnfilteredRowIterator)
+        {
+            UnfilteredRowIterator unfiltered = (UnfilteredRowIterator) partition;
+            List<Unfiltered> markers = null;
+            while (unfiltered.hasNext())
+            {
+                Unfiltered next = unfiltered.next();
+                if (next.isRow() && markers == null)
+                    return new PrefixedPartition(unfiltered, Collections.singletonList(next));
+
+                if (markers == null)
+                    markers = new ArrayList<>();
+                markers.add(next);
+
+                if (next.isRow())
+                    return new PrefixedPartition(unfiltered, markers);
+            }
+        }
+        else if (partition.hasNext())
+        {
+            return partition;
+        }
+
+        partition.close();
+        return null;
+    }
+
+    /**
+     * A partition whose first contents have already been read from it.
+     */
+    private static class PrefixedPartition extends AbstractUnfilteredRowIterator
+    {
+        private final UnfilteredRowIterator partition;
+        private final Iterator<Unfiltered> prefix;
+
+        PrefixedPartition(UnfilteredRowIterator partition, List<Unfiltered> prefix)
+        {
+            super(partition.metadata(),
+                  partition.partitionKey(),
+                  partition.partitionLevelDeletion(),
+                  partition.columns(),
+                  partition.staticRow(),
+                  partition.isReverseOrder(),
+                  partition.stats());
+            this.partition = partition;
+            this.prefix = prefix.iterator();
+        }
+
+        @Override
+        protected Unfiltered computeNext()
+        {
+            if (prefix.hasNext())
+                return prefix.next();
+
+            return partition.hasNext() ? partition.next() : endOfData();
+        }
+
+        @Override
+        public void close()
+        {
+            partition.close();
+        }
     }
 
     /**
@@ -866,6 +1013,103 @@ public class RowFilter
         public int size()
         {
             return expressions.size() + children.stream().mapToInt(FilterElement::size).sum();
+        }
+
+        /**
+         * Whether a disjunction in this tree has both expressions on static or partition key columns and expressions
+         * on other columns, so that the tree can't be split into a {@link #partitionLevelTree()} and a
+         * {@link #rowLevelTree()}.
+         */
+        public boolean hasMixedDisjunction()
+        {
+            if (isDisjunction && hasExpression(true) && hasExpression(false))
+                return true;
+            for (FilterElement child : children)
+                if (child.hasMixedDisjunction())
+                    return true;
+            return false;
+        }
+
+        /**
+         * Whether this tree has any expression, at any level.
+         */
+        public boolean hasExpressions()
+        {
+            if (!expressions.isEmpty())
+                return true;
+            for (FilterElement child : children)
+                if (child.hasExpressions())
+                    return true;
+            return false;
+        }
+
+        private boolean hasExpression(boolean partitionLevel)
+        {
+            for (Expression e : expressions)
+                if ((e.column.isStatic() || e.column.isPartitionKey()) == partitionLevel)
+                    return true;
+            for (FilterElement child : children)
+                if (child.hasExpression(partitionLevel))
+                    return true;
+            return false;
+        }
+
+        /**
+         * Whether a row satisfies this tree, taking the values of static columns from the given static row.
+         */
+        public boolean isSatisfiedBy(TableMetadata table, DecoratedKey key, Row row, Row staticRow, long nowInSec)
+        {
+            return isSatisfiedByRowOrStaticRow(table, key, row, staticRow, nowInSec);
+        }
+
+        /**
+         * Whether the static row of a partition without other rows satisfies this tree, as the only row of the
+         * partition: an expression on a regular or clustering column is never satisfied, since that row has no value
+         * for them.
+         */
+        public boolean isSatisfiedByStaticRow(TableMetadata table, DecoratedKey key, Row staticRow, long nowInSec)
+        {
+            return isSatisfiedByRowOrStaticRow(table, key, null, staticRow, nowInSec);
+        }
+
+        private boolean isSatisfiedByRowOrStaticRow(TableMetadata table, DecoratedKey key, @Nullable Row row, Row staticRow, long nowInSec)
+        {
+            if (isEmpty())
+                return true;
+            if (isDisjunction)
+            {
+                for (Expression e : expressions)
+                    if (isSatisfiedByRowOrStaticRow(e, table, key, row, staticRow, nowInSec))
+                        return true;
+                for (FilterElement child : children)
+                    if (child.isSatisfiedByRowOrStaticRow(table, key, row, staticRow, nowInSec))
+                        return true;
+                return false;
+            }
+            else
+            {
+                for (Expression e : expressions)
+                    if (!isSatisfiedByRowOrStaticRow(e, table, key, row, staticRow, nowInSec))
+                        return false;
+                for (FilterElement child : children)
+                    if (!child.isSatisfiedByRowOrStaticRow(table, key, row, staticRow, nowInSec))
+                        return false;
+                return true;
+            }
+        }
+
+        private static boolean isSatisfiedByRowOrStaticRow(Expression e,
+                                                           TableMetadata table,
+                                                           DecoratedKey key,
+                                                           @Nullable Row row,
+                                                           Row staticRow,
+                                                           long nowInSec)
+        {
+            if (e.column.isStatic())
+                return e.isSatisfiedBy(table, key, staticRow, nowInSec);
+            if (e.column.isPartitionKey())
+                return e.isSatisfiedBy(table, key, row == null ? staticRow : row, nowInSec);
+            return row != null && e.isSatisfiedBy(table, key, row, nowInSec);
         }
 
         public boolean isSatisfiedBy(TableMetadata table, DecoratedKey key, Row row, long nowInSec)
