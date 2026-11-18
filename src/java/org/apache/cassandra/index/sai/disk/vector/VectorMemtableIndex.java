@@ -270,19 +270,24 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
             if (resultKeys.isEmpty())
                 return CloseableIterator.emptyIterator();
 
-            int bruteForceRows = maxBruteForceRows(rerankK, resultKeys.size(), graph.size());
+            // The size of a view of a skip list is counted by walking it, so count it once
+            int rangeSize = resultKeys.size();
+            int bruteForceRows = maxBruteForceRows(rerankK, rangeSize, graph.size());
             logger.trace("Search range covers {} rows; max brute force rows is {} for memtable index with {} nodes, rerankK {}, LIMIT {}",
-                         resultKeys.size(), bruteForceRows, graph.size(), rerankK, limit);
+                         rangeSize, bruteForceRows, graph.size(), rerankK, limit);
             Tracing.trace("Search range covers {} rows; max brute force rows is {} for memtable index with {} nodes, rerankK {}, LIMIT {}",
-                          resultKeys.size(), bruteForceRows, graph.size(), rerankK, limit);
-            if (resultKeys.size() <= bruteForceRows)
+                          rangeSize, bruteForceRows, graph.size(), rerankK, limit);
+            if (rangeSize <= bruteForceRows)
             {
+                // A copy: resultKeys is a view of primaryKeys, which writes change concurrently, and the brute
+                // force sizes its arrays from the number of keys.
+                List<PrimaryKey> keys = new ArrayList<>(resultKeys);
                 // When we have a threshold, we only need to filter the results, not order them, because it means we're
                 // evaluating a boolean predicate in the SAI pipeline that wants to collate by PK
                 if (threshold > 0)
-                    return filterByBruteForce(queryVector, threshold, resultKeys);
+                    return filterByBruteForce(queryVector, threshold, keys);
                 else
-                    return orderByBruteForce(queryVector, resultKeys);
+                    return orderByBruteForce(queryVector, keys);
             }
             else
             {
@@ -357,7 +362,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
      * @param keys the keys to filter
      * @return an iterator over the keys that pass the filter in PK order
      */
-    private CloseableIterator<PrimaryKeyWithSortKey> filterByBruteForce(VectorFloat<?> queryVector, float threshold, NavigableSet<PrimaryKey> keys)
+    private CloseableIterator<PrimaryKeyWithSortKey> filterByBruteForce(VectorFloat<?> queryVector, float threshold, Collection<PrimaryKey> keys)
     {
         columnQueryMetrics.onBruteForceNodesReranked(keys.size());
         // Keys are already ordered in ascending PK order, so just use an ArrayList to collect the results.
