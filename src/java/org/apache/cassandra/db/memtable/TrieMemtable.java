@@ -681,13 +681,14 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                 }
                 finally
                 {
-                    indexer.commit();
                     updateMinTimestamp(update.stats().minTimestamp);
                     updateLiveDataSize(updater.dataSize);
                     updateCurrentOperations(update.operationCount());
 
                     columns = columns.mergeTo(update.columns());
                     stats = stats.mergeWith(update.stats());
+                    // last, so that a failure in Indexer#finish doesn't skip the updates above
+                    indexer.commit();
                 }
             }
             finally
