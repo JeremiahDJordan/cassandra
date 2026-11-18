@@ -97,19 +97,36 @@ public class FilterTree
 
     public boolean isSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
     {
+        return isSatisfiedBy(key, currentCluster, staticRow, false);
+    }
+
+    /**
+     * Whether the static row of a partition without other matching rows satisfies this tree, as the only row of the
+     * partition: an expression on a regular or clustering column is never satisfied, since that row has no value for
+     * them, as in {@link org.apache.cassandra.db.filter.RowFilter.FilterElement#isSatisfiedByStaticRow}. Evaluated on
+     * the static row, a negation on such a column, like {@code v != 2}, would be satisfied by the missing value, and the
+     * partition would be returned for its static row although none of its rows matches.
+     */
+    public boolean isSatisfiedByStaticRow(DecoratedKey key, Row staticRow)
+    {
+        return isSatisfiedBy(key, staticRow, staticRow, true);
+    }
+
+    private boolean isSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow, boolean staticRowOnly)
+    {
         OperationType localOperator = localOperator();
 
         if (localOperator == OperationType.AND && !isStrict && unindexedMutableTerms() > 1)
-            return isSatisfiedByIsolatingUnindexed(key, currentCluster, staticRow);
+            return isSatisfiedByIsolatingUnindexed(key, currentCluster, staticRow, staticRowOnly);
 
-        boolean result = localSatisfiedBy(key, currentCluster, staticRow, localOperator);
+        boolean result = localSatisfiedBy(key, currentCluster, staticRow, localOperator, staticRowOnly);
 
         if (shouldReturnNow(localOperator, result))
             return result;
 
         for (FilterTree child : children)
         {
-            result = localOperator.apply(result, child.isSatisfiedBy(key, currentCluster, staticRow));
+            result = localOperator.apply(result, child.isSatisfiedBy(key, currentCluster, staticRow, staticRowOnly));
             if (shouldReturnNow(localOperator, result))
                 return result;
         }
@@ -126,7 +143,7 @@ public class FilterTree
         return isStrict || !context.hasUnrepairedMatches() ? op : OperationType.OR;
     }
 
-    private boolean localSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow, OperationType localOperator)
+    private boolean localSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow, OperationType localOperator, boolean staticRowOnly)
     {
         if (currentCluster == null || !currentCluster.isRow())
             return false;
@@ -150,7 +167,7 @@ public class FilterTree
             while(filterIterator.hasPrevious())
             {
                 Expression filter = filterIterator.previous();
-                result = localOperator.apply(result, isSatisfiedBy(key, row, column, filter, now));
+                result = localOperator.apply(result, !neverSatisfied(column, staticRowOnly) && isSatisfiedBy(key, row, column, filter, now));
 
                 if (shouldReturnNow(localOperator, result))
                     return result;
@@ -166,7 +183,7 @@ public class FilterTree
      * unindexed mutable columns might have been updated on different replicas, so the expressions on those columns,
      * and the nested operations restricting those columns, are unioned (CASSANDRA-20189).
      */
-    private boolean isSatisfiedByIsolatingUnindexed(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
+    private boolean isSatisfiedByIsolatingUnindexed(DecoratedKey key, Unfiltered currentCluster, Row staticRow, boolean staticRowOnly)
     {
         if (currentCluster == null || !currentCluster.isRow())
             return false;
@@ -188,7 +205,8 @@ public class FilterTree
             ListIterator<Expression> filterIterator = filters.listIterator(filters.size());
             while (filterIterator.hasPrevious())
             {
-                boolean matches = isSatisfiedBy(key, row, column, filterIterator.previous(), now);
+                Expression filter = filterIterator.previous();
+                boolean matches = !neverSatisfied(column, staticRowOnly) && isSatisfiedBy(key, row, column, filter, now);
                 if (isUnindexed)
                 {
                     unindexedResult = matches;
@@ -206,12 +224,12 @@ public class FilterTree
         {
             if (!child.restrictsUnindexedMutableColumns())
             {
-                if (!child.isSatisfiedBy(key, currentCluster, staticRow))
+                if (!child.isSatisfiedBy(key, currentCluster, staticRow, staticRowOnly))
                     return false;
             }
             else if (!unindexedResult)
             {
-                unindexedResult = child.isSatisfiedBy(key, currentCluster, staticRow);
+                unindexedResult = child.isSatisfiedBy(key, currentCluster, staticRow, staticRowOnly);
             }
         }
 
@@ -247,6 +265,11 @@ public class FilterTree
     private boolean restrictsUnindexedMutableColumns()
     {
         return unindexedMutableTerms() > 0;
+    }
+
+    private static boolean neverSatisfied(ColumnMetadata column, boolean staticRowOnly)
+    {
+        return staticRowOnly && (column.kind == Kind.REGULAR || column.kind == Kind.CLUSTERING);
     }
 
     private static boolean isSatisfiedBy(DecoratedKey key, Row row, ColumnMetadata column, Expression filter, long now)

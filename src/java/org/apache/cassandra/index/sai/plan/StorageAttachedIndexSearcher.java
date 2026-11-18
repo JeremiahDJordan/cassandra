@@ -930,7 +930,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                     }
                     // If no row is live, only the static row can be returned, if it satisfies the filter on its own.
                     // A deleted row can satisfy a clustering restriction, but the partition doesn't match then.
-                    if (rows.isEmpty() && !filterTree.isSatisfiedBy(partition.partitionKey(), staticRow, staticRow))
+                    if (rows.isEmpty() && !filterTree.isSatisfiedByStaticRow(partition.partitionKey(), staticRow))
                         return null;
                     return new PrimaryKeyIterator(partition, staticRow, rows, validStaticKey, syntheticScoreColumn, controller.getOrderer());
                 }
@@ -1125,7 +1125,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
         public boolean matchesStaticRow()
         {
-            return filter.isSatisfiedBy(key, staticRow, staticRow);
+            return filter.isSatisfiedByStaticRow(key, staticRow);
         }
 
         @Override

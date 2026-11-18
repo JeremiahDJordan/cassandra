@@ -34,6 +34,8 @@ import static org.junit.Assert.assertTrue;
  * matches of the index (see IndexContext#canSubtractMatches), so the index returns every key and the filter decides.
  * Every key must include the partitions that only have a static row, which an expression on a static column matches as
  * a whole. Each query is checked against the same query filtered without indexes.
+ * A partition with rows matches through its static row alone only if no row-level restriction applies: when its rows
+ * fail them, it isn't returned, by the replica either.
  */
 public class StaticCollectionNegationTest extends SAITester.Versioned
 {
@@ -68,6 +70,11 @@ public class StaticCollectionNegationTest extends SAITester.Versioned
         "ck = 2 AND ss NOT CONTAINS 1",
         "ck <= 2 AND ss NOT CONTAINS 1",
         "ck = 2 AND sk NOT CONTAINS KEY 1",
+        // a partition whose static row matches but whose rows don't is no match, however the rows fail
+        "ss NOT CONTAINS 1 AND (r NOT CONTAINS 2 OR v != 2)",
+        "st = 0 AND (r NOT CONTAINS 2 OR v != 2)",
+        "st = 0 AND v != 2",
+        "ss NOT CONTAINS 1 AND r NOT CONTAINS 2",
     };
 
     private static final String[] LIMITS = { "", " LIMIT 3", " LIMIT 10", " PER PARTITION LIMIT 2",
@@ -130,6 +137,9 @@ public class StaticCollectionNegationTest extends SAITester.Versioned
             execute("INSERT INTO %s (pk, ck, v, r) VALUES (10, ?, ?, ?)", ck, ck % 3, set(ck % 3));
         }
         execute("INSERT INTO %s (pk, st, ss, sl, sk, sv, se) VALUES (9, 0, {2}, [2], {2: 2}, {2: 2}, {2: 2})");
+        // 11: a row holding 2 everywhere, and a static row
+        execute("INSERT INTO %s (pk, ck, v, r) VALUES (11, 1, 2, {2})");
+        execute("INSERT INTO %s (pk, st, ss, sl, sk, sv, se) VALUES (11, 0, {2}, [2], {2: 2}, {2: 2}, {2: 2})");
     }
 
     private void writeSecond()
