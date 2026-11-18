@@ -19,6 +19,7 @@ package org.apache.cassandra.index.sai.cql;
 import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.assertj.core.api.Assertions;
@@ -67,14 +68,23 @@ public class LargePartitionsTest extends SAITester.Versioned
             Assertions.assertThat(execute("SELECT * FROM %s WHERE t = 't_1'").size()).isEqualTo(numExpectedRows);
             Assertions.assertThat(execute("SELECT * FROM %s WHERE a = 'a_1'").size()).isEqualTo(numExpectedRows);
 
-            // the generic ORDER BY
-            if (version.after(Version.AA))
+            // the generic ORDER BY, which needs row-aware indexes on tables with clustering columns
+            if (version.onOrAfter(Version.ROW_AWARE_EARLIEST))
             {
                 Assertions.assertThat(execute("SELECT * FROM %s WHERE k = 2 ORDER BY n LIMIT " + LARGE_PARTITION_SIZE).size()).isEqualTo(LARGE_PARTITION_SIZE);
                 Assertions.assertThat(execute("SELECT * FROM %s WHERE k = 2 ORDER BY t LIMIT " + LARGE_PARTITION_SIZE).size()).isEqualTo(LARGE_PARTITION_SIZE);
 
                 Assertions.assertThat(execute("SELECT * FROM %s ORDER BY n LIMIT " + LARGE_PARTITION_SIZE).size()).isEqualTo(LARGE_PARTITION_SIZE);
                 Assertions.assertThat(execute("SELECT * FROM %s ORDER BY t LIMIT " + LARGE_PARTITION_SIZE).size()).isEqualTo(LARGE_PARTITION_SIZE);
+            }
+            else
+            {
+                Assertions.assertThatThrownBy(() -> execute("SELECT * FROM %s WHERE k = 2 ORDER BY n LIMIT " + LARGE_PARTITION_SIZE))
+                          .isInstanceOf(InvalidRequestException.class)
+                          .hasMessageContaining("Those versions index partitions rather than rows");
+                Assertions.assertThatThrownBy(() -> execute("SELECT * FROM %s ORDER BY t LIMIT " + LARGE_PARTITION_SIZE))
+                          .isInstanceOf(InvalidRequestException.class)
+                          .hasMessageContaining("Those versions index partitions rather than rows");
             }
 
             // test ANN

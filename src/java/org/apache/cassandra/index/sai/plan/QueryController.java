@@ -116,6 +116,11 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     public static final String INDEX_MAY_HAVE_BEEN_DROPPED = "An index may have been dropped. " +
                                                              StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE;
     public static final String INDEX_VERSION_DOES_NOT_SUPPORT_BM25 = "%s does not support BM25 scoring until it is rebuilt";
+    public static final String INDEX_VERSION_DOES_NOT_SUPPORT_ORDERING_ROWS =
+    "Ordering with index %s isn't supported on table %s, which has clustering columns, because the query uses " +
+    "indexes with an on-disk format version older than %s. Those versions index partitions rather than rows. " +
+    "The on-disk format version can be set via the -D%s system property, and the indexes on the sstables can be " +
+    "upgraded via nodetool upgradesstables.";
     private static final Logger logger = LoggerFactory.getLogger(QueryController.class);
 
     private final ColumnFamilyStore cfs;
@@ -693,10 +698,41 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             throw new FeatureNeedsIndexRebuildException(String.format(INDEX_VERSION_DOES_NOT_SUPPORT_BM25,
                                                                       orderer.context.getIndexName()));
         }
+        validateOrderingSupported();
 
         MemtableSearcher memtableSearcher = index -> index.orderBy(queryContext, orderer, predicate, mergeRange, softLimit);
         SSTableSearcher ssTableSearcher = (index, totalRows) -> index.orderBy(orderer, predicate, mergeRange, queryContext, softLimit, totalRows);
         return searchTopKRows(memtableSearcher, ssTableSearcher);
+    }
+
+    /**
+     * Indexes that aren't row-aware (on-disk format version {@link Version#AA}) only have partition keys, so in a
+     * table with clustering columns they can't say which row of a partition has each value: reject ordering with
+     * them, as for BM25 on versions that don't support it. A single such index (or sstable) among those of the query
+     * is enough.
+     */
+    private void validateOrderingSupported()
+    {
+        if (!isOrderingSupported(indexFeatureSet, cfs.metadata()))
+            throw new FeatureNeedsIndexRebuildException(orderingNotSupportedMessage(orderer, cfs.metadata()));
+    }
+
+    /**
+     * @return whether queries using indexes with the given features can be ordered by an index on the given table
+     * @see #validateOrderingSupported()
+     */
+    static boolean isOrderingSupported(IndexFeatureSet indexFeatureSet, TableMetadata table)
+    {
+        return indexFeatureSet.isRowAware() || !table.hasClustering();
+    }
+
+    static String orderingNotSupportedMessage(Orderer orderer, TableMetadata table)
+    {
+        return String.format(INDEX_VERSION_DOES_NOT_SUPPORT_ORDERING_ROWS,
+                             orderer.context.getIndexName(),
+                             table,
+                             Version.ROW_AWARE_EARLIEST,
+                             CassandraRelevantProperties.SAI_CURRENT_VERSION.getKey());
     }
 
     /**
@@ -706,6 +742,9 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     {
         try
         {
+            // Checked before reading the keys, so the rejection doesn't depend on whether the other indexes match
+            validateOrderingSupported();
+
             var primaryKeys = materializeKeys(source);
             if (primaryKeys.isEmpty())
             {

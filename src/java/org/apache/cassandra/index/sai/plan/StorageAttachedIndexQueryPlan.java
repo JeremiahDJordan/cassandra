@@ -34,6 +34,7 @@ import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexFeatureSet;
@@ -251,6 +252,27 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
     public boolean isTopK()
     {
         return orderer != null;
+    }
+
+    /**
+     * Validates the command against the indexes, and rejects ordering by an index on a table with clustering columns
+     * if any of the indexes used by the query isn't row-aware, as the replicas would do (see
+     * {@link QueryController#isOrderingSupported}). This only sees the indexes of this node, so replicas check it too.
+     * <p>
+     * If an index isn't queryable (for example a vector index that couldn't be built with the current version), the
+     * replicas report that instead, so we don't check it here.
+     */
+    @Override
+    public void validate(ReadCommand command) throws InvalidRequestException
+    {
+        Index.QueryPlan.super.validate(command);
+
+        if (orderer != null
+            && !QueryController.isOrderingSupported(indexFeatureSet, cfs.metadata())
+            && indexes.stream().allMatch(cfs.indexManager::isIndexQueryable))
+        {
+            throw new InvalidRequestException(QueryController.orderingNotSupportedMessage(orderer, cfs.metadata()));
+        }
     }
 
     @Override
