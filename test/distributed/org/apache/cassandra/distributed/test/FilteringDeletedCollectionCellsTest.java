@@ -78,7 +78,12 @@ public class FilteringDeletedCollectionCellsTest extends TestBaseImpl
                                       "ss CONTAINS ''", "ss CONTAINS 'a'", "ss CONTAINS 'x'",
                                       "sm CONTAINS KEY 'k'", "sm CONTAINS KEY 'o'", "sm CONTAINS ''", "sm CONTAINS 'v'",
                                       "sm['k'] = ''", "sm['k'] = 'v'", "s = ''", "s = 'a'",
-                                      "sl CONTAINS '' AND v = 1", "sm CONTAINS KEY 'k' AND v = 1" };
+                                      "sl CONTAINS '' AND v = 1", "sm CONTAINS KEY 'k' AND v = 1",
+                                      // negations
+                                      "sl NOT CONTAINS ''", "sl NOT CONTAINS 'b'", "ss NOT CONTAINS ''", "ss NOT CONTAINS 'x'",
+                                      "sm NOT CONTAINS KEY 'k'", "sm NOT CONTAINS ''", "sm['k'] != ''", "sm['k'] != 'v'",
+                                      "sm['k'] < 'w'", "s != 'a'", "sl NOT CONTAINS '' AND sm NOT CONTAINS KEY 'k'",
+                                      "sl NOT CONTAINS '' AND v = 1" };
             StringBuilder in = new StringBuilder("pk IN (0");
             for (int pk = 1; pk < PARTITIONS; pk++)
                 in.append(", ").append(pk);

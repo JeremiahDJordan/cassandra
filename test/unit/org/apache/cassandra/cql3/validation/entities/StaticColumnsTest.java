@@ -338,13 +338,16 @@ public class StaticColumnsTest extends CQLTester
         }
         Thread.sleep(2000); // let the TTLs expire
 
-        String[] restrictions = { "sl CONTAINS ''", "sl CONTAINS 'a'", "sl CONTAINS 'x'",
-                                  "ss CONTAINS ''", "ss CONTAINS 'a'", "ss CONTAINS 'x'",
-                                  "sm CONTAINS KEY 'k'", "sm CONTAINS KEY 'o'", "sm CONTAINS ''", "sm CONTAINS 'v'",
-                                  "sm['k'] = ''", "sm['k'] = 'v'", "s = ''", "s = 'a'",
+        String[] restrictions = { "sl CONTAINS ''", "sl CONTAINS 'a'", "sl CONTAINS 'x'", "sl NOT CONTAINS ''", "sl NOT CONTAINS 'b'",
+                                  "ss CONTAINS ''", "ss CONTAINS 'a'", "ss CONTAINS 'x'", "ss NOT CONTAINS ''", "ss NOT CONTAINS 'x'",
+                                  "sm CONTAINS KEY 'k'", "sm CONTAINS KEY 'o'", "sm NOT CONTAINS KEY 'k'",
+                                  "sm CONTAINS ''", "sm CONTAINS 'v'", "sm NOT CONTAINS ''",
+                                  "sm['k'] = ''", "sm['k'] = 'v'", "sm['k'] != ''", "sm['k'] != 'v'", "sm['k'] < 'w'",
+                                  "s = ''", "s = 'a'", "s != 'a'",
                                   "sl CONTAINS '' AND sm CONTAINS KEY 'k'",
+                                  "sl NOT CONTAINS '' AND sm NOT CONTAINS KEY 'k'",
                                   // static and regular restrictions together
-                                  "sl CONTAINS '' AND v = 1", "sm CONTAINS KEY 'k' AND v = 1" };
+                                  "sl CONTAINS '' AND v = 1", "sl NOT CONTAINS '' AND v = 1", "sm CONTAINS KEY 'k' AND v = 1" };
         for (int phase = 0; phase < 3; phase++)
         {
             if (phase == 1)
@@ -368,6 +371,8 @@ public class StaticColumnsTest extends CQLTester
             // the deleted and expired elements and entries don't count
             assertRowsIgnoringOrder(execute(String.format("SELECT pk FROM %s.%s WHERE sl CONTAINS '' ALLOW FILTERING", KEYSPACE, st)),
                                     row(6));
+            assertRowsIgnoringOrder(execute(String.format("SELECT pk FROM %s.%s WHERE sl NOT CONTAINS '' ALLOW FILTERING", KEYSPACE, st)),
+                                    row(0), row(1), row(2), row(3), row(4), row(5), row(7), row(8), row(9));
             assertEmpty(execute(String.format("SELECT pk FROM %s.%s WHERE ss CONTAINS 'x' ALLOW FILTERING", KEYSPACE, st)));
             assertRowsIgnoringOrder(execute(String.format("SELECT pk FROM %s.%s WHERE sm CONTAINS KEY 'k' ALLOW FILTERING", KEYSPACE, st)),
                                     row(6), row(7));
