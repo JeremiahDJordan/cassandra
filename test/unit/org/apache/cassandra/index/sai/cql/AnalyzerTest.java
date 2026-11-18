@@ -195,4 +195,29 @@ public class AnalyzerTest extends SAITester
             });
         }
     }
+
+    /**
+     * An element of which the analyzer makes no term, such as an empty string, holds no value, so it doesn't make a
+     * row fail {@code NOT CONTAINS}.
+     */
+    @Test
+    public void testNotContainsWithElementWithoutTerms() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v list<text>, m map<int, text>, x int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        createIndex("CREATE CUSTOM INDEX ON %s(values(m)) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        execute("INSERT INTO %s (k, v, m) VALUES (1, ['bach'], {1: 'bach'})");
+        execute("INSERT INTO %s (k, v, m) VALUES (2, ['', 'bach'], {1: '', 2: 'bach'})");
+        execute("INSERT INTO %s (k, v, m) VALUES (3, [''], {1: ''})");
+        execute("INSERT INTO %s (k, v, m) VALUES (4, ['!!', 'mozart'], {1: '!!', 2: 'mozart'})");
+        execute("INSERT INTO %s (k, x) VALUES (5, 0)");
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v NOT CONTAINS 'mozart'"), row(1), row(2), row(3), row(5));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE m NOT CONTAINS 'mozart'"), row(1), row(2), row(3), row(5));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v NOT CONTAINS 'bach'"), row(3), row(4), row(5));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v CONTAINS 'bach'"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v CONTAINS 'mozart'"), row(4));
+        });
+    }
 }
