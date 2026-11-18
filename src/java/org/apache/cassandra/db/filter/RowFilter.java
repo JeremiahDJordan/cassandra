@@ -1337,6 +1337,10 @@ public class RowFilter
                         {
                             List<ByteBuffer> elementTokens = analyzer.indexedTokens(elementValue);
                             List<ByteBuffer> queriedTokens = analyzer.queriedTokens();
+                            // A value the analyzer makes no terms of (such as '' for a tokenizing analyzer) is held by
+                            // no element, as the index finds no term for it, rather than by all of them
+                            if (queriedTokens.isEmpty())
+                                return false;
                             if (Operator.ANALYZER_MATCHES.isSatisfiedByAnalyzed(elementType, elementTokens, queriedTokens))
                                 return true;
                         }
@@ -1375,6 +1379,9 @@ public class RowFilter
                         ByteBuffer elementValue = cell.path().get(0);
                         List<ByteBuffer> elementTokens = analyzer.indexedTokens(elementValue);
                         List<ByteBuffer> queriedTokens = analyzer.queriedTokens();
+                        // As in contains(): a value of no terms is no key's
+                        if (queriedTokens.isEmpty())
+                            return false;
                         if (Operator.ANALYZER_MATCHES.isSatisfiedByAnalyzed(elementType, elementTokens, queriedTokens))
                             return true;
                     }

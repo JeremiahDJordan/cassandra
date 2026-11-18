@@ -173,4 +173,26 @@ public class AnalyzerTest extends SAITester
             assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v NOT CONTAINS KEY 'johann' ALLOW FILTERING"), row(2), row(3));
         });
     }
+
+    /**
+     * A tokenizing analyzer makes no term of '': no element holds it.
+     */
+    @Test
+    public void testContainsValueWithoutTerms() throws Throwable
+    {
+        for (String[] column : new String[][]{ { "list<text>", "v", "CONTAINS", "['Johann Strauss']" },
+                                               { "set<text>", "v", "CONTAINS", "{'Johann Strauss'}" },
+                                               { "map<int, text>", "VALUES(v)", "CONTAINS", "{1: 'Johann Strauss'}" },
+                                               { "map<text, int>", "KEYS(v)", "CONTAINS KEY", "{'Johann Strauss': 1}" } })
+        {
+            createTable("CREATE TABLE %s (k int PRIMARY KEY, v " + column[0] + ", x int)");
+            createIndex("CREATE CUSTOM INDEX ON %s(" + column[1] + ") USING 'StorageAttachedIndex' WITH OPTIONS = { 'index_analyzer': 'standard' }");
+            execute("INSERT INTO %s (k, v) VALUES (1, " + column[3] + ')');
+            execute("INSERT INTO %s (k, x) VALUES (2, 0)");
+            beforeAndAfterFlush(() -> {
+                assertEmpty(execute("SELECT k FROM %s WHERE v " + column[2] + " ''"));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v NOT " + column[2] + " ''"), row(1), row(2));
+            });
+        }
+    }
 }
