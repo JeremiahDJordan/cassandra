@@ -77,6 +77,7 @@ import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 
 public class TrieMemoryIndex extends MemoryIndex
@@ -501,8 +502,9 @@ public class TrieMemoryIndex extends MemoryIndex
         }
         else
         {
-            lowerBound = ByteComparable.EMPTY;
-            lowerInclusive = false;
+            // Unbounded: include the empty term (the root of the trie), which literal indexes index
+            lowerBound = null;
+            lowerInclusive = true;
         }
 
         if (expression.upper != null)
@@ -516,7 +518,25 @@ public class TrieMemoryIndex extends MemoryIndex
             upperInclusive = false;
         }
 
+        // Nothing sorts before the empty term: a range ending before it, such as the "less than" half of
+        // c != '', is empty, and slicing the trie with it would give the slice an end before its start.
+        if (isBeforeEmptyTerm(upperBound, upperInclusive))
+            return Trie.empty(TypeUtil.byteComparableVersionForTermsData(indexContext.version()));
+
         return data.subtrie(lowerBound, lowerInclusive, upperBound, upperInclusive);
+    }
+
+    /**
+     * @return whether the given upper bound excludes every term, which is the case of the empty term as an exclusive
+     * upper bound
+     */
+    private boolean isBeforeEmptyTerm(@Nullable ByteComparable upperBound, boolean upperInclusive)
+    {
+        if (upperBound == null || upperInclusive)
+            return false;
+        // The empty value of a non-literal type has no byte-comparable representation (a null source)
+        ByteSource bytes = upperBound.asComparableBytes(TypeUtil.byteComparableVersionForTermsData(indexContext.version()));
+        return bytes == null || bytes.next() == ByteSource.END_OF_STREAM;
     }
 
     public ByteBuffer getMinTerm()
