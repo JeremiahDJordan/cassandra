@@ -27,6 +27,7 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
@@ -740,20 +741,16 @@ public class LuceneAnalyzerTest extends SAITester
                     "\"filters\":[{\"name\":\"lowercase\"}]}'}");
         String query = "INSERT INTO %s (id, val) VALUES (0, 'abcdedfghijklmnopqrstuvwxyz abcdedfghijklmnopqrstuvwxyz')";
 
-        boolean validate = CassandraRelevantProperties.SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.getBoolean();
-        try
+        // WithProperties restores the previous value on close, including no value at all, which applies the guardrail
+        try (WithProperties properties = new WithProperties())
         {
-            CassandraRelevantProperties.SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.setBoolean(false);
+            properties.set(CassandraRelevantProperties.SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR, false);
             execute(query);
 
-            CassandraRelevantProperties.SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.setBoolean(true);
+            properties.set(CassandraRelevantProperties.SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR, true);
             assertThatThrownBy(() -> execute(query))
                     .hasMessage("Term's analyzed size for column val exceeds the cumulative limit for index. Max allowed size 8.000KiB.")
                     .isInstanceOf(InvalidRequestException.class);
-        }
-        finally
-        {
-            CassandraRelevantProperties.SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.setBoolean(validate);
         }
     }
 
