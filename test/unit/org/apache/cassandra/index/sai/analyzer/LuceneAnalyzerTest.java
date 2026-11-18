@@ -39,10 +39,13 @@ import org.junit.Test;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
+import org.apache.cassandra.utils.ClassLoadingTestSupport;
 import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
 import org.apache.lucene.analysis.en.EnglishAnalyzer;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -221,6 +224,17 @@ public class LuceneAnalyzerTest
                       "\"filters\":[{\"name\":\"synonym\", \"args\": " +
                       "{\"synonyms\": \"as => like\", \"analyzer\":\"not-a-class\"}}]}";
         tokenize("irrelevant text", json);
+    }
+
+    @Test
+    public void testAnalyzerClassNotInitializedBeforeTypeCheck()
+    {
+        ClassLoadingTestSupport.assertNotInitialized(ClassLoadingTestNonAssignable.class);
+        String json = "{\"tokenizer\":{\"name\" : \"keyword\"}," +
+                      "\"filters\":[{\"name\":\"synonym\", \"args\": " +
+                      "{\"synonyms\": \"as => like\", \"analyzer\":\"" + ClassLoadingTestNonAssignable.class.getName() + "\"}}]}";
+        assertThatThrownBy(() -> tokenize("irrelevant text", json)).isInstanceOf(RuntimeException.class);
+        assertFalse(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class));
     }
 
     public static List<String> tokenize(String testString, String json) throws Exception

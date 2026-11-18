@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.lucene.util.ResourceLoader;
 
 /**
@@ -44,7 +45,7 @@ public class ArgsStringLoader implements ResourceLoader
     @Override
     public <T> Class<? extends T> findClass(String cname, Class<T> expectedType) {
         try {
-            return Class.forName(cname).asSubclass(expectedType);
+            return FBUtilities.classForNameWithoutInitialization(cname, "analyzer component", expectedType);
         } catch (Exception e) {
             throw new RuntimeException("Cannot load class: " + cname, e);
         }

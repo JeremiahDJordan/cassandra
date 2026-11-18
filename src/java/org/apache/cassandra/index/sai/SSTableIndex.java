@@ -36,6 +36,7 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.virtual.SimpleDataSet;
 import org.apache.cassandra.dht.AbstractBounds;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.index.sai.disk.EmptyIndex;
 import org.apache.cassandra.index.sai.disk.PrimaryKeyMapIterator;
 import org.apache.cassandra.index.sai.disk.SearchableIndex;
@@ -58,6 +59,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.CloseableIterator;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
 
 /**
@@ -408,9 +410,10 @@ public class SSTableIndex implements Comparable<SSTableIndex>
         // the files of the dropped index.
         try
         {
-            return StorageAttachedIndex.class.isAssignableFrom(Class.forName(className));
+            FBUtilities.classForNameWithoutInitialization(className, "Index", StorageAttachedIndex.class);
+            return true;
         }
-        catch (ClassNotFoundException | LinkageError e)
+        catch (ConfigurationException | LinkageError e)
         {
             return false;
         }
