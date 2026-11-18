@@ -316,20 +316,26 @@ public class RowAwarePrimaryKeyMap implements PrimaryKeyMap
         }
     }
 
-    // Look for token collision by if the ajacent token in the token array matches the
-    // current token. If we find a collision we need to compare the partition key instead.
+    /**
+     * Finds the key among the rows with its token, which are in the order of their partition keys: distinct partition
+     * keys can share a token.
+     *
+     * @param rowId the first row with the token of the key
+     * @return the row of the key, or the inverted row of the next greater key, or {@link Long#MIN_VALUE} if there is
+     * no greater key
+     */
     protected long tokenCollisionDetection(PrimaryKey primaryKey, long rowId)
     {
-        // Look for collisions while we haven't reached the end of the tokens and the tokens don't collide
-        while (rowId + 1 < rowIdToToken.length() && primaryKey.token().getLongValue() == rowIdToToken.get(rowId + 1))
+        long token = primaryKey.token().getLongValue();
+        while (rowId < rowIdToToken.length() && rowIdToToken.get(rowId) == token)
         {
-            // If we had a collision then see if the partition key for this row is >= to the lookup partition key
-            if (primaryKeyFromRowId(rowId).compareTo(primaryKey) >= 0)
+            int cmp = primaryKeyFromRowId(rowId).compareTo(primaryKey);
+            if (cmp == 0)
                 return rowId;
-
+            if (cmp > 0)
+                return ~rowId;
             rowId++;
         }
-        // Note: We would normally expect to get here without going into the while loop
-        return rowId;
+        return rowId < rowIdToToken.length() ? ~rowId : Long.MIN_VALUE;
     }
 }
