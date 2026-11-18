@@ -299,9 +299,16 @@ public class IndexContext
 
         long start = nanoTime();
 
+        // Use 0 for nowInSecs, as update() does for the old row, so that the index holds the values of all the cells of
+        // the memtable that aren't tombstones, expired or not. A cell can be expired when it gets here: a hint, a
+        // replayed or delayed write of a TTL'd value, or a TTL of a second when the second ticks. Skipping it would
+        // leave the index without a value that a later update hands back as the old value: an update that writes the
+        // same value again would see no change and leave the row unindexed, and one that removes the old value would
+        // remove an occurrence that was never added. An expired value in the index only costs a candidate that
+        // post-filtering rejects, the same as a value that expires after it was indexed.
         if (isNonFrozenCollection())
         {
-            Iterator<ByteBuffer> bufferIterator = getValuesOf(row, FBUtilities.nowInSeconds());
+            Iterator<ByteBuffer> bufferIterator = getValuesOf(row, 0);
             if (bufferIterator != null)
             {
                 while (bufferIterator.hasNext())
@@ -313,7 +320,7 @@ public class IndexContext
         }
         else
         {
-            ByteBuffer value = getValueOf(key, row, FBUtilities.nowInSeconds());
+            ByteBuffer value = getValueOf(key, row, 0);
             target.index(key, row.clustering(), value, mt, opGroup);
         }
         indexMetrics.flatMap(metrics -> metrics.memtableIndexWriteLatency).ifPresent(timer ->
@@ -439,17 +446,17 @@ public class IndexContext
         // Use 0 for nowInSecs to get the value(s) from the oldRow regardless of its liveness status. To get to this point,
         // C* has already determined this is the current represntation of the oldRow in the memtable, and that means
         // we need to add the newValue to the index and remove the oldValue from it, even if it has already expired via
-        // TTL.
+        // TTL. The new values are read the same way, for the reason given in index().
         if (isNonFrozenCollection())
         {
             Iterator<ByteBuffer> oldValues = getValuesOf(oldRow, 0);
-            Iterator<ByteBuffer> newValues = getValuesOf(newRow, FBUtilities.nowInSeconds());
+            Iterator<ByteBuffer> newValues = getValuesOf(newRow, 0);
             target.update(key, oldRow.clustering(), oldValues, newValues, memtable, opGroup);
         }
         else
         {
             ByteBuffer oldValue = getValueOf(key, oldRow, 0);
-            ByteBuffer newValue = getValueOf(key, newRow, FBUtilities.nowInSeconds());
+            ByteBuffer newValue = getValueOf(key, newRow, 0);
             target.update(key, oldRow.clustering(), oldValue, newValue, memtable, opGroup);
         }
     }
