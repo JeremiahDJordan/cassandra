@@ -41,9 +41,8 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 
 /**
- * Several writers write the same new keys at the same time, each with its own vector. On a skip-list memtable the
- * index callbacks run inside the CAS loop of AtomicBTreePartition, so the vector memtable index can end up with a key
- * under the vectors of several writers; the flush must keep each row under the vector the row has.
+ * Several writers write the same new keys at the same time, each with its own vector. Each key must end up under the
+ * vector its row has, in the memtable index and after the flush.
  */
 public class VectorConcurrentFirstWritesTest extends SAITester
 {
@@ -96,8 +95,7 @@ public class VectorConcurrentFirstWritesTest extends SAITester
             thread.join();
         assertNull(failure.get());
 
-        // In the memtable index the key of each row must be under the vector of the row (it can also be under the
-        // vectors of the other writers, which the flush resolves).
+        // In the memtable index the key of each row must be under the vector of the row.
         IndexContext context = getIndexContext(index);
         Memtable current = getCurrentColumnFamilyStore().getCurrentMemtable();
         CassandraOnHeapGraph<PrimaryKey> graph = ((VectorMemtableIndex) context.getLiveMemtables().get(current)).getGraph();
@@ -116,6 +114,9 @@ public class VectorConcurrentFirstWritesTest extends SAITester
                 underSeveralVectors++;
         }
         assertEquals("rows whose key is not under their vector in the memtable index", 0, notUnderItsVector);
+        // Every memtable delivers SAI the index events of the updates it applied only, in order (the skip-list
+        // memtables apply SAI's updates atomically on request), so the key is under no other vector.
+        assertEquals("rows whose key is under several vectors in the memtable index", 0, underSeveralVectors);
         long conflictsBefore = context.getIndexMetrics().get().memtableIndexFlushVectorRowIdConflicts.getCount();
 
         // After the flush, each row must be among the nearest rows of its own vector. A row indexed under the vector

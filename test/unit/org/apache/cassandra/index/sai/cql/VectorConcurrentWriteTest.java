@@ -24,21 +24,18 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import org.junit.After;
 import org.junit.Test;
 
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
-import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
@@ -46,224 +43,17 @@ import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.index.sai.disk.vector.VectorPostings;
 import org.apache.cassandra.index.sai.memory.MemtableIndex;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
-import org.apache.cassandra.inject.ActionBuilder;
-import org.apache.cassandra.inject.Expression;
-import org.apache.cassandra.inject.Injection;
-import org.apache.cassandra.inject.Injections;
-import org.apache.cassandra.inject.InvokePointBuilder;
 
-import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
 
 /**
- * Concurrent writes of the same row into a {@code SkipListMemtable}, whose partitions retry the merge of a write until
- * it is the one that publishes the partition, must leave the memtable vector index with the vector the row ends up
- * with, and only that one.
+ * Concurrent writes of the same row into a {@code SkipListMemtable} must leave the memtable vector index with the
+ * vector the row ends up with, and only that one.
  */
 public class VectorConcurrentWriteTest extends SAITester
 {
     private static final String CREATE_TABLE = "CREATE TABLE %s (pk int PRIMARY KEY, v vector<float, 2>) WITH memtable = 'skiplist'";
     private static final String CREATE_INDEX = "CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}";
-
-    // the table of the race, the write held before its first attempt to publish its merge, and how many attempts it made
-    private static volatile String raceTable;
-    private static volatile Thread heldWriter;
-    private static volatile CountDownLatch holdReached;
-    private static volatile CountDownLatch release;
-    private static final AtomicInteger heldWriterAttempts = new AtomicInteger();
-
-    /**
-     * Called by the injected rule before each attempt of a write to publish its merge of a partition.
-     */
-    public static void beforePublish(PartitionUpdate update)
-    {
-        if (!update.metadata().name.equals(raceTable))
-            return;
-
-        if (heldWriter == null)
-        {
-            heldWriter = Thread.currentThread();
-            heldWriterAttempts.incrementAndGet();
-            holdReached.countDown();
-            try
-            {
-                release.await(1, TimeUnit.MINUTES);
-            }
-            catch (InterruptedException e)
-            {
-                throw new RuntimeException(e);
-            }
-        }
-        else if (Thread.currentThread() == heldWriter)
-        {
-            heldWriterAttempts.incrementAndGet();
-        }
-    }
-
-    @After
-    public void removeInjections()
-    {
-        Injections.deleteAll();
-    }
-
-    @Test
-    public void testUpdateMergedBeforeNewerUpdate() throws Throwable
-    {
-        createTableWithOtherRows();
-        execute("INSERT INTO %s (pk, v) VALUES (1, [1.0, 0.0]) USING TIMESTAMP 10");
-
-        race("UPDATE %s USING TIMESTAMP 20 SET v = [0.0, 1.0] WHERE pk = 1",
-             "UPDATE %s USING TIMESTAMP 30 SET v = [1.0, 0.0] WHERE pk = 1");
-
-        assertRowOneIndexedUnderItsVectorOnly();
-
-        flush();
-        assertAnnResults();
-    }
-
-    @Test
-    public void testDeleteMergedBeforeNewerUpdate() throws Throwable
-    {
-        createTableWithOtherRows();
-        execute("INSERT INTO %s (pk, v) VALUES (1, [1.0, 0.0]) USING TIMESTAMP 10");
-
-        race("DELETE v FROM %s USING TIMESTAMP 20 WHERE pk = 1",
-             "UPDATE %s USING TIMESTAMP 30 SET v = [1.0, 0.0] WHERE pk = 1");
-
-        assertRowOneIndexedUnderItsVectorOnly();
-    }
-
-    @Test
-    public void testInsertMergedBeforeNewerInsert() throws Throwable
-    {
-        createTableWithOtherRows();
-
-        race("INSERT INTO %s (pk, v) VALUES (1, [0.0, 1.0]) USING TIMESTAMP 20",
-             "INSERT INTO %s (pk, v) VALUES (1, [1.0, 0.0]) USING TIMESTAMP 30");
-
-        assertRowOneIndexedUnderItsVectorOnly();
-    }
-
-    /**
-     * Flushing the memtable index writes the row under the one vector it ends up with.
-     */
-    @Test
-    public void testFlushAfterInsertMergedBeforeNewerInsert() throws Throwable
-    {
-        createTableWithOtherRows();
-
-        race("INSERT INTO %s (pk, v) VALUES (1, [0.0, 1.0]) USING TIMESTAMP 20",
-             "INSERT INTO %s (pk, v) VALUES (1, [1.0, 0.0]) USING TIMESTAMP 30");
-
-        flush();
-        assertAnnResults();
-    }
-
-    @Test
-    public void testUpdateMergedBeforeOlderUpdate() throws Throwable
-    {
-        createTableWithOtherRows();
-        execute("INSERT INTO %s (pk, v) VALUES (1, [0.0, 1.0]) USING TIMESTAMP 10");
-
-        race("UPDATE %s USING TIMESTAMP 30 SET v = [1.0, 0.0] WHERE pk = 1",
-             "UPDATE %s USING TIMESTAMP 20 SET v = [0.0, 1.0] WHERE pk = 1");
-
-        assertRowOneIndexedUnderItsVectorOnly();
-    }
-
-    /**
-     * The newer write deletes the vector of a row that isn't in the memtable yet, and has no live data then. The older
-     * write merges again against it, which changes nothing, so the index gets no cell for that attempt.
-     */
-    @Test
-    public void testUpdateMergedBeforeNewerVectorDelete() throws Throwable
-    {
-        createTableWithOtherRows();
-
-        race("UPDATE %s USING TIMESTAMP 10 SET v = [0.0, 1.0] WHERE pk = 1",
-             "DELETE v FROM %s USING TIMESTAMP 20 WHERE pk = 1");
-
-        assertEmpty(execute("SELECT v FROM %s WHERE pk = 1"));
-        assertEquals(Map.of(2, List.of("[0.9, 0.1]"), 3, List.of("[0.1, 0.9]")), memtableIndexedVectors());
-    }
-
-    @Test
-    public void testInsertMergedBeforeNewerVectorDelete() throws Throwable
-    {
-        createTableWithOtherRows();
-
-        race("INSERT INTO %s (pk, v) VALUES (1, [0.0, 1.0]) USING TIMESTAMP 10",
-             "DELETE v FROM %s USING TIMESTAMP 20 WHERE pk = 1");
-
-        assertRows(execute("SELECT pk, v FROM %s WHERE pk = 1"), row(1, null));
-        assertEquals(Map.of(2, List.of("[0.9, 0.1]"), 3, List.of("[0.1, 0.9]")), memtableIndexedVectors());
-    }
-
-    /**
-     * The newer write deletes a row that has no vector in the memtable: as a new row with no live data, and as an
-     * update of a row with another column.
-     */
-    @Test
-    public void testUpdateMergedBeforeNewerRowDelete() throws Throwable
-    {
-        for (boolean rowInMemtable : new boolean[]{ false, true })
-        {
-            createTable("CREATE TABLE %s (pk int, c int, w int, v vector<float, 2>, PRIMARY KEY (pk, c)) WITH memtable = 'skiplist'");
-            createIndex(CREATE_INDEX);
-            execute("INSERT INTO %s (pk, c, v) VALUES (2, 0, [0.9, 0.1]) USING TIMESTAMP 1");
-            if (rowInMemtable)
-                execute("INSERT INTO %s (pk, c, w) VALUES (1, 0, 1) USING TIMESTAMP 1");
-
-            race("UPDATE %s USING TIMESTAMP 10 SET v = [0.0, 1.0] WHERE pk = 1 AND c = 0",
-                 "DELETE FROM %s USING TIMESTAMP 20 WHERE pk = 1 AND c = 0");
-
-            assertEmpty(execute("SELECT * FROM %s WHERE pk = 1"));
-            assertEquals("rowInMemtable=" + rowInMemtable, Map.of(2, List.of("[0.9, 0.1]")), memtableIndexedVectors());
-        }
-    }
-
-    /**
-     * The vector of a static column is indexed for the static row of its partition.
-     */
-    @Test
-    public void testStaticVectorRaces() throws Throwable
-    {
-        String[][] races = {
-            // first merged, first published, the vector the partition ends up with
-            { "UPDATE %s USING TIMESTAMP 20 SET s = [0.0, 1.0] WHERE pk = 1", "UPDATE %s USING TIMESTAMP 30 SET s = [1.0, 0.0] WHERE pk = 1", "[1.0, 0.0]" },
-            { "UPDATE %s USING TIMESTAMP 20 SET s = [0.0, 1.0] WHERE pk = 1", "DELETE s FROM %s USING TIMESTAMP 30 WHERE pk = 1", null },
-            { "INSERT INTO %s (pk, c, s) VALUES (1, 5, [0.0, 1.0]) USING TIMESTAMP 20", "UPDATE %s USING TIMESTAMP 30 SET s = [1.0, 0.0] WHERE pk = 1", "[1.0, 0.0]" },
-            { "UPDATE %s USING TIMESTAMP 30 SET s = [1.0, 0.0] WHERE pk = 1", "UPDATE %s USING TIMESTAMP 20 SET s = [0.0, 1.0] WHERE pk = 1", "[1.0, 0.0]" }
-        };
-        for (String[] writes : races)
-        {
-            createTable("CREATE TABLE %s (pk int, c int, s vector<float, 2> static, PRIMARY KEY (pk, c)) WITH memtable = 'skiplist'");
-            createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
-            execute("INSERT INTO %s (pk, c, s) VALUES (2, 0, [0.9, 0.1]) USING TIMESTAMP 1");
-            execute("INSERT INTO %s (pk, c, s) VALUES (1, 0, [0.5, 0.5]) USING TIMESTAMP 10");
-            execute("INSERT INTO %s (pk, c) VALUES (1, 1) USING TIMESTAMP 10");
-
-            race(writes[0], writes[1]);
-
-            String message = writes[0] + " / " + writes[1];
-            Map<Integer, List<String>> expected = new HashMap<>();
-            expected.put(2, List.of("[0.9, 0.1]"));
-            if (writes[2] != null)
-            {
-                expected.put(1, List.of(writes[2]));
-                assertEquals(message, writes[2], vectorString(execute("SELECT s FROM %s WHERE pk = 1 LIMIT 1").one(), "s"));
-            }
-            assertEquals(message, expected, memtableIndexedVectors());
-
-            flush();
-            List<Integer> partitions = new ArrayList<>();
-            for (UntypedResultSet.Row row : execute("SELECT pk FROM %s ORDER BY s ANN OF [1.0, 0.0] LIMIT 10"))
-                if (!partitions.contains(row.getInt("pk")))
-                    partitions.add(row.getInt("pk"));
-            assertEquals(message, writes[2] == null ? List.of(2) : List.of(1, 2), partitions);
-        }
-    }
 
     @Test
     public void testConcurrentUpdatesWithClientTimestamps() throws Throwable
@@ -326,89 +116,6 @@ public class VectorConcurrentWriteTest extends SAITester
             expected.put(row.getInt("pk"), List.of(vectorString(row)));
         assertEquals(rows, expected.size());
         assertEquals(expected, memtableIndexedVectors());
-    }
-
-    private void createTableWithOtherRows()
-    {
-        createTable(CREATE_TABLE);
-        createIndex(CREATE_INDEX);
-        execute("INSERT INTO %s (pk, v) VALUES (2, [0.9, 0.1]) USING TIMESTAMP 1");
-        execute("INSERT INTO %s (pk, v) VALUES (3, [0.1, 0.9]) USING TIMESTAMP 1");
-    }
-
-    /**
-     * Runs {@code firstMerged} on another thread and holds it once it has merged its write into the partition (and
-     * passed the merged row to the index) but before it publishes the merge, then runs {@code firstPublished}, then
-     * releases the first write, which has to merge again.
-     */
-    private void race(String firstMerged, String firstPublished) throws Throwable
-    {
-        holdReached = new CountDownLatch(1);
-        release = new CountDownLatch(1);
-        heldWriter = null;
-        heldWriterAttempts.set(0);
-        Injections.inject(holdBeforePublish());
-        raceTable = currentTable();
-
-        ExecutorService executor = Executors.newSingleThreadExecutor();
-        try
-        {
-            Future<?> heldWrite = executor.submit(() -> {
-                execute(firstMerged);
-                return null;
-            });
-            assertTrue("The first write did not reach the hold", holdReached.await(1, TimeUnit.MINUTES));
-            execute(firstPublished);
-            release.countDown();
-            heldWrite.get(1, TimeUnit.MINUTES);
-        }
-        finally
-        {
-            raceTable = null;
-            release.countDown();
-            executor.shutdownNow();
-            Injections.deleteAll();
-        }
-
-        // the held write lost the race to publish its first merge and merged again
-        assertEquals(2, heldWriterAttempts.get());
-    }
-
-    private static Injection holdBeforePublish()
-    {
-        return Injections.newCustom("hold_before_publish")
-                         .add(InvokePointBuilder.newInvokePoint()
-                                                .onClass("org.apache.cassandra.db.partitions.AtomicBTreePartition$Updater")
-                                                .onMethod("tryUpdateData")
-                                                .atInvoke("compareAndSet"))
-                         .add(ActionBuilder.newActionBuilder()
-                                           .actions()
-                                           .doAction(Expression.expr(VectorConcurrentWriteTest.class.getName() + ".beforePublish").args("$1")))
-                         .build();
-    }
-
-    private void assertRowOneIndexedUnderItsVectorOnly() throws Throwable
-    {
-        assertEquals("[1.0, 0.0]", vectorString(execute("SELECT v FROM %s WHERE pk = 1").one()));
-        assertEquals(Map.of(1, List.of("[1.0, 0.0]"),
-                            2, List.of("[0.9, 0.1]"),
-                            3, List.of("[0.1, 0.9]")),
-                     memtableIndexedVectors());
-        assertAnnResults();
-    }
-
-    private void assertAnnResults()
-    {
-        assertThat(annResults("[1.0, 0.0]")).containsExactly(1, 2, 3);
-        assertThat(annResults("[0.0, 1.0]")).containsExactly(3, 2, 1);
-    }
-
-    private List<Integer> annResults(String vector)
-    {
-        List<Integer> keys = new ArrayList<>();
-        for (UntypedResultSet.Row row : execute("SELECT pk FROM %s ORDER BY v ANN OF " + vector + " LIMIT 3"))
-            keys.add(row.getInt("pk"));
-        return keys;
     }
 
     private static String vectorString(UntypedResultSet.Row row)

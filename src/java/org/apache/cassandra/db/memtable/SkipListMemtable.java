@@ -200,13 +200,22 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
         // is visible, for the reads that purge the tombstones older than it
         if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
             updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
-        BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
-        updateMin(minTimestamp, update.stats().minTimestamp);
-        liveDataSize.addAndGet(initialSize + updater.dataSize);
-        columnsCollector.update(update.columns());
-        statsCollector.update(update.stats());
-        currentOperations.addAndGet(update.operationCount());
+        long addedSize = initialSize;
+        BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer, applied -> {
+            updateMin(minTimestamp, update.stats().minTimestamp);
+            liveDataSize.addAndGet(addedSize + applied.dataSize);
+            columnsCollector.update(update.columns());
+            statsCollector.update(update.stats());
+            currentOperations.addAndGet(update.operationCount());
+        });
         return updater.colUpdateTimeDelta;
+    }
+
+    @Override
+    public boolean appliesUpdatesAtomicallyOnRequest()
+    {
+        // AtomicBTreePartition.addAll merges and applies such an update under the partition's lock.
+        return true;
     }
 
     @Override

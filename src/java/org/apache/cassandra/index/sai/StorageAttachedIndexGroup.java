@@ -245,12 +245,21 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                                 .filter(Objects::nonNull)
                                 .collect(Collectors.toSet());
 
-        // Only a memtable that applies updates atomically delivers events for an update it has already applied. On any
-        // other memtable an indexer failure fails the update before it is applied, so stop at the first one.
-        final boolean deliverToAll = memtable != null && memtable.appliesUpdatesAtomically();
+        // Only a memtable that applies updates atomically, always or on request (which this indexer makes, see
+        // requiresAtomicUpdates), delivers events for an update it has already applied. On any other memtable an
+        // indexer failure fails the update before it is applied, so stop at the first one.
+        final boolean deliverToAll = memtable != null && (memtable.appliesUpdatesAtomically() || memtable.appliesUpdatesAtomicallyOnRequest());
 
         return indexers.isEmpty() ? null : new StorageAttachedIndex.IndexerAdapter()
         {
+            // The memtable indexes must see each applied update once, in memtable order: they remove the old values of
+            // a row on update, count the occurrences of a value and keep BM25 document lengths.
+            @Override
+            public boolean requiresAtomicUpdates()
+            {
+                return true;
+            }
+
             @Override
             public void insertRow(Row row)
             {

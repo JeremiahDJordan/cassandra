@@ -1806,24 +1806,32 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             Memtable mt = data.getMemtableFor(opGroup, commitLogPosition);
             UpdateTransaction indexer = newUpdateTransaction(update, context, updateIndexes, mt);
             long timeDelta;
-            // Nesting is tracked on the context; updateIndexes cannot identify it, as index build and compaction cleanup also pass false. See Memtable#checkSpaceAndPut.
-            if (context.enterMemtableWrite())
-            {
-                try
-                {
-                    timeDelta = mt.checkSpaceAndPut(update, indexer, opGroup);
-                }
-                finally
-                {
-                    context.exitMemtableWrite();
-                }
-            }
-            else
-            {
-                timeDelta = mt.put(update, indexer, opGroup);
-            }
             DecoratedKey key = update.partitionKey();
-            invalidateCachedPartition(key);
+            try
+            {
+                // Nesting is tracked on the context; updateIndexes cannot identify it, as index build and compaction cleanup also pass false. See Memtable#checkSpaceAndPut.
+                if (context.enterMemtableWrite())
+                {
+                    try
+                    {
+                        timeDelta = mt.checkSpaceAndPut(update, indexer, opGroup);
+                    }
+                    finally
+                    {
+                        context.exitMemtableWrite();
+                    }
+                }
+                else
+                {
+                    timeDelta = mt.put(update, indexer, opGroup);
+                }
+            }
+            finally
+            {
+                // Also when the put throws: an index transaction can fail after the memtable applied the update, and
+                // the cached partition would then miss it. Invalidating after a write that wasn't applied is harmless.
+                invalidateCachedPartition(key);
+            }
             metric.topWritePartitionFrequency.addSample(key.getKey(), 1);
             int dataSize = update.dataSize();
             if (metric.topWritePartitionSize.isEnabled()) // dont compute datasize if not needed

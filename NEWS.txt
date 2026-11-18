@@ -370,6 +370,15 @@ Upgrading
       read data from all the replicas they contact, so that the coordinator filters the reconciled rows. Other
       partition-restricted queries are single-partition reads, with digest reads and speculative retry, which run
       Paxos at SERIAL and LOCAL_SERIAL. Queries of full primary keys of that kind use the index instead of skipping it.
+    - On the skip-list memtables (SkipListMemtable, the default in the shipped cassandra.yaml, and
+      ShardedSkipListMemtable), the writes to one partition of a table with a storage-attached index (SAI) are now
+      applied one at a time, under a lock of the partition, as the trie memtables apply the writes of a shard: writes
+      racing on a partition could make SAI's in-memory index lose rows that hold a value, also after flush. Writes to
+      different partitions, and tables without SAI, are unaffected. Concurrent inserts into a single partition can be
+      slower: about half the throughput with many writers, and several times slower with a vector index (one partition
+      per tenant or per document ingests on one thread per partition). A legacy or custom index on such a table also
+      runs under the lock. An SAI index that fails on a write now leaves the write applied and fails it, as on the
+      trie memtables; the failing index misses the row until it is rebuilt.
 
 5.0.9
 =====

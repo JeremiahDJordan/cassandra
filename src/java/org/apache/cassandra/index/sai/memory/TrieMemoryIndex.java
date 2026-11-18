@@ -223,7 +223,8 @@ public class TrieMemoryIndex extends MemoryIndex
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
 
         // Add before removing so the row is never missing. Each term counts the occurrences of the row, so removing an
-        // old element releases only its own occurrence.
+        // old element releases only its own occurrence. The counts are exact because the memtable index sees each
+        // update once, in memtable order (see Index.Indexer#requiresAtomicUpdates).
         while (newValues != null && newValues.hasNext())
         {
             ByteBuffer newValue = newValues.next();

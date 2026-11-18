@@ -20,10 +20,14 @@ package org.apache.cassandra.db.partitions;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.NavigableSet;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
+import java.util.function.Consumer;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.TableMetadata;
@@ -32,7 +36,9 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.*;
+import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.ObjectSizes;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.memory.Cloner;
 import org.apache.cassandra.utils.memory.MemtableAllocator;
@@ -50,6 +56,8 @@ import static org.apache.cassandra.utils.Clock.Global.nanoTime;
  */
 public final class AtomicBTreePartition extends AbstractBTreePartition
 {
+    private static final Logger logger = LoggerFactory.getLogger(AtomicBTreePartition.class);
+
     public static final long EMPTY_SIZE = ObjectSizes.measure(new AtomicBTreePartition(null,
                                                                                        DatabaseDescriptor.getPartitioner().decorateKey(ByteBuffer.allocate(1)),
                                                                                        null));
@@ -114,16 +122,66 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
 
     /**
      * Adds a given update to this in-memtable partition.
+     * <p>
+     * Once the update is applied, {@code accountForApplied} is called with the updater, for the caller's bookkeeping of
+     * an applied update (the memtable's columns, minimum timestamp, size...). Then, if the index transaction failed
+     * after the update was applied (when it delivers held events, or completes), the failure is thrown: the update
+     * stays applied, and is accounted for, but the write fails. If the update was not applied, the failure is thrown
+     * and {@code accountForApplied} is not called.
      *
-     * @return an array containing first the difference in size seen after merging the updates, and second the minimum
-     * time delta between updates.
+     * @return the updater, with the difference in size seen after merging the updates and the minimum time delta
+     * between updates.
      */
+    public BTreePartitionUpdater addAll(final BTreePartitionUpdate update,
+                                        Cloner cloner,
+                                        OpOrder.Group writeOp,
+                                        UpdateTransaction indexer,
+                                        Consumer<? super BTreePartitionUpdater> accountForApplied)
+    {
+        // Updater.addAll returns only once the update is applied.
+        Updater updater = new Updater(allocator, cloner, writeOp, indexer).addAll(update);
+        try
+        {
+            accountForApplied.accept(updater);
+        }
+        finally
+        {
+            updater.throwIndexFailure();
+        }
+        return updater;
+    }
+
+    /**
+     * Adds a given update to this in-memtable partition, without a callback for the bookkeeping of an applied update.
+     * When the index transaction fails after the update was applied, this throws that failure, so the caller skips its
+     * bookkeeping for an update that stays in the memtable (an error is logged): a flush can then drop the update's
+     * cells, and compaction can purge a tombstone that shadows the update, which then comes back.
+     *
+     * @return the updater, with the difference in size seen after merging the updates and the minimum time delta
+     * between updates.
+     * @deprecated use {@link #addAll(BTreePartitionUpdate, Cloner, OpOrder.Group, UpdateTransaction, Consumer)}, and do
+     * the bookkeeping of the applied update in its callback.
+     */
+    @Deprecated(since = "5.0")
     public BTreePartitionUpdater addAll(final BTreePartitionUpdate update,
                                         Cloner cloner,
                                         OpOrder.Group writeOp,
                                         UpdateTransaction indexer)
     {
-        return new Updater(allocator, cloner, writeOp, indexer).addAll(update);
+        boolean[] applied = new boolean[1];
+        try
+        {
+            return addAll(update, cloner, writeOp, indexer, updater -> applied[0] = true);
+        }
+        catch (Throwable t)
+        {
+            if (applied[0])
+                NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 1, TimeUnit.MINUTES,
+                                 "An index failed on a write to {} after the update was applied: the update stays in " +
+                                 "the memtable without the memtable's bookkeeping, as the memtable adds updates " +
+                                 "without a callback for it", metadata());
+            throw t;
+        }
     }
 
     @VisibleForTesting
@@ -141,6 +199,10 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
     class Updater extends BTreePartitionUpdater
     {
         BTreePartitionData current;
+        /// Whether the update was applied.
+        private boolean applied;
+        /// The failure of the index transaction after the update was applied, or null.
+        private Throwable indexFailure;
 
         public Updater(MemtableAllocator allocator, Cloner cloner, OpOrder.Group writeOp, UpdateTransaction indexer)
         {
@@ -151,8 +213,15 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
         {
             try
             {
-                boolean shouldLock = shouldLock(writeOp);
+                boolean atomically = indexer.requiresAtomicApply();
+                boolean shouldLock = !atomically && shouldLock(writeOp);
                 indexer.start();
+
+                if (atomically)
+                {
+                    addAllAtomically(update);
+                    return this;
+                }
 
                 while (true)
                 {
@@ -175,8 +244,55 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
             }
             finally
             {
-                indexer.commit();
-                reportAllocatedMemory();
+                try
+                {
+                    indexer.commit();
+                }
+                catch (Throwable t)
+                {
+                    // An applied update stays applied: let the caller account for it before the write fails.
+                    if (!applied)
+                        throw t;
+                    indexFailure = t;
+                }
+                finally
+                {
+                    reportAllocatedMemory();
+                }
+            }
+        }
+
+        /**
+         * Throws the failure of the index transaction of an update that was applied, if any. The update is in the
+         * memtable, so the caller has done the bookkeeping of an applied update first.
+         */
+        private void throwIndexFailure()
+        {
+            if (indexFailure instanceof Error)
+                throw (Error) indexFailure;
+            if (indexFailure != null)
+                throw Throwables.unchecked(indexFailure);
+        }
+
+        /**
+         * Merges and applies the update under the partition's lock, which every update whose index transaction
+         * {@linkplain UpdateTransaction#requiresAtomicApply requires it} takes, and tells the transaction which
+         * merge it applied before releasing the lock. Its indexes then see the updates of the partition once each,
+         * in the order they were applied (see {@link org.apache.cassandra.db.memtable.Memtable#appliesUpdatesAtomicallyOnRequest}).
+         * A writer that doesn't take the lock (an update with no such index transaction) can still change the
+         * partition first; the merge is then retried, still under the lock.
+         * <p>
+         * Allocations never wait for room in the memtable pool (that is done before the write starts, see
+         * {@link org.apache.cassandra.db.memtable.Memtable#checkSpaceAndPut}), so holding the lock can't stop a flush
+         * from completing, whatever the write's op order group.
+         */
+        private void addAllAtomically(BTreePartitionUpdate update)
+        {
+            synchronized (AtomicBTreePartition.this)
+            {
+                while (!tryUpdateData(update))
+                    indexer.onAttemptLost();
+                indexer.onApplied();
             }
         }
 
@@ -186,7 +302,8 @@ public final class AtomicBTreePartition extends AbstractBTreePartition
             this.dataSize = 0;
             this.heapSize = 0;
             BTreePartitionData result = makeMergedPartition(current, update);
-            return refUpdater.compareAndSet(AtomicBTreePartition.this, current, result);
+            applied = refUpdater.compareAndSet(AtomicBTreePartition.this, current, result);
+            return applied;
         }
     }
 
