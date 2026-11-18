@@ -23,6 +23,7 @@ import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeSet;
@@ -82,7 +83,7 @@ public final class IndexMetadata
     static
     {
         indexNameAliases.put(StorageAttachedIndex.NAME, StorageAttachedIndex.class.getCanonicalName());
-        indexNameAliases.put(StorageAttachedIndex.class.getSimpleName().toLowerCase(), StorageAttachedIndex.class.getCanonicalName());
+        indexNameAliases.put(StorageAttachedIndex.class.getSimpleName().toLowerCase(Locale.US), StorageAttachedIndex.class.getCanonicalName());
         loadTrustedIndexImplementations(CassandraRelevantProperties.TRUSTED_INDEX_IMPLEMENTATIONS.getString());
     }
 
@@ -197,7 +198,7 @@ public final class IndexMetadata
 
     public static String expandAliases(String className)
     {
-        return indexNameAliases.getOrDefault(className.toLowerCase(), className);
+        return indexNameAliases.getOrDefault(className.toLowerCase(Locale.US), className);
     }
 
     /**
@@ -209,7 +210,7 @@ public final class IndexMetadata
     public static void loadTrustedIndexImplementations(String classNames)
     {
         for (String className : trustedIndexImplementations)
-            indexNameAliases.remove(simpleClassName(className).toLowerCase(), className);
+            indexNameAliases.remove(simpleClassName(className).toLowerCase(Locale.US), className);
         trustedIndexImplementations.clear();
 
         if (classNames == null)
@@ -231,7 +232,7 @@ public final class IndexMetadata
             }
 
             trustedIndexImplementations.add(className);
-            indexNameAliases.put(simpleName.toLowerCase(), className);
+            indexNameAliases.put(simpleName.toLowerCase(Locale.US), className);
             logger.info("Registered a trusted secondary implementation {}", className);
         }
     }

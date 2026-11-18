@@ -16,6 +16,7 @@
 package org.apache.cassandra.db.filter;
 
 import java.io.IOException;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -158,7 +159,7 @@ public class ANNOptions
 
     private static boolean parseUsePruning(String value)
     {
-        value = value.toLowerCase();
+        value = value.toLowerCase(Locale.US);
         if (!value.equals("true") && !value.equals("false"))
             throw new InvalidRequestException(String.format("Invalid '%s' ANN option. Expected a boolean but found: %s",
                                                             USE_PRUNING_OPTION_NAME, value));
