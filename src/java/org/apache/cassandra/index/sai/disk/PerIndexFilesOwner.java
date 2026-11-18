@@ -20,17 +20,21 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import javax.annotation.Nullable;
 
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.io.sstable.Descriptor;
 
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+
 /**
- * An owner of the per-index files of an index on an SSTable, while it may write or delete them by name: a writer of the
- * index, for a flush, a compaction or a build. An index created again with the same name uses the same file names
- * without immutable components, so the files that a writer of a dropped index owns may be those of the new index.
- * Guarded by {@link StorageAttachedIndex#SAME_NAME_FILES_LOCK}.
+ * An owner of the per-index files of an index on an SSTable, while it may write or delete them by name: a build of the
+ * index on an existing SSTable, or a writer of the index. An index created again with the same name uses the same file
+ * names without immutable components, so a build of an index waits, before it touches the files of an SSTable, until
+ * no owner of a dropped index of the same name is left for it. Guarded by
+ * {@link StorageAttachedIndex#SAME_NAME_FILES_LOCK}.
  */
 public final class PerIndexFilesOwner implements AutoCloseable
 {
@@ -69,7 +73,32 @@ public final class PerIndexFilesOwner implements AutoCloseable
     }
 
     /**
-     * @return whether a writer of a dropped index of the provided name owns the files of the provided SSTable
+     * Waits, for up to the provided time, until no owner of a dropped index of the provided name is left for the
+     * provided SSTable.
+     *
+     * @return whether no such owner is left
+     */
+    public static boolean awaitOwnersOfDroppedIndex(Descriptor descriptor,
+                                                    String indexName,
+                                                    long timeout,
+                                                    TimeUnit unit) throws InterruptedException
+    {
+        long deadline = nanoTime() + unit.toNanos(timeout);
+        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        {
+            while (hasOwnerOfDroppedIndex(descriptor, indexName))
+            {
+                long remaining = deadline - nanoTime();
+                if (remaining <= 0)
+                    return false;
+                StorageAttachedIndex.SAME_NAME_FILES_LOCK.wait(Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)));
+            }
+            return true;
+        }
+    }
+
+    /**
+     * @return whether a build or writer of a dropped index of the provided name owns the files of the provided SSTable
      */
     public static boolean hasOwnerOfDroppedIndex(Descriptor descriptor, String indexName)
     {

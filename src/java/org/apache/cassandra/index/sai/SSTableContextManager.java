@@ -223,6 +223,13 @@ public class SSTableContextManager
             context.close();
     }
 
+    /** @return the descriptor cached for the given sstable, if any, without loading one */
+    @Nullable
+    IndexDescriptor cachedIndexDescriptor(SSTableReader sstable)
+    {
+        return sstableDescriptors.get(sstable);
+    }
+
     /**
      * Returns a descriptor for the given sstable and indexes, reusing a cached one when possible.
      * <p>

@@ -259,13 +259,13 @@ Upgrading
       flush, compaction or stream that completes after CREATE INDEX of the same name or after a restart, are no longer
       used by a new index of that name and another column or other options. Markers written before the upgrade are
       empty, and the markers of the index files written by Apache Cassandra 5.0 don't hold a definition either: their
-      files are used as before. An index created on an existing table (CREATE INDEX) always builds from the table's
-      data: it deletes the files of its name already on the table's sstables, and an entire-sstable stream that is
-      sending those sstables at that time fails. Files written before the upgrade, or by Apache Cassandra, can still be
-      used by an index of the same name and another definition on a node that receives DROP INDEX and CREATE INDEX as
-      one schema change (e.g. it was down), on sstables imported or streamed once it exists, and after a restart that
-      follows a CREATE INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on
-      the nodes concerned. Older versions ignore the content of the marker.
+      files are used as before. An index created on an existing table (CREATE INDEX) deletes the files of its name on
+      the table's sstables that weren't built for its definition, so that it also builds over such files from the data.
+      Files written before the upgrade, or by Apache Cassandra, can still be used by an index of the same name and
+      another definition on a node that receives DROP INDEX and CREATE INDEX as one schema change (e.g. it was down),
+      on sstables imported or streamed once it exists, and after a restart that follows a CREATE INDEX that couldn't
+      list the sstable files (an error is logged): run nodetool rebuild_index on the nodes concerned. Older versions
+      ignore the content of the marker.
     - Storage-attached indexes (SAI) read the index files Apache Cassandra 5.0 wrote (on-disk version "aa", files
       named SAI+aa+...) instead of rebuilding them: after an in-place upgrade from Apache Cassandra 5.0, the indexes
       that exist when the node starts use them, as do these indexes for sstables imported (nodetool import) or
@@ -297,6 +297,35 @@ Upgrading
       was flushed to. If you query such columns for the empty value, rebuild those indexes on each node after
       upgrading it, with nodetool rebuild_index: the SSTables flushed before the upgrade keep missing such rows until
       then, or until compacted.
+    - Storage-attached indexes (SAI) on a component of a composite partition key (e.g. pk1 in
+      PRIMARY KEY ((pk1, pk2), ck)) now index static rows when they are built and when sstables are compacted, as
+      Apache Cassandra does. Before, an index written by an index build or a compaction missed partitions that
+      contain only a static row, and queries on that index returned fewer rows than the same query with
+      ALLOW FILTERING (indexes flushed from memtables were not affected). There is no new index version or
+      messaging change, but sstable indexes written before this release stay incomplete until their sstable is
+      compacted again. On tables with static columns, rebuild such indexes with
+      nodetool rebuild_index <keyspace> <table> <index>:
+        - only once every node runs this release, because streaming whole sstables copies their SAI files as they
+          are, so an incomplete index can come back from a node that wasn't upgraded yet;
+        - on one node at a time, because the index can't be queried on a node while it rebuilds it.
+      Such a rebuild may also rebuild the other SAI indexes of the table, see below.
+    - A nodetool rebuild_index of SAI indexes, on any table, now waits for the other SAI index builds of each
+      sstable it rebuilds (e.g. of a CREATE INDEX) to finish, and they wait for it, since it rewrites the SAI files
+      that all the indexes of the sstable share. It still repairs those files when they are damaged on disk: when
+      it can't read them, it rebuilds every SAI index of the table on that sstable.
+    - Creating an SAI index on a table with static columns no longer fails, with the index never becoming
+      queryable, when the sstables already have SAI files for another index of the table.
+    - The per-SSTable SAI files, which number the rows of an sstable for all its SAI indexes, were written by the
+      index builds of earlier releases (the first index created on existing sstables, or any nodetool rebuild_index)
+      with a row ID for the empty static row of each partition without one, in tables with static columns. They stay
+      in use: a CREATE INDEX that reuses them numbers its rows the same way, and a nodetool rebuild_index that
+      replaces them rebuilds every SAI index of the table on that sstable, which also repairs indexes that an earlier
+      rebuild_index of other indexes left pointing to the wrong rows. A rebuild_index also rebuilds every SAI index of
+      the table on the sstables holding data older than the drop of one of its columns, even once compacted, so
+      rebuilding one index of such a table can take as long as rebuilding all of them, and if it fails they all become
+      non-queryable on the node. An index build that finds per-SSTable files whose row count doesn't match the rows it
+      numbered fails, and the index stays non-queryable: then rebuild all the SAI indexes of the table in one command,
+      nodetool rebuild_index <keyspace> <table> <index> [<index> ...].
 
 5.0.9
 =====

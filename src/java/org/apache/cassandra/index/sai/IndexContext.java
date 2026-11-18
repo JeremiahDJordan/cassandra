@@ -1358,8 +1358,9 @@ public class IndexContext
             catch (Throwable e)
             {
                 // Components that pass validation but turn out to be corrupt when loaded are invalidated, so the
-                // index is rebuilt for this SSTable: Apache Cassandra's too. Other failures say nothing about the
-                // components: the SSTable is left out of the view, and the initial build fails (see
+                // index is rebuilt for this SSTable: Apache Cassandra's too, and segments whose row IDs aren't in
+                // the per-SSTable components (see SegmentMetadata). Other failures say nothing about the components:
+                // the SSTable is left out of the view, and the initial build fails (see
                 // StorageAttachedIndex#findNonIndexedSSTables).
                 if (!(e instanceof Error) && isCorruption(e))
                 {

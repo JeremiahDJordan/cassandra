@@ -1080,6 +1080,13 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         return contextManager.getOrLoadIndexDescriptor(sstable, indices);
     }
 
+    /** @return the descriptor cached for the SSTable, if any, without loading one */
+    @Nullable
+    IndexDescriptor cachedDescriptorFor(SSTableReader sstable)
+    {
+        return contextManager.cachedIndexDescriptor(sstable);
+    }
+
     /** Forgets the per-index components of that name of the descriptors cached for the SSTables of the table. */
     void forgetCachedComponentsOfName(String indexName)
     {

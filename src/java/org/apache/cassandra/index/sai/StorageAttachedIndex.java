@@ -18,8 +18,10 @@
 
 package org.apache.cassandra.index.sai;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
@@ -41,6 +43,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicates;
@@ -72,6 +75,7 @@ import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.FloatType;
@@ -102,6 +106,7 @@ import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.ComponentsBuildId;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
+import org.apache.cassandra.index.sai.disk.format.IndexDefinitionDigest;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
@@ -621,12 +626,13 @@ public class StorageAttachedIndex implements Index
     }
 
     /**
-     * Discards the per-index components named after this index that are already on disk for the table's SSTables:
-     * nothing says they were written for this index (e.g. they were left by a dropped index of the same name), so it
-     * must be built from the data. They are found from the TOC and from the files on disk, and deleted right away,
-     * even while a stream or a rebuild holds the SSTable, as the build of this index would append to them (an
-     * entire-SSTable stream sending them fails, and is retried). If a completion marker of them is still on disk
-     * afterwards, the initial build of this index fails rather than use them.
+     * Discards the per-index components named after this index that are already on disk for the table's SSTables and
+     * weren't built for its definition, so that it is built from the data: in particular, components written before
+     * their completion marker carried the definition of their index (see {@link IndexDefinitionDigest}) don't say which
+     * index they were written for (e.g. a dropped index of the same name). They are found from the TOC and from the
+     * files on disk, and deleted right away, even while a stream or a rebuild holds the SSTable, as the build of this
+     * index would append to them (an entire-SSTable stream sending them fails). If a completion marker of them is still
+     * on disk afterwards, the initial build of this index fails rather than use them.
      * <p>
      * The components Apache Cassandra wrote for an index of this name are discarded the same way (see
      * {@link StorageAttachedIndexGroup#discardApacheIndexComponents}).
@@ -676,8 +682,8 @@ public class StorageAttachedIndex implements Index
     }
 
     /**
-     * Unregisters from the TOC, and deletes, the per-index components named after this index on the provided SSTable:
-     * those the TOC lists, and those of the provided files on disk.
+     * Unregisters from the TOC, and deletes, the per-index components named after this index on the provided SSTable
+     * that it doesn't use: those the TOC lists, and those of the provided files on disk.
      *
      * @param filesOnDisk names of SAI component files of the SSTable on disk (see {@link SSTableWatcher#listSAIComponentFiles})
      * @return false if a completion marker of those components is still on disk, so that they could still be used
@@ -685,25 +691,52 @@ public class StorageAttachedIndex implements Index
     private boolean discardComponentsOfName(SSTableReader sstable, Set<String> filesOnDisk)
     {
         String name = indexContext.getIndexName();
-        Set<Component> stale = new HashSet<>();
+        Map<Component, ComponentsBuildId> listed = new HashMap<>();
         Set<ComponentsBuildId> builds = new HashSet<>();
         for (Component component : sstable.components())
         {
-            Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(component.name);
+            Optional<Version.ParsedFileName> parsed = tryParseFileName(component.name, indexContext);
             // Apache Cassandra's are discarded by StorageAttachedIndexGroup#discardApacheIndexComponents
             if (parsed.isEmpty() || !name.equals(parsed.get().indexName) || parsed.get().buildId.version().isApache())
                 continue;
-            stale.add(component);
+            listed.put(component, parsed.get().buildId);
             builds.add(parsed.get().buildId);
         }
         for (String file : filesOnDisk)
         {
-            Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(file);
+            Optional<Version.ParsedFileName> parsed = tryParseFileName(file, indexContext);
             if (parsed.isPresent() && name.equals(parsed.get().indexName) && !parsed.get().buildId.version().isApache())
                 builds.add(parsed.get().buildId);
         }
+
+        // Components built for this definition are what a build of this index would write. Those the TOC lists are
+        // kept, and so is the build the SSTable's descriptor holds for an index of this definition: DROP INDEX unlisted
+        // it while a reader kept its files, and this index loads it. Others, e.g. a generation an earlier rebuild
+        // replaced, are discarded, and so is everything while a build or writer of a dropped index of this name may
+        // still write or delete these files.
+        IndexDescriptor descriptor = IndexDescriptor.empty(sstable.descriptor, sstable.metadata().comparator);
+        Set<ComponentsBuildId> listedBuilds = new HashSet<>(listed.values());
+        ComponentsBuildId loaded = listedBuilds.isEmpty() ? loadedBuild(sstable) : null;
+        Set<ComponentsBuildId> kept = new HashSet<>();
+        if (!PerIndexFilesOwner.hasOwnerOfDroppedIndex(sstable.descriptor, name))
+        {
+            for (ComponentsBuildId buildId : builds)
+            {
+                boolean used = listedBuilds.contains(buildId) || buildId.equals(loaded);
+                if (used && isBuiltForDefinition(descriptor, buildId))
+                    kept.add(buildId);
+            }
+        }
+        builds.removeAll(kept);
+        if (loaded != null && kept.contains(loaded))
+            listKeptBuild(sstable, descriptor, loaded);
         if (builds.isEmpty())
             return true;
+        Set<Component> stale = new HashSet<>();
+        listed.forEach((component, buildId) -> {
+            if (builds.contains(buildId))
+                stale.add(component);
+        });
 
         Ref<? extends SSTableReader> ref = sstable.tryRef();
         if (ref == null)
@@ -725,7 +758,6 @@ public class StorageAttachedIndex implements Index
             }
 
             boolean discarded = true;
-            IndexDescriptor descriptor = IndexDescriptor.empty(sstable.descriptor, sstable.metadata().comparator);
             for (ComponentsBuildId buildId : builds)
             {
                 // All types, including any the TOC doesn't list: the build of this index would append to them.
@@ -760,6 +792,91 @@ public class StorageAttachedIndex implements Index
         finally
         {
             ref.release();
+        }
+    }
+
+    /**
+     * @return the parsed SAI file name, or empty if it isn't one, or is of a version this node doesn't know, which
+     * index discovery doesn't read either
+     */
+    static Optional<Version.ParsedFileName> tryParseFileName(String name, IndexContext context)
+    {
+        try
+        {
+            return Version.tryParseFileName(name);
+        }
+        catch (IllegalArgumentException e)
+        {
+            logger.warn(context.logMessage("Ignoring SAI file {}: {}"), name, e.getMessage());
+            return Optional.empty();
+        }
+    }
+
+    /**
+     * @return the build of this index's name that the descriptor cached for the provided SSTable holds, complete, for
+     * an index of this definition (that of a dropped index of the same definition), or null
+     */
+    private @Nullable ComponentsBuildId loadedBuild(SSTableReader sstable)
+    {
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
+        if (group == null)
+            return null;
+        IndexDescriptor cached = group.cachedDescriptorFor(sstable);
+        if (cached == null || !cached.includedIndexes().contains(indexContext))
+            return null;
+        IndexComponents.ForRead components = cached.perIndexComponents(indexContext);
+        return components.isComplete() ? components.buildId() : null;
+    }
+
+    /**
+     * Registers in the TOC the components of the provided build of this index's name on disk.
+     */
+    private void listKeptBuild(SSTableReader sstable, IndexDescriptor descriptor, ComponentsBuildId buildId)
+    {
+        EnumSet<IndexComponentType> types = EnumSet.allOf(IndexComponentType.class);
+        IndexComponents.ForWrite components = descriptor.perIndexComponentsOfBuild(indexContext, buildId, types);
+        Set<Component> kept = components.allAsCustomComponents();
+        if (kept.isEmpty())
+            return;
+
+        Ref<? extends SSTableReader> ref = sstable.tryRef();
+        if (ref == null)
+            return;
+        try
+        {
+            Tracker tracker = baseCfs.getTracker();
+            sstable.registerComponents(kept, tracker.getView().liveSSTables().contains(sstable) ? tracker : null);
+        }
+        catch (Throwable t)
+        {
+            JVMStabilityInspector.inspectThrowable(t);
+            logger.warn(indexContext.logMessage("Failed to register the components of this index's definition on {}"),
+                        sstable.descriptor, t);
+        }
+        finally
+        {
+            ref.release();
+        }
+    }
+
+    /**
+     * Whether the completion marker of the provided build of this index's name holds the digest of this index's
+     * definition (see {@link IndexDefinitionDigest}).
+     */
+    private boolean isBuiltForDefinition(IndexDescriptor descriptor, ComponentsBuildId buildId)
+    {
+        EnumSet<IndexComponentType> types = EnumSet.of(IndexComponentType.COLUMN_COMPLETION_MARKER);
+        IndexComponents.ForWrite marker = descriptor.perIndexComponentsOfBuild(indexContext, buildId, types);
+        if (!marker.has(IndexComponentType.COLUMN_COMPLETION_MARKER))
+            return false;
+        try
+        {
+            File file = marker.get(IndexComponentType.COLUMN_COMPLETION_MARKER).file();
+            return Arrays.equals(IndexDefinitionDigest.readMarker(file), IndexDefinitionDigest.markerContent(config));
+        }
+        catch (IOException e)
+        {
+            return false;
         }
     }
 
@@ -1486,7 +1603,16 @@ public class StorageAttachedIndex implements Index
             return;
 
         DecoratedKey key = update.partitionKey();
-        if (indexContext.getDefinition().isStatic())
+        if (indexContext.getDefinition().isPartitionKey())
+        {
+            // the same term for every row, and indexed with the static row too, if it has live data
+            Row row = Iterables.getFirst(update.rows(), null);
+            if (row == null && update.staticRow().hasLiveData(FBUtilities.nowInSeconds(), false))
+                row = update.staticRow();
+            if (row != null)
+                indexContext.validate(key, row, state);
+        }
+        else if (indexContext.getDefinition().isStatic())
         {
             Row staticRow = update.staticRow();
             if (!staticRow.isEmpty())
@@ -1689,6 +1815,8 @@ public class StorageAttachedIndex implements Index
     public void makeIndexNonQueryable()
     {
         baseCfs.indexManager.makeIndexNonQueryable(this, Status.BUILD_FAILED);
-        logger.warn(indexContext.logMessage("Storage-attached index is no longer queryable. Please restart this node to repair it."));
+        logger.warn(indexContext.logMessage("Storage-attached index is no longer queryable. See the error logged with this for " +
+                                            "its cause: unless it says otherwise, restarting this node, which builds the index " +
+                                            "again, or nodetool rebuild_index repairs it."));
     }
 }

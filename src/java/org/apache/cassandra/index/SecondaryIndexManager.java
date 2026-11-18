@@ -355,8 +355,14 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 initialization.trySuccess(null);
             },
             failure -> {
-                logAndMarkIndexesFailed(Collections.singleton(index), failure, true);
-                initialization.tryFailure(failure);
+                try
+                {
+                    logAndMarkIndexesFailed(Collections.singleton(index), failure, true);
+                }
+                finally
+                {
+                    initialization.tryFailure(failure);
+                }
             }
         );
         asyncExecutor.execute(initialBuildTask);
@@ -938,9 +944,15 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                @Override
                                public void onFailure(Throwable t)
                                {
-                                   logAndMarkIndexesFailed(groupedIndexes, t, false);
-                                   unbuiltIndexes.addAll(groupedIndexes);
-                                   build.setException(t);
+                                   try
+                                   {
+                                       logAndMarkIndexesFailed(groupedIndexes, t, false);
+                                   }
+                                   finally
+                                   {
+                                       unbuiltIndexes.addAll(groupedIndexes);
+                                       build.setException(t);
+                                   }
                                }
 
                                @Override
@@ -1160,12 +1172,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
     private void logAndMarkIndexesFailed(Set<Index> indexes, Throwable indexBuildFailure, boolean isInitialBuild)
     {
-        JVMStabilityInspector.inspectThrowable(indexBuildFailure);
-        if (indexBuildFailure != null)
-            logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes), indexBuildFailure);
-        else
-            logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes));
-        indexes.forEach(i -> this.markIndexFailed(i, isInitialBuild));
+        try
+        {
+            // (this rethrows a failure caused by an InterruptedException)
+            JVMStabilityInspector.inspectThrowable(indexBuildFailure);
+        }
+        finally
+        {
+            if (indexBuildFailure != null)
+                logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes), indexBuildFailure);
+            else
+                logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes));
+            indexes.forEach(i -> this.markIndexFailed(i, isInitialBuild));
+        }
     }
 
     /**

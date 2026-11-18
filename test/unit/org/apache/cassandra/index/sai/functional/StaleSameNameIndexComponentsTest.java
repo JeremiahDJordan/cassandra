@@ -53,13 +53,19 @@ import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.ReadFailureException;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexStatusManager;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.FileUtils;
+import org.apache.cassandra.index.sai.disk.PerIndexFilesOwner;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
+import org.apache.cassandra.index.sai.disk.format.IndexComponent;
+import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.v1.SSTableIndexWriter;
 import org.apache.cassandra.inject.ActionBuilder;
@@ -76,8 +82,10 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.IMMUTABLE_SAI_COMPONENTS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VALIDATE_PER_SSTABLE_CHECKSUM_ON_PARTIAL_BUILD;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -465,7 +473,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
     /**
      * A query holds the reader of the stale index across its drop and the creation of an index of the same definition:
      * when the initial build of the new index starts, the descriptor cached for the SSTable, which the other index
-     * keeps, no longer has the components of the dropped one.
+     * keeps, still has the components of the dropped one, which were built for the same definition.
      */
     @Test
     public void testReaderHeldAcrossDropAndCreateWithTheSameDefinition() throws Throwable
@@ -492,7 +500,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
             buildArmed = true;
             createIndexAsync("CREATE INDEX " + INDEX + " ON %s(a) USING 'sai'");
             assertThat(buildPaused.await(60, TimeUnit.SECONDS)).isTrue();
-            assertThat(group.descriptorFor(sstable).perIndexComponents(getIndexContext(INDEX)).isComplete()).isFalse();
+            assertThat(group.descriptorFor(sstable).perIndexComponents(getIndexContext(INDEX)).isComplete()).isTrue();
         }
         finally
         {
@@ -1035,9 +1043,20 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         return Injections.newCustom("fail_unregister")
                          .add(InvokePointBuilder.newInvokePoint().onClass(SSTable.class).onMethod("unregisterComponents").atEntry())
                          .add(ActionBuilder.newActionBuilder()
+                                           .conditions()
+                                           .when(StaleSameNameIndexComponentsTest.class.getName() + ".calledBy(\"onAddedToExistingTable\")")
                                            .actions()
                                            .doThrow(RuntimeException.class, Expression.quote("Failed to write the TOC (injected)")))
                          .build();
+    }
+
+    // called by Byteman
+    public static boolean calledBy(String method)
+    {
+        for (StackTraceElement element : Thread.currentThread().getStackTrace())
+            if (element.getMethodName().equals(method))
+                return true;
+        return false;
     }
 
     /**
@@ -1222,5 +1241,62 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         createIndex("CREATE CUSTOM INDEX text_index ON %s(text_value) USING 'StorageAttachedIndex' WITH OPTIONS = " +
                     "{'index_analyzer': '{\"tokenizer\":{\"name\":\"ngram\", " +
                     "\"args\":{\"minGramSize\":\"1\", \"maxGramSize\":\"1\"}}}'}");
+    }
+
+    /**
+     * A build of the stale index owns its files on the SSTable when the index is dropped and created again; a partial
+     * build of the other index then finds the per-SSTable components corrupt, and its rewrite fails once it has deleted
+     * them: the indexes it rebuilt become non-queryable, but not the new index, which it left out before deleting
+     * anything, and whose own build goes on once the owner is done.
+     */
+    @Test
+    public void testFailedRewriteAsItDeletesCorruptComponentsWhileBuildOfDroppedIndexOwnsItsFiles() throws Throwable
+    {
+        IMMUTABLE_SAI_COMPONENTS.setBoolean(false);
+        createTableWithStaleIndex();
+        createIndex("CREATE INDEX sibling_idx ON %s(a) USING 'sai'");
+        waitForTableIndexesQueryable();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        SSTableReader sstable = sstable();
+        StorageAttachedIndex dropped = (StorageAttachedIndex) cfs.indexManager.getIndexByName(INDEX);
+        PerIndexFilesOwner owner = PerIndexFilesOwner.tryOwn(sstable.descriptor, INDEX, dropped.isDropped());
+        assertThat(owner).isNotNull();
+        boolean validate = SAI_VALIDATE_PER_SSTABLE_CHECKSUM_ON_PARTIAL_BUILD.getBoolean();
+        try
+        {
+            dropIndex("DROP INDEX %s." + INDEX);
+            createIndexAsync("CREATE INDEX " + INDEX + " ON %s(t) USING 'sai'");
+            IndexComponent.ForRead component = loadDescriptor(sstable, cfs).perSSTableComponents()
+                                                                           .all()
+                                                                           .stream()
+                                                                           .filter(c -> c.componentType() != IndexComponentType.GROUP_COMPLETION_MARKER)
+                                                                           .max(Comparator.comparingLong(c -> c.file().length()))
+                                                                           .orElseThrow();
+            flipMiddleByte(component.file());
+            SAI_VALIDATE_PER_SSTABLE_CHECKSUM_ON_PARTIAL_BUILD.setBoolean(true);
+            Injections.inject(Injections.newCustom("fail_rewrite")
+                                        .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("prepareForRebuild").atExit())
+                                        .add(ActionBuilder.newActionBuilder()
+                                                          .actions()
+                                                          .doThrow(RuntimeException.class, Expression.quote("Injected rewrite failure")))
+                                        .build());
+
+            StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+            assertThat(CompletableFuture.supplyAsync(() -> partialBuild(group, sstable, "other_idx")).get(60, TimeUnit.SECONDS))
+            .hasStackTraceContaining("Injected rewrite failure");
+            Injections.deleteAll();
+            assertThat(cfs.indexManager.isIndexQueryable(cfs.indexManager.getIndexByName("other_idx"))).isFalse();
+            assertThat(cfs.indexManager.isIndexQueryable(cfs.indexManager.getIndexByName("sibling_idx"))).isFalse();
+            assertThat(cfs.indexManager.isIndexBuilding(INDEX)).isTrue();
+            assertThat(IndexStatusManager.instance.getIndexStatus(FBUtilities.getBroadcastAddressAndPort(), KEYSPACE, INDEX))
+            .isNotEqualTo(Index.Status.BUILD_FAILED);
+        }
+        finally
+        {
+            SAI_VALIDATE_PER_SSTABLE_CHECKSUM_ON_PARTIAL_BUILD.setBoolean(validate);
+            owner.close();
+        }
+        waitForAssert(() -> assertThat(cfs.indexManager.isIndexQueryable(INDEX)).isTrue(), 60, TimeUnit.SECONDS);
+        assertThat(execute("SELECT pk FROM %s WHERE t = ?", "t3" + "x".repeat(300))).hasSize(1);
     }
 }

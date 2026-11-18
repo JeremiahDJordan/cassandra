@@ -20,6 +20,7 @@ package org.apache.cassandra.db.guardrails;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Collections;
 
 import org.junit.Test;
 
@@ -72,6 +73,22 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
 
         testThreshold("k2", "INSERT INTO %s (k1, k2, v) VALUES (0, ?, 0)");
         testThreshold("k2", "UPDATE %s SET v = 1 WHERE k1 = 0 AND k2 = ?");
+    }
+
+    @Test
+    public void testCompositePartitionKeyWithStaticColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k1 int, k2 text, c int, s int STATIC, v int, PRIMARY KEY((k1, k2), c))");
+        createIndex("CREATE INDEX ON %s (k2) USING 'sai'");
+
+        testThreshold("k2", "INSERT INTO %s (k1, k2, s) VALUES (0, ?, 0)");
+        testThreshold("k2", "UPDATE %s SET s = 1 WHERE k1 = 0 AND k2 = ?");
+        testThreshold("k2", "INSERT INTO %s (k1, k2, c, s, v) VALUES (0, ?, 0, 0, 0)");
+
+        // a static-only delete writes no term, also for a key over the threshold that is already there
+        ByteBuffer key = allocate(FAIL_THRESHOLD + 1);
+        execute(superClientState, "INSERT INTO %s (k1, k2, s) VALUES (1, ?, 0)", Collections.singletonList(key));
+        assertValid("DELETE s FROM %s WHERE k1 = 1 AND k2 = ?", key);
     }
 
     @Test

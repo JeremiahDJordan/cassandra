@@ -33,6 +33,8 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -957,6 +959,38 @@ public class SAITester extends CQLTester
         ColumnFamilyStore.rebuildSecondaryIndex(KEYSPACE, currentTable(), indexes);
     }
 
+    protected static CompletableFuture<Throwable> rebuildAsync(ColumnFamilyStore cfs, String index)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(index));
+                return null;
+            }
+            catch (Throwable t)
+            {
+                return t;
+            }
+        });
+    }
+
+    /** Builds the provided index on the provided SSTable as a partial build, and returns what it threw, if anything. */
+    protected static Throwable partialBuild(StorageAttachedIndexGroup group, SSTableReader sstable, String indexName)
+    {
+        try
+        {
+            StorageAttachedIndex index = (StorageAttachedIndex) group.table().indexManager.getIndexByName(indexName);
+            TreeMap<SSTableReader, Set<StorageAttachedIndex>> sstables = new TreeMap<>(SSTableReader.idComparator);
+            sstables.put(sstable, Set.of(index));
+            new StorageAttachedIndexBuilder(group, sstables, false, false, false).build();
+            return null;
+        }
+        catch (Throwable t)
+        {
+            return t;
+        }
+    }
+
     protected void reloadSSTableIndex()
     {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable());
@@ -1370,6 +1404,39 @@ public class SAITester extends CQLTester
                                   .filter(v -> v.onDiskFormat().indexFeatureSet().isRowAware())
                                   .map(v -> new Object[]{ v })
                                   .collect(Collectors.toList());
+            }
+        }
+
+        /**
+         * {@link Versioned} with and without immutable components: AA, and DC and {@link Version#LATEST} each with and
+         * without them.
+         */
+        public abstract static class WithImmutableComponents extends Versioned
+        {
+            @Parameterized.Parameter(1)
+            public boolean immutableComponents;
+
+            @Parameterized.Parameters(name = "{0} immutable_components={1}")
+            public static Collection<Object[]> data()
+            {
+                List<Object[]> parameters = new ArrayList<>();
+                parameters.add(new Object[]{ Version.AA, false });
+                for (Version version : new Version[]{ Version.DC, Version.LATEST })
+                    for (boolean immutable : new boolean[]{ false, true })
+                        parameters.add(new Object[]{ version, immutable });
+                return parameters;
+            }
+
+            @Before
+            public void setImmutableComponents()
+            {
+                CassandraRelevantProperties.IMMUTABLE_SAI_COMPONENTS.setBoolean(immutableComponents);
+            }
+
+            @After
+            public void resetImmutableComponents()
+            {
+                CassandraRelevantProperties.IMMUTABLE_SAI_COMPONENTS.setBoolean(false);
             }
         }
     }

@@ -3293,6 +3293,15 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             FBUtilities.waitOnFuture(dumpMemtable());
     }
 
+    /**
+     * @return whether an operation is running with compactions disabled on this table (see
+     * {@link #runWithCompactionsDisabled}), such as a truncate; false only once that operation is done
+     */
+    public boolean isRunningWithCompactionsDisabled()
+    {
+        return longRunningSerializedOperationsLock.isLocked();
+    }
+
     @Override
     public <V> V runWithCompactionsDisabled(Callable<V> callable, OperationType operationType, boolean interruptValidation, boolean interruptViews, TableOperation.StopTrigger trigger)
     {
