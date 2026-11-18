@@ -36,8 +36,12 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.Refs;
 
 @RunWith(Parameterized.class)
@@ -172,5 +176,42 @@ public class MemtableQuickTest extends CQLTester
             }
             Assert.assertEquals((double) partitions, (double) totalPartitions, partitions * 0.1);
         }
+    }
+
+    @Test
+    public void testMinLocalDeletionTime() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, v int, PRIMARY KEY (k, c)) WITH memtable = '" + memtableClass + "'");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        execute("INSERT INTO %s (k, c, v) VALUES (1, 1, 1)");
+        Assert.assertEquals(Long.MAX_VALUE, cfs.getCurrentMemtable().getMinLocalDeletionTime());
+
+        long before = FBUtilities.nowInSeconds();
+        execute("INSERT INTO %s (k, c, v) VALUES (2, 1, 1) USING TTL 1000");
+        long after = FBUtilities.nowInSeconds();
+        execute("INSERT INTO %s (k, c, v) VALUES (3, 1, 1)");
+        long minLocalDeletionTime = cfs.getCurrentMemtable().getMinLocalDeletionTime();
+        Assert.assertTrue("TTL expiration " + minLocalDeletionTime + " not in [" + (before + 1000) + ", " + (after + 1000) + ']',
+                          minLocalDeletionTime >= before + 1000 && minLocalDeletionTime <= after + 1000);
+
+        before = FBUtilities.nowInSeconds();
+        execute("DELETE FROM %s WHERE k = 4 AND c = 1");
+        after = FBUtilities.nowInSeconds();
+        execute("INSERT INTO %s (k, c, v) VALUES (5, 1, 1)");
+        minLocalDeletionTime = cfs.getCurrentMemtable().getMinLocalDeletionTime();
+        Assert.assertTrue("deletion time " + minLocalDeletionTime + " not in [" + before + ", " + after + ']',
+                          minLocalDeletionTime >= before && minLocalDeletionTime <= after);
+    }
+
+    @Test
+    public void testMinLocalDeletionTimeOfPartitionDeletionUpdate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, v int, PRIMARY KEY (k, c)) WITH memtable = '" + memtableClass + "'");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        long nowInSec = FBUtilities.nowInSeconds() - 100;
+        new Mutation(PartitionUpdate.fullPartitionDelete(cfs.metadata(), Util.dk(ByteBufferUtil.bytes(1)), FBUtilities.timestampMicros(), nowInSec)).apply();
+        Assert.assertEquals(nowInSec, cfs.getCurrentMemtable().getMinLocalDeletionTime());
     }
 }

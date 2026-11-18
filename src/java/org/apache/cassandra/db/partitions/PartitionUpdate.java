@@ -21,12 +21,14 @@ import java.io.EOFException;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Iterables;
+import com.google.common.collect.Iterators;
 import com.google.common.collect.Lists;
 import com.google.common.primitives.Ints;
 import org.slf4j.Logger;
@@ -118,7 +120,8 @@ public class PartitionUpdate extends AbstractBTreePartition
     public static PartitionUpdate fullPartitionDelete(TableMetadata metadata, DecoratedKey key, long timestamp, long nowInSec)
     {
         MutableDeletionInfo deletionInfo = new MutableDeletionInfo(timestamp, nowInSec);
-        BTreePartitionData holder = new BTreePartitionData(RegularAndStaticColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, EncodingStats.NO_STATS);
+        EncodingStats stats = new EncodingStats(timestamp, nowInSec, LivenessInfo.NO_TTL);
+        BTreePartitionData holder = new BTreePartitionData(RegularAndStaticColumns.NONE, BTree.empty(), deletionInfo, Rows.EMPTY_STATIC_ROW, stats);
         return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
     }
 
@@ -135,6 +138,10 @@ public class PartitionUpdate extends AbstractBTreePartition
     public static PartitionUpdate singleRowUpdate(TableMetadata metadata, DecoratedKey key, Row row, Row staticRow)
     {
         MutableDeletionInfo deletionInfo = MutableDeletionInfo.live();
+        Row nonNullStaticRow = staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow;
+        EncodingStats stats = EncodingStats.Collector.collect(nonNullStaticRow,
+                                                              row == null ? Collections.emptyIterator() : Iterators.singletonIterator(row),
+                                                              deletionInfo);
         BTreePartitionData holder = new BTreePartitionData(
             new RegularAndStaticColumns(
                 staticRow == null ? Columns.NONE : Columns.from(staticRow),
@@ -142,8 +149,8 @@ public class PartitionUpdate extends AbstractBTreePartition
             ),
             row == null ? BTree.empty() : BTree.singleton(row),
             deletionInfo,
-            staticRow == null ? Rows.EMPTY_STATIC_ROW : staticRow,
-            EncodingStats.NO_STATS
+            nonNullStaticRow,
+            stats
         );
         return new PartitionUpdate(metadata, key, holder, deletionInfo, false);
     }
