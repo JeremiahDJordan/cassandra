@@ -161,6 +161,27 @@ public interface PrimaryKeyMap extends Closeable
     long ceiling(PrimaryKey key);
 
     /**
+     * Returns the row id a skip to the given key starts from: {@link #ceiling} of the key, or the first row of its
+     * token where telling the keys of a token apart requires reading them. {@link #isBefore} says which of the rows
+     * from there on are before the key.
+     *
+     * @param key the {@link PrimaryKey} to lookup
+     * @return a row id, negative only if no row is at or after the key
+     */
+    default long ceilingOfToken(PrimaryKey key)
+    {
+        return ceiling(key);
+    }
+
+    /**
+     * Whether a row at or after {@link #ceilingOfToken} of the given key is before that key.
+     */
+    default boolean isBefore(long sstableRowId, PrimaryKey key)
+    {
+        return false;
+    }
+
+    /**
      * Returns the sstable row id associated with the greatest {@link PrimaryKey} less than or equal to the given
      * {@link PrimaryKey}. If the {@link PrimaryKey} is a prefix of multiple {@link PrimaryKey}s in the map, e.g. it is
      * just a token or a token and a partition key, the row id associated with the greatest {@link PrimaryKey} will be

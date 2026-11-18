@@ -446,6 +446,12 @@ Upgrading
       WHERE clause. Queries whose index restrictions are in a disjunction with a branch that no index supports don't
       use an index, and are allowed, such as x = 1 OR a = 1 with x unindexed. With the guardrail enabled, its
       default, all these queries are allowed.
+    - Flushes and compactions of a table whose distinct partition keys share a token (Murmur3 token collisions,
+      which can be crafted) succeed when its storage-attached indexes (SAI) are at the on-disk version "ga". SAI
+      queries on such keys in different SSTables return their rows, on the on-disk versions "ba" and later and on the
+      SAI files of Apache Cassandra 5.0, instead of failing with "skipTo skipped to an item smaller than the target"
+      or, with assertions disabled, missing rows of "ga" SSTables or of Apache Cassandra 5.0's. ANN queries
+      restricted to a token range return the rows of an SSTable that holds several keys of the last token of the range.
 
 5.0.9
 =====

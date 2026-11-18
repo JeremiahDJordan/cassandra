@@ -20,6 +20,8 @@ Cassandra's `cassandra-5.0` branch at fb7f1b7aee, for the tests of
 | `negative` | `(pk int PRIMARY KEY, st set<text>, v int)` | `negative_st`; the second sstable deletes the set of pk 1 (whose row stays alive) |
 | `dot`      | `(pk int PRIMARY KEY, v vector<float, 8>)` | `dot_v` (DOT_PRODUCT, with product quantization), 4000 gaussian vectors, the first 200 of them scaled by 10 |
 | `varints`  | `(pk int PRIMARY KEY, vi varint, v int)` | `varints_vi`; varints written with redundant sign bytes (`blobAsVarint(0x0001)`, `blobAsVarint(0x0000ff)`, `blobAsVarint(0xffff)`), which Apache indexes as written |
+| `collisions-skinny`, `collisions-skinny-spread` | `(pk blob PRIMARY KEY, a int, b int)` | `collisions_skinny_a`, `collisions_skinny_b`; three groups of six partition keys that share a token (Murmur3 collisions) and keys of other tokens between the groups: in one sstable, or spread over six with one key of each group in each |
+| `collisions-wide`, `collisions-wide-spread` | `(pk blob, ck int, s int static, a int, b int, PRIMARY KEY (pk, ck))` | `collisions_wide_s`, `collisions_wide_a`, `collisions_wide_b`; the keys of `collisions-skinny`, laid out the same way |
 
 The several segments come from lowering `V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER` while building the indexes of an
 existing sstable.
@@ -30,6 +32,8 @@ The `generator` directory has the source of the tests that wrote them, at the sa
 - `GenerateApacheSAIDataMismatchTest`: `mismatch`, and `GenerateApacheSAIDataNegativeDotTest`: `negative` and `dot`
   (both into `/tmp/apache-sai-gen/data/<name>`);
 - `GenerateApacheSAIDataVarintsTest`: `varints`;
+- `GenerateApacheSAITokenCollisionDataTest`: the `collisions-*` directories (the `-spread` sstables, then the one that
+  compacts them);
 - `GenerateApacheSAIDataExtendedTest`: the others.
 
 To regenerate, copy them to `test/unit/org/apache/cassandra/index/sai/` of an Apache Cassandra 5.0 checkout (with the
