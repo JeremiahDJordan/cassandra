@@ -107,6 +107,11 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - A query that combines a static column and a regular column in an OR, e.g. WHERE v = 1 OR s = 2, now returns
+      the rows that satisfy either side, with or without indexes, including the static row of a partition without
+      other rows if it satisfies the OR. Before, it only returned rows that satisfied both sides without indexes,
+      and with SAI it could return fewer rows with LIMIT or paging than without. Run such queries only once every
+      node runs this release, because each replica filters the rows it returns.
 
 5.0.7
 ======
