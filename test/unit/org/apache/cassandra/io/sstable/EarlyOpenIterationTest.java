@@ -141,7 +141,7 @@ public class EarlyOpenIterationTest extends CQLTester
             {
                 try (var partition = iter.next())
                 {
-                    // consume all rows, so that the data is cached
+                    // consume all rows
                     partition.forEachRemaining(column -> {
                         // consume all columns
                     });

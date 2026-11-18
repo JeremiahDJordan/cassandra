@@ -73,7 +73,6 @@ import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.RandomAccessReader;
-import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ActiveRepairService;
@@ -163,8 +162,8 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
         // partition "ahead" of the data file.)
         boolean isOffline = options.overrideTxnIsOffline ? false : transaction.isOffline();
         this.dataFile = isOffline
-                        ? sstable.openDataReader(ReadPattern.SEQUENTIAL)
-                        : sstable.openDataReader(CompactionManager.instance.getRateLimiter(), ReadPattern.SEQUENTIAL);
+                        ? sstable.openDataReaderForScan()
+                        : sstable.openDataReaderForScan(CompactionManager.instance.getRateLimiter());
 
         this.scrubInfo = new ScrubInfo(dataFile, sstable, fileAccessLock.readLock());
 
