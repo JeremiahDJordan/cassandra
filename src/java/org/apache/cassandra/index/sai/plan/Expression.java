@@ -585,7 +585,11 @@ public class Expression
                     case NOT_EQ:
                     case NOT_CONTAINS_KEY:
                     case NOT_CONTAINS_VALUE:
-                        isMatch = validator.compare(term, requestedValue) != 0;
+                        // A value satisfies a negated operation if none of its terms is the requested value: a term
+                        // that differs from it doesn't make up for another that matches it (an analyzed value has
+                        // several terms)
+                        if (validator.compare(term, requestedValue) == 0)
+                            return false;
                         break;
                     case RANGE:
                         isMatch = isLowerSatisfiedBy(term) && isUpperSatisfiedBy(term);
@@ -605,7 +609,8 @@ public class Expression
                 if (isMatch)
                     return true;
             }
-            return false;
+            // No term matched: this satisfies a negated operation, and no other
+            return operation.isNonEquality();
         }
         finally
         {
