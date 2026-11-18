@@ -297,6 +297,26 @@ public class SSTableContextManager
         });
     }
 
+    /**
+     * Reloads, from the disk, the descriptor cached for the given sstable if it isn't the provided one, which a build
+     * wrote through: the sstable was removed and added again meanwhile (e.g. by an aborted compaction that had opened
+     * its result early), and the cache loaded another descriptor, without the build's components. It is reloaded in
+     * place, as the contexts of the sstable may refer to it. The caller holds the sstable's build lock exclusively and
+     * the group's monitor; the one load outside them, {@link StorageAttachedIndexGroup#descriptorFor}, only adds absent
+     * entries ({@link IndexDescriptor#loadIfAbsent}), so it can't undo the reload.
+     *
+     * @return whether the cached descriptor was reloaded
+     */
+    boolean reloadDescriptorIfReplaced(SSTableReader sstable, IndexDescriptor built, Set<StorageAttachedIndex> indices)
+    {
+        IndexDescriptor cached = sstableDescriptors.get(sstable);
+        // (if none is cached, the next load reads the disk as it is now)
+        if (cached == null || cached == built)
+            return false;
+        cached.reload(sstable, contexts(indices));
+        return true;
+    }
+
     void forgetPerIndexComponentsOfName(String indexName)
     {
         for (IndexDescriptor descriptor : sstableDescriptors.values())

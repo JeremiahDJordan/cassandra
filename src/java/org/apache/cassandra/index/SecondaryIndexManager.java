@@ -121,6 +121,7 @@ import org.apache.cassandra.index.transactions.CleanupTransaction;
 import org.apache.cassandra.index.transactions.CompactionTransaction;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
+import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.notifications.INotification;
@@ -250,6 +251,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * the initial build of an SSTable-attached index selects the live SSTables.
      */
     private final ReadWriteLock sstableAttachedIndexesAddLock = new ReentrantReadWriteLock();
+
+    private final Set<SSTableBuild> sstableBuildsInProgress = Sets.newConcurrentHashSet();
 
     // executes tasks returned by Indexer#addIndexColumn which may require index(es) to be (re)built
     private static final ExecutorPlus asyncExecutor = executorFactory()
@@ -444,6 +447,23 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     public boolean isIndexWritable(Index index)
     {
         return writableIndexes.containsKey(index.getIndexMetadata().name);
+    }
+
+    /**
+     * @return the SSTables given to the builds of the given index in progress that aren't full rebuilds (see
+     * {@link #buildIndexesAsync}), e.g. the asynchronous build of SSTables reloaded from remote storage: from before
+     * their builders are submitted until the index is marked built, or until the build fails (before the index is
+     * marked failed)
+     */
+    public Set<Descriptor> sstablesOfBuildsInProgress(String indexName)
+    {
+        Set<Descriptor> sstables = new HashSet<>();
+        for (SSTableBuild build : sstableBuildsInProgress)
+        {
+            if (build.indexes.contains(indexName))
+                sstables.addAll(build.sstables);
+        }
+        return sstables;
     }
 
     /**
@@ -895,7 +915,25 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         Set<Index> indexes = markIndexesBuilding(allIndexes, isFullRebuild, false);
         if (indexes.isEmpty())
             return ImmediateFuture.success(null);
+        SSTableBuild sstableBuild = isFullRebuild ? null : new SSTableBuild(indexes, sstables);
+        if (sstableBuild != null)
+            sstableBuildsInProgress.add(sstableBuild);
+        try
+        {
+            return submitIndexBuilds(sstables, indexes, isFullRebuild, sstableBuild);
+        }
+        catch (Throwable t)
+        {
+            // Nothing is going to build these SSTables: the end check of a full rebuild must count them.
+            if (sstableBuild != null)
+                sstableBuildsInProgress.remove(sstableBuild);
+            throw t;
+        }
+    }
 
+    private java.util.concurrent.Future<?> submitIndexBuilds(Collection<SSTableReader> sstables, Set<Index> indexes, boolean isFullRebuild,
+                                                             @Nullable SSTableBuild sstableBuild)
+    {
         // Build indexes in a try/catch, so that any index not marked as either built or failed will be marked as failed:
         final Set<Index> builtIndexes = Sets.newConcurrentHashSet();
         final Set<Index> unbuiltIndexes = Sets.newConcurrentHashSet();
@@ -930,6 +968,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                // Creating the build tasks can fail before anything is submitted (e.g. an SAI rebuild
                                // rejected because a zero-copy stream holds one of its sstables): mark these indexes
                                // failed, as a failed build would, so they don't stay counted as building forever.
+                               if (sstableBuild != null)
+                                   sstableBuildsInProgress.remove(sstableBuild);
                                logAndMarkIndexesFailed(groupedIndexes, t, false);
                                unbuiltIndexes.addAll(groupedIndexes);
                                SettableFuture<Object> failed = SettableFuture.create();
@@ -946,6 +986,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                {
                                    try
                                    {
+                                       // This build no longer adds its SSTables to the views: remove it first, so
+                                       // that the end check of a full rebuild doesn't leave them to it while its
+                                       // indexes are being marked failed.
+                                       if (sstableBuild != null)
+                                           sstableBuildsInProgress.remove(sstableBuild);
                                        logAndMarkIndexesFailed(groupedIndexes, t, false);
                                    }
                                    finally
@@ -970,6 +1015,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         ListenableFuture<List<Object>> allIndexBuilds = Futures.allAsList(futures);
         SettableFuture finalResult = SettableFuture.create();
         allIndexBuilds.addListener(() -> {
+            // (the indexes are marked built or failed by now)
+            if (sstableBuild != null)
+                sstableBuildsInProgress.remove(sstableBuild);
             try
             {
                 finalizeIndexBuild(indexes, builtIndexes, unbuiltIndexes);
@@ -1995,6 +2043,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 return true;
         }
         return false;
+    }
+
+    /** The indexes and SSTables of a build that isn't a full rebuild (see {@link #sstablesOfBuildsInProgress}). */
+    private static final class SSTableBuild
+    {
+        final Set<String> indexes;
+        final Set<Descriptor> sstables;
+
+        SSTableBuild(Set<Index> indexes, Collection<SSTableReader> sstables)
+        {
+            this.indexes = indexes.stream().map(index -> index.getIndexMetadata().name).collect(Collectors.toSet());
+            this.sstables = sstables.stream().map(sstable -> sstable.descriptor).collect(Collectors.toSet());
+        }
     }
 
     /**

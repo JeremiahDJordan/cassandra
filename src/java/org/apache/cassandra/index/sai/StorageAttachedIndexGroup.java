@@ -121,6 +121,8 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     private final IndexGroupMetrics groupMetrics;
 
     private final Set<StorageAttachedIndex> indices = ConcurrentHashMap.newKeySet();
+    // the indexes that a full rebuild (or several) is rebuilding, with the number of those rebuilds
+    private final Map<StorageAttachedIndex, Integer> fullRebuilds = new ConcurrentHashMap<>();
     private final ColumnFamilyStore baseCfs;
 
     private final SSTableContextManager contextManager;
@@ -665,6 +667,13 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         for (Map.Entry<StorageAttachedIndex, Set<SSTableReader>> entry : unloadable.entrySet())
         {
             StorageAttachedIndex index = entry.getKey();
+            // An index under a full rebuild is out of its own view for the SSTables being rebuilt: the rebuild
+            // checks the views once it is over (see StorageAttachedIndexBuilder.FullRebuild). Only while the
+            // manager counts the index as building, as a rebuild whose builders never ran never clears its record.
+            // Lock order: the manager's monitor inside the group's; the only opposite path is createIndex at
+            // startup, which has no full rebuild record, so take no other lock of the manager here.
+            if (fullRebuilds.containsKey(index) && baseCfs.indexManager.isIndexBuilding(index.getIndexMetadata().name))
+                continue;
             View view = index.getIndexContext().getView();
             List<Descriptor> missing = entry.getValue()
                                             .stream()
@@ -681,6 +690,31 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             index.makeIndexNonQueryable();
         }
         return incomplete;
+    }
+
+    /**
+     * A build that has written the components of a live SSTable through the given descriptor is about to update the
+     * views: reloads the descriptor cached for the SSTable from the disk if it isn't that one (see
+     * {@link SSTableContextManager#reloadDescriptorIfReplaced}). The caller must hold the SSTable's build lock
+     * exclusively; the group's monitor keeps out the loads of the SSTable that update the views (see that method for
+     * the one load outside it, which is harmless).
+     */
+    synchronized void reloadDescriptorIfReplaced(SSTableReader sstable, IndexDescriptor built)
+    {
+        if (contextManager.reloadDescriptorIfReplaced(sstable, built, indices))
+            logger.debug(logMessage("Reloaded the index descriptor of {}, which was loaded again while it was being built"), sstable.descriptor);
+    }
+
+    /** A full rebuild of the given indexes starts (see {@link StorageAttachedIndexBuilder.FullRebuild}). */
+    void fullRebuildStarted(Set<StorageAttachedIndex> indexes)
+    {
+        indexes.forEach(index -> fullRebuilds.merge(index, 1, Integer::sum));
+    }
+
+    /** A full rebuild of the given indexes is over. */
+    void fullRebuildEnded(Set<StorageAttachedIndex> indexes)
+    {
+        indexes.forEach(index -> fullRebuilds.computeIfPresent(index, (i, n) -> n == 1 ? null : n - 1));
     }
 
     /**

@@ -22,15 +22,20 @@
 package org.apache.cassandra.index.sai;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.SortedMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
@@ -48,12 +53,15 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.compaction.CompactionInterruptedException;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.Tracker;
+import org.apache.cassandra.index.IndexBuildDecider;
 import org.apache.cassandra.index.SecondaryIndexBuilder;
 import org.apache.cassandra.index.sai.disk.PerIndexFilesOwner;
 import org.apache.cassandra.index.sai.disk.PrimaryKeyMap;
@@ -65,6 +73,7 @@ import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
+import org.apache.cassandra.index.sai.view.View;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
@@ -150,6 +159,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     private final StorageAttachedIndexGroup group;
     private final TableMetadata metadata;
     private final Tracker tracker;
+    // the full rebuild this builder is one of the builders of, if it is
+    @Nullable
+    private volatile FullRebuild fullRebuild;
     private final TimeUUID compactionId = nextTimeUUID();
     private final boolean isFullRebuild;
     private final boolean isInitialBuild;
@@ -213,6 +225,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
         // the SSTables this build hasn't built yet
         Set<SSTableReader> unbuilt = new HashSet<>(sstables.keySet());
+        boolean succeeded = false;
         try
         {
             for (Map.Entry<SSTableReader, Set<StorageAttachedIndex>> e : sstables.entrySet())
@@ -231,13 +244,17 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 }
 
                 if (indexSSTable(sstable, existing))
+                {
+                    succeeded = true;
                     return;
+                }
                 unbuilt.remove(sstable);
 
                 // This SSTable's index build completed, so release its streaming status immediately, which allows
                 // other streaming operations to operate on it.
                 releaseStreamRebuildStatus(sstable);
             }
+            succeeded = true;
         }
         catch (CompactionInterruptedException e)
         {
@@ -245,11 +262,118 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 throw e;
             logger.info(logMessage("The SSTables that the index build stopped by a truncate hadn't built yet were removed by it: " +
                                    "the build is complete"));
+            succeeded = true;
         }
         finally
         {
             // Release the rebuild status for any sstables not already released above.
             releaseStreamRebuildStatus();
+            // The last builder of a full rebuild checks the result of the rebuild, and fails if it isn't complete.
+            if (fullRebuild != null)
+                fullRebuild.builderDone(succeeded);
+        }
+    }
+
+    /**
+     * The builders of one full rebuild (see StorageAttachedIndex#getParallelIndexBuildTasks). Once they have all
+     * succeeded, the last one checks that every rebuilt index has every live SSTable in its view, and fails the rebuild
+     * otherwise, as a successful rebuild makes its indexes queryable (SecondaryIndexManager#markIndexBuilt). It
+     * checks the SSTables the rebuild built, and the others if IndexBuildDecider#checkSSTablesNotBuiltByFullRebuild.
+     */
+    static final class FullRebuild
+    {
+        private final StorageAttachedIndexGroup group;
+        private final Set<StorageAttachedIndex> indexes;
+        private final AtomicInteger running;
+        // the SSTables the builders of this rebuild build
+        private final Set<Descriptor> rebuilt = ConcurrentHashMap.newKeySet();
+        private volatile boolean failed;
+
+        FullRebuild(StorageAttachedIndexGroup group, Set<StorageAttachedIndex> indexes, int builders)
+        {
+            this.group = group;
+            this.indexes = indexes;
+            this.running = new AtomicInteger(builders);
+            group.fullRebuildStarted(indexes);
+        }
+
+        /** the given SSTables are built by a builder of this rebuild */
+        void rebuilds(Collection<SSTableReader> sstables)
+        {
+            sstables.forEach(sstable -> rebuilt.add(sstable.descriptor));
+        }
+
+        void builderDone(boolean succeeded)
+        {
+            if (!succeeded)
+                failed = true;
+            if (running.decrementAndGet() > 0)
+                return;
+            group.fullRebuildEnded(indexes);
+            // The SSTables this rebuild built are checked whatever the decider says. The others are not where the
+            // builds of SSTables are left to something else (CNDB, whose decider skips them on some nodes): they can
+            // then be out of the view legitimately, until their components arrive, which is why the initial build
+            // doesn't check for missed SSTables there either (see StorageAttachedIndex#getInitializationTask).
+            if (!failed)
+                checkViews(IndexBuildDecider.instance.checkSSTablesNotBuiltByFullRebuild(group.table()));
+        }
+
+        private void checkViews(boolean notBuiltToo)
+        {
+            ColumnFamilyStore table = group.table();
+            for (StorageAttachedIndex index : indexes)
+            {
+                if (!group.containsIndex(index))
+                    continue;
+                List<SSTableReader> missing = notInView(table, index);
+                if (!notBuiltToo)
+                    missing.removeIf(sstable -> !rebuilt.contains(sstable.descriptor));
+                if (missing.isEmpty())
+                    continue;
+                // Leave to another build of the index in progress an SSTable it was given that has no complete
+                // components yet: that build adds it to the view or fails the index. If it fails after this check,
+                // this rebuild still makes the index queryable without it, but the index isn't recorded as built, so
+                // it is built again at the next start.
+                Set<Descriptor> building = table.indexManager.sstablesOfBuildsInProgress(index.getIndexMetadata().name);
+                if (!building.isEmpty())
+                    missing.removeIf(sstable -> building.contains(sstable.descriptor) && !hasCompleteComponents(sstable, index));
+                if (missing.isEmpty())
+                    continue;
+                // an SSTable added meanwhile (e.g. by a flush or a compaction) may not be in the view yet: load them
+                group.onSSTableChanged(Collections.emptyList(), missing, Collections.singleton(index), false);
+                // Only those SSTables: one added since the first look (e.g. by another flush) is added to the view when
+                // the group is notified of it, as one added after this check is.
+                View view = index.getIndexContext().getView();
+                missing.removeIf(sstable -> sstable.isMarkedCompacted() || view.containsSSTableIndex(sstable.descriptor));
+                if (missing.isEmpty())
+                    continue;
+                throw new IllegalStateException(index.getIndexContext().logMessage(
+                    String.format("The full rebuild of the index is over, but %d live SSTable(s) aren't in its view, so it " +
+                                  "can't be made queryable: rebuild it again (nodetool rebuild_index %s %s %s): %s",
+                                  missing.size(), table.keyspace.getName(), table.name, index.getIndexContext().getIndexName(),
+                                  missing.stream().limit(10).map(sstable -> sstable.descriptor).collect(Collectors.toList()))));
+            }
+        }
+
+        private static boolean hasCompleteComponents(SSTableReader sstable, StorageAttachedIndex index)
+        {
+            IndexContext context = index.getIndexContext();
+            return IndexDescriptor.load(sstable, Collections.singleton(context)).perIndexComponents(context).isComplete();
+        }
+
+        private static List<SSTableReader> notInView(ColumnFamilyStore table, StorageAttachedIndex index)
+        {
+            List<SSTableReader> missing = new ArrayList<>();
+            // The canonical set: the sources of a running compaction as they were, and no result opened early.
+            Iterable<SSTableReader> sstables = table.getSSTables(SSTableSet.CANONICAL);
+            // The view after the SSTables: an SSTable added, and notified to the group, in between is in it.
+            View view = index.getIndexContext().getView();
+            for (SSTableReader sstable : sstables)
+            {
+                if (!sstable.isMarkedCompacted() && !view.containsSSTableIndex(sstable.descriptor))
+                    missing.add(sstable);
+            }
+            return missing;
         }
     }
 
@@ -300,6 +424,15 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     {
         // If build() will never run, release here to avoid leaving the reserved sstables stuck in the REBUILDING state.
         releaseStreamRebuildStatus();
+        if (fullRebuild != null)
+            fullRebuild.builderDone(false);
+    }
+
+    /** Makes this builder one of those of the given full rebuild (before it runs). */
+    void partOf(FullRebuild fullRebuild)
+    {
+        fullRebuild.rebuilds(sstables.keySet());
+        this.fullRebuild = fullRebuild;
     }
 
     private void releaseStreamRebuildStatus()
@@ -1344,7 +1477,29 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             if (!tracker.getView().liveSSTables().contains(sstable))
                 return;
 
-            incomplete = group.onSSTableChanged(Collections.emptyList(), Collections.singleton(sstable), existing, false);
+            // The descriptor the group has cached for the SSTable may not be ours anymore: if the SSTable was removed and
+            // added again while we were writing (e.g. restored by a compaction that had opened its result early and
+            // aborted), the group loaded another one then, from the disk as it was, without the components we were
+            // writing (or, with immutable components, with those of the previous build), and would update the views
+            // from it. A full rebuild holds the build lock of the SSTable exclusively, so it can reload that one in
+            // place (see SSTableContextManager#reloadDescriptorIfReplaced); other builds can't (another build of the
+            // SSTable may be writing through it), and fail below instead.
+            if (isFullRebuild)
+                group.reloadDescriptorIfReplaced(sstable, indexDescriptor);
+
+            incomplete = new HashSet<>(group.onSSTableChanged(Collections.emptyList(), Collections.singleton(sstable), existing, false));
+            // Whatever the descriptor: an index we built must now have the SSTable in its view, or the build failed
+            for (StorageAttachedIndex index : existing)
+            {
+                if (!sstable.isMarkedCompacted() && !index.getIndexContext().getView().containsSSTableIndex(sstable.descriptor))
+                {
+                    logger.warn(index.getIndexContext().logMessage("The index was built on {}, but the SSTable isn't in its view " +
+                                                                   "after the build (e.g. it was loaded again while it was being built)"),
+                                sstable.descriptor);
+                    index.makeIndexNonQueryable();
+                    incomplete.add(index);
+                }
+            }
         }
         catch (Throwable t)
         {

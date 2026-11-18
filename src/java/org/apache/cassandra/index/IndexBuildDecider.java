@@ -63,6 +63,20 @@ public interface IndexBuildDecider
     }
 
     /**
+     * Whether a full rebuild of an index of the given table checks, before the index is made queryable, that the live
+     * SSTables it didn't build (added while it ran) are in the index's view, and fails otherwise; those it built are
+     * always checked. Return {@code false} where index components are built elsewhere or later than the SSTables are
+     * added. Either way, an SSTable that another build of the index in progress was given is left to that build. The
+     * default follows {@link #onInitialBuild()}.
+     *
+     * @param cfs the table of the rebuilt index
+     */
+    default boolean checkSSTablesNotBuiltByFullRebuild(ColumnFamilyStore cfs)
+    {
+        return !onInitialBuild().skipped();
+    }
+
+    /**
      * CNDB overrides this method to mark index queryable if there is no sstables on writer.
      *
      * @return true if index should be queryable after {@link Index#getInitializationTask()}

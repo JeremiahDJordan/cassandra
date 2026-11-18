@@ -317,6 +317,20 @@ public class StorageAttachedIndex implements Index
                 builders.add(new StorageAttachedIndexBuilder(indexGroup, current, isFullRebuild, false, true));
             }
 
+            // the last builder of a full rebuild checks that the rebuilt indexes have every live sstable in their views
+            if (isFullRebuild && !builders.isEmpty())
+            {
+                Set<StorageAttachedIndex> rebuilt = new HashSet<>();
+                for (Index index : indexes)
+                {
+                    if (index instanceof StorageAttachedIndex)
+                        rebuilt.add((StorageAttachedIndex) index);
+                }
+                StorageAttachedIndexBuilder.FullRebuild fullRebuild =
+                    new StorageAttachedIndexBuilder.FullRebuild(indexGroup, rebuilt, builders.size());
+                builders.forEach(builder -> ((StorageAttachedIndexBuilder) builder).partOf(fullRebuild));
+            }
+
             logger.info("Creating {} parallel index builds over {} total sstables for {}...", builders.size(), sstables.size(), cfs.metadata());
 
             return builders;
