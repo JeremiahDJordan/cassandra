@@ -47,6 +47,7 @@ import org.apache.cassandra.db.partitions.BTreePartitionUpdate;
 import org.apache.cassandra.db.partitions.BTreePartitionUpdater;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
@@ -197,7 +198,9 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
 
         BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
         updateMin(minTimestamp, update.stats().minTimestamp);
-        updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
+        // EncodingStats uses a synthetic epoch for no local deletion time
+        if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+            updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
         liveDataSize.addAndGet(initialSize + updater.dataSize);
         columnsCollector.update(update.columns());
         statsCollector.update(update.stats());
@@ -427,7 +430,7 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
         {
             long minLocalDeletionTime = Long.MAX_VALUE;
             for (AtomicBTreePartition partition : source.values())
-                minLocalDeletionTime = Math.min(minLocalDeletionTime, partition.stats().minLocalDeletionTime);
+                minLocalDeletionTime = EncodingStats.mergeMinLocalDeletionTime(minLocalDeletionTime, partition.stats());
 
             return minLocalDeletionTime;
         }

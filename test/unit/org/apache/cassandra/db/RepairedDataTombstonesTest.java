@@ -19,18 +19,25 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.TreeSet;
 
 import com.google.common.collect.Iterables;
 import org.junit.Test;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.AbstractRow;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -157,6 +164,44 @@ public class RepairedDataTombstonesTest extends CQLTester
     }
 
     @Test
+    public void readTestWithSkipListMemtableData() throws Throwable
+    {
+        readTestWithMemtableData("skiplist");
+    }
+
+    @Test
+    public void readTestWithTrieMemtableData() throws Throwable
+    {
+        readTestWithMemtableData("trie");
+    }
+
+    private void readTestWithMemtableData(String memtable) throws Throwable
+    {
+        createTable("create table %s (id int, id2 int, t text, t2 text, primary key (id, id2)) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true} and memtable = '" + memtable + "'");
+        for (int i = 0; i < 10; i++)
+        {
+            execute("delete from %s where id=? and id2=?", 1, i);
+        }
+        flush();
+        SSTableReader repairedSSTable = getCurrentColumnFamilyStore().getSSTables(SSTableSet.LIVE).iterator().next();
+        repair(getCurrentColumnFamilyStore(), repairedSSTable);
+        Thread.sleep(2000);
+        for (int i = 10; i < 20; i++)
+        {
+            execute("delete from %s where id=? and id2=?", 1, i);
+        }
+        flush();
+        // writes without deletions in the memtable don't hold back the purge of the repaired tombstones
+        execute("insert into %s (id, id2, t) values (999,999,'live')");
+        execute("insert into %s (id, id2, t) values (1,15,'live')");
+        Thread.sleep(1000);
+        verify();
+        verify2(1);
+        verifyRow(1, 5, 0);
+        verifyRow(1, 12, 1);
+    }
+
+    @Test
     public void readTestPartitionTombstones() throws Throwable
     {
         createTable("create table %s (id int, id2 int, t text, t2 text, primary key (id, id2)) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true}");
@@ -191,6 +236,92 @@ public class RepairedDataTombstonesTest extends CQLTester
             }
         }
         assertEquals(10, partitionsFound);
+    }
+
+    @Test
+    public void readTestNamesUnrepairedPartitionTombstone() throws Throwable
+    {
+        readTestNamesUnrepairedPartitionTombstone(false);
+    }
+
+    @Test
+    public void readTestNamesUnrepairedPartitionTombstoneWithOtherRow() throws Throwable
+    {
+        readTestNamesUnrepairedPartitionTombstone(true);
+    }
+
+    private void readTestNamesUnrepairedPartitionTombstone(boolean otherRow) throws Throwable
+    {
+        createTable("create table %s (id int, id2 int, t text, t2 text, primary key (id, id2)) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true}");
+        getCurrentColumnFamilyStore().disableAutoCompaction();
+        execute("insert into %s (id, id2, t) values (1, 5, 'live')");
+        flush();
+        repair(getCurrentColumnFamilyStore(), getCurrentColumnFamilyStore().getLiveSSTables().iterator().next());
+        execute("delete from %s where id=1");
+        if (otherRow)
+            execute("insert into %s (id, id2, t) values (1, 7, 'live')");
+        flush();
+        Thread.sleep(2000);
+        // the unrepaired sstable holds the partition deletion but not the requested row
+        ReadCommand cmd = Util.cmd(getCurrentColumnFamilyStore(), Util.dk(ByteBufferUtil.bytes(1))).includeRow(5).columns("t").build();
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            assertTrue(iterator.hasNext());
+            try (UnfilteredRowIterator rowIter = iterator.next())
+            {
+                assertFalse(rowIter.partitionLevelDeletion().isLive());
+                assertFalse(rowIter.hasNext());
+            }
+        }
+    }
+
+    @Test
+    public void readTestNamesStaticUnrepairedMemtablePartitionTombstone() throws Throwable
+    {
+        readTestNamesStaticUnrepairedMemtableTombstone(true);
+    }
+
+    @Test
+    public void readTestNamesStaticUnrepairedMemtableCellTombstone() throws Throwable
+    {
+        readTestNamesStaticUnrepairedMemtableTombstone(false);
+    }
+
+    private void readTestNamesStaticUnrepairedMemtableTombstone(boolean partitionDeletion) throws Throwable
+    {
+        createTable("create table %s (id int, id2 int, s text static, t text, primary key (id, id2)) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true}");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+        execute("insert into %s (id, id2, s, t) values (1, 5, 'live', 'live')");
+        flush();
+        repair(cfs, cfs.getLiveSSTables().iterator().next());
+        if (partitionDeletion)
+            execute("delete from %s where id=1");
+        else
+            execute("delete s from %s where id=1");
+        Thread.sleep(2000);
+        // a names read without clusterings reads only the static row and partition deletion of the memtable
+        ColumnMetadata s = cfs.metadata().getColumn(ByteBufferUtil.bytes("s"));
+        ReadCommand cmd = SinglePartitionReadCommand.create(cfs.metadata(),
+                                                            FBUtilities.nowInSeconds(),
+                                                            ColumnFilter.selection(RegularAndStaticColumns.of(s)),
+                                                            RowFilter.none(),
+                                                            DataLimits.NONE,
+                                                            Util.dk(ByteBufferUtil.bytes(1)),
+                                                            new ClusteringIndexNamesFilter(new TreeSet<>(cfs.metadata().comparator), false));
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            assertTrue(iterator.hasNext());
+            try (UnfilteredRowIterator rowIter = iterator.next())
+            {
+                if (partitionDeletion)
+                    assertFalse(rowIter.partitionLevelDeletion().isLive());
+                else
+                    assertTrue(rowIter.staticRow().getCell(s).isTombstone());
+            }
+        }
     }
 
     @Test
@@ -304,6 +435,28 @@ public class RepairedDataTombstonesTest extends CQLTester
                             int val = ByteBufferUtil.toInt(row.clustering().bufferAt(i));
                             assertTrue("val=" + val, val >= minVal && val < maxVal);
                         }
+                    }
+                }
+            }
+        }
+        assertEquals(expectedRows, foundRows);
+    }
+
+    private void verifyRow(int key, int id2, int expectedRows)
+    {
+        ReadCommand cmd = Util.cmd(getCurrentColumnFamilyStore(), Util.dk(ByteBufferUtil.bytes(key))).includeRow(id2).columns("t").build();
+        int foundRows = 0;
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            while (iterator.hasNext())
+            {
+                try (UnfilteredRowIterator rowIter = iterator.next())
+                {
+                    while (rowIter.hasNext())
+                    {
+                        rowIter.next();
+                        foundRows++;
                     }
                 }
             }
