@@ -30,6 +30,7 @@ import org.apache.cassandra.db.Slice;
 import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
@@ -130,10 +131,13 @@ public abstract class IndexSearcher implements Closeable, SegmentOrdering
                 // TODO if we end up needing to read the row still, is it better to store offset and use reader.unfilteredAt?
                 try (var iter = reader.rowIterator(key.partitionKey(), slices, columnFilter, false, SSTableReadsListener.NOOP_LISTENER))
                 {
-                    if (iter.hasNext())
+                    while (iter.hasNext())
                     {
-                        var row = (Row) iter.next();
-                        assert !iter.hasNext();
+                        Unfiltered unfiltered = iter.next();
+                        // A range tombstone covering the row adds its markers to the slice, so skip non-row unfiltereds.
+                        if (!unfiltered.isRow())
+                            continue;
+                        var row = (Row) unfiltered;
                         var cell = row.getCell(indexContext.getDefinition());
                         if (cell == null)
                             return null;
