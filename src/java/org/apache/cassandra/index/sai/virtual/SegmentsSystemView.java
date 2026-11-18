@@ -43,6 +43,9 @@ public class SegmentsSystemView extends AbstractVirtualTable
 {
     public static final String NAME = "sstable_index_segments";
 
+    /** The name of this table in Apache Cassandra, under which it is registered too */
+    public static final String APACHE_NAME = "sai_sstable_index_segments";
+
     public static final String KEYSPACE_NAME = "keyspace_name";
     public static final String INDEX_NAME = "index_name";
     public static final String SSTABLE_NAME = "sstable_name";
@@ -60,7 +63,12 @@ public class SegmentsSystemView extends AbstractVirtualTable
 
     public SegmentsSystemView(String keyspace)
     {
-        super(TableMetadata.builder(keyspace, NAME)
+        this(keyspace, NAME);
+    }
+
+    public SegmentsSystemView(String keyspace, String name)
+    {
+        super(TableMetadata.builder(keyspace, name)
                            .partitioner(new LocalPartitioner(UTF8Type.instance))
                            .comment("SSTable index segment metadata")
                            .kind(TableMetadata.Kind.VIRTUAL)

@@ -173,6 +173,8 @@ New features
       -Dcassandra.sai.validate_per_sstable_checksum_on_partial_build=false turns it off, which keeps the previous
       behaviour: those files are then only checksum-validated when the sstable is loaded at startup, streamed or
       imported, and a full rebuild (nodetool rebuild_index) always rewrites them.
+    - The virtual table system_views.sstable_index_segments, of SAI index segments, is also available under its
+      Apache Cassandra name, system_views.sai_sstable_index_segments, with the same columns.
 
 Upgrading
 ---------

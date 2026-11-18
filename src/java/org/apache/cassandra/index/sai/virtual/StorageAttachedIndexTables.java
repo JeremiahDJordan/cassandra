@@ -32,6 +32,7 @@ public class StorageAttachedIndexTables
     {
         return Arrays.asList(new ColumnIndexesSystemView(keyspace),
                              new SegmentsSystemView(keyspace),
+                             new SegmentsSystemView(keyspace, SegmentsSystemView.APACHE_NAME),
                              new SSTableIndexesSystemView(keyspace));
     }
 }

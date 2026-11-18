@@ -19,6 +19,7 @@ package org.apache.cassandra.index.sai.virtual;
 
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import com.google.common.collect.ImmutableList;
@@ -38,6 +39,7 @@ import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.virtual.VirtualKeyspace;
 import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
+import org.apache.cassandra.db.virtual.VirtualTable;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SAITester;
@@ -54,6 +56,7 @@ import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.service.StorageService;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_ENCRYPTION;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
@@ -104,7 +107,10 @@ public class SegmentsSystemViewTest extends SAITester
     @BeforeClass
     public static void setup() throws Exception
     {
-        VirtualKeyspaceRegistry.instance.register(new VirtualKeyspace(SchemaConstants.VIRTUAL_VIEWS, ImmutableList.of(new SegmentsSystemView(SchemaConstants.VIRTUAL_VIEWS))));
+        VirtualKeyspaceRegistry.instance.register(new VirtualKeyspace(SchemaConstants.VIRTUAL_VIEWS,
+                                                                      ImmutableList.of(new SegmentsSystemView(SchemaConstants.VIRTUAL_VIEWS),
+                                                                                       new SegmentsSystemView(SchemaConstants.VIRTUAL_VIEWS,
+                                                                                                              SegmentsSystemView.APACHE_NAME))));
 
         requireNetwork();
     }
@@ -213,6 +219,35 @@ public class SegmentsSystemViewTest extends SAITester
         dropIndex("DROP INDEX %s." +  stringIndex);
         assertEmpty(execute(SELECT, numericIndex));
         assertEmpty(execute(SELECT, stringIndex));
+    }
+
+    /**
+     * The table is also registered under its Apache Cassandra name, with the same columns and rows.
+     */
+    @Test
+    public void testApacheName() throws Throwable
+    {
+        assertThat(StorageAttachedIndexTables.getAll(SchemaConstants.VIRTUAL_VIEWS)).extracting(VirtualTable::name)
+                                                                                    .contains(SegmentsSystemView.NAME, SegmentsSystemView.APACHE_NAME);
+
+        createTable("CREATE TABLE %s (k int, c int, v1 int, v2 text, PRIMARY KEY (k, c))");
+        createIndex("CREATE CUSTOM INDEX ON %s(v1) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v2) USING 'StorageAttachedIndex'");
+        for (int i = 0; i < 10; i++)
+            execute("INSERT INTO %s(k, c, v1, v2) VALUES (?, ?, ?, ?)", i, 10, i, "v" + i);
+        flush();
+
+        String select = "SELECT * FROM %s.%s WHERE " + SegmentsSystemView.KEYSPACE_NAME + " = '" + KEYSPACE + '\'';
+        UntypedResultSet rows = execute(String.format(select, SchemaConstants.VIRTUAL_VIEWS, SegmentsSystemView.NAME));
+        UntypedResultSet apacheRows = execute(String.format(select, SchemaConstants.VIRTUAL_VIEWS, SegmentsSystemView.APACHE_NAME));
+        assertEquals(2, rows.size());
+        assertEquals(columns(rows), columns(apacheRows));
+        assertRows(apacheRows, getRows(rows));
+    }
+
+    private static List<String> columns(UntypedResultSet rows)
+    {
+        return rows.metadata().stream().map(c -> c.name + " " + c.type.asCQL3Type()).collect(Collectors.toList());
     }
 
     private HashMap<String, Long> indexFileLengths(String table) throws Exception
