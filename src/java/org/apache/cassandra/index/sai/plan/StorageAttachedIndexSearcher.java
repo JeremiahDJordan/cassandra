@@ -752,7 +752,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                     {
                         // If there are no regular rows, return the static row only
                         if (!clusters.hasNext())
-                            return new PrimaryKeyIterator(partition, staticRow, null, sourceKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
+                            return new PrimaryKeyIterator(partition, staticRow, null, sourceKey, syntheticScoreColumn, controller.getOrderer());
 
                         isStaticValid = true;
                         break;
@@ -775,7 +775,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                             // We can only count the pk as processed once we know it was valid for one of the
                             // scored keys.
                             processedKeys.add(pk);
-                            return new PrimaryKeyIterator(partition, staticRow, row, sourceKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
+                            return new PrimaryKeyIterator(partition, staticRow, row, sourceKey, syntheticScoreColumn, controller.getOrderer());
                         }
                     }
                 }
@@ -806,8 +806,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                                       @Nullable Unfiltered content,
                                       PrimaryKeyWithSortKey primaryKeyWithSortKey,
                                       ColumnMetadata syntheticScoreColumn,
-                                      Orderer orderer,
-                                      int nowInSec)
+                                      Orderer orderer)
             {
                 super(partition.metadata(),
                       partition.partitionKey(),
@@ -834,10 +833,13 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                 ArrayList<ColumnData> columnData = new ArrayList<>(originalRow.columnCount() + 1);
                 columnData.addAll(originalRow.columnData());
 
-                // inject +score as a new column
+                // inject +score as a new column, with the timestamp of the data it is computed from: the ordered
+                // column's, or the newest of the row if the row doesn't have it. With an older timestamp, a row deletion
+                // that the row's data supersedes (a row deleted and written again) would shadow the score.
                 float score = ((PrimaryKeyWithScore) primaryKeyWithSortKey).getExactScore(orderer, originalRow);
+                ColumnData orderedData = originalRow.getColumnData(orderer.context.getDefinition());
                 columnData.add(BufferCell.live(syntheticScoreColumn,
-                                               nowInSec,
+                                               orderedData != null ? orderedData.maxTimestamp() : newestTimestamp(originalRow),
                                                FloatType.instance.decompose(score)));
 
                 this.row = BTreeRow.create(originalRow.clustering(),
@@ -847,6 +849,17 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                                                 .auto(true)
                                                 .addAll(columnData)
                                                 .build());
+            }
+
+            /**
+             * @return the newest timestamp of the data of the given row: its primary key liveness info and its cells
+             */
+            private long newestTimestamp(Row row)
+            {
+                long timestamp = row.primaryKeyLivenessInfo().timestamp();
+                for (ColumnData cd : row)
+                    timestamp = Math.max(timestamp, cd.maxTimestamp());
+                return timestamp;
             }
 
             @Override
