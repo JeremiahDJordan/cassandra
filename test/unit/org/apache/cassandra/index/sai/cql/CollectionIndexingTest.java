@@ -148,6 +148,97 @@ public class CollectionIndexingTest extends SAITester.Versioned
         assertEquals(2, execute("SELECT * FROM %s WHERE value[1] != 'v3'").size());
     }
 
+    /**
+     * m[k] != v matches the rows whose map doesn't have the entry (k, v), including null and empty maps and expired or
+     * shadowed entries; m and u hold the same data.
+     */
+    @Test
+    public void indexMapEntriesNotEquals() throws Throwable
+    {
+        checkMapEntriesNotEquals(false);
+    }
+
+    @Test
+    public void indexStaticMapEntriesNotEquals() throws Throwable
+    {
+        checkMapEntriesNotEquals(true);
+    }
+
+    private void checkMapEntriesNotEquals(boolean isStatic) throws Throwable
+    {
+        String st = isStatic ? " static" : "";
+        createTable("CREATE TABLE %s (pk int, ck int, w int, m map<text, text>" + st + ", u map<text, text>" + st + ", PRIMARY KEY (pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(ENTRIES(m)) USING 'StorageAttachedIndex'");
+        for (int pk = 0; pk < 18; pk++)
+            execute("INSERT INTO %s (pk, ck, w) VALUES (?, 0, 1)", pk); // 0: no map
+        String where = isStatic ? " WHERE pk = ?" : " WHERE pk = ? AND ck = 0";
+        String set = "UPDATE %s SET m = %s, u = %<s" + where;
+        String setEntry = "UPDATE %1$s%2$s SET m[%3$s] = %4$s, u[%3$s] = %4$s" + where;
+        String remove = "UPDATE %s SET m = m - {'k'}, u = u - {'k'}" + where;
+        execute(String.format(set, "%s", "{'k': 'v'}"), 1);
+        execute(String.format(set, "%s", "{'k': 'x'}"), 2);
+        execute(String.format(set, "%s", "{'o': 'v'}"), 3);
+        execute(String.format(set, "%s", "{'k': 'v', 'o': 'x'}"), 4);
+        execute(String.format(set, "%s", "{'k': 'v'}"), 5);
+        execute(String.format(set, "%s", "null"), 5); // map deleted
+        execute(String.format(set, "%s", "{'k': 'v'}"), 6);
+        execute(String.format(set, "%s", "{'o': 'x'}"), 6); // map overwritten
+        execute(String.format(set, "%s", "{'k': 'v'}"), 7);
+        execute(String.format(setEntry, "%s", "", "'k'", "'x'"), 7); // entry updated
+        execute(String.format(set, "%s", "{'k': 'x'}"), 8);
+        execute(String.format(setEntry, "%s", "", "'k'", "'v'"), 8);
+        execute(String.format(set, "%s", "{'k': 'v'}"), 9);
+        execute(String.format(remove, "%s"), 9); // map emptied
+        execute(String.format(set, "%s", "{'k': 'v', 'o': 'x'}"), 10);
+        execute(String.format(remove, "%s"), 10);
+        execute(String.format(set, "%s", "{'z': 'v'}"), 11);
+        // 12 to 14: entries written at timestamp 1, shadowed later by deletions at timestamp 5 in another sstable
+        for (int pk = 12; pk <= 14; pk++)
+            execute(String.format("UPDATE %s USING TIMESTAMP 1 SET m = {'k': 'v'}, u = {'k': 'v'}" + where, "%s"), pk);
+        // 15 to 17: expired entries
+        execute(String.format(setEntry, "%s", " USING TTL 1", "'k'", "'v'"), 15);
+        execute(String.format(set, "%s", "{'o': 'x'}"), 16);
+        execute(String.format(setEntry, "%s", " USING TTL 1", "'k'", "'v'"), 16);
+        execute(String.format("UPDATE %s USING TTL 1 SET m = {'k': 'v'}, u = {'k': 'v'}" + where, "%s"), 17);
+        Thread.sleep(2000);
+
+        assertMapEntriesMatchFiltering();
+        flush();
+        assertMapEntriesMatchFiltering();
+        // later writes in another sstable
+        execute(String.format(set, "%s", "{'k': 'v'}"), 2);
+        execute(String.format(set, "%s", "null"), 1);
+        execute(String.format(setEntry, "%s", "", "'o'", "'x'"), 3);
+        execute("DELETE FROM %s USING TIMESTAMP 5 WHERE pk = 12");
+        execute("DELETE FROM %s USING TIMESTAMP 5 WHERE pk = 13 AND ck >= 0"); // a range tombstone
+        execute("DELETE FROM %s USING TIMESTAMP 5 WHERE pk = 14");
+        execute(String.format(setEntry, "%s", "", "'a'", "'b'"), 14);
+        assertMapEntriesMatchFiltering();
+        flush();
+        assertMapEntriesMatchFiltering();
+        compact();
+        assertMapEntriesMatchFiltering();
+    }
+
+    private void assertMapEntriesMatchFiltering()
+    {
+        for (String key : new String[]{ "'k'", "'o'", "'z'" })
+        {
+            for (String value : new String[]{ "'v'", "'x'" })
+            {
+                for (String op : new String[]{ "!=", "=" })
+                {
+                    String restriction = "%s[" + key + "] " + op + ' ' + value;
+                    assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE " + String.format(restriction, "m")),
+                                            getRows(execute("SELECT pk FROM %s WHERE " + String.format(restriction, "u") + " ALLOW FILTERING")));
+                }
+            }
+        }
+        // two entry restrictions
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE m['k'] != 'v' AND m['o'] != 'x'"),
+                                getRows(execute("SELECT pk FROM %s WHERE u['k'] != 'v' AND u['o'] != 'x' ALLOW FILTERING")));
+    }
+
     @Test
     public void indexFrozenList()
     {
