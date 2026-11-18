@@ -241,6 +241,23 @@ public class BM25Test extends SAITester
     }
 
     @Test
+    public void testRowDeletedAndWrittenAgain() throws Throwable
+    {
+        // the row deletion must not shadow the score the replica adds to the row
+        createTable("CREATE TABLE %s (k int, c int, v text, n int, PRIMARY KEY (k, c))");
+        createIndex("CREATE CUSTOM INDEX ON %s(n) USING 'org.apache.cassandra.index.sai.StorageAttachedIndex'");
+        createAnalyzedIndex();
+        execute("INSERT INTO %s (k, c, v, n) VALUES (1, 1, 'apple', 0)");
+        execute("DELETE FROM %s WHERE k = 2 AND c = 1");
+        execute("INSERT INTO %s (k, c, v, n) VALUES (2, 1, 'apple juice', 0)");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT k, c FROM %s ORDER BY v BM25 OF 'apple' LIMIT 3"), row(1, 1), row(2, 1));
+            assertRows(execute("SELECT k, c FROM %s WHERE n = 0 ORDER BY v BM25 OF 'apple' LIMIT 3"), row(1, 1), row(2, 1));
+        });
+    }
+
+    @Test
     public void testTwoIndexesAmbiguousPredicate() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
