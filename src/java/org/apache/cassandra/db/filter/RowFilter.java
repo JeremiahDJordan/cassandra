@@ -280,11 +280,13 @@ public class RowFilter
         return new Transformation<>()
         {
             DecoratedKey pk;
+            boolean hasMatchingRow;
 
             @Override
             protected BaseRowIterator<?> applyToPartition(BaseRowIterator<?> partition)
             {
                 pk = partition.partitionKey();
+                hasMatchingRow = false;
 
                 // Short-circuit all partitions that won't match based on static and partition keys
                 if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow(), nowInSec))
@@ -297,7 +299,12 @@ public class RowFilter
                                               ? Transformation.apply((UnfilteredRowIterator) partition, this)
                                               : Transformation.apply((RowIterator) partition, this);
 
-                return filterNonStaticColumns ? withRowsOrNull(iterator) : iterator;
+                // hasNext() reads ahead the first content that passes the filter: the usual partition, where that
+                // is a row, is returned as it is
+                if (!filterNonStaticColumns || (iterator.hasNext() && hasMatchingRow))
+                    return iterator;
+
+                return withRowsOrNull(iterator);
             }
 
             @Override
@@ -313,6 +320,7 @@ public class RowFilter
                 if (!rowLevelOperation.isSatisfiedBy(metadata, pk, purged, nowInSec))
                     return null;
 
+                hasMatchingRow = true;
                 return row;
             }
         };
