@@ -97,6 +97,16 @@ Upgrading
       receives DROP INDEX and CREATE INDEX as one schema change (e.g. it was down), and after a restart that follows a
       CREATE INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes
       concerned. Older versions ignore the content of the marker.
+    - ANN queries (ORDER BY v ANN OF [...]) on a storage-attached index on a vector in the partition key, e.g. v in
+      PRIMARY KEY ((k, v), c), of a table with static columns now return every live row of a matching partition, and a
+      partition left with its static row alone. An index flushed from a memtable by an earlier release kept, for each
+      partition, only the key of its static row or only the keys of its rows, whichever was written first: plain ANN
+      queries, and those the planner runs by sorting first, are right on such indexes without a rebuild, but queries
+      that filter first and then sort by the vector (e.g. WHERE s = 1 ORDER BY v ANN OF [...] with an index on s,
+      which the planner can choose) miss the rows of partitions whose static row was written before their rows, and
+      partitions left with their static row alone whose earlier rows were deleted or expired, until the sstable is
+      compacted. Unless every sstable of the table has been compacted since the upgrade, rebuild such indexes with
+      nodetool rebuild_index once every node runs this release, one node at a time.
 
 Deprecation
 ---------

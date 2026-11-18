@@ -40,25 +40,12 @@ public class PrimaryKeys implements Iterable<MemoryIndex.PkWithFrequency>
     private static final long MAP_ENTRY_OVERHEAD = 40 + Integer.BYTES;
 
     /**
-     * Comparator for the internal map. It extends the natural {@link PrimaryKey} order with one extra rule:
-     * when a STATIC key and a WIDE key (one with real clustering values) compare as equal via
-     * {@code compareTo} — because {@code hasClustering()} is {@code false} for both — the STATIC key
-     * sorts before the WIDE key. This prevents the two from being treated as duplicates in the map
-     * while leaving the natural ordering used by iterators and {@code skipTo} completely unchanged.
-     * <p>
-     * Static row keys sort before all wide-row keys in the same partition.
+     * Comparator for the internal map: the natural {@link PrimaryKey} order, with a STATIC key before the WIDE keys
+     * (with real clustering values) of its partition, which it compares equal to via {@code compareTo}. This prevents
+     * the two from being treated as duplicates in the map while leaving the natural ordering used by iterators and
+     * {@code skipTo} unchanged.
      */
-    static final Comparator<PrimaryKey> KEY_COMPARATOR = (a, b) -> {
-        int cmp = a.compareTo(b);
-        if (cmp != 0)
-            return cmp;
-        // Break the STATIC-vs-WIDE tie: STATIC < WIDE, STATIC == no-clustering, WIDE == WIDE.
-        if (a.isStaticRow() && b.hasClustering())
-            return -1;
-        if (b.isStaticRow() && a.hasClustering())
-            return 1;
-        return 0;
-    };
+    static final Comparator<PrimaryKey> KEY_COMPARATOR = PrimaryKey.STATIC_BEFORE_ROWS;
 
     private final ConcurrentSkipListMap<PrimaryKey, Integer> keys = new ConcurrentSkipListMap<>(KEY_COMPARATOR);
 

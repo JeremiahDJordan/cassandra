@@ -31,6 +31,7 @@ import net.openhft.chronicle.hash.serialization.BytesWriter;
 import net.openhft.chronicle.map.MapEntry;
 import org.agrona.collections.Int2IntHashMap;
 import org.agrona.collections.IntArrayList;
+import org.apache.cassandra.index.sai.utils.PrimaryKey;
 
 public class VectorPostings<T>
 {
@@ -63,10 +64,21 @@ public class VectorPostings<T>
     public boolean add(T key)
     {
         for (T existing : postings)
-            if (existing.equals(key))
+            if (isSameKey(existing, key))
                 return false;
         postings.add(key);
         return true;
+    }
+
+    /**
+     * Whether two keys are the same: a static key compares equal to the row keys of its partition but is a key of its
+     * own (with a vector in a partition key column, the static row and the rows of a partition have the same vector).
+     */
+    private static boolean isSameKey(Object a, Object b)
+    {
+        if (!a.equals(b))
+            return false;
+        return !(a instanceof PrimaryKey) || ((PrimaryKey) a).hasClustering() == ((PrimaryKey) b).hasClustering();
     }
 
     /**
@@ -119,7 +131,7 @@ public class VectorPostings<T>
 
     public void remove(T key)
     {
-        postings.remove(key);
+        postings.removeIf(existing -> isSameKey(existing, key));
     }
 
     public long ramBytesUsed()

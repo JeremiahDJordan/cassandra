@@ -68,14 +68,30 @@ public class FilterTree
 
     public boolean isSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
     {
-        boolean result = localSatisfiedBy(key, currentCluster, staticRow);
+        return isSatisfiedBy(key, currentCluster, staticRow, false);
+    }
+
+    /**
+     * Whether the static row of a partition without other matching rows satisfies this tree, as the only row of the
+     * partition: an expression on a regular or clustering column is never satisfied, since that row has no value for
+     * them. Evaluated on the static row, a negation on such a column, like {@code v != 2}, would be satisfied by the
+     * missing value, and the partition would be returned for its static row although none of its rows matches.
+     */
+    public boolean isSatisfiedByStaticRow(DecoratedKey key, Row staticRow)
+    {
+        return isSatisfiedBy(key, staticRow, staticRow, true);
+    }
+
+    private boolean isSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow, boolean staticRowOnly)
+    {
+        boolean result = localSatisfiedBy(key, currentCluster, staticRow, staticRowOnly);
 
         if (shouldReturnNow(result))
             return result;
 
         for (FilterTree child : children)
         {
-            result = op.apply(result, child.isSatisfiedBy(key, currentCluster, staticRow));
+            result = op.apply(result, child.isSatisfiedBy(key, currentCluster, staticRow, staticRowOnly));
             if (shouldReturnNow(result))
                 return result;
         }
@@ -83,7 +99,7 @@ public class FilterTree
         return result;
     }
 
-    private boolean localSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow)
+    private boolean localSatisfiedBy(DecoratedKey key, Unfiltered currentCluster, Row staticRow, boolean staticRowOnly)
     {
         if (currentCluster == null || !currentCluster.isRow())
             return false;
@@ -108,38 +124,48 @@ public class FilterTree
             {
                 Expression filter = filterIterator.previous();
 
-                // RowFilter would match a static row alone on any regular column
-                if (filter.unindexedMapEntry != null && row != null && row.isStatic() == column.isStatic())
-                {
-                    result = op.apply(result, isSatisfiedBy(filter.unindexedMapEntry, filter.context.columnFamilyStore().metadata(), key, row, now));
-                }
-                else if (filter.unindexed != null)
-                {
-                    // the row filter expression reads the cells of a purged row, as RowFilter#isSatisfiedBy gives it
-                    TableMetadata metadata = filter.context.columnFamilyStore().metadata();
-                    Row purged = row == null ? null : row.purge(DeletionPurger.PURGE_ALL, now, metadata.enforceStrictLiveness());
-                    result = op.apply(result, purged != null && filter.unindexed.isSatisfiedBy(metadata, key, purged));
-                }
-                else if (TypeUtil.isNonFrozenCollection(column.type))
-                {
-                    Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
-                    result = op.apply(result, filter.isSatisfiedBy(valueIterator));
-                }
-                else if (filter.context.isFrozenCollectionElements())
-                {
-                    result = op.apply(result, filter.isSatisfiedBy(filter.context.getFrozenCollectionElementsOf(key, row, now)));
-                }
-                else
-                {
-                    ByteBuffer value = filter.context.getValueOf(key, row, now);
-                    result = op.apply(result, filter.isSatisfiedBy(value));
-                }
+                result = op.apply(result, !neverSatisfied(column, staticRowOnly) && isSatisfiedBy(key, row, column, filter, now));
 
                 if (shouldReturnNow(result))
                     return result;
             }
         }
         return result;
+    }
+
+    private static boolean neverSatisfied(ColumnMetadata column, boolean staticRowOnly)
+    {
+        return staticRowOnly && (column.kind == Kind.REGULAR || column.kind == Kind.CLUSTERING);
+    }
+
+    private static boolean isSatisfiedBy(DecoratedKey key, Row row, ColumnMetadata column, Expression filter, int now)
+    {
+        // RowFilter would match a static row alone on any regular column
+        if (filter.unindexedMapEntry != null && row != null && row.isStatic() == column.isStatic())
+        {
+            return isSatisfiedBy(filter.unindexedMapEntry, filter.context.columnFamilyStore().metadata(), key, row, now);
+        }
+        else if (filter.unindexed != null)
+        {
+            // the row filter expression reads the cells of a purged row, as RowFilter#isSatisfiedBy gives it
+            TableMetadata metadata = filter.context.columnFamilyStore().metadata();
+            Row purged = row == null ? null : row.purge(DeletionPurger.PURGE_ALL, now, metadata.enforceStrictLiveness());
+            return purged != null && filter.unindexed.isSatisfiedBy(metadata, key, purged);
+        }
+        else if (TypeUtil.isNonFrozenCollection(column.type))
+        {
+            Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
+            return filter.isSatisfiedBy(valueIterator);
+        }
+        else if (filter.context.isFrozenCollectionElements())
+        {
+            return filter.isSatisfiedBy(filter.context.getFrozenCollectionElementsOf(key, row, now));
+        }
+        else
+        {
+            ByteBuffer value = filter.context.getValueOf(key, row, now);
+            return filter.isSatisfiedBy(value);
+        }
     }
 
     /**
