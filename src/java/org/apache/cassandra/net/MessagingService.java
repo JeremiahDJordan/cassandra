@@ -229,10 +229,11 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
         VERSION_DS_11(MessagingService.VERSION_DS_11, false),
         VERSION_DS_12(MessagingService.VERSION_DS_12, false), // adds index hints (CNDB-13129)
         VERSION_DS_20(MessagingService.VERSION_DS_20, true), // DS Converged Cassandra 5.0
+        VERSION_DS_21(MessagingService.VERSION_DS_21, true), // adds LIKE semantics and blob indexes
         VERSION_DSE_68(MessagingService.VERSION_DSE_68, false), // DSE 6.8
         ;
 
-        public static final Version CURRENT = VERSION_DS_20; // TODO - we should consider what should be there - also there is CASSANDRA-19126 which changes the logic here
+        public static final Version CURRENT = VERSION_DS_21; // TODO - we should consider what should be there - also there is CASSANDRA-19126 which changes the logic here
 
         public final int value;
         public final boolean supportsExtendedDeletionTime;
@@ -276,8 +277,9 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
     public static final int VERSION_DS_11 = 101; // adds ann_options (CNDB-12456)
     public static final int VERSION_DS_12 = 102; // adds index hints (CNDB-13129)
     public static final int VERSION_DS_20 = 110; // DS Converged Cassandra 5.0
+    public static final int VERSION_DS_21 = 111; // adds LIKE semantics and blob indexes
     public static final int minimum_version = VERSION_40;
-    public static final int maximum_version = VERSION_DS_20;
+    public static final int maximum_version = VERSION_DS_21;
     // we want to use a modified behavior for the tools and clients - that is, since they are not running a server, they
     // should not need to run in a compatibility mode. They should be able to connect to the server regardless whether
     // it uses messaving version 4 or 5
@@ -304,7 +306,6 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
     }
     static Map<Integer, Integer> versionOrdinalMap = Arrays.stream(Version.values()).collect(Collectors.toMap(v -> v.value, Enum::ordinal));
 
-    @Deprecated(since = "5.0") // remove when cndb no longer supports bdp/6.8-cndb
     private static int currentVersion()
     {
         int version = CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION.getInt();
@@ -334,6 +335,52 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
         if (version >= VERSION_DS_10 && version < VERSION_DS_20)
             return false;
         return version != VERSION_DSE_68;
+    }
+
+    /**
+     * Whether the given messaging version is spoken by DataStax 5.0-based nodes, i.e. it's {@link #VERSION_DS_20} or a
+     * later DataStax version. Apache Cassandra nodes ({@link #VERSION_50} and below), DS Converged Cassandra 4.0 nodes
+     * ({@link #VERSION_DS_10} to {@link #VERSION_DS_12}) and DSE 6.8 nodes ({@link #VERSION_DSE_68}) don't speak it.
+     * <p>
+     * See {@link org.apache.cassandra.gms.DataStaxFeatureSupport}, which uses it to accept a request that only
+     * DataStax nodes process correctly (a query or a schema change Apache Cassandra 5.0 would reject or mis-evaluate)
+     * only once no other node is involved.
+     *
+     * @param version the messaging version
+     * @return {@code true} if {@code version} is {@link #VERSION_DS_20} or a later DataStax version
+     */
+    public static boolean isDataStax50OrLater(int version)
+    {
+        return version >= VERSION_DS_20 && version != VERSION_DSE_68;
+    }
+
+    /**
+     * Whether the given messaging version is {@link #VERSION_DS_21} (the messaging version of 5.0.10) or a later
+     * DataStax version, whose nodes support the features that need every node of a request on DataStax 5.0.10 or later
+     * (see {@link org.apache.cassandra.gms.DataStaxFeatureSupport}).
+     */
+    public static boolean isDataStax21OrLater(int version)
+    {
+        return version >= VERSION_DS_21 && isDataStax50OrLater(version);
+    }
+
+    /**
+     * The messaging version whose serialization the given one uses: {@link #VERSION_DS_21} only tells what a node
+     * supports, and serializes everything as {@link #VERSION_DS_20}. So data that is written for storage, and the
+     * checks that need the same serialization on both sides, use this version.
+     */
+    public static int serializationVersion(int version)
+    {
+        return version == VERSION_DS_21 ? VERSION_DS_20 : version;
+    }
+
+    /**
+     * Whether the given messaging version serializes as {@link #current_version} does (see
+     * {@link #serializationVersion}).
+     */
+    public static boolean isCurrentSerializationVersion(int version)
+    {
+        return serializationVersion(version) == serializationVersion(current_version);
     }
 
     /**

@@ -950,6 +950,9 @@ public class Config
      */
     public volatile boolean force_optimized_index_status_format = false;
 
+    /** @see NewFeaturePeerVersionCheck */
+    public volatile NewFeaturePeerVersionCheck new_feature_peer_version_check = NewFeaturePeerVersionCheck.messaging;
+
     public volatile String default_secondary_index = CassandraIndex.NAME;
     public volatile boolean default_secondary_index_enabled = true;
 
@@ -1252,6 +1255,24 @@ public class Config
     public enum InternodeCompression
     {
         all, none, dc
+    }
+
+    /**
+     * How the requests using a feature that older nodes don't support, or evaluate differently, check the messaging
+     * versions of the other nodes (see {@code org.apache.cassandra.gms.DataStaxFeatureSupport}): LIKE restrictions,
+     * which every node that the query can contact must evaluate the same way.
+     */
+    public enum NewFeaturePeerVersionCheck
+    {
+        /**
+         * Every node involved must speak messaging version DS 21 or a later DataStax version.
+         */
+        messaging,
+        /**
+         * Nothing is checked. Only for a deployment that guarantees that every node runs the same build and messaging
+         * version, such as one without gossip.
+         */
+        none
     }
 
     public enum DiskAccessMode

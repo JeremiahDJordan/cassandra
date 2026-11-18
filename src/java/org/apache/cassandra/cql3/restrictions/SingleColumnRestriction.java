@@ -24,11 +24,14 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.LikePatterns;
@@ -39,14 +42,21 @@ import org.apache.cassandra.cql3.Term;
 import org.apache.cassandra.cql3.Terms;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.statements.Bound;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.MultiClusteringBuilder;
 import org.apache.cassandra.db.filter.ANNOptions;
 import org.apache.cassandra.db.filter.IndexHints;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.StringType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.gms.DataStaxFeatureSupport;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.LocalStrategy;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.serializers.ListSerializer;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -979,6 +989,10 @@ public abstract class SingleColumnRestriction implements SingleRestriction
 
     public static final class LikeRestriction extends SingleColumnRestriction
     {
+        public static final String LIKE_UNSUPPORTED_BY_NODES_MESSAGE =
+        "LIKE restriction on column %s isn't supported while the query can contact nodes on a messaging version " +
+        "below DS 21 (5.0.10): nodes %s may evaluate it with other LIKE semantics";
+
         /** The token of a {@code '%'} wildcard in {@link #tokenize}. */
         @VisibleForTesting
         static final int ANY_STRING = -1;
@@ -1043,18 +1057,60 @@ public abstract class SingleColumnRestriction implements SingleRestriction
                                    ANNOptions annOptions,
                                    IndexHints indexHints)
         {
-            Pair<Operator, ByteBuffer> operation = makeSpecific(value.bindAndGet(options), bindEscape(options));
+            ByteBuffer pattern = value.bindAndGet(options);
+            if (pattern == null || pattern == ByteBufferUtil.UNSET_BYTE_BUFFER)
+                throw invalidRequest("Invalid null or unset value for LIKE on column %s", columnDef.name);
 
-            // there must be a suitable INDEX for LIKE_XXX expressions
+            Pair<Operator, ByteBuffer> operation = makeSpecific(pattern, bindEscape(options));
+
             RowFilter.SimpleExpression expression = filter.add(columnDef, operation.left, operation.right);
-            indexRegistry.getBestIndexFor(expression, indexHints)
-                         .orElseThrow(() -> invalidRequest("%s is only supported on properly indexed columns",
-                                                           expression));
+
+            // Without a suitable index, the rows are filtered with the pattern (CASSANDRA-17198). StatementRestrictions
+            // only lets that happen with ALLOW FILTERING, on string columns.
+            if (!indexRegistry.getBestIndexFor(expression, indexHints).isPresent())
+                checkTrue(supportsFiltering(columnDef), "%s is only supported on properly indexed columns", expression);
+
+            // whether an index serves it or not, the replicas filter the rows with the pattern; the nodes are the same
+            // for all the LIKE restrictions of the query
+            filter.checkOnce(LikeRestriction.class,
+                             () -> checkReplicasSupportLike(columnDef, options.getConsistency()));
 
             // whatever index serves it, the rows are filtered with the pattern (Operator#isSatisfiedBy): reject a
             // pattern that can't be compiled here rather than on the replicas
             if (operation.left != Operator.LIKE_PREFIX)
                 LikePatterns.forPatternOperator(operation.left, operation.right, columnDef.name);
+        }
+
+        /**
+         * Whether a LIKE restriction on the given column can be evaluated by filtering: string columns, as LIKE
+         * patterns are matched against UTF-8 bytes.
+         */
+        public static boolean supportsFiltering(ColumnMetadata columnDef)
+        {
+            return columnDef.type.unwrap() instanceof StringType;
+        }
+
+        /**
+         * Rejects a LIKE restriction on the given column while the read can contact a node below DS 21 (see
+         * {@link DataStaxFeatureSupport#nodesNotSupportingRead}), unless {@link Config#new_feature_peer_version_check}
+         * is {@code none}: such a node may evaluate the pattern with other semantics, and return wrong rows.
+         */
+        private static void checkReplicasSupportLike(ColumnMetadata columnDef, ConsistencyLevel consistency)
+        {
+            // only this node holds the rows of virtual and local tables
+            KeyspaceMetadata keyspace = Schema.instance.getKeyspaceMetadata(columnDef.ksName);
+            if (keyspace != null
+                && (keyspace.kind == KeyspaceMetadata.Kind.VIRTUAL
+                    || keyspace.params.replication.klass == LocalStrategy.class))
+                return;
+
+            if (DatabaseDescriptor.getNewFeaturePeerVersionCheck() == Config.NewFeaturePeerVersionCheck.none)
+                return;
+
+            Set<InetAddressAndPort> unsupported =
+                DataStaxFeatureSupport.nodesNotSupportingRead(columnDef.ksName, consistency);
+            if (!unsupported.isEmpty())
+                throw invalidRequest(LIKE_UNSUPPORTED_BY_NODES_MESSAGE, columnDef.name, unsupported);
         }
 
         /**

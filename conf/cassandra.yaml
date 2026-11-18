@@ -1843,6 +1843,15 @@ transparent_data_encryption_options:
   ## false); set it to false to prefer legacy indexes.
   # prioritize_over_legacy_index: true
 
+# LIKE restrictions, served by an index or filtered, are rejected while the query can contact a node on a messaging
+# version below DS 21 (the messaging version of 5.0.10), such as Apache Cassandra nodes and DataStax nodes before
+# 5.0.10, which may match them as a plain "contains" and return wrong rows (see NEWS.txt for the nodes a query can
+# contact). This setting can also be set at runtime through the StorageService MBean (setNewFeaturePeerVersionCheck).
+# - messaging: the messaging versions of the nodes are checked.
+# - none: nothing is checked, and a DataStax node before 5.0.10 may return wrong rows for LIKE. Only use it in a
+#   deployment that guarantees that every node runs the same build and messaging version, such as one without gossip.
+# new_feature_peer_version_check: messaging
+
 #####################
 # SAFETY THRESHOLDS #
 #####################

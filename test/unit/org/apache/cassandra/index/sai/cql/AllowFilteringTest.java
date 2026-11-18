@@ -17,17 +17,40 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+
+import com.google.common.base.Throwables;
 import org.junit.Test;
 
+import org.apache.cassandra.Util;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.gms.DataStaxFeatureSupport;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.FakePeer;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.index.IndexBuildInProgressException;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 
 /**
@@ -640,5 +663,630 @@ public class AllowFilteringTest extends SAITester
         assertRowCount(execute("SELECT * FROM %s WHERE k2=2.2 AND k3 IN (1.21, 1.22, 1.23) ALLOW FILTERING"), 0);
         // To test if an IN clause without an AND condition does not create a query plan and works as expected.
         assertRowCount(execute("SELECT * FROM %s WHERE k2 IN (1.1,2.2) ALLOW FILTERING"), 6);
+    }
+
+    @Test
+    public void testAllowFilteringWithLikePrefixPostFiltering()
+    {
+        createTable("CREATE TABLE %S (k1 int, k2 text, k3 int, PRIMARY KEY (k1))");
+        createIndex("CREATE INDEX ON %s(k3) USING 'sai'");
+
+        execute("insert into %s (k1, k2, k3) values (1, 'fo', 1)");
+        execute("insert into %s (k1, k2, k3) values (2, 'foo', 2)");
+        execute("insert into %s (k1, k2, k3) values (3, 'fo', 3)");
+        execute("insert into %s (k1, k2, k3) values (4, 'ba', 4)");
+        execute("insert into %s (k1, k2, k3) values (5, 'bar', 5)");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE 'f%%' ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE 'ca%%' ALLOW FILTERING"), 0);
+        assertThatThrownBy(() -> execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE 'f%%'"))
+                .hasMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
+                .isInstanceOf(InvalidRequestException.class);
+    }
+
+    @Test
+    public void testAllowFilteringWithLikeSuffixPostFiltering()
+    {
+        createTable("CREATE TABLE %S (k1 int, k2 text, k3 int, PRIMARY KEY (k1))");
+        createIndex("CREATE INDEX ON %s(k3) USING 'sai'");
+
+        execute("insert into %s (k1, k2, k3) values (1, 'fo', 1)");
+        execute("insert into %s (k1, k2, k3) values (2, 'foo', 2)");
+        execute("insert into %s (k1, k2, k3) values (3, 'fo', 3)");
+        execute("insert into %s (k1, k2, k3) values (4, 'ba', 4)");
+        execute("insert into %s (k1, k2, k3) values (5, 'bar', 5)");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE '%%o' ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE '%%c' ALLOW FILTERING"), 0);
+        assertThatThrownBy(() -> execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE '%%c'"))
+                .hasMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
+                .isInstanceOf(InvalidRequestException.class);
+    }
+
+    @Test
+    public void testAllowFilteringWithLikeContainsPostFiltering()
+    {
+        createTable("CREATE TABLE %S (k1 int, k2 text, k3 int, PRIMARY KEY (k1))");
+        createIndex("CREATE INDEX ON %s(k3) USING 'sai'");
+
+        execute("insert into %s (k1, k2, k3) values (1, 'fo', 1)");
+        execute("insert into %s (k1, k2, k3) values (2, 'foo', 2)");
+        execute("insert into %s (k1, k2, k3) values (3, 'fo', 3)");
+        execute("insert into %s (k1, k2, k3) values (4, 'ba', 4)");
+        execute("insert into %s (k1, k2, k3) values (5, 'bar', 5)");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE '%%ar%%' ALLOW FILTERING"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE '%%ca%%' ALLOW FILTERING"), 0);
+        assertThatThrownBy(() -> execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE '%%ca%%'"))
+                .hasMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
+                .isInstanceOf(InvalidRequestException.class);
+    }
+
+    @Test
+    public void testAllowFilteringWithLikeMatchesPostFiltering()
+    {
+        createTable("CREATE TABLE %S (k1 int, k2 text, k3 int, PRIMARY KEY (k1))");
+        createIndex("CREATE INDEX ON %s(k3) USING 'sai'");
+
+        execute("insert into %s (k1, k2, k3) values (1, 'fo', 1)");
+        execute("insert into %s (k1, k2, k3) values (2, 'foo', 2)");
+        execute("insert into %s (k1, k2, k3) values (3, 'fo', 3)");
+        execute("insert into %s (k1, k2, k3) values (4, 'ba', 4)");
+        execute("insert into %s (k1, k2, k3) values (5, 'bar', 5)");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE 'foo' ALLOW FILTERING"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE 'baar' ALLOW FILTERING"), 0);
+        assertThatThrownBy(() -> execute("SELECT * FROM %s WHERE k3 > 0 AND k2 LIKE 'baar'"))
+                .hasMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE)
+                .isInstanceOf(InvalidRequestException.class);
+    }
+
+    /**
+     * LIKE filtering: {@code %} anywhere and {@code _} are wildcards, {@code ESCAPE} makes them literal, and a
+     * wildcard-free pattern is an equality, with or without SAI indexes on other columns.
+     */
+    @Test
+    public void testAllowFilteringWithLikePatterns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i int)");
+        execute("INSERT INTO %s (k, v, i) VALUES (1, 'abc', 1)");
+        execute("INSERT INTO %s (k, v, i) VALUES (2, 'axxc', 1)");
+        execute("INSERT INTO %s (k, v, i) VALUES (3, 'a%%c', 1)");
+        execute("INSERT INTO %s (k, v, i) VALUES (4, 'a_c', 1)");
+        execute("INSERT INTO %s (k, v, i) VALUES (5, 'xabcx', 1)");
+        execute("INSERT INTO %s (k, i) VALUES (6, 1)");
+
+        for (boolean withIndex : new boolean[]{ false, true })
+        {
+            if (withIndex)
+                createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+            String filter = withIndex ? "i = 1 AND " : "";
+
+            beforeAndAfterFlush(() -> {
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE 'a%%' ALLOW FILTERING"),
+                                        row(1), row(2), row(3), row(4));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE '%%c' ALLOW FILTERING"),
+                                        row(1), row(2), row(3), row(4));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE '%%b%%' ALLOW FILTERING"),
+                                        row(1), row(5));
+                // a wildcard-free pattern matches equal values only, not values containing it
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE 'abc' ALLOW FILTERING"),
+                                        row(1));
+                // an inner % is a wildcard, as is _
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE 'a%%c' ALLOW FILTERING"),
+                                        row(1), row(2), row(3), row(4));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE 'a_c' ALLOW FILTERING"),
+                                        row(1), row(3), row(4));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE '%%a_c%%' ALLOW FILTERING"),
+                                        row(1), row(3), row(4), row(5));
+                // escaped wildcards are literal
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE 'a#%%c' ESCAPE '#' ALLOW FILTERING"),
+                                        row(3));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE 'a#_%%' ESCAPE '#' ALLOW FILTERING"),
+                                        row(4));
+                // bind markers
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE ? ALLOW FILTERING", "%x%"),
+                                        row(2), row(5));
+                // disjunctions
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "(v LIKE 'abc' OR v LIKE 'x%%') ALLOW FILTERING"),
+                                        row(1), row(5));
+                // a pattern that is only wildcards is still rejected
+                assertInvalidMessage("LIKE value can't be empty.",
+                                     "SELECT k FROM %s WHERE " + filter + "v LIKE '%%' ALLOW FILTERING");
+            });
+
+            assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
+                                 "SELECT k FROM %s WHERE " + filter + "v LIKE 'a%%'");
+        }
+    }
+
+    /**
+     * LIKE filtering on primary key and static columns.
+     */
+    @Test
+    public void testAllowFilteringWithLikeOnPrimaryKeyAndStaticColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k1 text, k2 text, c1 text, c2 text, s text static, v text, PRIMARY KEY ((k1, k2), c1, c2))");
+        execute("INSERT INTO %s (k1, k2, c1, c2, s, v) VALUES ('a1', 'b1', 'c1', 'd1', 's1', 'v1')");
+        execute("INSERT INTO %s (k1, k2, c1, c2, s, v) VALUES ('a1', 'b1', 'c2', 'd2', 's1', 'v2')");
+        execute("INSERT INTO %s (k1, k2, c1, c2, s, v) VALUES ('a2', 'b2', 'c1', 'd3', 'x2', 'v3')");
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE k1 LIKE 'a1%%' ALLOW FILTERING"), row("v1"), row("v2"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE k2 LIKE '%%2' ALLOW FILTERING"), row("v3"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE k1 = 'a1' AND k2 LIKE 'b%%' ALLOW FILTERING"), row("v1"), row("v2"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE c1 LIKE '%%1' ALLOW FILTERING"), row("v1"), row("v3"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE k1 = 'a1' AND k2 = 'b1' AND c1 LIKE 'c_' ALLOW FILTERING"), row("v1"), row("v2"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE k1 = 'a1' AND k2 = 'b1' AND c1 = 'c1' AND c2 LIKE 'd%%' ALLOW FILTERING"), row("v1"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE s LIKE 's%%' ALLOW FILTERING"), row("v1"), row("v2"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE v LIKE '%%3' ALLOW FILTERING"), row("v3"));
+        });
+
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, "SELECT v FROM %s WHERE k1 LIKE 'a1%%'");
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, "SELECT v FROM %s WHERE c1 LIKE 'c%%'");
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, "SELECT v FROM %s WHERE v LIKE 'v%%'");
+
+        // a LIKE on a partition key component makes a key range query, also with an index serving it
+        createIndex("CREATE INDEX ON %s(k2) USING 'sai'");
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE k1 = 'a1' AND k2 LIKE 'b%%' ALLOW FILTERING"), row("v1"), row("v2"));
+            assertRowsIgnoringOrder(execute("SELECT v FROM %s WHERE k2 LIKE 'b%%'"), row("v1"), row("v2"), row("v3"));
+        });
+
+        // LIKE still can't be used in updates and deletions
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns",
+                             "DELETE FROM %s WHERE k1 = 'a1' AND k2 = 'b1' AND c1 LIKE 'c%%'");
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns",
+                             "UPDATE %s SET v = 'x' WHERE k1 = 'a1' AND k2 = 'b1' AND c1 = 'c1' AND c2 LIKE 'd%%'");
+    }
+
+    /**
+     * LIKE filtering is only supported on string columns, and on columns whose index doesn't support LIKE.
+     */
+    @Test
+    public void testAllowFilteringWithLikeOnUnsupportedColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, a ascii, t text, i int, b blob, l list<text>, analyzed text)");
+        createIndex("CREATE CUSTOM INDEX ON %s(analyzed) USING 'StorageAttachedIndex' WITH OPTIONS = { 'index_analyzer' : 'standard' }");
+        execute("INSERT INTO %s (k, a, t, i, b, l, analyzed) VALUES (1, 'abc', 'abc', 1, 0x01, ['abc'], 'Quick Fox')");
+
+        assertRows(execute("SELECT k FROM %s WHERE a LIKE 'ab%%' ALLOW FILTERING"), row(1));
+
+        // the analyzed index doesn't support LIKE, so the raw values are filtered, without the analyzer
+        assertRows(execute("SELECT k FROM %s WHERE analyzed LIKE 'Quick%%' ALLOW FILTERING"), row(1));
+        assertRows(execute("SELECT k FROM %s WHERE analyzed LIKE 'quick%%' ALLOW FILTERING"));
+        assertRows(execute("SELECT k FROM %s WHERE analyzed LIKE 'Quick Fox' ALLOW FILTERING"), row(1));
+        assertInvalidMessage(String.format(StatementRestrictions.HAS_UNSUPPORTED_INDEX_RESTRICTION_MESSAGE_SINGLE, "analyzed"),
+                             "SELECT k FROM %s WHERE analyzed LIKE 'Quick%%'");
+
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns",
+                             "SELECT k FROM %s WHERE i LIKE ? ALLOW FILTERING", 1);
+        assertInvalidMessage("LIKE restriction is only supported on properly indexed columns",
+                             "SELECT k FROM %s WHERE b LIKE ? ALLOW FILTERING", ByteBufferUtil.bytes("abc"));
+        assertInvalidMessage("cannot be restricted by a 'LIKE' relation",
+                             "SELECT k FROM %s WHERE l LIKE 'a%%' ALLOW FILTERING");
+    }
+
+    /**
+     * LIKE restrictions, filtered or served by an index, are rejected when a replica may evaluate them with other
+     * semantics, as its messaging version says, whatever its release version. The fake peer can't be read from, so the
+     * queries are executed internally, but the coordinator builds the same row filter.
+     */
+    @Test
+    public void testLikeRequiresDataStaxReplicas() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i text)");
+        createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+        execute("INSERT INTO %s (k, v, i) VALUES (1, 'abc', 'abc')");
+        assertLikeAccepted();
+
+        try (FakePeer peer = new FakePeer("127.0.0.2"))
+        {
+            // a peer with an unknown messaging version that isn't alive isn't counted...
+            assertLikeAccepted();
+            // ... but it is while alive: it's about to announce its version
+            peer.alive(true);
+            assertLikeRejected(peer);
+            peer.messagingVersion(MessagingService.VERSION_DS_21);
+            assertLikeAccepted();
+
+            // Apache Cassandra, DS Converged Cassandra 4.0, DSE 6.8 and earlier DataStax 5.0 messaging versions, alive
+            // or not
+            for (int version : new int[]{ MessagingService.VERSION_40, MessagingService.VERSION_50,
+                                          MessagingService.VERSION_DS_10, MessagingService.VERSION_DS_12,
+                                          MessagingService.VERSION_DS_20, MessagingService.VERSION_DSE_68 })
+            {
+                for (String release : new String[]{ "5.0.7.0", "5.0.10.0", "5.0.10" })
+                {
+                    peer.messagingVersion(version).releaseVersion(release);
+                    assertLikeRejected(peer);
+                    peer.alive(false);
+                    assertLikeRejected(peer);
+                    peer.alive(true);
+                }
+            }
+
+            // DS 21 is enough
+            peer.messagingVersion(MessagingService.VERSION_DS_21);
+            for (String release : new String[]{ "5.0.7.0", "5.0.10", "5.0.10.0", "5.1.0" })
+            {
+                peer.releaseVersion(release);
+                assertLikeAccepted();
+            }
+
+            // After a restart of this node with the peer still down, its messaging version, only kept in memory, is
+            // unknown: the peer isn't counted until it's alive, when it's counted until it announces its version.
+            peer.alive(false).forgetMessagingVersion();
+            assertLikeAccepted();
+            peer.alive(true);
+            assertLikeRejected(peer);
+            peer.messagingVersion(MessagingService.VERSION_DS_21);
+            assertLikeAccepted();
+        }
+    }
+
+    /**
+     * A peer that Nodes doesn't know (such as a peer of a custom token metadata provider) has never been seen alive in
+     * gossip: the failure detector isn't asked about it, whatever its gossip state says, and it's decided by its
+     * messaging version alone, if known.
+     */
+    @Test
+    public void testLikeWithPeerUnknownToNodes() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i text)");
+        createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+        execute("INSERT INTO %s (k, v, i) VALUES (1, 'abc', 'abc')");
+
+        try (FakePeer peer = new FakePeer("127.0.0.2", false))
+        {
+            assertLikeAccepted();
+            peer.alive(true);
+            assertLikeAccepted();
+            peer.messagingVersion(MessagingService.VERSION_DS_21);
+            assertLikeAccepted();
+            // a version known to be unsupported still counts, alive or not
+            peer.messagingVersion(MessagingService.VERSION_DS_20);
+            assertLikeRejected(peer);
+            peer.alive(false);
+            assertLikeRejected(peer);
+        }
+    }
+
+    /**
+     * The nodes a query can contact are checked again as soon as a messaging version or the liveness of a node
+     * changes. The changes are made directly, not through FakePeer.
+     */
+    @Test
+    public void testLikeChecksPeersAgain() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i text)");
+        createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+        execute("INSERT INTO %s (k, v, i) VALUES (1, 'abc', 'abc')");
+
+        try (FakePeer peer = new FakePeer("127.0.0.2"))
+        {
+            peer.alive(true).messagingVersion(MessagingService.VERSION_DS_21);
+            EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(peer.address);
+            assertLikeAccepted();
+
+            // down, with a messaging version below DS 21
+            state.markDead();
+            MessagingService.instance().versions.set(peer.address, MessagingService.VERSION_DS_20);
+            assertLikeRejected(peer);
+
+            // back on DS 21
+            MessagingService.instance().versions.set(peer.address, MessagingService.VERSION_DS_21);
+            assertLikeAccepted();
+
+            // its messaging version unknown: not counted while down, counted once alive
+            MessagingService.instance().versions.reset(peer.address);
+            assertLikeAccepted();
+            state.markAlive();
+            assertLikeRejected(peer);
+            MessagingService.instance().versions.set(peer.address, MessagingService.VERSION_DS_21);
+            assertLikeAccepted();
+        }
+    }
+
+    /**
+     * A query whose check of the nodes started before a node refused a LIKE read checks them again, and so do the
+     * queries after it (see {@link DataStaxFeatureSupport#refreshReadChecks}).
+     */
+    @Test
+    public void testLikeRefusalDuringCheck() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        Injections.Barrier holdCheck = Injections.newBarrier("hold_read_check", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(DataStaxFeatureSupport.class)
+                                                                        .onMethod("checkRead")
+                                                                        .atExit())
+                                                 .build();
+        try (FakePeer peer = new FakePeer("127.0.0.2"))
+        {
+            peer.alive(false);
+            EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(peer.address);
+            assertThat(DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, ConsistencyLevel.ONE)).isEmpty();
+            Injections.inject(holdCheck);
+            DataStaxFeatureSupport.refreshReadChecks(KEYSPACE);
+
+            CompletableFuture<Set<InetAddressAndPort>> checked =
+                CompletableFuture.supplyAsync(() -> DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, ConsistencyLevel.ONE));
+            Util.spinAssertEquals(1L, holdCheck::getCount, 60);
+            // the peer comes back alive with an unknown version, and refuses a read
+            state.markAlive();
+            DataStaxFeatureSupport.refreshReadChecks(KEYSPACE);
+            holdCheck.countDown();
+
+            assertThat(checked.get(60, TimeUnit.SECONDS)).containsExactly(peer.address);
+            assertThat(DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, ConsistencyLevel.ONE)).containsExactly(peer.address);
+        }
+        finally
+        {
+            holdCheck.disable();
+        }
+    }
+
+    /**
+     * A node that refuses a LIKE read makes the reads of its keyspace check the nodes again, not those of other
+     * keyspaces.
+     */
+    @Test
+    public void testLikeRefusalChecksItsKeyspaceAgain() throws Throwable
+    {
+        String otherKeyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = " +
+                                              "{'class': 'SimpleStrategy', 'replication_factor': '1'}");
+        Injections.Counter checks = Injections.newCounter("read_checks")
+                                              .add(InvokePointBuilder.newInvokePoint()
+                                                                     .onClass(DataStaxFeatureSupport.class)
+                                                                     .onMethod("checkRead"))
+                                              .build();
+        List<ConsistencyLevel> scopes = Arrays.asList(ConsistencyLevel.ONE, ConsistencyLevel.LOCAL_ONE);
+        for (ConsistencyLevel consistency : scopes)
+        {
+            DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, consistency);
+            DataStaxFeatureSupport.nodesNotSupportingRead(otherKeyspace, consistency);
+        }
+        Injections.inject(checks);
+        try
+        {
+            DataStaxFeatureSupport.refreshReadChecks(KEYSPACE);
+            for (ConsistencyLevel consistency : scopes)
+                DataStaxFeatureSupport.nodesNotSupportingRead(otherKeyspace, consistency);
+            assertEquals(0, checks.get());
+            // once for every node, once for the local datacenter
+            for (int i = 0; i < 2; i++)
+                for (ConsistencyLevel consistency : scopes)
+                    DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, consistency);
+            assertEquals(2, checks.get());
+        }
+        finally
+        {
+            checks.disable();
+        }
+    }
+
+    /**
+     * A check of the nodes that is running when a node refuses a LIKE read of its keyspace is done again before the read
+     * returns, and its first result isn't kept.
+     */
+    @Test
+    public void testLikeRefusalDuringRunningCheck() throws Throwable
+    {
+        Injections.Counter checks = Injections.newCounter("read_checks_during_refusal")
+                                              .add(InvokePointBuilder.newInvokePoint()
+                                                                     .onClass(DataStaxFeatureSupport.class)
+                                                                     .onMethod("checkRead"))
+                                              .build();
+        Injections.Barrier holdCheck = Injections.newBarrier("hold_invalidated_read_check", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(DataStaxFeatureSupport.class)
+                                                                        .onMethod("checkRead")
+                                                                        .atExit())
+                                                 .build();
+        try
+        {
+            DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, ConsistencyLevel.ONE);
+            DataStaxFeatureSupport.refreshReadChecks(KEYSPACE);
+            Injections.inject(checks, holdCheck);
+
+            CompletableFuture<Set<InetAddressAndPort>> checked =
+                CompletableFuture.supplyAsync(() -> DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, ConsistencyLevel.ONE));
+            Util.spinAssertEquals(1L, holdCheck::getCount, 60);
+            DataStaxFeatureSupport.refreshReadChecks(KEYSPACE);
+            holdCheck.countDown();
+
+            assertThat(checked.get(60, TimeUnit.SECONDS)).isEmpty();
+            assertEquals(2, checks.get());
+            DataStaxFeatureSupport.nodesNotSupportingRead(KEYSPACE, ConsistencyLevel.ONE);
+            assertEquals(2, checks.get());
+        }
+        finally
+        {
+            holdCheck.disable();
+            checks.disable();
+        }
+    }
+
+    /**
+     * The nodes a LIKE query can contact aren't checked again until they change, however long it takes.
+     */
+    @Test
+    public void testLikeNoCheckWithoutChange() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i text)");
+        createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+        execute("INSERT INTO %s (k, v, i) VALUES (1, 'abc', 'abc')");
+
+        Injections.Counter checks = Injections.newCounter("read_checks")
+                                              .add(InvokePointBuilder.newInvokePoint()
+                                                                     .onClass(DataStaxFeatureSupport.class)
+                                                                     .onMethod("checkRead"))
+                                              .build();
+        try (FakePeer peer = new FakePeer("127.0.0.2"))
+        {
+            peer.alive(true).messagingVersion(MessagingService.VERSION_DS_21);
+            assertLikeAccepted();
+            Injections.inject(checks);
+
+            TimeUnit.MILLISECONDS.sleep(1100);
+            assertLikeAccepted();
+            assertEquals(0, checks.get());
+
+            peer.messagingVersion(MessagingService.VERSION_DS_20);
+            assertLikeRejected(peer);
+            assertEquals(1, checks.get());
+        }
+        finally
+        {
+            checks.disable();
+        }
+    }
+
+    /**
+     * new_feature_peer_version_check: messaging checks the messaging versions, and none checks nothing.
+     */
+    @Test
+    public void testNewFeaturePeerVersionCheck() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i text)");
+        createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+        execute("INSERT INTO %s (k, v, i) VALUES (1, 'abc', 'abc')");
+
+        Config.NewFeaturePeerVersionCheck check = DatabaseDescriptor.getNewFeaturePeerVersionCheck();
+        assertEquals(Config.NewFeaturePeerVersionCheck.messaging, check);
+        try (FakePeer peer = new FakePeer("127.0.0.2"))
+        {
+            // a DataStax 5.0 node before 5.0.10, and an Apache Cassandra node
+            for (int version : new int[]{ MessagingService.VERSION_DS_20, MessagingService.VERSION_50 })
+            {
+                peer.messagingVersion(version);
+                StorageService.instance.setNewFeaturePeerVersionCheck("messaging");
+                assertLikeRejected(peer);
+                StorageService.instance.setNewFeaturePeerVersionCheck("none");
+                assertLikeAccepted();
+            }
+
+            // a live node with an unknown version
+            peer.alive(true).forgetMessagingVersion();
+            StorageService.instance.setNewFeaturePeerVersionCheck("messaging");
+            assertLikeRejected(peer);
+            StorageService.instance.setNewFeaturePeerVersionCheck("none");
+            assertLikeAccepted();
+
+            assertThatThrownBy(() -> StorageService.instance.setNewFeaturePeerVersionCheck("full"))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessage("Invalid new_feature_peer_version_check full, expected one of [messaging, none]");
+            assertEquals("none", StorageService.instance.getNewFeaturePeerVersionCheck());
+        }
+        finally
+        {
+            DatabaseDescriptor.setNewFeaturePeerVersionCheck(check);
+        }
+    }
+
+    private void assertLikeAccepted() throws Throwable
+    {
+        assertRows(executeInternal("SELECT k FROM %s WHERE i LIKE 'a%%' AND v LIKE 'a%%' ALLOW FILTERING"), row(1));
+        assertRows(executeInternal("SELECT k FROM %s WHERE v LIKE 'a%%' ALLOW FILTERING"), row(1));
+        assertRows(executeInternal("SELECT k FROM %s WHERE i LIKE 'a%%'"), row(1));
+        assertRows(executeInternal("SELECT k FROM %s WHERE i LIKE 'a%%' ALLOW FILTERING"), row(1));
+    }
+
+    private void assertLikeRejected(FakePeer peer)
+    {
+        for (String column : new String[]{ "v", "i" })
+        {
+            assertThatThrownBy(() -> executeInternal("SELECT k FROM %s WHERE " + column + " LIKE 'a%%' ALLOW FILTERING"))
+                    .isInstanceOf(InvalidRequestException.class)
+                    .hasMessage(String.format(SingleColumnRestriction.LikeRestriction.LIKE_UNSUPPORTED_BY_NODES_MESSAGE,
+                                              column, Collections.singleton(peer.address)));
+        }
+        // the nodes are checked once per query, whatever its number of LIKE restrictions
+        assertThatThrownBy(() -> executeInternal("SELECT k FROM %s WHERE i LIKE 'a%%' AND v LIKE 'a%%' ALLOW FILTERING"))
+                .isInstanceOf(InvalidRequestException.class)
+                .hasMessageStartingWith("LIKE restriction on column ")
+                .hasMessageEndingWith(String.format(SingleColumnRestriction.LikeRestriction.LIKE_UNSUPPORTED_BY_NODES_MESSAGE,
+                                                    "x", Collections.singleton(peer.address)).substring("LIKE restriction on column x".length()));
+    }
+
+    /**
+     * A LIKE restriction on a clustering column without a supporting index needs ALLOW FILTERING, even within a
+     * partition.
+     */
+    @Test
+    public void testLikeOnClusteringColumnsRequiresAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c1 text, c2 text, v int, PRIMARY KEY (k, c1, c2))");
+        execute("INSERT INTO %s (k, c1, c2, v) VALUES (1, 'aa', 'xa', 1)");
+        execute("INSERT INTO %s (k, c1, c2, v) VALUES (1, 'aa', 'ya', 2)");
+        execute("INSERT INTO %s (k, c1, c2, v) VALUES (1, 'ba', 'xa', 3)");
+        execute("INSERT INTO %s (k, c1, c2, v) VALUES (2, 'ab', 'xa', 4)");
+
+        String[] queries = { "SELECT v FROM %s WHERE k = 1 AND c1 LIKE 'a%%'",
+                             "SELECT v FROM %s WHERE k IN (1, 2) AND c1 LIKE 'a%%'",
+                             "SELECT v FROM %s WHERE k = 1 AND c1 = 'aa' AND c2 LIKE 'x%%'",
+                             "SELECT v FROM %s WHERE c1 = 'aa' AND c2 LIKE 'x%%'",
+                             "SELECT v FROM %s WHERE c1 LIKE 'a%%' AND c2 = 'xa'" };
+        Object[][][] expected = { { row(1), row(2) },
+                                  { row(1), row(2), row(4) },
+                                  { row(1) },
+                                  { row(1) },
+                                  { row(1), row(4) } };
+
+        beforeAndAfterFlush(() -> {
+            for (int i = 0; i < queries.length; i++)
+            {
+                assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE, queries[i]);
+                assertRowsIgnoringOrder(execute(queries[i] + " ALLOW FILTERING"), expected[i]);
+            }
+        });
+
+        // an index serving the LIKE doesn't need filtering
+        createIndex("CREATE INDEX ON %s(c1) USING 'sai'");
+        assertRowsIgnoringOrder(execute(queries[0]), expected[0]);
+    }
+
+    /**
+     * Materialized views can't be restricted by LIKE.
+     */
+    @Test
+    public void testLikeInMaterializedViewIsRejected()
+    {
+        boolean enabled = DatabaseDescriptor.getMaterializedViewsEnabled();
+        DatabaseDescriptor.setMaterializedViewsEnabled(true);
+        try
+        {
+            createTable("CREATE TABLE %s (k int, c text, v int, PRIMARY KEY (k, c))");
+            assertThatThrownBy(() -> createView("CREATE MATERIALIZED VIEW %s AS SELECT * FROM %s " +
+                                                "WHERE k IS NOT NULL AND c LIKE 'a%%' PRIMARY KEY (c, k)"))
+                    .satisfies(e -> assertThat(Throwables.getRootCause(e))
+                                    .isInstanceOf(InvalidRequestException.class)
+                                    .hasMessage(String.format(StatementRestrictions.RESTRICTION_REQUIRES_INDEX_MESSAGE,
+                                                              "LIKE", "c LIKE 'a%'")));
+        }
+        finally
+        {
+            DatabaseDescriptor.setMaterializedViewsEnabled(enabled);
+        }
+    }
+
+    /**
+     * A LIKE pattern can't be null or unset.
+     */
+    @Test
+    public void testLikeWithNullOrUnsetPattern()
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i text)");
+        createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+        execute("INSERT INTO %s (k, v, i) VALUES (1, 'abc', 'abc')");
+
+        for (Object pattern : new Object[]{ null, unset() })
+        {
+            assertInvalidMessage("Invalid null or unset value for LIKE on column v",
+                                 "SELECT k FROM %s WHERE v LIKE ? ALLOW FILTERING", pattern);
+            assertInvalidMessage("Invalid null or unset value for LIKE on column i",
+                                 "SELECT k FROM %s WHERE i LIKE ?", pattern);
+        }
     }
 }

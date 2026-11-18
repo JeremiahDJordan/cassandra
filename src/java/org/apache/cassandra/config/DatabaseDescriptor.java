@@ -5556,6 +5556,16 @@ public class DatabaseDescriptor
         conf.force_optimized_index_status_format = value;
     }
 
+    public static Config.NewFeaturePeerVersionCheck getNewFeaturePeerVersionCheck()
+    {
+        return conf.new_feature_peer_version_check;
+    }
+
+    public static void setNewFeaturePeerVersionCheck(Config.NewFeaturePeerVersionCheck value)
+    {
+        conf.new_feature_peer_version_check = Objects.requireNonNull(value);
+    }
+
     public static RepairRetrySpec getRepairRetrySpec()
     {
         return conf == null ? new RepairRetrySpec() : conf.repair.retries;

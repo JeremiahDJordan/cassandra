@@ -108,7 +108,7 @@ public enum StorageCompatibilityMode
             case UPGRADING:
             case NONE:
             default:
-                return MessagingService.current_version;
+                return MessagingService.serializationVersion(MessagingService.current_version);
         }
     }
 }

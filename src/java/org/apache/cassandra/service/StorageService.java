@@ -7953,6 +7953,29 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     }
 
     @Override
+    public String getNewFeaturePeerVersionCheck()
+    {
+        return DatabaseDescriptor.getNewFeaturePeerVersionCheck().name();
+    }
+
+    @Override
+    public void setNewFeaturePeerVersionCheck(String value)
+    {
+        Config.NewFeaturePeerVersionCheck check;
+        try
+        {
+            check = Config.NewFeaturePeerVersionCheck.valueOf(value);
+        }
+        catch (IllegalArgumentException | NullPointerException e)
+        {
+            throw new IllegalArgumentException("Invalid new_feature_peer_version_check " + value + ", expected one of " +
+                                               Arrays.toString(Config.NewFeaturePeerVersionCheck.values()));
+        }
+        DatabaseDescriptor.setNewFeaturePeerVersionCheck(check);
+        logger.info("new_feature_peer_version_check set to {}", check);
+    }
+
+    @Override
     public void setPaxosRepairRaceWait(boolean paxosRepairRaceWait)
     {
         DatabaseDescriptor.setPaxosRepairRaceWait(paxosRepairRaceWait);

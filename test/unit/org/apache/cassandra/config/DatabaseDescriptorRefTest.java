@@ -83,6 +83,7 @@ public class DatabaseDescriptorRefTest
     "org.apache.cassandra.config.Config$FlushCompression",
     "org.apache.cassandra.config.Config$InternodeCompression",
     "org.apache.cassandra.config.Config$MemtableAllocationType",
+    "org.apache.cassandra.config.Config$NewFeaturePeerVersionCheck",
     "org.apache.cassandra.config.Config$PaxosOnLinearizabilityViolation",
     "org.apache.cassandra.config.Config$PaxosStatePurging",
     "org.apache.cassandra.config.Config$PaxosVariant",

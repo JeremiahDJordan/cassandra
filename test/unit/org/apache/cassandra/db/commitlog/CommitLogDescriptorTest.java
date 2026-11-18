@@ -93,7 +93,8 @@ public class CommitLogDescriptorTest
         // CURRENT_VERSION is computed from MessagingService.current_version (doesn't respect SCM)
         // but when we read from a filename, it should return the messaging version that corresponds to the version in the filename
         String newCLName = "CommitLog-" + CommitLogDescriptor.CURRENT_VERSION + "-1340512736956320000.log";
-        Assert.assertEquals(MessagingService.current_version, CommitLogDescriptor.fromFileName(newCLName).getMessagingVersion());
+        Assert.assertEquals(MessagingService.serializationVersion(MessagingService.current_version),
+                            CommitLogDescriptor.fromFileName(newCLName).getMessagingVersion());
     }
 
     @Test
@@ -364,8 +365,9 @@ public class CommitLogDescriptorTest
         {
             int commitLogVersion = CommitLogDescriptor.currentVersion(messagingVersion.value);
 
+            // VERSION_DS_21 serializes as VERSION_DS_20
+            int expectedMessagingVersion = MessagingService.serializationVersion(messagingVersion.value);
             // special case for MessagingService.VERSION_3014
-            int expectedMessagingVersion = messagingVersion.value;
             if (MessagingService.Version.VERSION_3014 == messagingVersion)
                 expectedMessagingVersion = MessagingService.VERSION_30;
 

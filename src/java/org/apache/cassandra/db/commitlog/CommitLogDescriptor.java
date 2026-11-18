@@ -295,6 +295,7 @@ public class CommitLogDescriptor
             case MessagingService.VERSION_DS_12:
                 return VERSION_DS_12;
             case MessagingService.VERSION_DS_20:
+            case MessagingService.VERSION_DS_21: // serialized as VERSION_DS_20
                 return VERSION_DS_20;
             default:
                 throw new IllegalStateException("Unknown messaging version " + messagingVersion);

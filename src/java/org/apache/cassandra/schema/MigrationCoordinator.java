@@ -387,7 +387,7 @@ public class MigrationCoordinator
             return false;
         }
 
-        if (messagingService.versions.getRaw(endpoint) != MessagingService.current_version)
+        if (!MessagingService.isCurrentSerializationVersion(messagingService.versions.getRaw(endpoint)))
         {
             if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major) && messagingService.versions.getRaw(endpoint) == MessagingService.VERSION_50)
             {
@@ -779,7 +779,7 @@ public class MigrationCoordinator
         // only push schema to nodes with known and equal versions
         return !endpoint.equals(FBUtilities.getBroadcastAddressAndPort())
                && messagingService.versions.knows(endpoint)
-               && messagingService.versions.getRaw(endpoint) == MessagingService.current_version;
+               && MessagingService.isCurrentSerializationVersion(messagingService.versions.getRaw(endpoint));
     }
 
 }

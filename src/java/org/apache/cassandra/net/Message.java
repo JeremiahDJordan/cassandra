@@ -59,6 +59,7 @@ import static org.apache.cassandra.net.MessagingService.VERSION_DS_10;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_11;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_12;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_20;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_21;
 import static org.apache.cassandra.utils.FBUtilities.getBroadcastAddressAndPort;
 import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
 import static org.apache.cassandra.utils.vint.VIntCoding.computeUnsignedVIntSize;
@@ -1198,6 +1199,7 @@ public class Message<T>
                     serializedSizeDS12 = serializer.serializedSize(this, VERSION_DS_12);
                 return serializedSizeDS12;
             case VERSION_DS_20:
+            case VERSION_DS_21: // serialized as VERSION_DS_20
                 if (serializedSizeDS20 == 0)
                     serializedSizeDS20 = (int) serializer.serializedSize(this, VERSION_DS_20);
                 return serializedSizeDS20;
@@ -1243,6 +1245,7 @@ public class Message<T>
                     payloadSizeDS12 = serializer.payloadSize(this, VERSION_DS_12);
                 return payloadSizeDS12;
             case VERSION_DS_20:
+            case VERSION_DS_21: // serialized as VERSION_DS_20
                 if (payloadSizeDS20 < 0)
                     payloadSizeDS20 = serializer.payloadSize(this, VERSION_DS_20);
                 return payloadSizeDS20;

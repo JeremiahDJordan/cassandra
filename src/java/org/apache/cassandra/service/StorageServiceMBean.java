@@ -1333,6 +1333,11 @@ public interface StorageServiceMBean extends NotificationEmitter
     boolean getForceOptimizedIndexStatusFormat();
     void setForceOptimizedIndexStatusFormat(boolean value);
 
+    /** @see org.apache.cassandra.config.Config.NewFeaturePeerVersionCheck */
+    String getNewFeaturePeerVersionCheck();
+    /** @param value {@code messaging} or {@code none}, see {@link org.apache.cassandra.config.Config.NewFeaturePeerVersionCheck} */
+    void setNewFeaturePeerVersionCheck(String value);
+
     void setPaxosRepairRaceWait(boolean paxosRepairCoordinatorWait);
 
     boolean getPaxosRepairRaceWait();

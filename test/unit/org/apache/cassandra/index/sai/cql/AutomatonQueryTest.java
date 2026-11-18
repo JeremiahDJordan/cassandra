@@ -558,8 +558,11 @@ public class AutomatonQueryTest extends SAITester
                     "{ 'index_analyzer' : 'standard' }");
         execute("INSERT INTO %s (pk, v) VALUES (?, ?)", 1, "quick brown");
 
-        assertInvalidMessage(String.format(StatementRestrictions.INDEX_DOES_NOT_SUPPORT_LIKE_MESSAGE, 'v'),
+        assertInvalidMessage(String.format(StatementRestrictions.HAS_UNSUPPORTED_INDEX_RESTRICTION_MESSAGE_SINGLE, 'v'),
                              "SELECT pk FROM %s WHERE v LIKE '%%quick%%'");
+        // ... unless it's filtered, which matches the pattern against the raw value
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v LIKE '%%quick%%' ALLOW FILTERING"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v LIKE 'brown%%' ALLOW FILTERING"));
         // ... while the analyzer match operator works
         assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v : 'quick'"), row(1));
     }
@@ -603,15 +606,17 @@ public class AutomatonQueryTest extends SAITester
     }
 
     @Test
-    public void testNoIndexRejection()
+    public void testNoIndexRequiresAllowFiltering()
     {
         createTable("CREATE TABLE %s (pk int PRIMARY KEY, v text)");
         execute("INSERT INTO %s (pk, v) VALUES (?, ?)", 1, "abc");
 
-        assertInvalidMessage("is only supported on properly indexed columns",
+        // without an index, LIKE needs ALLOW FILTERING
+        assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                              "SELECT pk FROM %s WHERE v LIKE '%%a'");
-        assertInvalidMessage("is only supported on properly indexed columns",
-                             "SELECT pk FROM %s WHERE v LIKE '%%a' ALLOW FILTERING");
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v LIKE '%%a' ALLOW FILTERING"));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v LIKE '%%c' ALLOW FILTERING"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v LIKE 'a%%c' ALLOW FILTERING"), row(1));
     }
 
     // ---------------------------------------------------------------------------------------------------------

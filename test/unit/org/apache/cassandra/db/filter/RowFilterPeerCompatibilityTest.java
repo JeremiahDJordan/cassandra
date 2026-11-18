@@ -23,15 +23,23 @@ import java.util.Map;
 
 import org.junit.Test;
 
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadQuery;
+import org.apache.cassandra.db.SinglePartitionReadQuery;
+import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -134,6 +142,48 @@ public class RowFilterPeerCompatibilityTest extends SAITester
     }
 
     /**
+     * LIKE isn't sent to nodes below DS 21, which may evaluate it with other semantics, unless
+     * new_feature_peer_version_check is none. Computing the size of the filter doesn't fail.
+     */
+    @Test
+    public void testLikeForNodesBelowDS21() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, t text)");
+        createIndex("CREATE CUSTOM INDEX ON %s(t) USING 'StorageAttachedIndex'");
+
+        Config.NewFeaturePeerVersionCheck check = DatabaseDescriptor.getNewFeaturePeerVersionCheck();
+        try
+        {
+            for (String query : new String[]{ "SELECT * FROM %s WHERE t LIKE 'abc'",
+                                              "SELECT * FROM %s WHERE t LIKE 'a%%c'",
+                                              "SELECT * FROM %s WHERE t LIKE 'abc' AND k = 1" })
+            {
+                RowFilter filter = rowFilter(query);
+                serialize(filter, MessagingService.VERSION_DS_21);
+                assertReadRequestSize(query, MessagingService.VERSION_DS_21);
+                for (int version : new int[]{ MessagingService.VERSION_DS_10, MessagingService.VERSION_DS_12,
+                                              MessagingService.VERSION_DS_20, MessagingService.VERSION_DSE_68 })
+                {
+                    DatabaseDescriptor.setNewFeaturePeerVersionCheck(Config.NewFeaturePeerVersionCheck.messaging);
+                    RowFilter.serializer.serializedSize(filter, version);
+                    assertThatThrownBy(() -> serialize(filter, version))
+                        .as(query + " for " + version)
+                        .isInstanceOf(IncompatibleMessagingVersionException.class)
+                        .hasMessage("Cannot serialize a row filter for messaging version " + version +
+                                    ": the LIKE operator needs DS 21");
+
+                    DatabaseDescriptor.setNewFeaturePeerVersionCheck(Config.NewFeaturePeerVersionCheck.none);
+                    serialize(filter, version);
+                }
+            }
+        }
+        finally
+        {
+            DatabaseDescriptor.setNewFeaturePeerVersionCheck(check);
+        }
+    }
+
+    /**
      * Checks that the given filter is serialized for Apache Cassandra 5.0 nodes with only the expression kinds that it
      * reads as we mean them (simple, map equality, custom and user expressions) and the operators it knows.
      */
@@ -164,6 +214,26 @@ public class RowFilterPeerCompatibilityTest extends SAITester
         // the analyzer matches of a non-tokenizing index are sent as the analyzed equalities they are
         if (filter.expressions().stream().anyMatch(e -> e.operator() == Operator.ANALYZER_MATCHES))
             assertThat(deserialized.expressions().stream().map(RowFilter.Expression::operator)).as(query).contains(Operator.EQ);
+    }
+
+    /**
+     * Checks that a read request with the given query is serialized to the size computed for it, which messaging
+     * computes for DS 21 as for DS 20.
+     */
+    private void assertReadRequestSize(String query, int version) throws Exception
+    {
+        SelectStatement statement = (SelectStatement) QueryProcessor.prepareInternal(formatQuery(query)).statement;
+        ReadQuery readQuery = statement.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+        ReadCommand command = readQuery instanceof SinglePartitionReadQuery.Group
+                              ? (ReadCommand) ((SinglePartitionReadQuery.Group<?>) readQuery).queries.get(0)
+                              : (ReadCommand) readQuery;
+        Message<ReadCommand> message = Message.out(Verb.READ_REQ, command);
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            int size = message.serializedSize(version);
+            Message.serializer.serialize(message, out, version);
+            assertThat(out.getLength()).as(query).isEqualTo(size);
+        }
     }
 
     private RowFilter rowFilter(String query)

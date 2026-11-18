@@ -80,7 +80,7 @@ final class HintsDescriptor
     static final int VERSION_DS_11 = MessagingService.VERSION_DS_11;
     static final int VERSION_DS_12 = MessagingService.VERSION_DS_12;
     static final int VERSION_DS_20 = MessagingService.VERSION_DS_20;
-    static final int CURRENT_VERSION = MessagingService.current_version;
+    static final int CURRENT_VERSION = hintsVersionFromMessagingVersion(MessagingService.current_version);
 
     static final String COMPRESSION = "compression";
     static final String ENCRYPTION = "encryption";
@@ -182,6 +182,7 @@ final class HintsDescriptor
             case MessagingService.VERSION_DS_12:
                 return VERSION_DS_12;
             case MessagingService.VERSION_DS_20:
+            case MessagingService.VERSION_DS_21: // serialized as VERSION_DS_20
                 return VERSION_DS_20;
             default:
                 throw new IllegalStateException("Unknown messaging version " + messagingVersion);

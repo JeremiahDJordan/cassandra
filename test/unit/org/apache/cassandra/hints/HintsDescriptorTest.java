@@ -125,11 +125,12 @@ public class HintsDescriptorTest
     public void testMessagingVersion()
     {
         String errorMsg = "Please update the current Hints messaging version to match the current messaging version";
+        int currentVersion = MessagingService.serializationVersion(MessagingService.current_version);
         int messageVersion = HintsDescriptor.messagingVersion(HintsDescriptor.CURRENT_VERSION);
-        assertEquals(errorMsg, messageVersion, MessagingService.current_version);
+        assertEquals(errorMsg, messageVersion, currentVersion);
 
         HintsDescriptor descriptor = new HintsDescriptor(UUID.randomUUID(), HintsDescriptor.CURRENT_VERSION, System.currentTimeMillis(), ImmutableMap.of());
-        assertEquals(errorMsg, descriptor.messagingVersion(), MessagingService.current_version);
+        assertEquals(errorMsg, descriptor.messagingVersion(), currentVersion);
     }
 
     @Test
@@ -230,9 +231,9 @@ public class HintsDescriptorTest
                     break;
                 case UPGRADING:
                 case NONE:
-                    // These modes should use current_version
+                    // These modes should use the serialization of current_version
                     assertEquals("Mode " + mode + " should use current_version for hints storage",
-                                 MessagingService.current_version, expectedVersion);
+                                 MessagingService.serializationVersion(MessagingService.current_version), expectedVersion);
                     break;
                 default:
                     throw new AssertionError("Undefined hints storage version behaviour for mode " + mode);

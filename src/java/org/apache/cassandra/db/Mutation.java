@@ -64,6 +64,7 @@ import static org.apache.cassandra.net.MessagingService.VERSION_DS_10;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_11;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_12;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_20;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_21;
 
 public class Mutation implements IMutation, Supplier<Mutation>
 {
@@ -405,6 +406,7 @@ public class Mutation implements IMutation, Supplier<Mutation>
                     serializedSizeDS12 = (int) serializer.serializedSize(this, VERSION_DS_12);
                 return serializedSizeDS12;
             case VERSION_DS_20:
+            case VERSION_DS_21: // serialized as VERSION_DS_20
                 if (serializedSizeDS20 == 0)
                     serializedSizeDS20 = (int) serializer.serializedSize(this, VERSION_DS_20);
                 return serializedSizeDS20;
@@ -521,7 +523,7 @@ public class Mutation implements IMutation, Supplier<Mutation>
         @SuppressWarnings("JavadocReference")
         private Serialization serialization(Mutation mutation, int version)
         {
-            int versionOrdinal = MessagingService.getVersionOrdinal(version);
+            int versionOrdinal = cachedSerializationOrdinal(version);
             // Retrieves the cached version, or build+cache it if it's not cached already.
             Serialization serialization = mutation.cachedSerializations[versionOrdinal];
             if (serialization == null)
@@ -547,6 +549,16 @@ public class Mutation implements IMutation, Supplier<Mutation>
             }
 
             return serialization;
+        }
+
+        /**
+         * {@link MessagingService#VERSION_DS_21} shares the cached serialization of the version it's serialized as, as
+         * it shares its cached sizes (see {@link Mutation#serializedSize(int)}). The cached serialization of a received
+         * mutation is the bytes it was received as, which may differ from what the mutation serializes to.
+         */
+        private static int cachedSerializationOrdinal(int version)
+        {
+            return MessagingService.getVersionOrdinal(MessagingService.serializationVersion(version));
         }
 
         static void serializeInternal(PartitionUpdate.PartitionUpdateSerializer serializer,
@@ -599,7 +611,8 @@ public class Mutation implements IMutation, Supplier<Mutation>
 
                 //Only cache serializations that don't hit the limit
                 if (!teeIn.isLimitReached())
-                    m.cachedSerializations[MessagingService.getVersionOrdinal(version)] = new CachedSerialization(dob.toByteArray());
+                    m.cachedSerializations[cachedSerializationOrdinal(version)] =
+                        new CachedSerialization(dob.toByteArray());
 
                 return m;
             }

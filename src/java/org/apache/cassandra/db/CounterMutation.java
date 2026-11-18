@@ -76,6 +76,7 @@ import static org.apache.cassandra.net.MessagingService.VERSION_DS_10;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_11;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_12;
 import static org.apache.cassandra.net.MessagingService.VERSION_DS_20;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_21;
 import static org.apache.cassandra.net.MessagingService.VERSION_40;
 import static org.apache.cassandra.net.MessagingService.VERSION_50;
 import static org.apache.cassandra.net.MessagingService.VERSION_DSE_68;
@@ -517,6 +518,7 @@ public class CounterMutation implements IMutation
                     serializedSizeDS12 = (int) serializer.serializedSize(this, VERSION_DS_12);
                 return serializedSizeDS12;
             case VERSION_DS_20:
+            case VERSION_DS_21: // serialized as VERSION_DS_20
                 if (serializedSizeDS20 == 0)
                     serializedSizeDS20 = (int) serializer.serializedSize(this, VERSION_DS_20);
                 return serializedSizeDS20;

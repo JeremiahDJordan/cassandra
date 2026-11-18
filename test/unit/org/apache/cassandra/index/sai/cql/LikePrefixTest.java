@@ -243,10 +243,13 @@ public class LikePrefixTest extends SAITester
         execute("INSERT INTO %s (pk, v) VALUES (?, ?)", 1, "some text");
 
         // analyzed indexes don't support LIKE at all...
-        assertInvalidMessage(String.format(StatementRestrictions.INDEX_DOES_NOT_SUPPORT_LIKE_MESSAGE, 'v'),
+        assertInvalidMessage(String.format(StatementRestrictions.HAS_UNSUPPORTED_INDEX_RESTRICTION_MESSAGE_SINGLE, 'v'),
                              "SELECT pk FROM %s WHERE v LIKE 'some%%'");
-        assertInvalidMessage(String.format(StatementRestrictions.INDEX_DOES_NOT_SUPPORT_LIKE_MESSAGE, 'v'),
+        assertInvalidMessage(String.format(StatementRestrictions.HAS_UNSUPPORTED_INDEX_RESTRICTION_MESSAGE_SINGLE, 'v'),
                              "SELECT pk FROM %s WHERE v LIKE '%%text'");
+        // ... but LIKE can be filtered
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v LIKE 'some%%' ALLOW FILTERING"), row(1));
+        assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE v LIKE '%%text' ALLOW FILTERING"), row(1));
     }
 
     @Test

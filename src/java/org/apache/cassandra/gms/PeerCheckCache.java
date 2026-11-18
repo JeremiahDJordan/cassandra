@@ -15,6 +15,7 @@
  */
 package org.apache.cassandra.gms;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -44,6 +45,9 @@ public final class PeerCheckCache<T>
 {
     /** How many times a read checks the nodes, at most, before it returns: again if they changed during the check. */
     private static final int MAX_CHECKS_PER_READ = 2;
+
+    /** The count of changes of the result that {@link #invalidate} stores, which no read finds current. */
+    private static final long INVALIDATED = -1;
 
     private static final AtomicLong peerChanges = new AtomicLong();
 
@@ -89,6 +93,19 @@ public final class PeerCheckCache<T>
     }
 
     /**
+     * Makes the reads of the given keyspace check the nodes again, including a read whose check is running.
+     */
+    public void invalidate(String keyspace)
+    {
+        for (ConcurrentMap<String, Scope<T>> scopes : Arrays.asList(everyNode, localDatacenter))
+        {
+            Scope<T> scope = scopes.get(keyspace);
+            if (scope != null)
+                scope.set(new Result<>(INVALIDATED, null));
+        }
+    }
+
+    /**
      * Returns the result of the check of the nodes that a read of the given keyspace at the given consistency level can
      * contact: those of this node's datacenter at LOCAL_ONE, LOCAL_QUORUM and LOCAL_SERIAL, every node otherwise.
      */
@@ -121,16 +138,17 @@ public final class PeerCheckCache<T>
                 return result.value;
 
             // A result is kept with the count of changes read before its check, so a change during the check makes the
-            // next read check again. This read checks again too, a bounded number of times.
+            // next read check again, and it isn't kept over an invalidation made during the check. This read checks
+            // again too, a bounded number of times.
             T value = null;
             for (int i = 0; i < MAX_CHECKS_PER_READ; i++)
             {
                 long changes = peerChanges.get();
                 String datacenter = local ? DatabaseDescriptor.getLocalDataCenter() : null;
                 value = check.apply(keyspace, datacenter);
-                scope.set(new Result<>(changes, value));
-                if (peerChanges.get() == changes)
+                if (scope.compareAndSet(result, new Result<>(changes, value)) && peerChanges.get() == changes)
                     return value;
+                result = scope.get();
             }
             return value;
         }

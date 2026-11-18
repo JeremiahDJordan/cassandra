@@ -66,9 +66,10 @@ public class StorageCompatibilityModeTest
         assertEquals(MessagingService.VERSION_40, StorageCompatibilityMode.CASSANDRA_4.storageMessagingVersion());
         assertEquals(MessagingService.VERSION_40, StorageCompatibilityMode.HCD_1.storageMessagingVersion());
 
-        // UPGRADING and NONE should use the current messaging version
-        assertEquals(MessagingService.current_version, StorageCompatibilityMode.UPGRADING.storageMessagingVersion());
-        assertEquals(MessagingService.current_version, StorageCompatibilityMode.NONE.storageMessagingVersion());
+        // UPGRADING and NONE should use the serialization version of the current messaging version
+        int current = MessagingService.serializationVersion(MessagingService.current_version);
+        assertEquals(current, StorageCompatibilityMode.UPGRADING.storageMessagingVersion());
+        assertEquals(current, StorageCompatibilityMode.NONE.storageMessagingVersion());
     }
 
     @Test
@@ -87,8 +88,8 @@ public class StorageCompatibilityModeTest
                     break;
                 case UPGRADING:
                 case NONE:
-                    assertEquals("Mode " + mode + " should use current_version for storage",
-                                 MessagingService.current_version, version);
+                    assertEquals("Mode " + mode + " should use the serialization version of current_version",
+                                 MessagingService.serializationVersion(MessagingService.current_version), version);
                     break;
                 default:
                     throw new AssertionError("Undefined storage messaging version behaviour for mode " + mode);

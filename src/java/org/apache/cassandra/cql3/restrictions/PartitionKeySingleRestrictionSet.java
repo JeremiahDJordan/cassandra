@@ -145,7 +145,19 @@ final class PartitionKeySingleRestrictionSet extends RestrictionSetWrapper imple
             return false;
 
         // slice or has unrestricted key component
-        return hasUnrestrictedPartitionKeyComponents(table) || hasSlice() || hasContains();
+        return hasUnrestrictedPartitionKeyComponents(table) || hasSlice() || hasContains() || hasLike();
+    }
+
+    // LIKE doesn't select partition keys: like a slice, it's either served by an index or filtered
+    private boolean hasLike()
+    {
+        List<SingleRestriction> restrictions = restrictions();
+        for (int i = 0; i < restrictions.size(); i++)
+        {
+            if (restrictions.get(i).isLIKE())
+                return true;
+        }
+        return false;
     }
 
     @Override

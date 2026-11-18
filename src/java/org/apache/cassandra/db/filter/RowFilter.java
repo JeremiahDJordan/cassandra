@@ -38,6 +38,7 @@ import com.google.common.base.Objects;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.LikePatterns;
@@ -81,6 +82,7 @@ import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.InvalidPatternException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.gms.DataStaxFeatureSupport;
 import org.apache.cassandra.gms.IFailureDetector;
 import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.index.Index;
@@ -249,8 +251,12 @@ public class RowFilter
      */
     private static IncompatibleMessagingVersionException incompatibleVersion(int version, String feature)
     {
-        String error = String.format(DATASTAX_ONLY_FEATURE_ERROR, feature);
-        String message = String.format("Cannot serialize a row filter for messaging version %d: %s", version, error);
+        return serializationRefused(version, String.format(DATASTAX_ONLY_FEATURE_ERROR, feature));
+    }
+
+    private static IncompatibleMessagingVersionException serializationRefused(int version, String reason)
+    {
+        String message = String.format("Cannot serialize a row filter for messaging version %d: %s", version, reason);
         return new IncompatibleMessagingVersionException(message);
     }
 
@@ -667,6 +673,8 @@ public class RowFilter
         private final IndexRegistry indexRegistry;
         private final IndexHints indexHints;
         private final OptimizerOptions optimizerOptions;
+        /** The keys of the checks already run for this filter, shared with its sub-builders, see {@link #checkOnce}. */
+        private final Set<Object> performedChecks;
 
         public Builder(boolean needsReconciliation, IndexRegistry indexRegistry, IndexHints indexHints)
         {
@@ -675,15 +683,39 @@ public class RowFilter
 
         public Builder(boolean needsReconciliation, IndexRegistry indexRegistry, IndexHints indexHints, OptimizerOptions optimizerOptions)
         {
+            this(needsReconciliation, indexRegistry, indexHints, optimizerOptions, new HashSet<>(2));
+        }
+
+        private Builder(boolean needsReconciliation,
+                        IndexRegistry indexRegistry,
+                        IndexHints indexHints,
+                        OptimizerOptions optimizerOptions,
+                        Set<Object> performedChecks)
+        {
             this.needsReconciliation = needsReconciliation;
             this.indexRegistry = indexRegistry;
             this.indexHints = indexHints;
             this.optimizerOptions = optimizerOptions;
+            this.performedChecks = performedChecks;
         }
 
         public RowFilter build()
         {
             return new RowFilter(current.build(), needsReconciliation, indexHints, optimizerOptions);
+        }
+
+        /**
+         * Runs the given check unless a check with the same key has already run for the filter being built, including
+         * in its sub-builders for the conjunctions under a disjunction: some restrictions need a check that depends on
+         * the query, not on each of them.
+         *
+         * @param key what identifies the check
+         * @param check the check, which throws if it fails
+         */
+        public void checkOnce(Object key, Runnable check)
+        {
+            if (performedChecks.add(key))
+                check.run();
         }
 
         public RowFilter buildFromRestrictions(StatementRestrictions restrictions,
@@ -754,7 +786,8 @@ public class RowFilter
             {
                 // If we're in disjunction mode, we must not pass the current builder to addToRowFilter.
                 // We create a new conjunction sub-builder instead and add all expressions there.
-                var builder = new Builder(needsReconciliation, indexRegistry, indexHints, optimizerOptions);
+                // it's part of the same filter: the checks it runs are shared (see #checkOnce)
+                var builder = new Builder(needsReconciliation, indexRegistry, indexHints, optimizerOptions, performedChecks);
                 addToRowFilterDelegate.accept(builder);
 
                 if (builder.current.expressions.size() == 1 && builder.current.children.isEmpty())
@@ -1546,21 +1579,33 @@ public class RowFilter
         {
             /**
              * Refuses to serialize the DataStax-only parts of a filter (see {@link #dataStaxOnlyFeature(Expression,
-             * boolean)}) for nodes below DS 10, which would fail to deserialize them or read something else. The
-             * coordinator normally rejects such queries first (see {@link RowFilter#validateForPeers}), but it may not
-             * know the version of a node yet. The read then fails for that replica, right away.
+             * boolean)}) for nodes below DS 10, which would fail to deserialize them or read something else, and LIKE
+             * for nodes below DS 21, which may evaluate it with other semantics. The coordinator normally rejects such
+             * queries first (see {@link RowFilter#validateForPeers}), but it may not know the version of a node yet.
+             * The read then fails for that replica, right away.
              * <p>
              * This is only checked by {@link #serialize}, never by {@link #serializedSize}: a messaging connection
              * handles a failed serialization by computing the size of the message again, which must not fail too.
              */
             private static void checkSerializable(Expression expression, int version)
             {
-                if (version >= MessagingService.VERSION_DS_10)
-                    return;
-
-                String feature = dataStaxOnlyFeature(expression, true);
-                if (feature != null)
-                    throw incompatibleVersion(version, feature);
+                if (version < MessagingService.VERSION_DS_10)
+                {
+                    String feature = dataStaxOnlyFeature(expression, true);
+                    if (feature != null)
+                        throw incompatibleVersion(version, feature);
+                }
+                else if (expression.operator.isLike()
+                         && !MessagingService.isDataStax21OrLater(version)
+                         && DatabaseDescriptor.getNewFeaturePeerVersionCheck()
+                            != Config.NewFeaturePeerVersionCheck.none)
+                {
+                    // the coordinator rejects LIKE while the query can contact such a node (see
+                    // DataStaxFeatureSupport#nodesNotSupportingRead), but it may not know the node's version yet, or
+                    // the read may reach another datacenter
+                    DataStaxFeatureSupport.refreshReadChecks(expression.column.ksName);
+                    throw serializationRefused(version, "the LIKE operator needs DS 21");
+                }
             }
 
             /**

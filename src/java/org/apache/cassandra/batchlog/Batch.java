@@ -147,7 +147,7 @@ public final class Batch
              * If version doesn't match the current one, we cannot not just read the encoded mutations verbatim,
              * so we decode them instead, to deal with compatibility.
              */
-            return version == MessagingService.current_version
+            return MessagingService.isCurrentSerializationVersion(version)
                  ? createRemote(id, creationTime, readEncodedMutations(in))
                  : createLocal(id, creationTime, decodeMutations(in, version));
         }

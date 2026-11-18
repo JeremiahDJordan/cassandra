@@ -908,9 +908,19 @@ public class SecondaryIndexTest extends CQLTester
         for (String column : new String[]{"k1", "k2", "c1", "c2", "s", "v1", "v2"})
         {
             createIndex(format("CREATE INDEX %s_idx ON %%s(%<s)", column));
-            assertInvalidMessage(format(StatementRestrictions.INDEX_DOES_NOT_SUPPORT_LIKE_MESSAGE, column),
-                    format("SELECT * FROM %%s WHERE %s LIKE ?", column),
-                    "%abc");
+            String query = format("SELECT * FROM %%s WHERE %s LIKE ?", column);
+            if (column.equals("k1") || column.equals("k2") || column.equals("v2"))
+            {
+                // LIKE can't be filtered on non-string columns (CASSANDRA-17198)
+                assertInvalidMessage(format(StatementRestrictions.INDEX_DOES_NOT_SUPPORT_LIKE_MESSAGE, column), query, "%abc");
+                assertInvalidMessage(format(StatementRestrictions.INDEX_DOES_NOT_SUPPORT_LIKE_MESSAGE, column), query + " ALLOW FILTERING", "%abc");
+            }
+            else
+            {
+                // LIKE on string columns can be filtered (CASSANDRA-17198)
+                assertInvalidMessage(format(StatementRestrictions.HAS_UNSUPPORTED_INDEX_RESTRICTION_MESSAGE_SINGLE, column), query, "%abc");
+                assertEmpty(execute(query + " ALLOW FILTERING", "%abc"));
+            }
         }
     }
 

@@ -462,7 +462,14 @@ public class StatementRestrictions
                 {
                     Restriction restriction = relation.toRestriction(table, boundNames, indexHints);
 
-                    if (relation.isLIKE() && (!type.allowUseOfSecondaryIndices() || !restriction.hasSupportingIndex(indexRegistry, indexHints)))
+                    // A LIKE restriction that no index supports is filtered on string columns of a SELECT, which
+                    // requires ALLOW FILTERING; LikeRestriction#addToRowFilter checks that the replicas support it.
+                    // Views have no index registry and never support LIKE.
+                    if (relation.isLIKE()
+                        && (!type.allowUseOfSecondaryIndices()
+                            || forView
+                            || (!restriction.hasSupportingIndex(indexRegistry, indexHints)
+                                && !SingleColumnRestriction.LikeRestriction.supportsFiltering(restriction.getFirstColumn()))))
                     {
                         if (getColumnsWithUnsupportedIndexRestrictions(table, indexHints, ImmutableList.of(restriction)).isEmpty())
                         {
@@ -635,6 +642,15 @@ public class StatementRestrictions
             {
                 checkFalse(clusteringColumnsRestrictions.hasContains() && !hasQueryableIndex && !allowFiltering,
                            "Clustering columns can only be restricted with CONTAINS with a secondary index or filtering");
+
+                // A LIKE restriction on a clustering column that no index supports is filtered (CASSANDRA-17198), even
+                // in a single partition, so it needs ALLOW FILTERING.
+                if (!allowFiltering)
+                {
+                    List<Restriction> unsupportedLikes = likesWithoutSupportingIndex(clusteringColumnsRestrictions, indexRegistry);
+                    if (!unsupportedLikes.isEmpty())
+                        throwRequiresAllowFilteringError(table, indexHints, unsupportedLikes, state);
+                }
     
                 if (!clusteringColumnsRestrictions.isEmpty() && clusteringColumnsRestrictions.needFiltering())
                 {
@@ -780,6 +796,21 @@ public class StatementRestrictions
                     return true;
 
             return false;
+        }
+
+        /**
+         * Returns the given restrictions that are LIKE restrictions no index supports. Without an index registry
+         * (views), no index supports anything.
+         */
+        private List<Restriction> likesWithoutSupportingIndex(RestrictionSetWrapper restrictions, IndexRegistry indexRegistry)
+        {
+            List<Restriction> likes = new ArrayList<>();
+            for (SingleRestriction restriction : restrictions.restrictions())
+            {
+                if (restriction.isLIKE() && (indexRegistry == null || !restriction.hasSupportingIndex(indexRegistry, indexHints)))
+                    likes.add(restriction);
+            }
+            return likes;
         }
 
         /**

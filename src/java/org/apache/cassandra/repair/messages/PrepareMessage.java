@@ -103,7 +103,8 @@ public class PrepareMessage extends RepairMessage
         public void serialize(PrepareMessage message, DataOutputPlus out, int version) throws IOException
         {
             if (!ALLOW_MIXED_REPAIR)
-                Preconditions.checkArgument(version == MessagingService.current_version, MIXED_MODE_ERROR);
+                Preconditions.checkArgument(MessagingService.isCurrentSerializationVersion(version),
+                                            MIXED_MODE_ERROR);
 
             out.writeInt(message.tableIds.size());
             for (TableId tableId : message.tableIds)
@@ -124,7 +125,8 @@ public class PrepareMessage extends RepairMessage
         public PrepareMessage deserialize(DataInputPlus in, int version) throws IOException
         {
             if (!ALLOW_MIXED_REPAIR)
-                Preconditions.checkArgument(version == MessagingService.current_version, MIXED_MODE_ERROR);
+                Preconditions.checkArgument(MessagingService.isCurrentSerializationVersion(version),
+                                            MIXED_MODE_ERROR);
 
             int tableIdCount = in.readInt();
             List<TableId> tableIds = new ArrayList<>(tableIdCount);

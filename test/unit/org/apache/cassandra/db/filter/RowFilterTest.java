@@ -18,8 +18,10 @@
 
 package org.apache.cassandra.db.filter;
 
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Test;
 
@@ -50,6 +52,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.btree.BTree;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -200,5 +203,26 @@ public class RowFilterTest
         assertThatThrownBy(() -> filter.isSatisfiedBy(metadata, key, row, 1))
             .isInstanceOf(InvalidPatternException.class)
             .hasMessageStartingWith("Invalid pattern for LIKE '<term>' restriction on column v: ");
+    }
+
+    @Test
+    public void testCheckOnce() throws Exception
+    {
+        RowFilter.Builder builder = new RowFilter.Builder(false, null, IndexHints.NONE);
+        AtomicInteger runs = new AtomicInteger();
+        builder.checkOnce("a", runs::incrementAndGet);
+        builder.checkOnce("a", runs::incrementAndGet);
+        builder.checkOnce("b", runs::incrementAndGet);
+        assertEquals(2, runs.get());
+
+        // under a disjunction, each conjunction is built by a sub-builder that shares the checks of the filter
+        Field current = RowFilter.Builder.class.getDeclaredField("current");
+        current.setAccessible(true);
+        current.set(builder, new RowFilter.FilterElement.Builder(true));
+        builder.addAllAsConjunction(b -> b.checkOnce("a", runs::incrementAndGet));
+        builder.addAllAsConjunction(b -> b.checkOnce("c", runs::incrementAndGet));
+        builder.addAllAsConjunction(b -> b.checkOnce("c", runs::incrementAndGet));
+        builder.checkOnce("c", runs::incrementAndGet);
+        assertEquals(3, runs.get());
     }
 }

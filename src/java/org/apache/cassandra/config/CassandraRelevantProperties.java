@@ -459,12 +459,10 @@ public enum CassandraRelevantProperties
     DRAIN_EXECUTOR_TIMEOUT_MS("cassandra.drain_executor_timeout_ms", convertToString(TimeUnit.MINUTES.toMillis(5))),
     DROP_OVERSIZED_READ_REPAIR_MUTATIONS("cassandra.drop_oversized_readrepair_mutations"),
     /**
-     * The current messaging version. This is used when we add new messaging versions without adopting them immediately,
-     * or to force the node to use a specific version for testing purposes.
-     * @deprecated remove when cndb no longer supports bdp/6.8-cndb
+     * The current messaging version. A node can speak an earlier version than its default, such as DS 20 (110)
+     * during an upgrade from an earlier 5.0 release (see NEWS.txt), or for testing.
      */
-    @Deprecated(since = "5.0")
-    DS_CURRENT_MESSAGING_VERSION("ds.current_messaging_version", Integer.toString(MessagingService.VERSION_DS_20)),
+    DS_CURRENT_MESSAGING_VERSION("ds.current_messaging_version", Integer.toString(MessagingService.VERSION_DS_21)),
     DTEST_API_LOG_TOPOLOGY("cassandra.dtest.api.log.topology"),
     /** This property indicates if the code is running under the in-jvm dtest framework */
     DTEST_IS_IN_JVM_DTEST("org.apache.cassandra.dtest.is_in_jvm_dtest"),
