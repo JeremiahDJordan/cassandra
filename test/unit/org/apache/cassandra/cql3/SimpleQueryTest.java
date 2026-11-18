@@ -619,4 +619,18 @@ public class SimpleQueryTest extends CQLTester
 
         assertRows(execute("SELECT * FROM %s WHERE k1=1"), row(1, 1, 2));
     } 
+
+    /**
+     * An end token equal to the minimum token is unbounded (CASSANDRA-20557).
+     */
+    @Test
+    public void testTokenRestriction()
+    {
+        createTable("CREATE TABLE %s (id int primary key)");
+        for (int i = 0; i < 10; i++)
+            execute("INSERT INTO %s (id) values (?)", i);
+
+        assertRows(execute("SELECT * FROM %s where token(id) > 0 AND token(id) < " + Long.MIN_VALUE),  row(7), row(6), row(9), row(3));
+        assertRows(execute("SELECT * FROM %s where token(id) > 0 AND token(id) <= " + Long.MIN_VALUE), row(7), row(6), row(9), row(3));
+    }
 }

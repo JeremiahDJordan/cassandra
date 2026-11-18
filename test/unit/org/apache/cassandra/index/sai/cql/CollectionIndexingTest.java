@@ -362,4 +362,36 @@ public class CollectionIndexingTest extends SAITester.Versioned
 //        assertInvalidMessage(String.format(StatementRestrictions.HAS_UNSUPPORTED_INDEX_RESTRICTION_MESSAGE_SINGLE, "value"),
 //                query, values);
     }
+
+    /**
+     * CONTAINS and CONTAINS KEY on a map without an index, or with an index on the other part of the map, must be
+     * evaluated against the right part of the map.
+     */
+    @Test
+    public void unindexedContainsExpressions()
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, m map<int, int>)");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'"); // just to make sure that SAI is involved
+
+        Object[] row = row(0, 1, map(2, 3));
+        execute("INSERT INTO %s (k, v, m) VALUES (?, ?, ?)", row);
+        execute("INSERT INTO %s (k, v, m) VALUES (?, ?, ?)", 1, 1, map(12, 13));
+
+        // try without any indexes on the map
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS 3 ALLOW FILTERING"), row);
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2 ALLOW FILTERING"), row);
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2 AND m CONTAINS 3 ALLOW FILTERING"), row);
+
+        // try with index on map values
+        createIndex("CREATE CUSTOM INDEX ON %s(m) USING 'StorageAttachedIndex'");
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS 3"), row);
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2 ALLOW FILTERING"), row);
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2 AND m CONTAINS 3 ALLOW FILTERING"), row);
+
+        // try with index on map keys
+        createIndex("CREATE CUSTOM INDEX ON %s(KEYS(m)) USING 'StorageAttachedIndex'");
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS 3"), row);
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2"), row);
+        assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2 AND m CONTAINS 3"), row);
+    }
 }

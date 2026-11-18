@@ -1198,4 +1198,45 @@ public class VectorTypeTest extends VectorTester.VersionedWithChecksums
             assertRowCount(execute("SELECT pk FROM %s ORDER BY val2 ANN OF ? LIMIT 10", randomVectorBoxed(128)), 10);
         });
     }
+
+    /**
+     * ANN with a partition restriction and a map entry predicate, when another partition gets a matching row
+     * (CASSANDRA-19404).
+     */
+    @Test
+    public void multiPartitionUpdateMultiIndexTest()
+    {
+        createTable("CREATE TABLE %s (pk int, row_v vector<float, 2>, metadata map<text, text>, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(entries(metadata)) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(row_v) USING 'StorageAttachedIndex'");
+
+        String select = "SELECT * FROM %s WHERE metadata['map_k'] = 'map_v' AND pk = 0 ORDER BY row_v ann of [0.1, 0.2] LIMIT 4";
+        assertRows(execute(select));
+
+        execute("INSERT INTO %s (pk, metadata, row_v) VALUES (0, {'map_k' : 'map_v'}, [0.11, 0.19])");
+        Object[] row = row(0, map("map_k", "map_v"), vector(0.11f, 0.19f));
+        assertRows(execute(select), row);
+
+        execute("INSERT INTO %s (pk, metadata, row_v) VALUES (10, {'map_k' : 'map_v'}, [0.11, 0.19])");
+        assertRows(execute(select), row);
+    }
+
+    /**
+     * A hybrid query matching many keys: the planner picks the strategy, only the result is checked (CASSANDRA-20086).
+     */
+    @Test
+    public void testHybridQueryMatchingManyKeys() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int primary key, i int, val vector<float, 2>)");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(i) USING 'StorageAttachedIndex'");
+
+        for (int i = 1; i <= 100; i++)
+            execute("INSERT INTO %s (pk, i, val) VALUES (?, ?, [1,0])", i, i);
+
+        beforeAndAfterFlush(() -> {
+            UntypedResultSet rows = execute("SELECT pk FROM %s WHERE i < ? ORDER BY val ANN OF [0,1] LIMIT 3", 20);
+            assertRowCount(rows, 3);
+        });
+    }
 }

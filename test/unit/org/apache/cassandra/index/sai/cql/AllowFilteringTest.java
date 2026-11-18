@@ -559,4 +559,86 @@ public class AllowFilteringTest extends SAITester
         execute("SELECT * FROM %s WHERE v=0");
         execute("SELECT * FROM %s WHERE v=0 ALLOW FILTERING");
     }
+
+    // Adopted from Apache (CASSANDRA-20025): post-filtering with IN on a column that isn't indexed
+
+    @Test
+    public void testAllowFilteringTextWithINClause()
+    {
+        createTable("CREATE TABLE %s (k1 TEXT, k2 TEXT, k3 TEXT, PRIMARY KEY(k1))");
+        createIndex("CREATE CUSTOM INDEX ON %s(k2) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s1','s11','s111')");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s2','s11','s11')");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s3','s22','s111')");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s4','s22','s111')");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s5','s31','s111')");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k2='s11' AND k3 IN ('s11','s111') ALLOW FILTERING"), 2);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2='s22' AND k3 IN ('s111','s111') ALLOW FILTERING"), 2);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2='s22' AND k3 IN ('s','s1') ALLOW FILTERING"), 0);
+        // To test if an IN clause without an AND condition does not create a query plan and works as expected.
+        assertRowCount(execute("SELECT * FROM %s WHERE k2 IN ('s11','s22') ALLOW FILTERING"), 4);
+    }
+
+    @Test
+    public void testAllowFilteringIntWithINClause()
+    {
+        createTable("CREATE TABLE %s (k1 text, k2 int, k3 int, PRIMARY KEY(k1))");
+        createIndex("CREATE CUSTOM INDEX ON %s(k2) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s1',11,1)");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s2',11,11)");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s3',11,111)");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s4',22,1)");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s5',22,11)");
+        execute("INSERT INTO %s (k1,k2,k3) VALUES ('s6',22,111)");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=11 AND k3 IN (1,11,111) ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=22 AND k3 IN (1,11,111) ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=22 AND k3 IN (101,102) ALLOW FILTERING"), 0);
+        // To test if an IN clause without an AND condition does not create a query plan and works as expected.
+        assertRowCount(execute("SELECT * FROM %s WHERE k2 IN (11,22) ALLOW FILTERING"), 6);
+    }
+
+    @Test
+    public void testAllowFilteringBigIntWithINClause()
+    {
+        createTable("CREATE TABLE %s (k1 text, k2 bigint, k3 bigint, PRIMARY KEY(k1))");
+        createIndex("CREATE CUSTOM INDEX ON %s(k2) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s1', 1001, 100)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s2', 1001, 200)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s3', 1001, 300)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s4', 2002, 100)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s5', 2002, 200)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s6', 2002, 300)");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=1001 AND k3 IN (100, 200, 300) ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=2002 AND k3 IN (100, 200, 300) ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=2002 AND k3 IN (101, 201, 301) ALLOW FILTERING"), 0);
+        // To test if an IN clause without an AND condition does not create a query plan and works as expected.
+        assertRowCount(execute("SELECT * FROM %s WHERE k2 IN (1001,2002) ALLOW FILTERING"), 6);
+    }
+
+    @Test
+    public void testAllowFilteringBigDecimalWithINClause()
+    {
+        createTable("CREATE TABLE %s (k1 text, k2 decimal, k3 decimal, PRIMARY KEY(k1))");
+        createIndex("CREATE CUSTOM INDEX ON %s(k2) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s1', 1.1, 1.11)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s2', 1.1, 1.12)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s3', 1.1, 1.13)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s4', 2.2, 1.11)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s5', 2.2, 1.12)");
+        execute("INSERT INTO %s (k1, k2, k3) VALUES ('s6', 2.2, 1.13)");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=1.1 AND k3 IN (1.11, 1.12, 1.13) ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=2.2 AND k3 IN (1.11, 1.12, 1.13) ALLOW FILTERING"), 3);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=2.2 AND k3 IN (1.21, 1.22, 1.13) ALLOW FILTERING"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE k2=2.2 AND k3 IN (1.21, 1.22, 1.23) ALLOW FILTERING"), 0);
+        // To test if an IN clause without an AND condition does not create a query plan and works as expected.
+        assertRowCount(execute("SELECT * FROM %s WHERE k2 IN (1.1,2.2) ALLOW FILTERING"), 6);
+    }
 }

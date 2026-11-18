@@ -30,6 +30,9 @@ import org.apache.cassandra.db.marshal.TimeType;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.db.memtable.AbstractShardedMemtable;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.db.marshal.ByteType;
+import org.apache.cassandra.db.marshal.IntegerType;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class CompositePartitionKeyIndexStaticTest extends SAITester
 {
@@ -136,5 +139,89 @@ public class CompositePartitionKeyIndexStaticTest extends SAITester
                                            SimpleDateType.instance.fromString("-1306427-11-21"), true, "뾕⌒籖鋿紞", true),
                                        row(TimeType.instance.fromString("23:15:13.897962392"), new BigInteger("-2272"),
                                            SimpleDateType.instance.fromString("-1296648-01-08"), true, "뾕⌒籖鋿紞", false)));
+    }
+
+    /**
+     * Indexes on partition key columns hold keys of both static and regular rows, across memtables and several
+     * SSTables.
+     */
+    @Test
+    public void testStaticAndNonStaticKeysOnFlush() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk0 tinyint, pk1 bigint, ck0 blob, s1 text static, s0 set<uuid> static, v0 smallint, PRIMARY KEY ((pk0, pk1), ck0)) WITH CLUSTERING ORDER BY (ck0 DESC)");
+        disableCompaction(KEYSPACE);
+        createIndex("CREATE CUSTOM INDEX tbl_pk0 ON %s(pk0) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX tbl_pk1 ON %s(pk1) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX tbl_s1 ON %s(s1) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX tbl_v0 ON %s(v0) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (pk0, pk1, ck0, s1, s0, v0) VALUES (-62, -5815950741950477880, 0x326f, '켅憓ᤃꝃ窰ŷ', {00000000-0000-4700-aa00-000000000000}, 19310) USING TIMESTAMP 1");
+        execute("DELETE FROM %s USING TIMESTAMP 2 WHERE  pk0 = 45 AND  pk1 = 6014418364385708772 AND  ck0 = 0x7c10");
+        execute("DELETE FROM %s USING TIMESTAMP 3 WHERE  pk0 = -41 AND  pk1 = -3934225888295599640");
+        execute("INSERT INTO %s (pk0, pk1, ck0, s1, s0, v0) " +
+                "VALUES (-64, 7973592261481566341, 0x0d, '摻', {00000000-0000-4800-8900-000000000000, 00000000-0000-4900-8600-000000000000}, -23873) USING TIMESTAMP 4");
+        flush(KEYSPACE);
+
+        execute("UPDATE %s USING TIMESTAMP 5 SET v0=-359, s1='ل≻Ⱆ喡䮠?' WHERE  pk0 = -64 AND  pk1 = 7973592261481566341 AND  ck0 = 0x99d570024de738f37877");
+        execute("INSERT INTO %s (pk0, pk1, ck0, v0, s1, s0) " +
+                "VALUES (-104, -4990846884898776392, 0xf7ac771298eaf1d4, -6977, '凘纖볭菮⏏↶?蜑', null) USING TIMESTAMP 6");
+        execute("INSERT INTO %s (pk0, pk1, ck0, s1, s0, v0) " +
+                "VALUES (-62, -5815950741950477880, 0x9277e744212e1c4b50, '瀛⛕徳倬糽ᢷ' + '雴', {00000000-0000-4700-b100-000000000000, 00000000-0000-4800-9300-000000000000}, 5423) USING TIMESTAMP 7");
+        execute("DELETE FROM %s USING TIMESTAMP 8 WHERE  pk0 = -64 AND  pk1 = 7973592261481566341");
+        flush(KEYSPACE);
+
+        execute("DELETE s0, s1, s0 FROM %s USING TIMESTAMP 9 WHERE  pk0 = -62 AND  pk1 = -5815950741950477880");
+        execute("DELETE FROM %s USING TIMESTAMP 10 WHERE  pk0 = -41 AND  pk1 = -3934225888295599640 AND  ck0 = 0xd753dc3a473acaf665");
+        execute("INSERT INTO %s (pk0, pk1, ck0, s1, s0, v0) " +
+                "VALUES (-62, -5815950741950477880, 0xd1e07b568a7188, 'ᑿ鼾戆' + '篐뵡?䰫', {00000000-0000-4500-b000-000000000000}, 17933) USING TIMESTAMP 11");
+        execute("UPDATE %s USING TIMESTAMP 12 SET v0=null, s0={00000000-0000-4600-a000-000000000000, 00000000-0000-4d00-8200-000000000000, 00000000-0000-4f00-9200-000000000000} " +
+                "WHERE  pk0 = -41 AND  pk1 = -3934225888295599640 AND  ck0 = 0x0dab3b038131efa2");
+
+        assertRowCount(execute("SELECT * FROM %s WHERE pk0 >= ? LIMIT 81", (byte) -104), 5);
+        execute("DELETE FROM %s USING TIMESTAMP 13 WHERE  pk0 = -64 AND  pk1 = 7973592261481566341");
+        flush(KEYSPACE);
+
+        beforeAndAfterFlush(() ->
+                            assertRows(execute("SELECT pk0, pk1, ck0 FROM %s WHERE pk0 >= ?", (byte) -104),
+                                       row((byte) -62, -5815950741950477880L, ByteBufferUtil.hexToBytes("d1e07b568a7188")),
+                                       row((byte) -62, -5815950741950477880L, ByteBufferUtil.hexToBytes("9277e744212e1c4b50")),
+                                       row((byte) -62, -5815950741950477880L, ByteBufferUtil.hexToBytes("326f")),
+                                       row((byte) -104, -4990846884898776392L, ByteBufferUtil.hexToBytes("f7ac771298eaf1d4")),
+                                       row((byte) -41, -3934225888295599640L, null)));
+    }
+
+    /**
+     * A row deletion that only deletes cells must not make an index on a partition key column return the row.
+     */
+    @Test
+    public void testIgnoreCellDeletions() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk0 boolean, pk1 varint, ck0 tinyint, ck1 varint, s0 list<frozen<map<double, smallint>>> static, " +
+                    "                 s1 map<frozen<set<uuid>>, frozen<map<inet, date>>> static, v0 frozen<map<frozen<set<text>>, uuid>>, " +
+                    "                 PRIMARY KEY ((pk0, pk1), ck0, ck1)) WITH CLUSTERING ORDER BY (ck0 DESC, ck1 DESC)");
+        disableCompaction(KEYSPACE);
+        createIndex("CREATE CUSTOM INDEX tbl_pk0 ON %s(pk0) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (pk0, pk1, ck0, ck1, s0, s1, v0) " +
+                "VALUES (true, 0, 109, 0, [{2.2352903520430565E260: -29214, 2.605618737869944E274: -13041}], " +
+                "        {{00000000-0000-4400-9f00-000000000000, 00000000-0000-4500-9b00-000000000000, 00000000-0000-4b00-bf00-000000000000}: {'18.112.79.221': '-2306623-03-19', '227.58.183.116': '-3929454-04-25'}}, " +
+                "        {{'⭎憢?', '黣偛紑'}: 00000000-0000-4900-8600-000000000000, {'㛽ꓗ\uE0A1', '剢ꮱ死䰀륬ਐ喑\uE102ퟚ', '竖䝏爐뷤曀'}: 00000000-0000-4900-bc00-000000000000}) USING TIMESTAMP 1");
+        execute("INSERT INTO %s (pk0, pk1, ck0, ck1, s1, v0) " +
+                "VALUES (true, 0, 114, 742, {{00000000-0000-4000-9a00-000000000000, 00000000-0000-4700-ba00-000000000000}: {'96.31.70.25': '-912836-06-15', '185.90.18.173': '-5257542-01-31', '223.18.191.245': '-4633145-10-30'}}, " +
+                "                           {{'뫥\uE3DA㩎뎠ྭẒ\uF457'}: 00000000-0000-4800-8600-000000000000}) USING TIMESTAMP 2");
+
+        // This will result in the creation of erroneous postings if cell deletions are not accounted for:
+        execute("DELETE v0, s1, s0 FROM %s USING TIMESTAMP 6 WHERE  pk0 = true AND  pk1 = 0 AND  ck0 = 121 AND  ck1 = 1");
+
+        execute("UPDATE %s USING TIMESTAMP 8 SET s0 += [{4.3056056376102396E-169: 22551, 1.439623561042819E208: 20450}, {-2.7900719406964408E-242: 30147, 8.586565205109037E-211: 28721, 4.603864140847754E20: -12814}], " +
+                "                                s1 += {{00000000-0000-4200-b900-000000000000, 00000000-0000-4500-ab00-000000000000}: {'2.67.240.121': '-471656-04-17', '134.186.187.51': '-2056459-04-13'}}, " +
+                "                                v0={{'?', '蠥╩徰昰\uEC2A弳펠재', '됢簔Ὕ텇⢌យ稭澣'}: 00000000-0000-4d00-8d00-000000000000} " +
+                "WHERE  pk0 = true AND  pk1 = 0 AND  ck0 = 37 AND  ck1 = 0");
+
+        beforeAndAfterFlush(() ->
+                assertRows(execute("SELECT pk0, pk1, ck0, ck1 FROM %s WHERE pk0 = ? LIMIT 4", true),
+                           row(true, IntegerType.instance.fromString("0"), ByteType.instance.fromString("114"), IntegerType.instance.fromString("742")),
+                           row(true, IntegerType.instance.fromString("0"), ByteType.instance.fromString("109"), IntegerType.instance.fromString("0")),
+                           row(true, IntegerType.instance.fromString("0"), ByteType.instance.fromString("37"), IntegerType.instance.fromString("0"))));
     }
 }
