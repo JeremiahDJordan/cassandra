@@ -316,8 +316,7 @@ public abstract class ColumnFilter
     /**
      * Returns this filter for a source that drops the cells of the fetched but not queried simple columns that are
      * older than the primary key liveness info of their row. This filter is local to a replica and is not serialized.
-     * It must only be used for the sources of a read that can't have a primary key liveness info that is not live,
-     * see {@code SinglePartitionReadCommand#sstableColumnFilter}.
+     * See {@code ReadCommand#sstableColumnFilter} for when a read may use it.
      */
     public ColumnFilter withNotQueriedCellsOlderThanRowDropped()
     {

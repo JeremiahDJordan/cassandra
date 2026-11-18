@@ -521,7 +521,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         // data is being tracked. This is only requested after an initial digest mismatch
         UnfilteredRowIterator partition = cfs.isRowCacheEnabled() && !executionController.isTrackingRepairedStatus()
                                         ? getThroughCache(cfs, executionController)
-                                        : queryMemtableAndDisk(cfs, executionController);
+                                        : queryMemtableAndDisk(cfs, executionController, true);
         return new SingletonUnfilteredPartitionIterator(partition);
     }
 
@@ -552,7 +552,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 // Some other read is trying to cache the value, just do a normal non-caching read
                 Tracing.trace("Row cache miss (race)");
                 cfs.metric.rowCacheMiss.inc();
-                return queryMemtableAndDisk(cfs, executionController);
+                return queryMemtableAndDisk(cfs, executionController, true);
             }
 
             CachedPartition cachedPartition = (CachedPartition)cached;
@@ -567,7 +567,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
             cfs.metric.rowCacheHitOutOfRange.inc();
             Tracing.trace("Ignoring row cache as cached value could not satisfy query");
-            return queryMemtableAndDisk(cfs, executionController);
+            return queryMemtableAndDisk(cfs, executionController, true);
         }
 
         cfs.metric.rowCacheMiss.inc();
@@ -668,7 +668,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         }
 
         Tracing.trace("Fetching data but not populating cache as query does not query from the start of the partition");
-        return queryMemtableAndDisk(cfs, executionController);
+        return queryMemtableAndDisk(cfs, executionController, true);
     }
 
     /**
@@ -688,13 +688,22 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
      */
     public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, ReadExecutionController executionController)
     {
+        return queryMemtableAndDisk(cfs, executionController, false);
+    }
+
+    /**
+     * @param rereadsRows whether the caller reads again the rows that may need cells that the sstables skipped, see
+     * {@link ReadCommand#sstableColumnFilter}
+     */
+    private UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, ReadExecutionController executionController, boolean rereadsRows)
+    {
         assert executionController != null && executionController.validForReadOn(cfs);
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Executing single-partition query on {}; stage READ pending: {}, active: {}", cfs.name, Stage.READ.getPendingTaskCount(), Stage.READ.getActiveTaskCount());
 
         Tracing.trace("Acquiring sstable references");
         ColumnFamilyStore.ViewFragment view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));
-        return queryMemtableAndDisk(cfs, view, null, executionController);
+        return queryMemtableAndDiskInternal(cfs, view, null, executionController, Clock.Global.nanoTime(), rereadsRows);
     }
 
     public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs,
@@ -706,20 +715,21 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Executing single-partition query on {}; stage READ pending: {}, active: {}", cfs.name, Stage.READ.getPendingTaskCount(), Stage.READ.getActiveTaskCount());
 
-        return queryMemtableAndDiskInternal(cfs, view, rowTransformer, executionController, Clock.Global.nanoTime());
+        return queryMemtableAndDiskInternal(cfs, view, rowTransformer, executionController, Clock.Global.nanoTime(), false);
     }
 
     private UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs, ReadExecutionController controller, long startTimeNanos)
     {
         var view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));
-        return queryMemtableAndDiskInternal(cfs, view, null, controller, startTimeNanos);
+        return queryMemtableAndDiskInternal(cfs, view, null, controller, startTimeNanos, false);
     }
 
     private UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs,
                                                                ColumnFamilyStore.ViewFragment view,
                                                                Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer,
                                                                ReadExecutionController controller,
-                                                               long startTimeNanos)
+                                                               long startTimeNanos,
+                                                               boolean rereadsRows)
     {
         /*
          * We have 2 main strategies:
@@ -743,7 +753,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             && !queriesMulticellType()
             && !controller.isTrackingRepairedStatus())
         {
-            return queryMemtableAndSSTablesInTimestampOrder(cfs, view, rowTransformer, (ClusteringIndexNamesFilter)clusteringIndexFilter(), controller, startTimeNanos);
+            return queryMemtableAndSSTablesInTimestampOrder(cfs, view, rowTransformer, (ClusteringIndexNamesFilter)clusteringIndexFilter(), controller, startTimeNanos, rereadsRows);
         }
 
         if (Tracing.traceSinglePartitions())
@@ -796,7 +806,9 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             view.sstables.sort(SSTableReader.maxTimestampDescending);
             int nonIntersectingSSTables = 0;
             int includedDueToTombstones = 0;
-            ColumnFilter sstableColumnFilter = hasMemtableData ? columnFilter() : sstableColumnFilter(view.sstables, controller);
+            ColumnFilter sstableColumnFilter = hasMemtableData && !rereadsRows
+                                               ? columnFilter()
+                                               : sstableColumnFilter(view.sstables, hasMemtableData ? view.memtables : Collections.emptyList(), controller);
 
             if (controller.isTrackingRepairedStatus())
                 Tracing.trace("Collecting data from sstables and tracking repaired status");
@@ -948,30 +960,6 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
     }
 
     /**
-     * The filter of the sstables of a read that reads no memtable data. When none of the sstables can hold a primary
-     * key liveness info that is not live (no TTL, or nothing expired or deleted at {@code nowInSec}), the primary key
-     * liveness info of each merged row is live, or is shadowed by a deletion that also shadows the cells older than
-     * it. {@link ReadCommand#withoutSkippableCells} then removes from the merged rows the fetched but not queried simple
-     * cells older than the primary key liveness info of their row in any source, so the sstables can skip them.
-     */
-    private ColumnFilter sstableColumnFilter(List<SSTableReader> sstables, ReadExecutionController controller)
-    {
-        ColumnFilter filter = columnFilter();
-        if (filter.allFetchedColumnsAreQueried() || controller.isTrackingRepairedStatus())
-            return filter;
-
-        for (SSTableReader sstable : sstables)
-        {
-            int maxTTL = sstable.getMaxTTL();
-            // a view's expired liveness info is never live, whatever its local expiration time
-            if (maxTTL == LivenessInfo.EXPIRED_LIVENESS_TTL
-                || (maxTTL != LivenessInfo.NO_TTL && sstable.getMinLocalDeletionTime() <= nowInSec()))
-                return filter;
-        }
-        return filter.withNotQueriedCellsOlderThanRowDropped();
-    }
-
-    /**
      * Return a wrapped iterator that when closed will update the sstables iterated and READ sample metrics.
      * Note that we cannot use the Transformations framework because they greedily get the static row, which
      * would cause all iterators to be initialized and hence all sstables to be accessed.
@@ -1033,7 +1021,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
      * no collection or counters are included).
      * This method assumes the filter is a {@code ClusteringIndexNamesFilter}.
      */
-    private UnfilteredRowIterator queryMemtableAndSSTablesInTimestampOrder(ColumnFamilyStore cfs, ColumnFamilyStore.ViewFragment view, Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer, ClusteringIndexNamesFilter filter, ReadExecutionController controller, long startTimeNanos)
+    private UnfilteredRowIterator queryMemtableAndSSTablesInTimestampOrder(ColumnFamilyStore cfs, ColumnFamilyStore.ViewFragment view, Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer, ClusteringIndexNamesFilter filter, ReadExecutionController controller, long startTimeNanos, boolean rereadsRows)
     {
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Acquiring sstable references");
@@ -1066,7 +1054,9 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
         /* add the SSTables on disk */
         view.sstables.sort(SSTableReader.maxTimestampDescending);
-        ColumnFilter sstableColumnFilter = hasMemtableData ? columnFilter() : sstableColumnFilter(view.sstables, controller);
+        ColumnFilter sstableColumnFilter = hasMemtableData && !rereadsRows
+                                           ? columnFilter()
+                                           : sstableColumnFilter(view.sstables, hasMemtableData ? view.memtables : Collections.emptyList(), controller);
         // read sorted sstables
         for (SSTableReader sstable : view.sstables)
         {

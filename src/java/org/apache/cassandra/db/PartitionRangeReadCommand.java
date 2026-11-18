@@ -366,6 +366,7 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
             }
 
+            ColumnFilter sstableColumnFilter = sstableColumnFilter(view.sstables, view.memtables, controller);
             int selectedSSTablesCnt = 0;
             for (SSTableReader sstable : view.sstables)
             {
@@ -376,7 +377,7 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
                 if (!intersects && !hasPartitionLevelDeletions && !hasRequiredStatics)
                     continue;
 
-                UnfilteredPartitionIterator iter = sstable.partitionIterator(columnFilter(), dataRange(), readCountUpdater);
+                UnfilteredPartitionIterator iter = sstable.partitionIterator(sstableColumnFilter, dataRange(), readCountUpdater);
                 inputCollector.addSSTableIterator(sstable, RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false));
 
                 if (!sstable.isRepaired())
