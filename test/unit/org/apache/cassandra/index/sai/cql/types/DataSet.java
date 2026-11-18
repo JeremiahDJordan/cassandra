@@ -33,6 +33,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.InetAddressType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UUIDType;
@@ -746,6 +747,42 @@ public abstract class DataSet<T> extends CQLTester
         public String toString()
         {
             return "inet";
+        }
+    }
+
+    public static class BlobDataSet extends DataSet<ByteBuffer>
+    {
+        public BlobDataSet()
+        {
+            values = new ByteBuffer[NUMBER_OF_VALUES];
+            List<ByteBuffer> list = Arrays.asList(values);
+
+            for (int index = 0; index < values.length; index++)
+            {
+                ByteBuffer value;
+                do
+                {
+                    byte[] bytes = new byte[getRandom().nextIntBetween(1, 256)];
+                    getRandom().nextBytes(bytes);
+                    value = ByteBuffer.wrap(bytes);
+                }
+                while (list.contains(value));
+                values[index] = value;
+            }
+        }
+
+        @Override
+        public QuerySet querySet()
+        {
+            // blobs are ordered as unsigned bytes, unlike ByteBuffer#compareTo
+            var type = BytesType.instance;
+            Comparator<Object[]> comparator = Comparator.comparing(objects -> (ByteBuffer) objects[2], type);
+            return new QuerySet.LiteralQuerySet(this, comparator);
+        }
+
+        public String toString()
+        {
+            return "blob";
         }
     }
 }

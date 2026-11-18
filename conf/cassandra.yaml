@@ -1846,10 +1846,14 @@ transparent_data_encryption_options:
 # LIKE restrictions, served by an index or filtered, are rejected while the query can contact a node on a messaging
 # version below DS 21 (the messaging version of 5.0.10), such as Apache Cassandra nodes and DataStax nodes before
 # 5.0.10, which may match them as a plain "contains" and return wrong rows (see NEWS.txt for the nodes a query can
-# contact). This setting can also be set at runtime through the StorageService MBean (setNewFeaturePeerVersionCheck).
+# contact). CREATE INDEX of a storage-attached index on blob values is rejected while any node, even down, is below
+# DS 21, as such nodes don't support blob indexes. This setting can also be set at runtime through the
+# StorageService MBean (setNewFeaturePeerVersionCheck).
 # - messaging: the messaging versions of the nodes are checked.
-# - none: nothing is checked, and a DataStax node before 5.0.10 may return wrong rows for LIKE. Only use it in a
-#   deployment that guarantees that every node runs the same build and messaging version, such as one without gossip.
+# - none: nothing is checked, and a DataStax node before 5.0.10 may return wrong rows for LIKE or fail to build a
+#   blob index. Only use it in a deployment that guarantees that every node runs the same build and messaging
+#   version, such as one without gossip.
+# The rejection of DataStax-only SELECT features while the query can contact a node below DS 10 has no opt-out.
 # new_feature_peer_version_check: messaging
 
 #####################
@@ -2317,13 +2321,17 @@ drop_compact_storage_enabled: false
 # before emitting a failure (defaults to -1 to disable)
 #sai_sstable_indexes_per_query_fail_threshold: -1
 
-# The fail thresholds of the three SAI term size guardrails below are also the maximum size of a term SAI indexes:
+# The fail thresholds of the four SAI term size guardrails below are also the maximum size of a term SAI indexes:
 # larger terms written by superusers or internally, which guardrails don't apply to, are not indexed. String and frozen
 # terms are never indexed over 32766 bytes, the most the index files can hold: client writes of larger ones are rejected
 # whatever the fail threshold.
 # Guardrail specifying warn/fail thresholds for the size of string terms written to an SAI index
 # sai_string_term_size_warn_threshold: 1KiB
 # sai_string_term_size_fail_threshold: 8KiB
+
+# Guardrail specifying warn/fail thresholds for the size of blob terms written to an SAI index
+# sai_blob_term_size_warn_threshold: 1KiB
+# sai_blob_term_size_fail_threshold: 8KiB
 
 # Guardrail specifying warn/fail thresholds for the size of frozen terms written to an SAI index
 # sai_frozen_term_size_warn_threshold: 1KiB

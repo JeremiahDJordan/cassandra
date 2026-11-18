@@ -35,6 +35,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.BooleanType;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.DecimalType;
@@ -533,11 +534,20 @@ public class TypeUtil
     /* Type comparison to get rid of ReversedType */
 
     /**
-     * Returns <code>true</code> if values of the given {@link AbstractType} should be indexed as literals.
+     * Returns <code>true</code> if values of the given {@link AbstractType} should be indexed as literals. This applies
+     * to string types, frozen types, composite types, the bytes (blob) type and the boolean type.
      */
     public static boolean isLiteral(AbstractType<?> type)
     {
-        return isUTF8OrAscii(type) || isCompositeOrFrozen(type) || baseType(type) instanceof BooleanType;
+        return isUTF8OrAscii(type) || isCompositeOrFrozen(type) || isBytes(type) || baseType(type) instanceof BooleanType;
+    }
+
+    /**
+     * Returns <code>true</code> if given {@link AbstractType} is the bytes (blob) type.
+     */
+    public static boolean isBytes(AbstractType<?> type)
+    {
+        return baseType(type) instanceof BytesType;
     }
 
     /**

@@ -999,6 +999,8 @@ public class Config
     public volatile int sai_sstable_indexes_per_query_fail_threshold = -1;
     public volatile DataStorageSpec.LongBytesBound sai_string_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
     public volatile DataStorageSpec.LongBytesBound sai_string_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_blob_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
+    public volatile DataStorageSpec.LongBytesBound sai_blob_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
     public volatile DataStorageSpec.LongBytesBound sai_frozen_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("1KiB");
     public volatile DataStorageSpec.LongBytesBound sai_frozen_term_size_fail_threshold = new DataStorageSpec.LongBytesBound("8KiB");
     public volatile DataStorageSpec.LongBytesBound sai_vector_term_size_warn_threshold = new DataStorageSpec.LongBytesBound("16KiB");
@@ -1260,7 +1262,8 @@ public class Config
     /**
      * How the requests using a feature that older nodes don't support, or evaluate differently, check the messaging
      * versions of the other nodes (see {@code org.apache.cassandra.gms.DataStaxFeatureSupport}): LIKE restrictions,
-     * which every node that the query can contact must evaluate the same way.
+     * which every node that the query can contact must evaluate the same way, and CREATE INDEX on blob values, which
+     * every node must support.
      */
     public enum NewFeaturePeerVersionCheck
     {

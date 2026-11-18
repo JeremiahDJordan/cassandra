@@ -42,11 +42,13 @@ import java.util.stream.Collectors;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Operator;
@@ -75,6 +77,7 @@ import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.dht.OrderPreservingPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.gms.DataStaxFeatureSupport;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexBuildDecider;
 import org.apache.cassandra.index.IndexRegistry;
@@ -97,6 +100,9 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableStreamRebuildState;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.nodes.IPeerInfo;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
@@ -117,6 +123,9 @@ import static org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig.MAX_TOP_K
 public class StorageAttachedIndex implements Index
 {
     public static final String NAME = "sai";
+    public static final String BLOB_INDEX_UNSUPPORTED_BY_NODES_MESSAGE =
+    "Cannot create a storage-attached index on the blob values of column %s while there are nodes on a messaging " +
+    "version below DS 21 (5.0.10): nodes %s don't support it";
     public static final String NGRAM_WITHOUT_QUERY_ANALYZER_WARNING =
     "Using an ngram analyzer without defining a query_analyzer. " +
     "This means that the same ngram analyzer will be applied to both indexed and queried column values. " +
@@ -286,7 +295,8 @@ public class StorageAttachedIndex implements Index
                                                                         CQL3Type.Native.SMALLINT, CQL3Type.Native.TEXT, CQL3Type.Native.TIME,
                                                                         CQL3Type.Native.TIMESTAMP, CQL3Type.Native.TIMEUUID, CQL3Type.Native.TINYINT,
                                                                         CQL3Type.Native.UUID, CQL3Type.Native.VARCHAR, CQL3Type.Native.INET,
-                                                                        CQL3Type.Native.VARINT, CQL3Type.Native.DECIMAL, CQL3Type.Native.BOOLEAN);
+                                                                        CQL3Type.Native.VARINT, CQL3Type.Native.DECIMAL, CQL3Type.Native.BOOLEAN,
+                                                                        CQL3Type.Native.BLOB);
 
     private static final Set<Class<? extends IPartitioner>> ILLEGAL_PARTITIONERS =
             ImmutableSet.of(OrderPreservingPartitioner.class, LocalPartitioner.class, ByteOrderedPartitioner.class, RandomPartitioner.class);
@@ -320,6 +330,48 @@ public class StorageAttachedIndex implements Index
                                              target.right,
                                              config,
                                              baseCfs);
+    }
+
+    /**
+     * Rejects the creation of an index on blob values (CASSANDRA-20012), on a blob column or on the elements, keys,
+     * values or entries of a non-frozen collection of blobs, while some node of the cluster may not be able to build
+     * it: only DataStax nodes on messaging version DS 21 or later support them (see {@link DataStaxFeatureSupport}).
+     * Frozen ({@code FULL}) indexes of blobs aren't affected. Only checked when the index is created, so that an
+     * existing index doesn't block other schema changes.
+     */
+    public static void validateSupportedByAllNodes(TableMetadata table, IndexMetadata index)
+    {
+        Pair<ColumnMetadata, IndexTarget.Type> target = TargetParser.parse(table, index);
+        if (target == null || !indexesBlobTerms(TypeUtil.cellValueType(target.left, target.right)))
+            return;
+
+        if (DatabaseDescriptor.getNewFeaturePeerVersionCheck() == Config.NewFeaturePeerVersionCheck.none)
+            return;
+
+        // The schema reaches every node: the endpoints with a host ID, which include the ring members, and the other
+        // peers known to Nodes, such as joining nodes. A node that is down gets it when it comes back, so a node whose
+        // version isn't known counts even when it's down.
+        Iterable<InetAddressAndPort> nodes = Iterables.concat(StorageService.instance.getTokenMetadataForKeyspace(table.keyspace).getAllEndpoints(),
+                                                              Nodes.peers().get()
+                                                                   .filter(peer -> !peer.isRemoved())
+                                                                   .map(IPeerInfo::getPeerAddressAndPort)
+                                                                   .collect(Collectors.toList()));
+        Set<InetAddressAndPort> unsupported = DataStaxFeatureSupport.nodesNotSupporting(nodes, true);
+        if (!unsupported.isEmpty())
+            throw new InvalidRequestException(String.format(BLOB_INDEX_UNSUPPORTED_BY_NODES_MESSAGE, target.left.name, unsupported));
+    }
+
+    /**
+     * Whether an index on values of the given type has blob terms, i.e. the type is blob or a composite (map entries)
+     * with a blob component.
+     */
+    private static boolean indexesBlobTerms(AbstractType<?> type)
+    {
+        if (TypeUtil.isBytes(type))
+            return true;
+        if (TypeUtil.isComposite(type))
+            return type.subTypes().stream().anyMatch(TypeUtil::isBytes);
+        return false;
     }
 
     /**
@@ -396,6 +448,12 @@ public class StorageAttachedIndex implements Index
         }
 
         AbstractType<?> type = TypeUtil.cellValueType(target.left, target.right);
+
+        // Blob values can't be analyzed, alone or in map entries. Unlike the other non-string types, whose
+        // index_analyzer is ignored with a warning, reject any analyzer option, query_analyzer included: blob indexes
+        // are new (CASSANDRA-20012), so no existing index has one.
+        if (indexesBlobTerms(type) && (AbstractAnalyzer.isAnalyzed(options) || options.containsKey(LuceneAnalyzer.QUERY_ANALYZER)))
+            throw new InvalidRequestException("CQL type " + CQL3Type.Native.BLOB + " cannot be analyzed.");
 
         // Validate analyzers by building them
         try (AbstractAnalyzer.AnalyzerFactory analyzerFactory = AbstractAnalyzer.fromOptions(targetColumn, type, options))

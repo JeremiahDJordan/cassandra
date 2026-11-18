@@ -82,7 +82,8 @@ public class TypeUtilTest extends SaiRandomizedTest
             AbstractType<?> reversedType = ReversedType.getInstance(type);
 
             boolean isUTF8OrAscii = cql3Type == CQL3Type.Native.ASCII || cql3Type == CQL3Type.Native.TEXT || cql3Type == CQL3Type.Native.VARCHAR;
-            boolean isLiteral = cql3Type == CQL3Type.Native.ASCII || cql3Type == CQL3Type.Native.TEXT || cql3Type == CQL3Type.Native.VARCHAR || cql3Type == CQL3Type.Native.BOOLEAN;
+            boolean isLiteral = cql3Type == CQL3Type.Native.ASCII || cql3Type == CQL3Type.Native.TEXT || cql3Type == CQL3Type.Native.VARCHAR || cql3Type == CQL3Type.Native.BOOLEAN ||
+                                cql3Type == CQL3Type.Native.BLOB;
             assertEquals(isLiteral, TypeUtil.isLiteral(type));
             assertEquals(TypeUtil.isLiteral(type), TypeUtil.isLiteral(reversedType));
             assertEquals(isUTF8OrAscii, TypeUtil.isUTF8OrAscii(type));

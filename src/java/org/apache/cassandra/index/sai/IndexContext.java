@@ -58,6 +58,7 @@ import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.BooleanType;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.InetAddressType;
@@ -154,7 +155,7 @@ public class IndexContext
     "Index hints including a SAI index used for ORDER BY cannot include any other index";
 
     private static final Set<AbstractType<?>> EQ_ONLY_TYPES =
-            ImmutableSet.of(UTF8Type.instance, AsciiType.instance, BooleanType.instance, UUIDType.instance);
+            ImmutableSet.of(UTF8Type.instance, AsciiType.instance, BooleanType.instance, UUIDType.instance, BytesType.instance);
 
     public static final String ENABLE_SEGMENT_COMPACTION_OPTION_NAME = "enable_segment_compaction";
 
@@ -269,6 +270,13 @@ public class IndexContext
             this.termSizeFailThreshold = GuardrailsConfig::getSaiFrozenTermSizeFailThreshold;
             maxTermSizeProperty = SAI_MAX_FROZEN_TERM_SIZE;
         }
+        else if (TypeUtil.isBytes(getValidator()))
+        {
+            // Blob terms have their own guardrail and share the legacy string property
+            this.termSizeGuardrail = Guardrails.saiBlobTermSize;
+            this.termSizeFailThreshold = GuardrailsConfig::getSaiBlobTermSizeFailThreshold;
+            maxTermSizeProperty = SAI_MAX_STRING_TERM_SIZE;
+        }
         else
         {
             this.termSizeGuardrail = Guardrails.saiStringTermSize;
@@ -376,8 +384,8 @@ public class IndexContext
 
     /**
      * The maximum size of a term of this index: the legacy cassandra.sai.max_*_size_kb system property of its kind if
-     * set, else the failure threshold of its term size guardrail if enabled, else the property's default. Except for
-     * vectors, it is at most {@link #MAX_ON_DISK_TERM_SIZE}.
+     * set (the string one for blobs), else the failure threshold of its term size guardrail if enabled, else the
+     * property's default. Except for vectors, it is at most {@link #MAX_ON_DISK_TERM_SIZE}.
      */
     public long maxTermSize()
     {

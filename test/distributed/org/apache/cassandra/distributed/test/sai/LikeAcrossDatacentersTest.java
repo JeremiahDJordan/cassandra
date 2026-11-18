@@ -49,6 +49,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * LIKE during an upgrade done one datacenter at a time: dc1 is on messaging version DS 21, dc2 on DS 20. A query
  * accepts LIKE while the nodes it can contact are on DS 21, so dc1 coordinators accept it at the LOCAL_* consistency
  * levels, and reject it at the others, which can reach dc2. A read that reaches dc2 anyway fails for those nodes.
+ * Blob indexes need every node of the ring.
  */
 public class LikeAcrossDatacentersTest extends TestBaseImpl
 {
@@ -107,6 +108,12 @@ public class LikeAcrossDatacentersTest extends TestBaseImpl
                                                   ": the LIKE operator needs DS 21").getResult()).isNotEmpty();
             cluster.get(1).runOnInstance(() -> BBHelper.ignoreVersions.set(false));
 
+            for (int node = 1; node <= cluster.size(); node++)
+            {
+                int coordinator = node;
+                assertThatThrownBy(() -> cluster.schemaChange(withKeyspace("CREATE INDEX ON %s.t(b) USING 'sai'"), false, cluster.get(coordinator)))
+                    .hasMessageContaining("Cannot create a storage-attached index on the blob values of column b while there are nodes on a messaging version below DS 21");
+            }
         }
     }
 

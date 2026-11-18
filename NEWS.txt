@@ -153,17 +153,26 @@ New features
       case_sensitive: false, normalize or ascii options matches it against the normalized values: with such an index
       on ci, ci LIKE 'QUICK%' matches 'quick fox' through the index, but not when the index isn't used (for instance
       with ALLOW FILTERING and WITH excluded_indexes = {*}). (CASSANDRA-17198)
+    - Storage-attached indexes (SAI) support blob columns, and the elements, keys, values and entries of non-frozen
+      collections of blobs. They serve equality (=, IN, CONTAINS, CONTAINS KEY, map entry equality) and ORDER BY;
+      other operators on blobs are filtered. A new guardrail, sai_blob_term_size_warn_threshold and
+      sai_blob_term_size_fail_threshold (1KiB and 8KiB by default), named as in Apache Cassandra 6.0, limits the size
+      of indexed blob terms as the other sai_*_term_size guardrails limit theirs (see Upgrading, CASSANDRA-19493): a
+      client write of a larger blob term gets a warning or fails, and the failure threshold is the maximum size of an
+      indexed blob term. Frozen collections of blobs keep sai_frozen_term_size, and map entries with a blob key or
+      value sai_string_term_size. Blob terms have no system property of their own: if set,
+      -Dcassandra.sai.max_string_term_size_kb sets their maximum size too, as it does for strings. (CASSANDRA-20012)
 
 Upgrading
 ---------
-    - This release speaks messaging version DS 21 (111), which tells the other nodes that it supports LIKE, and
-      serializes everything as DS 20 (110), the version of the earlier 5.0 releases: reads, writes, repair, hints,
-      batches, streaming, commit logs and Paxos state work across an upgrade and a downgrade. Upgrade from an earlier
-      5.0 release in two rolling restarts: first start 5.0.10 with -Dds.current_messaging_version=110, then, once
-      every node runs 5.0.10, remove the option. A node started with the option speaks DS 20, so schema changes reach
-      every node during the upgrade; without it, the earlier releases neither pull schema from 5.0.10 nodes nor push
-      schema to them. LIKE stays unavailable until the option is removed: a node started with it counts as a node
-      without LIKE.
+    - This release speaks messaging version DS 21 (111), which tells the other nodes that it supports LIKE and blob
+      indexes, and serializes everything as DS 20 (110), the version of the earlier 5.0 releases: reads, writes,
+      repair, hints, batches, streaming, commit logs and Paxos state work across an upgrade and a downgrade. Upgrade
+      from an earlier 5.0 release in two rolling restarts: first start 5.0.10 with -Dds.current_messaging_version=110,
+      then, once every node runs 5.0.10, remove the option. A node started with the option speaks DS 20, so schema
+      changes reach every node during the upgrade; without it, the earlier releases neither pull schema from 5.0.10
+      nodes nor push schema to them. LIKE and blob indexes stay unavailable until the option is removed: a node
+      started with it counts as a node that supports neither.
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
       return the same value as the address column. This avoids the risk of client connections overwhelming
       DNS. (CASSANDRA-21539)
@@ -228,6 +237,11 @@ Upgrading
       Cassandra 5.0 nodes, and DataStax 5.0 nodes before 5.0.10, filter a pattern without wildcards or with inner
       wildcards as a plain "contains" (LIKE 'abc' returns 'xabcx'). The new_feature_peer_version_check setting in
       cassandra.yaml can turn this check off. (CASSANDRA-17198)
+    - CREATE INDEX of a storage-attached index on blob values (see New features) is rejected while any node, in any
+      datacenter, is on a messaging version below DS 21 (the messaging version of 5.0.10), as the schema reaches every
+      node and every node builds the index. A node whose messaging version isn't known counts even when it's down (or
+      unknown to system.peers): after a restart of the coordinator, wait for all the nodes to be up. Before
+      downgrading to Apache Cassandra 5.0 or to a version without blob indexes, drop them. (CASSANDRA-20012)
 
 5.0.9
 =====

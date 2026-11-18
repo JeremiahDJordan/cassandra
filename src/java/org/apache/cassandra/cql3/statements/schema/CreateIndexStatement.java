@@ -48,6 +48,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.KeyspaceMetadata;
@@ -261,6 +262,10 @@ public final class CreateIndexStatement extends AlterSchemaStatement
 
         TableMetadata newTable = table.withSwapped(table.indexes.with(index));
         newTable.validate(table);
+
+        // SAI indexes on blob values (CASSANDRA-20012) are only created once every node supports them
+        if (guardRails == IndexGuardrails.SAI)
+            StorageAttachedIndex.validateSupportedByAllNodes(table, index);
 
         return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.tables.withSwapped(newTable)));
     }
