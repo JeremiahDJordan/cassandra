@@ -107,6 +107,35 @@ Behaviour that differs from HCD 1.2:
       encrypted, every `trickle_fsync_interval` (10 MiB by default) of uncompressed data. HCD 1.2 ignored
       `trickle_fsync` for these files. Set `trickle_fsync: false` to turn it off.
 
+DIFFERENCES FROM APACHE CASSANDRA 5.0 (SAI AND VECTORS)
+=======================================================
+
+These deliberate differences from Apache Cassandra 5.0 matter when upgrading from Apache Cassandra 5.0 or running a
+cluster that mixes it with this version. All but the last affect which schemas are accepted:
+    - Storage-attached indexes (SAI) on partition key or clustering columns with a non-default case_sensitive,
+      normalize or ascii option are accepted, and only log a warning ("Schema contains an invalid index analyzer on
+      primary key column"). Apache Cassandra 5.0 rejects any of those options on those columns ("Analysis options are
+      not supported on primary key columns", CASSANDRA-18782). This keeps existing DataStax schemas loading. The
+      options have no effect on those columns: a restriction on such a column matches its values as written, so with
+      case_sensitive set to false, c = 'b' doesn't find a row whose c is 'B'. There is no option to reject them: to keep
+      a schema Apache Cassandra 5.0 can use, don't create such indexes. (The index_analyzer and query_analyzer options
+      are DataStax-only: Apache Cassandra 5.0 rejects them on any column.)
+    - Vector types may only have float elements: vector<int, N> and other non-float vectors are rejected ("vectors
+      may only use float"), which Apache Cassandra 5.0 accepts. Start every node with
+      -Dcassandra.float_only_vectors=false to accept them, e.g. before upgrading from an Apache Cassandra 5.0 cluster
+      whose schema has them. Apache Cassandra 5.0 only allows SAI indexes on float vectors; don't create one on a
+      non-float vector here either.
+    - New vector types may have at most 8192 dimensions: the vector_dimensions_fail_threshold guardrail defaults to
+      8192, whatever the guardrails profile, while Apache Cassandra 5.0 disables it (-1). Like any guardrail, it is
+      checked when a table or type is created or altered by a user it applies to (not a superuser), so existing
+      schemas with larger vectors still load. Set vector_dimensions_fail_threshold: -1 in cassandra.yaml to remove the
+      limit, as in Apache Cassandra 5.0.
+    - A full rebuild of a single SAI index (nodetool rebuild_index <keyspace> <table> <index>) also rewrites the
+      per-SSTable index files of every sstable, which all the SAI indexes of the table share (primary keys, tokens,
+      offsets). Apache Cassandra 5.0 keeps them when they are complete and pass checksum validation
+      (CASSANDRA-21515). Here, this rebuild is how damaged per-SSTable files are repaired, and how they are upgraded to
+      the current on-disk format. It costs a pass over the keys of each sstable and the writes of those files.
+
 5.0.10
 ======
 
