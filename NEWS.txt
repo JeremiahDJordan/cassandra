@@ -127,6 +127,12 @@ Upgrading
       that validates the whole table definition, such as ALTER TABLE ... ADD, it rejects the change for any table
       that sets the option. Before downgrading, remove the option from those tables with ALTER TABLE ... WITH
       compaction = {...} listing the other options only. (CASSANDRA-21615)
+    - On a node with several data directories, a flush of a table with a storage-attached index (SAI) on a vector
+      writes a single sstable, in one of the directories, rather than one sstable per directory, which failed (Apache
+      Cassandra rejects such indexes on such nodes, CASSANDRA-18715). Until compaction moves its data to the
+      directories that own their token ranges, data and the tombstones that shadow it can be on different disks, so
+      with disk_failure_policy: best_effort, losing the disk that holds such an sstable can bring back data it
+      deleted.
     - GROUP BY queries with a limit or a page size, at consistency levels that read several replicas, now make short
       read protection requests when a replica returns as many groups as the limit and the reconciled result doesn't
       have as many groups, or doesn't have all the rows of the replica's last group: such a replica may have more
