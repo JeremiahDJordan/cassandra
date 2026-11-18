@@ -1697,6 +1697,22 @@ public class RowFilter
             checkBindValueSet(value, "Unsupported unset map value for column %s", column.name);
         }
 
+        /**
+         * @return the map key this expression compares the value of
+         */
+        public ByteBuffer getMapKey()
+        {
+            return key;
+        }
+
+        /**
+         * @return the value the map value at {@link #getMapKey()} is compared to
+         */
+        public ByteBuffer getMapValue()
+        {
+            return value;
+        }
+
         @Override
         public ByteBuffer getIndexValue()
         {
