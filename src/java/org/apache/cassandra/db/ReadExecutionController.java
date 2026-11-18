@@ -29,6 +29,7 @@ import com.codahale.metrics.Snapshot;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.marshal.Redaction;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.metrics.DecayingEstimatedHistogramReservoir;
@@ -65,6 +66,8 @@ public class ReadExecutionController implements AutoCloseable
     private List<Memtable> otherOpenedMemtables;
 
     private final Histogram sstablesScannedPerRowRead;
+
+    private ScannedTombstones scannedTombstones = ScannedTombstones.NONE;
 
     private boolean mayNeedSkippedCells;
 
@@ -315,6 +318,52 @@ public class ReadExecutionController implements AutoCloseable
     public RepairedDataInfo getRepairedDataInfo()
     {
         return repairedDataInfo;
+    }
+
+    /**
+     * The read's count of the tombstones that an index searcher scans but doesn't return; {@link
+     * ScannedTombstones#NONE} for a read that counts no tombstones.
+     */
+    public ScannedTombstones scannedTombstones()
+    {
+        return scannedTombstones;
+    }
+
+    void setScannedTombstones(ScannedTombstones scannedTombstones)
+    {
+        this.scannedTombstones = scannedTombstones;
+    }
+
+    /**
+     * Counts what an index searcher scans but the read doesn't see against the read's tombstone thresholds, metrics and
+     * trace: the tombstones it drops, and those it holds until it knows whether it returns them.
+     */
+    public interface ScannedTombstones
+    {
+        ScannedTombstones NONE = new ScannedTombstones()
+        {
+            @Override
+            public void countDropped(DecoratedKey partitionKey, Unfiltered dropped)
+            {
+            }
+
+            @Override
+            public void checkHeld(DecoratedKey partitionKey, Unfiltered held, long heldTombstones)
+            {
+            }
+        };
+
+        /**
+         * Counts the tombstones of what the searcher drops in the given partition (see
+         * {@link ReadCommand#countedTombstones}), failing the read once there are too many.
+         */
+        void countDropped(DecoratedKey partitionKey, Unfiltered dropped);
+
+        /**
+         * Fails the read if counting the given number of tombstones, which the searcher holds for the given partition
+         * until it knows whether it returns them, would cross the failure threshold; {@code held} is the last of them.
+         */
+        void checkHeld(DecoratedKey partitionKey, Unfiltered held, long heldTombstones);
     }
 
     /**

@@ -75,6 +75,12 @@ public class StaticCollectionNegationTest extends SAITester.Versioned
         "st = 0 AND (r NOT CONTAINS 2 OR v != 2)",
         "st = 0 AND v != 2",
         "ss NOT CONTAINS 1 AND r NOT CONTAINS 2",
+        // the deleted data of a partition whose static row doesn't match satisfies the other side of the disjunction
+        "ss NOT CONTAINS 1 OR ck = 1",
+        "ss NOT CONTAINS 1 OR r NOT CONTAINS 3",
+        "sk NOT CONTAINS KEY 1 OR v != 9",
+        "pk = 12 AND (ss NOT CONTAINS 1 OR ck = 1)",
+        "pk = 14 AND (ss NOT CONTAINS 1 OR r NOT CONTAINS 3)",
     };
 
     private static final String[] LIMITS = { "", " LIMIT 3", " LIMIT 10", " PER PARTITION LIMIT 2",
@@ -87,11 +93,11 @@ public class StaticCollectionNegationTest extends SAITester.Versioned
     }
 
     @Test
-    public void testNegationsOnStaticCollections()
+    public void testNegationsOnStaticCollections() throws Throwable
     {
         // the expected rows, filtered without indexes, before and after the second batch of writes
         createTable(SCHEMA);
-        writeFirst();
+        writeFirst(false);
         Map<String, List<String>> first = select(true);
         writeSecond();
         Map<String, List<String>> second = select(true);
@@ -101,7 +107,9 @@ public class StaticCollectionNegationTest extends SAITester.Versioned
             createIndex("CREATE CUSTOM INDEX ON %s(" + target + ") USING 'StorageAttachedIndex'");
         disableCompaction();
         List<String> failures = new ArrayList<>();
-        writeFirst();
+        writeFirst(true);
+        // let the TTL expire
+        Thread.sleep(2100);
         check(failures, "memtable", first);
         flush();
         check(failures, "sstable", first);
@@ -114,7 +122,11 @@ public class StaticCollectionNegationTest extends SAITester.Versioned
         assertTrue(String.format("%d failures:%n%s", failures.size(), String.join("\n", failures)), failures.isEmpty());
     }
 
-    private void writeFirst()
+    /**
+     * @param deletedData whether to write the data that ends up deleted in the partitions without live rows, which the
+     *                    table of the expected rows doesn't get: filtering on a table with deleted data is what is tested
+     */
+    private void writeFirst(boolean deletedData)
     {
         // 1, 2, 5: only a static row, with or without the collections; 3, 6: rows and a static row; 4: rows only;
         // 7: only a static row, whose collections only have a deleted element
@@ -140,6 +152,19 @@ public class StaticCollectionNegationTest extends SAITester.Versioned
         // 11: a row holding 2 everywhere, and a static row
         execute("INSERT INTO %s (pk, ck, v, r) VALUES (11, 1, 2, {2})");
         execute("INSERT INTO %s (pk, st, ss, sl, sk, sv, se) VALUES (11, 0, {2}, [2], {2: 2}, {2: 2}, {2: 2})");
+        // 12, 14, 15: a static row holding 1, which doesn't match the negations of 1, and only deleted data: a range
+        // tombstone, a deleted row, an expired row
+        for (int pk : new int[]{ 12, 14, 15 })
+            execute("INSERT INTO %s (pk, st, ss, sl, sk, sv, se) VALUES (?, 1, {1}, [1], {1: 1}, {1: 1}, {1: 1})", pk);
+        if (deletedData)
+        {
+            execute("INSERT INTO %s (pk, ck, v, r) VALUES (12, 1, 1, {1})");
+            execute("INSERT INTO %s (pk, ck, v, r) VALUES (12, 2, 2, {2})");
+            execute("DELETE FROM %s WHERE pk = 12 AND ck >= 0");
+            execute("INSERT INTO %s (pk, ck, v, r) VALUES (14, 1, 1, {1})");
+            execute("DELETE FROM %s WHERE pk = 14 AND ck = 1");
+            execute("INSERT INTO %s (pk, ck, v, r) VALUES (15, 1, 1, {1}) USING TTL 1");
+        }
     }
 
     private void writeSecond()

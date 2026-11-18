@@ -31,6 +31,7 @@ import java.util.function.LongPredicate;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 
 import javax.annotation.Nullable;
 
@@ -630,7 +631,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                 iterator = withQueryCancellation(iterator);
                 iterator = withReadObserver(iterator);
                 iterator = RTBoundValidator.validate(withoutPurgeableTombstones(iterator, cfs, executionController), Stage.PURGED, false);
-                iterator = withMetricsRecording(iterator, cfs.metric, startTimeNanos);
+                iterator = withMetricsRecording(iterator, cfs.metric, startTimeNanos, executionController);
                 if (executionInfo != null)
                     iterator = executionInfo.countFetched(iterator, nowInSec());
 
@@ -789,12 +790,49 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     /**
+     * The number of tombstones that the read counts for a row, static or not, or a range tombstone marker
+     * ({@link #withMetricsRecording}): one for each cell of a row that isn't live, or, for a row without such cells and
+     * without live data, one for its deletion or expired primary key liveness; one for a marker.
+     */
+    public static int countedTombstones(Unfiltered unfiltered, long nowInSec, boolean enforceStrictLiveness)
+    {
+        if (!unfiltered.isRow())
+            return 1;
+
+        Row row = (Row) unfiltered;
+        return countedRowTombstones(row, nowInSec, row.hasLiveData(nowInSec, enforceStrictLiveness));
+    }
+
+    private static int countedRowTombstones(Row row, long nowInSec, boolean hasLiveData)
+    {
+        int tombstones = 0;
+        for (Cell<?> cell : row.cells())
+            if (!cell.isLive(nowInSec))
+                tombstones++;
+
+        // a row without tombstone cells counts one for its primary key deletion
+        if (tombstones == 0
+            && !hasLiveData
+            && !row.primaryKeyLivenessInfo().isLive(nowInSec)
+            && row.hasDeletion(nowInSec))
+            tombstones = 1;
+
+        return tombstones;
+    }
+
+    /**
      * Wraps the provided iterator so that metrics on what is scanned by the command are recorded.
      * This also log warning/trow TombstoneOverwhelmingException if appropriate.
+     * <p>
+     * It also counts the tombstones that an index searcher scans and doesn't return
+     * ({@link ReadExecutionController#scannedTombstones()}), so that the thresholds and metrics see one total.
      */
-    private UnfilteredPartitionIterator withMetricsRecording(UnfilteredPartitionIterator iter, final TableMetrics metric, final long startTimeNanos)
+    private UnfilteredPartitionIterator withMetricsRecording(UnfilteredPartitionIterator iter,
+                                                             final TableMetrics metric,
+                                                             final long startTimeNanos,
+                                                             ReadExecutionController executionController)
     {
-        class MetricRecording extends Transformation<UnfilteredRowIterator>
+        class MetricRecording extends Transformation<UnfilteredRowIterator> implements ReadExecutionController.ScannedTombstones
         {
             private final boolean enforceStrictLiveness = metadata().enforceStrictLiveness();
 
@@ -804,6 +842,12 @@ public abstract class ReadCommand extends AbstractReadQuery
             private long lastReportedTombstones = 0;
 
             private DecoratedKey currentKey;
+            private boolean inPartition;
+
+                // tombstones dropped by the searcher for a partition the read hasn't seen yet: reported with that
+                // partition if the searcher returns it, otherwise on their own
+            private DecoratedKey droppedKey;
+            private long droppedTombstones;
 
             private Threshold.GuardedCounter createTombstoneCounter()
             {
@@ -816,12 +860,27 @@ public abstract class ReadCommand extends AbstractReadQuery
             private MetricRecording()
             {
                 recordReadRequest(metric);
+                executionController.setScannedTombstones(this);
             }
 
             @Override
             public UnfilteredRowIterator applyToPartition(UnfilteredRowIterator iter)
             {
+                if (droppedKey != null)
+                {
+                    if (droppedKey.equals(iter.partitionKey()))
+                    {
+                        // dropped before the searcher returned the partition: reported with it
+                        droppedKey = null;
+                        droppedTombstones = 0;
+                    }
+                    else
+                    {
+                        reportDropped();
+                    }
+                }
                 currentKey = iter.partitionKey();
+                inPartition = true;
                 return Transformation.apply(iter, this);
             }
 
@@ -834,25 +893,13 @@ public abstract class ReadCommand extends AbstractReadQuery
             @Override
             public Row applyToRow(Row row)
             {
-                boolean hasTombstones = false;
-                for (Cell<?> cell : row.cells())
-                {
-                    if (!cell.isLive(ReadCommand.this.nowInSec()))
-                    {
-                        countTombstone(row.clustering());
-                        hasTombstones = true; // allows to avoid counting an extra tombstone if the whole row expired
-                    }
-                }
+                boolean hasLiveData = row.hasLiveData(ReadCommand.this.nowInSec(), enforceStrictLiveness);
+                int rowTombstones = countedRowTombstones(row, ReadCommand.this.nowInSec(), hasLiveData);
+                for (int i = 0; i < rowTombstones; i++)
+                    countTombstone(currentKey, row.clustering());
 
-                if (row.hasLiveData(ReadCommand.this.nowInSec(), enforceStrictLiveness))
+                if (hasLiveData)
                     ++liveRows;
-                else if (!row.primaryKeyLivenessInfo().isLive(ReadCommand.this.nowInSec())
-                        && row.hasDeletion(ReadCommand.this.nowInSec())
-                        && !hasTombstones)
-                {
-                    // We're counting primary key deletions only here.
-                    countTombstone(row.clustering());
-                }
 
                 return row;
             }
@@ -860,11 +907,42 @@ public abstract class ReadCommand extends AbstractReadQuery
             @Override
             public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
             {
-                countTombstone(marker.clustering());
+                countTombstone(currentKey, marker.clustering());
                 return marker;
             }
 
-            private void countTombstone(ClusteringPrefix<?> clustering)
+            @Override
+            public void countDropped(DecoratedKey partitionKey, Unfiltered dropped)
+            {
+                int droppedNow = countedTombstones(dropped, ReadCommand.this.nowInSec(), enforceStrictLiveness);
+                if (droppedNow == 0)
+                    return;
+
+                if (!inPartition || !partitionKey.equals(currentKey))
+                {
+                    if (droppedKey != null && !droppedKey.equals(partitionKey))
+                        reportDropped();
+                    droppedKey = partitionKey;
+                    droppedTombstones += droppedNow;
+                }
+                for (int i = 0; i < droppedNow; i++)
+                    countTombstone(partitionKey, dropped.clustering());
+            }
+
+            @Override
+            public void checkHeld(DecoratedKey partitionKey, Unfiltered held, long heldTombstones)
+            {
+                try
+                {
+                    tombstones.checkIncrement(heldTombstones);
+                }
+                catch (InvalidRequestException e)
+                {
+                    throw failOnTombstones(partitionKey, held.clustering());
+                }
+            }
+
+            private void countTombstone(DecoratedKey partitionKey, ClusteringPrefix<?> clustering)
             {
                 try
                 {
@@ -872,20 +950,38 @@ public abstract class ReadCommand extends AbstractReadQuery
                 }
                 catch (InvalidRequestException e)
                 {
-                    metric.tombstoneFailures.inc();
-                    throw new TombstoneOverwhelmingException(tombstones.get(),
-                                                             ReadCommand.this.toCQLString(Redaction.REDACT),
-                                                             ReadCommand.this.metadata(),
-                                                             currentKey,
-                                                             clustering);
+                    throw failOnTombstones(partitionKey, clustering);
                 }
+            }
+
+            private TombstoneOverwhelmingException failOnTombstones(DecoratedKey partitionKey, ClusteringPrefix<?> clustering)
+            {
+                metric.tombstoneFailures.inc();
+                return new TombstoneOverwhelmingException(tombstones.get(),
+                                                          ReadCommand.this.toCQLString(Redaction.REDACT),
+                                                          ReadCommand.this.metadata(),
+                                                          partitionKey,
+                                                          clustering);
+            }
+
+            /**
+             * Reports the tombstones that the searcher dropped of a partition that it didn't return.
+             */
+            private void reportDropped()
+            {
+                if (droppedTombstones > 0)
+                    metric.topReadPartitionTombstoneCount.addSample(droppedKey.getKey(), droppedTombstones);
+                lastReportedTombstones += droppedTombstones;
+                droppedKey = null;
+                droppedTombstones = 0;
             }
 
             @Override
             protected void onPartitionClose()
             {
                 int lr = liveRows - lastReportedLiveRows;
-                long ts = tombstones.get() - lastReportedTombstones;
+                // what was dropped of another partition meanwhile is that partition's
+                long ts = tombstones.get() - droppedTombstones - lastReportedTombstones;
 
                 if (lr > 0)
                     metric.topReadPartitionRowCount.addSample(currentKey.getKey(), lr);
@@ -894,12 +990,16 @@ public abstract class ReadCommand extends AbstractReadQuery
                     metric.topReadPartitionTombstoneCount.addSample(currentKey.getKey(), ts);
 
                 lastReportedLiveRows = liveRows;
-                lastReportedTombstones = tombstones.get();
+                lastReportedTombstones = tombstones.get() - droppedTombstones;
+                inPartition = false;
             }
 
             @Override
             public void onClose()
             {
+                if (droppedKey != null)
+                    reportDropped();
+
                 recordReadLatency(metric, nanoTime() - startTimeNanos);
 
                 metric.incLiveRows(liveRows);
@@ -1335,28 +1435,50 @@ public abstract class ReadCommand extends AbstractReadQuery
                                                                      ColumnFamilyStore cfs,
                                                                      ReadExecutionController controller)
     {
-        class WithoutPurgeableTombstones extends PurgeFunction
+        return Transformation.apply(iterator, new WithoutPurgeableTombstones(cfs, controller));
+    }
+
+    /**
+     * The purge of {@link #withoutPurgeableTombstones} for one partition at a time, for an index searcher that holds,
+     * drops or counts deletions before the read's own purge: a tombstone the read would purge isn't one it would count.
+     * It must be created before the read starts. The function returns {@code null}, after closing the partition, if
+     * nothing is left of it.
+     */
+    public UnaryOperator<UnfilteredRowIterator> partitionPurger(ColumnFamilyStore cfs, ReadExecutionController controller)
+    {
+        WithoutPurgeableTombstones purge = new WithoutPurgeableTombstones(cfs, controller);
+        return purge::applyToPartition;
+    }
+
+    private class WithoutPurgeableTombstones extends PurgeFunction
+    {
+        private final ReadExecutionController controller;
+
+        private WithoutPurgeableTombstones(ColumnFamilyStore cfs, ReadExecutionController controller)
         {
-            public WithoutPurgeableTombstones()
-            {
-                super(nowInSec(), cfs.gcBefore(nowInSec()), controller.oldestUnrepairedTombstone(),
-                      cfs.onlyPurgeRepairedTombstones(),
-                      iterator.metadata().enforceStrictLiveness());
-            }
-
-            // Index searches, and writes to the memtables the read opened, lower the controller's value after this is created
-            @Override
-            protected long oldestUnrepairedTombstone()
-            {
-                return controller.oldestUnrepairedTombstone();
-            }
-
-            protected LongPredicate getPurgeEvaluator()
-            {
-                return time -> true;
-            }
+            super(nowInSec(), cfs.gcBefore(nowInSec()), controller.oldestUnrepairedTombstone(),
+                  cfs.onlyPurgeRepairedTombstones(),
+                  metadata().enforceStrictLiveness());
+            this.controller = controller;
         }
-        return Transformation.apply(iterator, new WithoutPurgeableTombstones());
+
+        // Index searches, and writes to the memtables the read opened, lower the controller's value after this is created
+        @Override
+        protected long oldestUnrepairedTombstone()
+        {
+            return controller.oldestUnrepairedTombstone();
+        }
+
+        protected LongPredicate getPurgeEvaluator()
+        {
+            return time -> true;
+        }
+
+        @Override
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+            return super.applyToPartition(partition);
+        }
     }
 
     /**

@@ -444,7 +444,7 @@ public class MultiRangeReadCommand extends ReadCommand implements MultiPartition
     public boolean selectsFullPartition()
     {
         return metadata().isStaticCompactTable() ||
-               (ranges().stream().allMatch(DataRange::selectsAllPartition) && !rowFilter().hasExpressionOnClusteringOrRegularColumns());
+               (ranges().stream().allMatch(DataRange::selectsAllPartition) && rowFilter().canKeepPartitionsWithOnlyStaticData());
     }
 
     private static class Deserializer extends SelectionDeserializer

@@ -82,6 +82,7 @@ import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.InvalidPatternException;
@@ -487,18 +488,18 @@ public class RowFilter
     }
 
     /**
-     * Checks if some of the expressions apply to clustering or regular columns.
-     * @return {@code true} if some of the expressions apply to clustering or regular columns, {@code false} otherwise.
+     * Whether this filter can keep a partition that has only static data, for its static row: whether the static row
+     * alone can satisfy the expression tree, an expression on a clustering or regular column never being satisfied by
+     * it (see {@link FilterElement#isSatisfiedByStaticRow}). Such a partition is returned as a row of its static
+     * content, so the limits must count it as a row (see {@link org.apache.cassandra.db.ReadQuery#selectsFullPartition()}).
+     * <p>
+     * Without a disjunction that mixes expressions on static or partition key columns and on other columns, this is
+     * whether no expression is on a clustering or regular column. With one, an expression on a regular column under an
+     * OR doesn't prevent it: {@code st = 0 OR v = 1} keeps the partitions with only a static row whose {@code st} is 0.
      */
-    public boolean hasExpressionOnClusteringOrRegularColumns()
+    public boolean canKeepPartitionsWithOnlyStaticData()
     {
-        for (Expression expression : expressions())
-        {
-            ColumnMetadata column = expression.column();
-            if (column.isClusteringColumn() || column.isRegular())
-                return true;
-        }
-        return false;
+        return root.isSatisfiableByStaticRow();
     }
 
     protected Transformation<BaseRowIterator<?>> filter(TableMetadata metadata, long nowInSec)
@@ -610,6 +611,19 @@ public class RowFilter
 
                 if (root.isSatisfiedByStaticRow(metadata, pk, staticRow, nowInSec))
                     return iterator;
+
+                // The static row doesn't match on its own, so the partition is only a match if one of its live rows
+                // is: markers and rows without live data alone would make it look like a match for its static row.
+                // Withholding it doesn't hide its deletions from a coordinator that reconciles (replica filtering
+                // protection reads it again from the silent replicas), but a returned partition keeps all of them.
+                // A read that needs no reconciliation drops them.
+                if (iterator instanceof UnfilteredRowIterator)
+                    return UnfilteredRowIterators.withLiveRowsOrNull((UnfilteredRowIterator) iterator,
+                                                                     needsReconciliation(),
+                                                                     nowInSec,
+                                                                     metadata.enforceStrictLiveness(),
+                                                                     null,
+                                                                     null);
 
                 return withRowsOrNull(iterator);
             }
@@ -1342,6 +1356,43 @@ public class RowFilter
                 if (child.hasExpressions())
                     return true;
             return false;
+        }
+
+        /**
+         * Whether the static row of a partition without other rows can satisfy this tree for some values (see
+         * {@link #isSatisfiedByStaticRow}): an expression on a clustering or regular column is never satisfied, and
+         * any other expression can be.
+         */
+        public boolean isSatisfiableByStaticRow()
+        {
+            if (isEmpty())
+                return true;
+            if (isDisjunction)
+            {
+                for (Expression e : expressions)
+                    if (!isOnClusteringOrRegularColumn(e))
+                        return true;
+                for (FilterElement child : children)
+                    if (child.isSatisfiableByStaticRow())
+                        return true;
+                return false;
+            }
+            else
+            {
+                for (Expression e : expressions)
+                    if (isOnClusteringOrRegularColumn(e))
+                        return false;
+                for (FilterElement child : children)
+                    if (!child.isSatisfiableByStaticRow())
+                        return false;
+                return true;
+            }
+        }
+
+        private static boolean isOnClusteringOrRegularColumn(Expression expression)
+        {
+            ColumnMetadata column = expression.column();
+            return column.isClusteringColumn() || column.isRegular();
         }
 
         private boolean hasExpression(boolean partitionLevel)

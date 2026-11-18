@@ -96,7 +96,7 @@ public interface PartitionRangeReadQuery extends MultiPartitionReadQuery
         if (metadata().isStaticCompactTable())
             return true;
 
-        return dataRange().selectsAllPartition() && !rowFilter().hasExpressionOnClusteringOrRegularColumns();
+        return dataRange().selectsAllPartition() && rowFilter().canKeepPartitionsWithOnlyStaticData();
     }
 
 }
