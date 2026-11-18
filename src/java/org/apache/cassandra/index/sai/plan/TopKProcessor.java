@@ -21,7 +21,9 @@ package org.apache.cassandra.index.sai.plan;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
@@ -98,6 +100,8 @@ public class TopKProcessor
     private VectorFloat<?> queryVector = null;
 
     private final int limit;
+    // The most rows of a partition that the query returns: PER PARTITION LIMIT, or 1 for SELECT DISTINCT
+    private final int perPartitionLimit;
 
     public TopKProcessor(ReadCommand command)
     {
@@ -111,6 +115,7 @@ public class TopKProcessor
         this.indexContext = indexAndExpression.left;
         this.expression = indexAndExpression.right;
         this.limit = command.limits().count();
+        this.perPartitionLimit = command.limits().perPartitionCount();
         this.scoreColumn = ColumnMetadata.syntheticScoreColumn(expression.column(), FloatType.instance);
     }
 
@@ -140,16 +145,18 @@ public class TopKProcessor
                     if (expression.operator() == Operator.ANN || expression.operator() == Operator.BM25)
                     {
                         PartitionResults pr = processScoredPartition(partitionRowIterator);
-                        topK.addAll(pr.rows);
+                        addPartitionRows(topK, pr.rows, comparator);
                     }
                     else
                     {
+                        List<Triple<PartitionInfo, Row, ?>> rows = new ArrayList<>();
                         while (partitionRowIterator.hasNext())
                         {
                             Row row = (Row) partitionRowIterator.next();
                             ByteBuffer value = row.getCell(expression.column()).buffer();
-                            topK.add(Triple.of(PartitionInfo.create(partitionRowIterator), row, value));
+                            rows.add(Triple.of(PartitionInfo.create(partitionRowIterator), row, value));
                         }
+                        addPartitionRows(topK, rows, comparator);
                     }
                 }
             }
@@ -160,6 +167,23 @@ public class TopKProcessor
                 sortedRows.add(Pair.create(triple.getLeft(), triple.getMiddle()));
             return InMemoryPartitionIterator.create(command, sortedRows);
         }
+    }
+
+    /**
+     * Adds the rows of a partition to the top-k selection. Only the first {@link #perPartitionLimit} rows of the
+     * partition can be in the results, so we don't let the others take the place of rows of other partitions: the
+     * per-partition limit is only applied after this processor (see {@code RangeCommands#partitions}).
+     */
+    private <T extends Triple<PartitionInfo, Row, ?>> void addPartitionRows(TopKSelector<Triple<PartitionInfo, Row, ?>> topK,
+                                                                            List<T> rows,
+                                                                            Comparator<Triple<PartitionInfo, Row, ?>> comparator)
+    {
+        if (rows.size() > perPartitionLimit)
+        {
+            rows.sort(comparator);
+            rows = rows.subList(0, perPartitionLimit);
+        }
+        topK.addAll(rows);
     }
 
     /**
@@ -184,14 +208,18 @@ public class TopKProcessor
         {
             TreeMap<PartitionInfo, TreeSet<Unfiltered>> unfilteredByPartition = new TreeMap<>(Comparator.comparing(pi -> pi.key));
 
+            // The rows taken from each partition, to apply the per-partition limit, if any
+            Map<DecoratedKey, Integer> rowsByPartition = perPartitionLimit < limit ? new HashMap<>() : null;
+
             int rowsMatched = 0;
-            // Because each “partition” from ScoreOrderedResultRetriever is actually a single row
-            // or tombstone, we can simply read them until we have enough.
+            // Because each “partition” from ScoreOrderedResultRetriever is actually a single row or tombstone, or
+            // the rows of a partition that share the score of its static row, we can simply read them until we have
+            // enough.
             while (rowsMatched < limit && partitions.hasNext())
             {
                 try (BaseRowIterator<?> partitionRowIterator = partitions.next())
                 {
-                    rowsMatched += processSingleRowPartition(unfilteredByPartition, partitionRowIterator);
+                    rowsMatched += processSortedPartition(unfilteredByPartition, partitionRowIterator, limit - rowsMatched, rowsByPartition);
                 }
             }
 
@@ -255,14 +283,16 @@ public class TopKProcessor
         float keyAndStaticScore = getScoreForRow(key, staticRow);
         var pr = new PartitionResults(partitionInfo);
 
+        // A partition with only static content takes part in the top-k selection through an empty static row, which
+        // InMemoryPartitionIterator removes, so the partition is returned with its static content and no rows.
         if (!partitionRowIterator.hasNext())
-            pr.addRow(Triple.of(partitionInfo, BTreeRow.emptyRow(Clustering.EMPTY), keyAndStaticScore));
+            pr.addRow(Triple.of(partitionInfo, BTreeRow.emptyRow(Clustering.STATIC_CLUSTERING), keyAndStaticScore));
 
         while (partitionRowIterator.hasNext())
         {
             Unfiltered unfiltered = partitionRowIterator.next();
-            // Always include tombstones for coordinator. It relies on ReadCommand#withMetricsRecording to throw
-            // TombstoneOverwhelmingException to prevent OOM.
+            // This runs on the coordinator (see #reorder), whose partitions are filtered, so they hold no range
+            // tombstone markers: one would be set apart, and not returned. Nothing here counts tombstones.
             if (unfiltered.isRangeTombstoneMarker())
             {
                 pr.addTombstone(unfiltered);
@@ -278,18 +308,49 @@ public class TopKProcessor
     }
 
     /**
-     * Processes a single partition, without scoring it.
+     * Processes a partition of {@link StorageAttachedIndexSearcher.ScoreOrderedResultRetriever}, without scoring it. It
+     * has a single row, or none if only its static row matches, unless the ordered column is static: then its rows are
+     * tied, and the first ones in clustering order are kept, as the coordinator does. Rows beyond the per-partition
+     * limit aren't added nor counted ({@code rowsByPartition}, {@code null} without such a limit, holds the rows taken
+     * so far).
+     *
+     * @return the number of rows added, counting a partition with only a static row as one row
      */
-    private int processSingleRowPartition(TreeMap<PartitionInfo, TreeSet<Unfiltered>> unfilteredByPartition,
-                                          BaseRowIterator<?> partitionRowIterator)
+    private int processSortedPartition(TreeMap<PartitionInfo, TreeSet<Unfiltered>> unfilteredByPartition,
+                                       BaseRowIterator<?> partitionRowIterator,
+                                       int maxRows,
+                                       @Nullable Map<DecoratedKey, Integer> rowsByPartition)
     {
-        Unfiltered unfiltered = partitionRowIterator.hasNext() ? partitionRowIterator.next() : null;
-        assert !partitionRowIterator.hasNext() : "Only one row should be returned";
-        // Always include tombstones for coordinator. It relies on ReadCommand#withMetricsRecording to throw
-        // TombstoneOverwhelmingException to prevent OOM.
+        if (rowsByPartition != null)
+        {
+            int taken = rowsByPartition.getOrDefault(partitionRowIterator.partitionKey(), 0);
+            maxRows = Math.min(maxRows, perPartitionLimit - taken);
+            if (maxRows <= 0)
+                return 0;
+        }
+
         PartitionInfo partitionInfo = PartitionInfo.create(partitionRowIterator);
-        addUnfiltered(unfilteredByPartition, partitionInfo, unfiltered);
-        return unfiltered != null && unfiltered.isRangeTombstoneMarker() ? 0 : 1;
+        if (!partitionRowIterator.hasNext())
+        {
+            addUnfiltered(unfilteredByPartition, partitionInfo, null);
+            if (rowsByPartition != null)
+                rowsByPartition.merge(partitionRowIterator.partitionKey(), 1, Integer::sum);
+            return 1;
+        }
+
+        int rows = 0;
+        while (rows < maxRows && partitionRowIterator.hasNext())
+        {
+            Unfiltered unfiltered = partitionRowIterator.next();
+            // Keep tombstones for the coordinator's reconciliation. ReadCommand#withMetricsRecording counts those
+            // returned; those the retriever skipped earlier are counted nowhere.
+            addUnfiltered(unfilteredByPartition, partitionInfo, unfiltered);
+            if (!unfiltered.isRangeTombstoneMarker())
+                rows++;
+        }
+        if (rowsByPartition != null && rows > 0)
+            rowsByPartition.merge(partitionRowIterator.partitionKey(), rows, Integer::sum);
+        return rows;
     }
 
     private void addUnfiltered(SortedMap<PartitionInfo, TreeSet<Unfiltered>> unfilteredByPartition,

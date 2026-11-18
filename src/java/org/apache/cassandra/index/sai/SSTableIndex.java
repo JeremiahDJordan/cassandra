@@ -50,6 +50,7 @@ import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.index.sai.plan.Orderer;
 import org.apache.cassandra.index.sai.utils.AbortedOperationException;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
+import org.apache.cassandra.index.sai.utils.PrimaryKeyListUtil;
 import org.apache.cassandra.index.sai.utils.PrimaryKeyWithSortKey;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.io.sstable.SSTableIdFactory;
@@ -425,6 +426,12 @@ public class SSTableIndex implements Comparable<SSTableIndex>
         context.checkpoint();
         context.addSstablesHit(1);
         assert !isReleased();
+
+        // An index on a static column only has the static rows, so we look up the partitions of the keys, as
+        // VectorMemtableIndex#orderResultsBy does. This must happen before splitting the keys by segment: the bounds
+        // of the segments are static row keys too.
+        if (indexContext.getDefinition().isStatic())
+            keys = PrimaryKeyListUtil.toStaticRowKeys(keys);
 
         return searchableIndex.orderResultsBy(context, keys, orderer, limit, totalRows);
     }

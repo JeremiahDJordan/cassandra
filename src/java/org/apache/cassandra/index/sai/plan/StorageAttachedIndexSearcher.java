@@ -540,10 +540,14 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
     /**
      * A result retriever that consumes an iterator primary keys sorted by some score, materializes the row for each
-     * primary key (currently, each primary key is required to be fully qualified and should only point to one row),
-     * apply the filter tree to the row to test that the real row satisfies the WHERE clause, and finally tests
-     * that the row is valid for the ORDER BY clause. The class performs some optimizations to avoid materializing
-     * rows unnecessarily. See the class for more details.
+     * primary key (each primary key is required to be fully qualified and should only point to one row, unless the
+     * ordered column is static), apply the filter tree to the row to test that the real row satisfies the WHERE
+     * clause, and finally tests that the row is valid for the ORDER BY clause. The class performs some optimizations
+     * to avoid materializing rows unnecessarily. See the class for more details.
+     * <p>
+     * If the ordered column is static, its index has one key per partition, pointing to the static row. All the rows
+     * of that partition share the sort value of the static row, so each key produces a partition with all its rows
+     * that satisfy the WHERE clause, up to the limit.
      * <p>
      * The resulting {@link UnfilteredRowIterator} objects are not guaranteed to be in any particular order. It is
      * the responsibility of the caller to sort the results if necessary.
@@ -568,12 +572,32 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         @Nullable
         private final ColumnMetadata syntheticScoreColumn;
 
+        // Whether the ordered column is static, in which case each key selects all the rows of its partition
+        private final boolean isOrderedColumnStatic;
+
+        // Whether the ordered column is a partition key column, in which case a partition with only a static row
+        // matches the ordering on its own
+        private final boolean isOrderedColumnPartitionKey;
+
         // The limit requested by the query. We cannot load more than softLimit rows in bulk because we only want
         // to fetch the topk rows where k is the limit. However, we allow the iterator to fetch more rows than the
         // soft limit to avoid confusing behavior. When the softLimit is reached, the iterator will fetch one row
         // at a time.
         private final int softLimit;
-        private int returnedRowCount = 0;
+
+        // The limit, or the per-partition limit (PER PARTITION LIMIT, or 1 for SELECT DISTINCT) if lower
+        private final int maxRowsPerPartition;
+
+        // Rows returned per partition, when a key gives one row and the per-partition limit is lower than the limit
+        @Nullable
+        private final Map<DecoratedKey, Integer> rowsByPartition;
+
+        // Whether we materialize one key at a time, to return the rows in score order: see fillPendingRows
+        private final boolean oneKeyAtATime;
+
+        // The number of partition iterators returned. Each has a single row unless the ordered column is static, but
+        // it's only used when materializing several keys at a time, so not in that case.
+        private int returnedPartitionCount = 0;
 
         private ScoreOrderedResultRetriever(CloseableIterator<PrimaryKeyWithSortKey> scoredPrimaryKeyIterator,
                                             FilterTree filterTree,
@@ -600,6 +624,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             this.processedKeys = new HashSet<>(limit);
             this.pendingRows = new ArrayDeque<>(limit);
             this.softLimit = limit;
+            this.maxRowsPerPartition = Math.min(limit, controller.command().limits().perPartitionCount());
 
             // When +score is added on the coordinator side, it's represented as a PrecomputedColumnFilter
             // even in a 'SELECT *' because WCF is not capable of representing synthetic columns.
@@ -607,6 +632,10 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             var tempColumn = ColumnMetadata.syntheticScoreColumn(orderedColumn, FloatType.instance);
             var isScoreFetched = controller.command().columnFilter().fetchesExplicitly(tempColumn);
             this.syntheticScoreColumn = isScoreFetched ? tempColumn : null;
+            this.isOrderedColumnStatic = orderedColumn.isStatic();
+            this.isOrderedColumnPartitionKey = orderedColumn.isPartitionKey();
+            this.rowsByPartition = !isOrderedColumnStatic && maxRowsPerPartition < softLimit ? new HashMap<>() : null;
+            this.oneKeyAtATime = isOrderedColumnStatic || rowsByPartition != null;
         }
 
         @Override
@@ -614,8 +643,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         {
             if (pendingRows.isEmpty())
                 fillPendingRows();
-            returnedRowCount++;
-            // Because we know ordered keys are fully qualified, we do not iterate partitions
+            returnedPartitionCount++;
+            // Because we know ordered keys are fully qualified (or point to a static row), we do not iterate partitions
             return !pendingRows.isEmpty() ? pendingRows.poll() : endOfData();
         }
 
@@ -627,8 +656,12 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         {
             // Group PKs by source sstable/memtable
             var groupedKeys = new HashMap<PrimaryKey, List<PrimaryKeyWithSortKey>>();
-            // We always want to get at least 1.
-            int rowsToRetrieve = Math.max(1, softLimit - returnedRowCount);
+            // We always want to get at least 1. A batch of keys is materialized in primary key order, not score order,
+            // which is only fine if all its rows make it to the results. So we go one key at a time when a key can give
+            // several rows (a static ordered column), or with a per-partition limit lower than the limit, where only
+            // the best rows of each partition are kept and full partitions are skipped unread (that can scan the whole
+            // ordering index).
+            int rowsToRetrieve = oneKeyAtATime ? 1 : Math.max(1, softLimit - returnedPartitionCount);
             // We want to get the first unique `rowsToRetrieve` keys to materialize
             // Don't pass the priority queue here because it is more efficient to add keys in bulk
             fillKeys(groupedKeys, rowsToRetrieve, null);
@@ -702,10 +735,28 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             while (scoredPrimaryKeyIterator.hasNext())
             {
                 var key = scoredPrimaryKeyIterator.next();
-                if (isInRange(key.partitionKey()) && controller.selects(key))
+                if (isInRange(key.partitionKey()) && controller.selects(key) && !isPartitionFull(key.partitionKey()))
                     return key;
+                // Skipped keys aren't read, so nothing else notices that the query has timed out. With a
+                // per-partition limit this loop can go through every key of the index (a few wide partitions, or
+                // fewer partitions than LIMIT / PER PARTITION LIMIT), so check here.
+                queryContext.checkpoint();
             }
             return null;
+        }
+
+        /**
+         * @return whether the per-partition limit doesn't let more rows of the partition be in the results
+         */
+        private boolean isPartitionFull(DecoratedKey partitionKey)
+        {
+            return rowsByPartition != null && rowsByPartition.getOrDefault(partitionKey, 0) >= maxRowsPerPartition;
+        }
+
+        private void countReturnedRow(DecoratedKey partitionKey)
+        {
+            if (rowsByPartition != null)
+                rowsByPartition.merge(partitionKey, 1, Integer::sum);
         }
 
         /**
@@ -735,33 +786,64 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                 queryContext.checkpoint();
                 queryContext.addKeysFetched(sourceKeys.size());
 
+                var staticRow = partition.staticRow();
+                PrimaryKeyWithSortKey validStaticKey = null;
+
+                // Each of the primary keys are equal, but they have different source tables.
+                // Therefore, we check to see if the static row is valid for any of them. We do it before filtering the
+                // rows, so a stale key of a static column doesn't make us scan the partition.
+                for (PrimaryKeyWithSortKey sourceKey : sourceKeys)
+                {
+                    if (sourceKey.isIndexDataValid(staticRow, nowInSec))
+                    {
+                        validStaticKey = sourceKey;
+                        break;
+                    }
+                }
+
+                // If the static row isn't valid, we can skip the partition.
+                if (validStaticKey == null)
+                    return null;
+
                 UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
                 UnfilteredRowIterator clusters = applyIndexFilter(counted, filterTree);
 
                 if (clusters == null)
                     return null;
 
-                var staticRow = partition.staticRow();
-                boolean isStaticValid = false;
-
-                // Each of the primary keys are equal, but they have different source tables.
-                // Therefore, we check to see if the static row is valid for any of them.
-                for (PrimaryKeyWithSortKey sourceKey : sourceKeys)
+                // If the ordered column is static, its key selects every row of the partition that satisfies the
+                // filter, and the rows don't hold the indexed value, so the static row is the one to validate.
+                if (isOrderedColumnStatic)
                 {
-                    if (sourceKey.isIndexDataValid(staticRow, nowInSec))
+                    processedKeys.add(pk);
+                    boolean enforceStrictLiveness = partition.metadata().enforceStrictLiveness();
+                    List<Unfiltered> rows = new ArrayList<>();
+                    // No more than maxRowsPerPartition rows of a single partition can be in the results. Deleted rows
+                    // don't count, so we skip them.
+                    while (clusters.hasNext() && rows.size() < maxRowsPerPartition)
                     {
-                        // If there are no regular rows, return the static row only
-                        if (!clusters.hasNext())
-                            return new PrimaryKeyIterator(partition, staticRow, null, sourceKey, syntheticScoreColumn, controller.getOrderer());
-
-                        isStaticValid = true;
-                        break;
+                        Unfiltered unfiltered = clusters.next();
+                        if (unfiltered.isRow() && ((Row) unfiltered).hasLiveData(nowInSec, enforceStrictLiveness))
+                            rows.add(unfiltered);
                     }
+                    // If no row is live, only the static row can be returned, if it satisfies the filter on its own.
+                    // A deleted row can satisfy a clustering restriction, but the partition doesn't match then.
+                    if (rows.isEmpty() && !filterTree.isSatisfiedBy(partition.partitionKey(), staticRow, staticRow))
+                        return null;
+                    return new PrimaryKeyIterator(partition, staticRow, rows, validStaticKey, syntheticScoreColumn, controller.getOrderer());
                 }
 
-                // If the static row isn't valid, we can skip the partition.
-                if (!isStaticValid)
-                    return null;
+                // If there are no regular rows, return the static row only. That can only be a match when the ordered
+                // column is a partition key column: an index on a regular or clustering column has no key for a
+                // partition without rows, and the filter, which has the ordering expression, doesn't match the static
+                // row on its own. A stale key mustn't take a slot of the partition.
+                if (!clusters.hasNext())
+                {
+                    if (!isOrderedColumnPartitionKey)
+                        return null;
+                    countReturnedRow(partition.partitionKey());
+                    return new PrimaryKeyIterator(partition, staticRow, Collections.emptyList(), validStaticKey, syntheticScoreColumn, controller.getOrderer());
+                }
 
                 var row = clusters.next();
                 if (!row.isRangeTombstoneMarker())
@@ -775,7 +857,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                             // We can only count the pk as processed once we know it was valid for one of the
                             // scored keys.
                             processedKeys.add(pk);
-                            return new PrimaryKeyIterator(partition, staticRow, row, sourceKey, syntheticScoreColumn, controller.getOrderer());
+                            countReturnedRow(partition.partitionKey());
+                            return new PrimaryKeyIterator(partition, staticRow, Collections.singletonList(row), sourceKey, syntheticScoreColumn, controller.getOrderer());
                         }
                     }
                 }
@@ -794,16 +877,18 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             FileUtils.closeQuietly(scoredPrimaryKeyIterator);
         }
 
-        public static class PrimaryKeyIterator extends AbstractUnfilteredRowIterator
+        public class PrimaryKeyIterator extends AbstractUnfilteredRowIterator
         {
-            private boolean consumed = false;
+            private final Iterator<Unfiltered> rows;
 
-            @Nullable
-            private final Unfiltered row;
-
+            /**
+             * @param content the rows of the partition, which all have the sort value of {@code primaryKeyWithSortKey}.
+             *                There can only be more than one if the ordered column is static. It is empty if only the
+             *                static row is returned.
+             */
             public PrimaryKeyIterator(UnfilteredRowIterator partition,
                                       Row staticRow,
-                                      @Nullable Unfiltered content,
+                                      List<Unfiltered> content,
                                       PrimaryKeyWithSortKey primaryKeyWithSortKey,
                                       ColumnMetadata syntheticScoreColumn,
                                       Orderer orderer)
@@ -816,39 +901,53 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                       partition.isReverseOrder(),
                       partition.stats());
 
-                if (content == null || !content.isRow() || !(primaryKeyWithSortKey instanceof PrimaryKeyWithScore))
+                // The rows of a static vector don't get the synthetic score: the coordinator scores all the rows of
+                // the partition with the vector of its static row (see TopKProcessor#processScoredPartition).
+                if (syntheticScoreColumn == null
+                    || isOrderedColumnStatic
+                    || !(primaryKeyWithSortKey instanceof PrimaryKeyWithScore))
                 {
-                    this.row = content;
+                    this.rows = content.iterator();
                     return;
                 }
 
-                if (syntheticScoreColumn == null)
+                List<Unfiltered> scoredRows = new ArrayList<>(content.size());
+                for (Unfiltered unfiltered : content)
                 {
-                    this.row = content;
-                    return;
-                }
+                    if (!unfiltered.isRow())
+                    {
+                        scoredRows.add(unfiltered);
+                        continue;
+                    }
 
+                    Row originalRow = (Row) unfiltered;
+                    float score = ((PrimaryKeyWithScore) primaryKeyWithSortKey).getExactScore(orderer, originalRow);
+                    scoredRows.add(withScore(originalRow, syntheticScoreColumn, score, orderer));
+                }
+                this.rows = scoredRows.iterator();
+            }
+
+            private Row withScore(Row originalRow, ColumnMetadata syntheticScoreColumn, float score, Orderer orderer)
+            {
                 // Clone the original Row
-                Row originalRow = (Row) content;
                 ArrayList<ColumnData> columnData = new ArrayList<>(originalRow.columnCount() + 1);
                 columnData.addAll(originalRow.columnData());
 
                 // inject +score as a new column, with the timestamp of the data it is computed from: the ordered
                 // column's, or the newest of the row if the row doesn't have it. With an older timestamp, a row deletion
                 // that the row's data supersedes (a row deleted and written again) would shadow the score.
-                float score = ((PrimaryKeyWithScore) primaryKeyWithSortKey).getExactScore(orderer, originalRow);
                 ColumnData orderedData = originalRow.getColumnData(orderer.context.getDefinition());
                 columnData.add(BufferCell.live(syntheticScoreColumn,
                                                orderedData != null ? orderedData.maxTimestamp() : newestTimestamp(originalRow),
                                                FloatType.instance.decompose(score)));
 
-                this.row = BTreeRow.create(originalRow.clustering(),
-                                           originalRow.primaryKeyLivenessInfo(),
-                                           originalRow.deletion(),
-                                           BTree.builder(ColumnData.comparator)
-                                                .auto(true)
-                                                .addAll(columnData)
-                                                .build());
+                return BTreeRow.create(originalRow.clustering(),
+                                       originalRow.primaryKeyLivenessInfo(),
+                                       originalRow.deletion(),
+                                       BTree.builder(ColumnData.comparator)
+                                            .auto(true)
+                                            .addAll(columnData)
+                                            .build());
             }
 
             /**
@@ -865,10 +964,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             @Override
             protected Unfiltered computeNext()
             {
-                if (consumed || row == null)
-                    return endOfData();
-                consumed = true;
-                return row;
+                return rows.hasNext() ? rows.next() : endOfData();
             }
         }
     }
