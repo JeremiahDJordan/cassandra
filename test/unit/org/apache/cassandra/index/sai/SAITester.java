@@ -968,6 +968,36 @@ public class SAITester extends CQLTester
         assertEquals(expected, rs.all().size());
     }
 
+    /**
+     * {@link #assertRows(UntypedResultSet, Object[]...)} with the message in front of the failure's.
+     */
+    public static void assertRows(String message, UntypedResultSet result, Object[]... rows)
+    {
+        try
+        {
+            assertRows(result, rows);
+        }
+        catch (AssertionError e)
+        {
+            throw new AssertionError(message + ": " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * {@link #assertRowsIgnoringOrder(UntypedResultSet, Object[]...)} with the message in front of the failure's.
+     */
+    public static void assertRowsIgnoringOrder(String message, UntypedResultSet result, Object[]... rows)
+    {
+        try
+        {
+            assertRowsIgnoringOrder(result, rows);
+        }
+        catch (AssertionError e)
+        {
+            throw new AssertionError(message + ": " + e.getMessage(), e);
+        }
+    }
+
     protected static Injection newFailureOnEntry(String name, Class<?> invokeClass, String method, Class<? extends Throwable> exception)
     {
         return Injections.newCustom(name)

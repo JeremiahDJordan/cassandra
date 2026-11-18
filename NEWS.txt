@@ -107,6 +107,17 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - ANN queries (ORDER BY v ANN OF [...]) on a storage-attached index on a vector in the partition key, e.g. v in
+      PRIMARY KEY ((k, v), c), of a table with static columns now return every live row of a matching partition, and a
+      partition left with its static row alone. An index flushed from a memtable by an earlier release kept, for each
+      partition, only the key of its static row or only the keys of its rows, whichever was written first: plain ANN
+      queries, and those the planner runs by sorting first, are right on such indexes without a rebuild, but queries
+      that filter first and then sort by the vector (e.g. WHERE s = 1 ORDER BY v ANN OF [...] with an index on s,
+      which the planner can choose, or WITH optimizer_options = {'hybrid_sort_order': 'filter_then_sort'}) miss the
+      rows of partitions whose static row was written before their rows, and partitions left with their static row
+      alone whose earlier rows were deleted or expired, until the sstable is compacted. Unless every sstable of the
+      table has been compacted since the upgrade, rebuild such indexes with nodetool rebuild_index once every node
+      runs this release, one node at a time.
 
 5.0.7
 ======
