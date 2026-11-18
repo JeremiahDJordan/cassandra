@@ -519,8 +519,9 @@ public class TrieMemoryIndex extends MemoryIndex
         }
         else
         {
-            lowerBound = ByteComparable.EMPTY;
-            lowerInclusive = false;
+            // Unbounded: include the empty term (the root of the trie), which literal indexes index
+            lowerBound = null;
+            lowerInclusive = true;
         }
 
         if (expression.upper != null)
@@ -542,7 +543,8 @@ public class TrieMemoryIndex extends MemoryIndex
 
     /**
      * Returns whether the given term range can't contain any term because its bounds are inverted
-     * (e.g. {@code v > 5 AND v < 3}) or equal with at least one exclusive side. A null bound is unbounded.
+     * (e.g. {@code v > 5 AND v < 3}) or equal with at least one exclusive side. A null upper bound is unbounded; a
+     * null lower bound is the empty term, inclusive, which sorts before every other term.
      * <p>
      * Trie slices reject out-of-order bounds, so this must be checked before slicing. Equal bounds with one exclusive
      * side would make a valid empty slice, they are also reported here only because they are empty.
@@ -550,9 +552,16 @@ public class TrieMemoryIndex extends MemoryIndex
     private boolean isEmptyRange(@Nullable ByteComparable lowerBound, boolean lowerInclusive,
                                  @Nullable ByteComparable upperBound, boolean upperInclusive)
     {
-        if (lowerBound == null || upperBound == null)
+        if (upperBound == null)
             return false;
+        if (lowerBound == null)
+        {
+            lowerBound = ByteComparable.EMPTY;
+            lowerInclusive = true;
+        }
 
+        // The empty value of a non-literal type has no byte-comparable representation (a null source), which sorts
+        // before all the others.
         int cmp = ByteComparable.compare(lowerBound, upperBound, data.byteComparableVersion());
         return cmp > 0 || (cmp == 0 && !(lowerInclusive && upperInclusive));
     }
