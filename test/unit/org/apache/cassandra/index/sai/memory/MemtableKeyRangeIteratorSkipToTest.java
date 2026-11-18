@@ -35,6 +35,7 @@ import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -75,6 +76,45 @@ public class MemtableKeyRangeIteratorSkipToTest extends SAITester
                            iterator.peek().compareTo(target) >= 0);
             assertFalse(iterator.hasNext());
         }
+    }
+
+    /**
+     * A skip to the key of the static row of the current partition, which compares equal to every key of the
+     * partition, doesn't go back into rows already returned.
+     */
+    @Test
+    public void testSkipToStaticKeyOfCurrentPartition() throws IOException
+    {
+        createTable("CREATE TABLE %s (k int, c int, s int static, v int, PRIMARY KEY (k, c))");
+        execute("INSERT INTO %s (k, c, s, v) VALUES (0, 1, 0, 0)");
+        execute("INSERT INTO %s (k, c, v) VALUES (0, 2, 0)");
+        execute("INSERT INTO %s (k, c, v) VALUES (0, 3, 0)");
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Memtable memtable = cfs.getTracker().getView().getCurrentMemtable();
+        PrimaryKey.Factory factory = PrimaryKey.factory(cfs.metadata().comparator,
+                                                        Version.current(KEYSPACE).onDiskFormat().indexFeatureSet());
+        PartitionPosition min = cfs.getPartitioner().getMinimumToken().minKeyBound();
+        AbstractBounds<PartitionPosition> all = new Range<>(min, min);
+
+        try (MemtableKeyRangeIterator iterator = new MemtableKeyRangeIterator(memtable, factory, all))
+        {
+            PrimaryKey first = iterator.next();
+            assertEquals(1, clustering(first));
+            PrimaryKey staticKey = factory.create(first.partitionKey(), Clustering.STATIC_CLUSTERING);
+            iterator.skipTo(staticKey);
+            assertEquals(2, clustering(iterator.next()));
+            iterator.skipTo(staticKey);
+            iterator.skipTo(first);
+            assertEquals(3, clustering(iterator.next()));
+            iterator.skipTo(staticKey);
+            assertFalse(iterator.hasNext());
+        }
+    }
+
+    private static int clustering(PrimaryKey key)
+    {
+        return Int32Type.instance.compose(key.clustering().bufferAt(0));
     }
 
     /**
