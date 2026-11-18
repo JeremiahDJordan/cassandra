@@ -932,7 +932,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                     // A deleted row can satisfy a clustering restriction, but the partition doesn't match then.
                     if (rows.isEmpty() && !filterTree.isSatisfiedBy(partition.partitionKey(), staticRow, staticRow))
                         return null;
-                    return new PrimaryKeyIterator(partition, staticRow, rows, validStaticKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
+                    return new PrimaryKeyIterator(partition, staticRow, rows, validStaticKey, syntheticScoreColumn, controller.getOrderer());
                 }
 
                 // If there are no regular rows, return the static row only. That can only be a match when the ordered
@@ -944,7 +944,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                     if (!isOrderedColumnPartitionKey)
                         return null;
                     countReturnedRow(partition.partitionKey());
-                    return new PrimaryKeyIterator(partition, staticRow, Collections.emptyList(), validStaticKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
+                    return new PrimaryKeyIterator(partition, staticRow, Collections.emptyList(), validStaticKey, syntheticScoreColumn, controller.getOrderer());
                 }
 
                 var row = clusters.next();
@@ -960,7 +960,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                             // scored keys.
                             processedKeys.add(pk);
                             countReturnedRow(partition.partitionKey());
-                            return new PrimaryKeyIterator(partition, staticRow, Collections.singletonList(row), sourceKey, syntheticScoreColumn, controller.getOrderer(), nowInSec);
+                            return new PrimaryKeyIterator(partition, staticRow, Collections.singletonList(row), sourceKey, syntheticScoreColumn, controller.getOrderer());
                         }
                     }
                 }
@@ -994,8 +994,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                                       List<Unfiltered> content,
                                       PrimaryKeyWithSortKey primaryKeyWithSortKey,
                                       ColumnMetadata syntheticScoreColumn,
-                                      Orderer orderer,
-                                      long nowInSec)
+                                      Orderer orderer)
             {
                 super(partition.metadata(),
                       partition.partitionKey(),
@@ -1026,12 +1025,12 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
                     Row originalRow = (Row) unfiltered;
                     float score = ((PrimaryKeyWithScore) primaryKeyWithSortKey).getExactScore(orderer, originalRow);
-                    scoredRows.add(withScore(originalRow, syntheticScoreColumn, score, nowInSec));
+                    scoredRows.add(withScore(originalRow, syntheticScoreColumn, score, orderer));
                 }
                 this.rows = scoredRows.iterator();
             }
 
-            private Row withScore(Row originalRow, ColumnMetadata syntheticScoreColumn, float score, long nowInSec)
+            private Row withScore(Row originalRow, ColumnMetadata syntheticScoreColumn, float score, Orderer orderer)
             {
                 // Clone the original Row
                 ArrayList<ColumnData> columnData = new ArrayList<>(originalRow.columnCount() + 1);
@@ -1039,9 +1038,13 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                 for (var cd : originalRow)
                     columnData.add(cd instanceof ComplexColumnData ? BTreeComplexColumn.from((ComplexColumnData) cd) : cd);
 
-                // inject +score as a new column
+                // inject +score as a new column, with the timestamp of the data it is computed from: the ordered
+                // column's, or the newest of the row if the row doesn't have it. With an older timestamp, a row deletion
+                // that the row's data supersedes (a row deleted and written again) would shadow the score, and the
+                // coordinator would drop it when it deserializes the row.
+                ColumnData orderedData = originalRow.getColumnData(orderer.context.getDefinition());
                 columnData.add(BufferCell.live(syntheticScoreColumn,
-                                               nowInSec,
+                                               orderedData != null ? orderedData.maxTimestamp() : newestTimestamp(originalRow),
                                                FloatType.instance.decompose(score)));
 
                 return BTreeRow.create(originalRow.clustering(),
@@ -1051,6 +1054,17 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                                             .auto(true)
                                             .addAll(columnData)
                                             .build());
+            }
+
+            /**
+             * @return the newest timestamp of the data of the given row: its primary key liveness info and its cells
+             */
+            private long newestTimestamp(Row row)
+            {
+                long timestamp = row.primaryKeyLivenessInfo().timestamp();
+                for (ColumnData cd : row)
+                    timestamp = Math.max(timestamp, cd.maxTimestamp());
+                return timestamp;
             }
 
             @Override
