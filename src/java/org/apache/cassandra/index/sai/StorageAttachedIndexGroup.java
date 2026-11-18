@@ -268,7 +268,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                     return;
                 }
 
-                IndexerFailures failures = new IndexerFailures(baseCfs);
+                IndexerFailures failures = null;
                 for (Index.Indexer indexer : indexers)
                 {
                     try
@@ -277,10 +277,13 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                     }
                     catch (Throwable t)
                     {
+                        if (failures == null)
+                            failures = new IndexerFailures(baseCfs);
                         failures.add(t);
                     }
                 }
-                failures.maybeFail();
+                if (failures != null)
+                    failures.maybeFail();
             }
         };
     }
