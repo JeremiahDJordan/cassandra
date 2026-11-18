@@ -241,6 +241,8 @@ public class SSTableIndex implements Comparable<SSTableIndex>
     // 2. or includes everything minus the keys matching the expression
     // if the column type values cannot be truncated, i.e., matching the keys is always precise.
     // (not matching precisely will lead to false negatives)
+    // 3. or includes everything if the expression's value is an empty value that the index doesn't store, which
+    // matches no indexed value (see Expression#hasUnindexedEmptyValue).
     // The negations on a collection index (NOT CONTAINS, NOT CONTAINS KEY and m[k] != v) include everything, because
     // the index can match keys whose collection no longer holds the value (see IndexContext#canSubtractMatches).
     //
@@ -263,7 +265,8 @@ public class SSTableIndex implements Comparable<SSTableIndex>
         if (!subtractMatches
             || TypeUtil.supportsRounding(expression.validator)
             || !this.getVersion().onDiskFormat().indexFeatureSet().isRowAware()
-            || !IndexContext.canSubtractMatches(expression))
+            || !IndexContext.canSubtractMatches(expression)
+            || expression.hasUnindexedEmptyValue())
         {
             return allKeys;
         }

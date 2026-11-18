@@ -413,11 +413,12 @@ public class TypeUtil
 
     /**
      * Compares 2 InetAddress terms by ensuring that both addresses are represented as
-     * ipv6 addresses.
+     * ipv6 addresses. An empty value (which {@link InetAddressType} accepts) sorts before every address, as it does
+     * for {@link InetAddressType}.
      */
     private static int compareInet(ByteBuffer b1, ByteBuffer b2)
     {
-        assert isIPv6(b1) && isIPv6(b2);
+        assert (isIPv6(b1) || !b1.hasRemaining()) && (isIPv6(b2) || !b2.hasRemaining());
 
         return FastByteOperations.compareUnsigned(b1, b2);
     }
