@@ -49,6 +49,8 @@ public class ReadExecutionController implements AutoCloseable
     private final RepairedDataInfo repairedDataInfo;
     private long oldestUnrepairedTombstone = Long.MAX_VALUE;
 
+    private boolean mayNeedSkippedCells;
+
     ReadExecutionController(ReadCommand command,
                             OpOrder.Group baseOp,
                             TableMetadata baseMetadata,
@@ -104,6 +106,22 @@ public class ReadExecutionController implements AutoCloseable
     void updateMinOldestUnrepairedTombstone(long candidate)
     {
         oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, candidate);
+    }
+
+    /**
+     * Whether sstables of the read skipped cells that a row merged with memtable data may need, see
+     * {@link ReadCommand#sstableColumnFilter}, since the last call.
+     */
+    boolean takeMayNeedSkippedCells()
+    {
+        boolean value = mayNeedSkippedCells;
+        mayNeedSkippedCells = false;
+        return value;
+    }
+
+    void setMayNeedSkippedCells()
+    {
+        mayNeedSkippedCells = true;
     }
 
     boolean validForReadOn(ColumnFamilyStore cfs)
