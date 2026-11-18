@@ -39,6 +39,9 @@ import org.apache.cassandra.index.sai.utils.SingletonIntIterator;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.RandomAccessReader;
 
+/**
+ * The row id to ordinal map of the vector postings of versions CA and DB, and of Apache Cassandra 5.0's vector indexes.
+ */
 public class V2OnDiskOrdinalsMap implements OnDiskOrdinalsMap
 {
     private static final Logger logger = LoggerFactory.getLogger(V2OnDiskOrdinalsMap.class);
