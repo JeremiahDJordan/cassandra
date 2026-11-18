@@ -20,7 +20,10 @@ package org.apache.cassandra.index.sai.plan;
 
 import java.nio.ByteBuffer;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.LongSupplier;
+import java.util.function.ToLongFunction;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
@@ -93,6 +96,7 @@ import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.InsertionOrderedNavigableSet;
 import org.apache.cassandra.utils.MergeIterator;
+import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 
@@ -110,6 +114,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     "The on-disk format version can be set via the -D%s system property, and the indexes on the sstables can be " +
     "upgraded via nodetool upgradesstables.";
     private static final Logger logger = LoggerFactory.getLogger(QueryController.class);
+    private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
 
     /**
      * Controls whether we optimize query plans.
@@ -1103,12 +1108,37 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
         long rowCount = 0;
         for (MemtableIndex index : queryView.memtableIndexes)
-            rowCount += index.estimateMatchingRowsCount(predicate);
+            rowCount += estimateOrAssumeAllRows(predicate, index, index::estimateMatchingRowsCount, index::getRowCount);
 
         for (SSTableIndex index : queryView.sstableIndexes)
-            rowCount += index.estimateMatchingRowsCount(predicate);
+            rowCount += estimateOrAssumeAllRows(predicate, index, index::estimateMatchingRowsCount, index::getRowCount);
 
         return rowCount;
+    }
+
+    /**
+     * Estimates the number of rows of an index matching the predicate with the given estimator, or, if the estimator
+     * fails, conservatively assumes that all the rows of the index match. An estimate is only meant for planning the
+     * query, so it must never fail the query. A failure is a bug in the estimation: it is logged, and counted in the
+     * TotalEstimateFailures table query metric (see {@link QueryContext#addEstimateFailure()}).
+     */
+    private long estimateOrAssumeAllRows(Expression predicate,
+                                         Object index,
+                                         ToLongFunction<Expression> estimator,
+                                         LongSupplier rowCount)
+    {
+        try
+        {
+            return estimator.applyAsLong(predicate);
+        }
+        catch (RuntimeException | AssertionError e)
+        {
+            queryContext.addEstimateFailure();
+            long allRows = rowCount.getAsLong();
+            noSpamLogger.warn("Failed to estimate the number of rows of {} matching {}, assuming all its {} rows match",
+                              index, predicate, allRows, e);
+            return allRows;
+        }
     }
 
     /**

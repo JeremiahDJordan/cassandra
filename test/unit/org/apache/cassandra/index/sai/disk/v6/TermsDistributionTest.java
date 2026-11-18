@@ -23,8 +23,10 @@ import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.List;
 import java.util.Random;
 
 import org.junit.Test;
@@ -32,12 +34,15 @@ import org.junit.Test;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.IntegerType;
+import org.apache.cassandra.db.marshal.ReversedType;
 import org.apache.cassandra.db.marshal.TimestampType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.index.sai.SAIUtil;
 import org.apache.cassandra.index.sai.disk.ModernResettableByteBuffersIndexOutput;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.oldlucene.ByteArrayIndexInput;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -328,6 +333,96 @@ public class TermsDistributionTest
             assertTrue(ByteComparable.compare(encoded[i], encoded[i + 1], TypeUtil.BYTE_COMPARABLE_VERSION) < 0);
             assertTrue(decimals[i].compareTo(decimals[i + 1]) < 0);
         }
+    }
+
+    @Test
+    public void testToBigDecimalKeepsTheOrderOfFloatingPointTerms()
+    {
+        double negativeNaN = Double.longBitsToDouble(0xfff8000000000000L);
+        double[] doubles = { negativeNaN, Double.NEGATIVE_INFINITY, -Double.MAX_VALUE, -1.5, -Double.MIN_VALUE, -0.0,
+                             0.0, Double.MIN_VALUE, 1.5, Double.MAX_VALUE, Double.POSITIVE_INFINITY, Double.NaN };
+        float negativeFloatNaN = Float.intBitsToFloat(0xffc00000);
+        float[] floats = { negativeFloatNaN, Float.NEGATIVE_INFINITY, -Float.MAX_VALUE, -1.5f, -Float.MIN_VALUE, -0.0f,
+                           0.0f, Float.MIN_VALUE, 1.5f, Float.MAX_VALUE, Float.POSITIVE_INFINITY, Float.NaN };
+
+        List<ByteBuffer> doubleValues = new ArrayList<>();
+        for (double d : doubles)
+            doubleValues.add(DoubleType.instance.decompose(d));
+        List<ByteBuffer> floatValues = new ArrayList<>();
+        for (float f : floats)
+            floatValues.add(FloatType.instance.decompose(f));
+
+        assertToBigDecimalKeepsTheOrder(DoubleType.instance, doubleValues);
+        assertToBigDecimalKeepsTheOrder(ReversedType.getInstance(DoubleType.instance), doubleValues);
+        assertToBigDecimalKeepsTheOrder(FloatType.instance, floatValues);
+        assertToBigDecimalKeepsTheOrder(ReversedType.getInstance(FloatType.instance), floatValues);
+
+        // Finite values convert to themselves, or to their opposites for a reversed type
+        Version version = SAIUtil.currentVersion();
+        ByteBuffer value = DoubleType.instance.decompose(-1.5);
+        assertEquals(0, new BigDecimal("-1.5").compareTo(toBigDecimal(DoubleType.instance, value, version)));
+        assertEquals(0, new BigDecimal("1.5").compareTo(toBigDecimal(ReversedType.getInstance(DoubleType.instance), value, version)));
+    }
+
+    // -0.0 and 0.0 are different terms but convert to the same big decimal
+    private static void assertToBigDecimalKeepsTheOrder(AbstractType<?> type, List<ByteBuffer> values)
+    {
+        Version version = SAIUtil.currentVersion();
+        List<ByteBuffer> sorted = new ArrayList<>(values);
+        sorted.sort((a, b) -> ByteComparable.compare(version.onDiskFormat().encodeForTrie(a, type),
+                                                     version.onDiskFormat().encodeForTrie(b, type),
+                                                     VERSION));
+        BigDecimal previous = null;
+        int increases = 0;
+        for (ByteBuffer value : sorted)
+        {
+            BigDecimal decimal = toBigDecimal(type, value, version);
+            if (previous != null)
+            {
+                assertTrue(type + ": " + decimal + " should not be less than " + previous, decimal.compareTo(previous) >= 0);
+                if (decimal.compareTo(previous) > 0)
+                    increases++;
+            }
+            previous = decimal;
+        }
+        assertEquals(type.toString(), values.size() - 2, increases);
+    }
+
+    private static BigDecimal toBigDecimal(AbstractType<?> type, ByteBuffer value, Version version)
+    {
+        return TermsDistribution.toBigDecimal(version.onDiskFormat().encodeForTrie(value, type), type, version, VERSION);
+    }
+
+    @Test
+    public void testInfiniteAndNaNDoubles()
+    {
+        // Estimates over a distribution with infinite and NaN values, in buckets of their own and with finite values
+        AbstractType<Double> type = DoubleType.instance;
+        Version version = SAIUtil.currentVersion();
+        double[] specials = { Double.NEGATIVE_INFINITY, -Double.MAX_VALUE, Double.MAX_VALUE, Double.POSITIVE_INFINITY, Double.NaN };
+        List<ByteComparable> terms = new ArrayList<>();
+        for (double d : specials)
+            terms.add(version.onDiskFormat().encodeForTrie(type.decompose(d), type));
+        for (int i = 0; i < 1000; i++)
+            terms.add(version.onDiskFormat().encodeForTrie(type.decompose((double) i), type));
+        terms.sort((a, b) -> ByteComparable.compare(a, b, VERSION));
+
+        var builder = new TermsDistribution.Builder(type, VERSION, 10, 0, version);
+        for (ByteComparable term : terms)
+            builder.add(term, 1);
+        var td = builder.build();
+
+        for (ByteComparable lower : terms)
+        {
+            for (ByteComparable upper : new ByteComparable[]{ terms.get(0), terms.get(500), terms.get(terms.size() - 2),
+                                                              terms.get(terms.size() - 1) })
+            {
+                long estimate = td.estimateNumRowsInRange(lower, true, upper, true);
+                assertTrue(estimate >= 0 && estimate <= terms.size());
+            }
+            assertTrue(td.estimateNumRowsMatchingExact(lower) >= 0);
+        }
+        assertEquals(terms.size(), td.estimateNumRowsInRange(null, true, null, true));
     }
 
     private ByteComparable encode(int value)
