@@ -427,7 +427,7 @@ disk and index versions remain unchanged; no index rebuild is required.
 restart to keep the original in-memory layout while retaining automatic Highway selection.
 Neither layout changes the configured ANN search budget.
 
-The local branch uses `io.github.jbellis:jvector:4.0.2-ann-search-SNAPSHOT` to make the
-paired JVector changes reviewable and reproducible. Build and install that branch before
-building Cassandra. A release must replace this local coordinate with a published artifact
+The local branch uses `io.github.jbellis:jvector:4.1.0-ann-search-SNAPSHOT` to make the
+paired JVector changes reviewable and reproducible. Build and install the `jvector-perf-poc`
+JVector branch, which is based on JVector main, before building Cassandra. A release must replace this local coordinate with a published artifact
 and validate the native packages on the supported operating systems and architectures.
