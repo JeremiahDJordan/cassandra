@@ -32,6 +32,7 @@ import java.util.function.UnaryOperator;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
+import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -308,7 +309,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
          */
         private void completeFetchedPartitions()
         {
-            if (builders.stream().noneMatch(builder -> builder.unresolvedStatic))
+            if (!Iterables.any(builders, builder -> builder.unresolvedStatic))
                 return;
 
             List<UnfilteredRowIterator> known = new ArrayList<>(builders.size());
