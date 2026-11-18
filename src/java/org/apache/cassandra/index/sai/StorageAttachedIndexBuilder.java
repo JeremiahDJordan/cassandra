@@ -89,6 +89,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     private final TimeUUID compactionId = nextTimeUUID();
     private final boolean isFullRebuild;
     private final boolean isInitialBuild;
+    /** Whether the built SSTables are live, rather than about to be added by a stream or an import. */
+    private final boolean updateViews;
 
     private final SortedMap<SSTableReader, Set<StorageAttachedIndex>> sstables;
 
@@ -97,12 +99,27 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
     StorageAttachedIndexBuilder(StorageAttachedIndexGroup group, SortedMap<SSTableReader, Set<StorageAttachedIndex>> sstables, boolean isFullRebuild, boolean isInitialBuild)
     {
+        this(group, sstables, isFullRebuild, isInitialBuild, true);
+    }
+
+    /**
+     * @param updateViews whether the SSTables are live. This must be {@code false} for SSTables that aren't live
+     *                    yet, which their indexes pick up when they are added to the table: a failure to build them
+     *                    fails the operation that was going to add them, and doesn't affect the indexes.
+     */
+    StorageAttachedIndexBuilder(StorageAttachedIndexGroup group,
+                                SortedMap<SSTableReader, Set<StorageAttachedIndex>> sstables,
+                                boolean isFullRebuild,
+                                boolean isInitialBuild,
+                                boolean updateViews)
+    {
         this.group = group;
         this.metadata = group.metadata();
         this.sstables = sstables;
         this.tracker = group.table().getTracker();
         this.isFullRebuild = isFullRebuild;
         this.isInitialBuild = isInitialBuild;
+        this.updateViews = updateViews;
         this.totalSizeInBytes = sstables.keySet().stream().mapToLong(SSTableReader::uncompressedLength).sum();
     }
 
@@ -180,7 +197,12 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             }
 
             long keyCount = SSTableReader.getApproximateKeyCount(Set.of(sstable));
-            indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes, txn, keyCount, perIndexComponentsOnly, group.table().metric);
+            // For an SSTable that isn't live yet, a failed build fails the operation that was going to add it (a stream
+            // or an import), and the indexes, which don't serve it, are fine. That includes the failures the writer
+            // handles itself (adding a row, completing a segment), which abort it as failures of the index.
+            indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes,
+                                                         updateViews ? indexes : Collections.emptySet(),
+                                                         txn, keyCount, perIndexComponentsOnly, group.table().metric);
 
             indexWriter.begin();
 
@@ -230,7 +252,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         {
             if (indexWriter != null)
             {
-                indexWriter.abort(t, true);
+                // The index is only affected if the SSTable is live: for one that isn't yet, the failure fails the
+                // operation that was going to add it (a stream or import), and the index is fine without it. The
+                // writer then neither makes the index non-queryable nor rethrows, and the failure is handled below.
+                indexWriter.abort(t, updateViews);
             }
 
             if (t instanceof InterruptedException)
