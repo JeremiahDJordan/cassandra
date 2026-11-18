@@ -158,4 +158,19 @@ public class AnalyzerTest extends SAITester
                     "'index_analyzer': 'english'};");
         assertEmpty(execute("SELECT * FROM %s WHERE v = 'and'"));
     }
+
+    @Test
+    public void testNotContainsKeyWithoutMap() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v map<text, text>, x int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(KEYS(v)) USING 'StorageAttachedIndex' WITH OPTIONS = { 'case_sensitive': 'false' }");
+        execute("INSERT INTO %s (k, v) VALUES (1, {'Johann': 'x'})");
+        execute("INSERT INTO %s (k, v) VALUES (2, {'Richard': 'x'})");
+        execute("INSERT INTO %s (k, x) VALUES (3, 0)");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT k FROM %s WHERE v CONTAINS KEY 'johann'"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v NOT CONTAINS KEY 'johann'"), row(2), row(3));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v NOT CONTAINS KEY 'johann' ALLOW FILTERING"), row(2), row(3));
+        });
+    }
 }
