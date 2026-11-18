@@ -279,6 +279,10 @@ public class FilterTree
             Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
             return filter.isSatisfiedBy(valueIterator);
         }
+        else if (filter.context.isFrozenCollectionElements())
+        {
+            return filter.isSatisfiedBy(filter.context.getFrozenCollectionElementsOf(key, row, now));
+        }
         else
         {
             ByteBuffer value = filter.context.getValueOf(key, row, now);

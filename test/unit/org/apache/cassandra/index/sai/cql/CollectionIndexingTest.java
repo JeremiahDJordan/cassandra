@@ -485,4 +485,77 @@ public class CollectionIndexingTest extends SAITester.Versioned
         assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2"), row);
         assertRows(execute("SELECT k, v, m FROM %s WHERE v = 1 AND m CONTAINS KEY 2 AND m CONTAINS 3"), row);
     }
+
+    /**
+     * CONTAINS, CONTAINS KEY and their negations on unindexed frozen collections are evaluated on the elements of the
+     * collections when another expression of the query is served by an index.
+     */
+    @Test
+    public void unindexedFrozenCollectionRegularColumns() throws Throwable
+    {
+        testUnindexedFrozenCollections("PRIMARY KEY (k, x))", false);
+    }
+
+    @Test
+    public void unindexedFrozenCollectionClusteringColumns() throws Throwable
+    {
+        testUnindexedFrozenCollections("PRIMARY KEY (k, x, m, s, l))", false);
+    }
+
+    @Test
+    public void unindexedFrozenCollectionDescendingClusteringColumns() throws Throwable
+    {
+        testUnindexedFrozenCollections("PRIMARY KEY (k, x, m, s, l)) WITH CLUSTERING ORDER BY (x ASC, m DESC, s DESC, l DESC)", false);
+    }
+
+    @Test
+    public void unindexedFrozenCollectionStaticColumns() throws Throwable
+    {
+        testUnindexedFrozenCollections("PRIMARY KEY (k, x))", true);
+    }
+
+    private void testUnindexedFrozenCollections(String primaryKey, boolean statics) throws Throwable
+    {
+        String st = statics ? " static" : "";
+        createTable("CREATE TABLE %s (k int, x int, m frozen<map<int, text>>" + st + ", s frozen<set<int>>" + st +
+                    ", l frozen<list<int>>" + st + ", v int" + st + ", " + primaryKey);
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (k, x, m, s, l, v) VALUES (0, 0, {1: 'a'}, {1}, [1], 1)");
+        execute("INSERT INTO %s (k, x, m, s, l, v) VALUES (1, 0, {2: 'b'}, {2}, [2], 1)");
+        execute("INSERT INTO %s (k, x, m, s, l, v) VALUES (2, 0, {2: 'b', 3: 'c'}, {2, 3}, [3, 2], 1)");
+        execute("INSERT INTO %s (k, x, m, s, l, v) VALUES (3, 0, {2: 'b'}, {2}, [2], 2)");
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND m CONTAINS KEY 2 ALLOW FILTERING"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND m CONTAINS 'b' ALLOW FILTERING"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND m CONTAINS 'c' ALLOW FILTERING"), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND s CONTAINS 2 ALLOW FILTERING"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND l CONTAINS 2 ALLOW FILTERING"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND m CONTAINS KEY 2 AND m CONTAINS 'c' ALLOW FILTERING"), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND m NOT CONTAINS KEY 2 ALLOW FILTERING"), row(0));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND m NOT CONTAINS 'b' ALLOW FILTERING"), row(0));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND s NOT CONTAINS 2 ALLOW FILTERING"), row(0));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND l NOT CONTAINS 3 ALLOW FILTERING"), row(0), row(1));
+            assertRows(execute("SELECT k FROM %s WHERE k = 1 AND v = 1 AND s CONTAINS 2 ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND m = {2: 'b'} ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 1 AND l > [2] ALLOW FILTERING"), row(2));
+        });
+    }
+
+    @Test
+    public void unindexedFrozenCollectionPartitionKeyColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k1 int, k2 frozen<list<int>>, c int, v int, PRIMARY KEY ((k1, k2), c))");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (k1, k2, c, v) VALUES (1, [1, 2], 0, 1)");
+        execute("INSERT INTO %s (k1, k2, c, v) VALUES (2, [3], 0, 1)");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT k1 FROM %s WHERE v = 1 AND k2 = [1, 2] ALLOW FILTERING"), row(1));
+            assertRows(execute("SELECT k1 FROM %s WHERE v = 1 AND k2 CONTAINS 3 ALLOW FILTERING"), row(2));
+            assertRows(execute("SELECT k1 FROM %s WHERE v = 1 AND k2 NOT CONTAINS 3 ALLOW FILTERING"), row(1));
+        });
+    }
 }

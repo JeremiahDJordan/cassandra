@@ -1294,6 +1294,25 @@ public class IndexContext
         }
     }
 
+    /**
+     * Whether this context evaluates expressions on the keys or values of a frozen collection, which only an unindexed
+     * context does (see {@link org.apache.cassandra.index.sai.plan.QueryController#determineIndexTargetType}).
+     */
+    public boolean isFrozenCollectionElements()
+    {
+        return TypeUtil.isFrozenCollection(column.type)
+               && (indexType == IndexTarget.Type.KEYS || indexType == IndexTarget.Type.VALUES);
+    }
+
+    /**
+     * @return the keys or values of the frozen collection of the row, see {@link #isFrozenCollectionElements()}
+     */
+    public Iterator<ByteBuffer> getFrozenCollectionElementsOf(DecoratedKey key, Row row, long nowInSecs)
+    {
+        ByteBuffer value = getValueOf(key, row, nowInSecs);
+        return value == null ? null : TypeUtil.frozenCollectionIterator(column.type, value, indexType);
+    }
+
     public Iterator<ByteBuffer> getValuesOf(Row row, long nowInSecs)
     {
         if (row == null)
