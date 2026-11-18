@@ -221,6 +221,35 @@ public class VectorUpdateDeleteTest extends VectorTester.VersionedWithChecksums
         assertContainsInt(result, "pk", 2);
     }
 
+    // A row that gets its vector by an update must be found by a key restricted search of the memtable index, which
+    // only considers the keys the memtable index knows to have a vector.
+    @Test
+    public void keyRestrictedSearchOfRowThatGetsItsVectorByUpdateTest() throws Throwable
+    {
+        String[][] histories = {
+        { "INSERT INTO %s (pk, ck) VALUES (0, 0)" },
+        { "INSERT INTO %s (pk, ck, val) VALUES (0, 0, [1.0, 1.0])", "UPDATE %s SET val = null WHERE pk = 0 AND ck = 0" },
+        { "INSERT INTO %s (pk, ck, val) VALUES (0, 0, [1.0, 1.0])", "DELETE FROM %s WHERE pk = 0 AND ck = 0", "INSERT INTO %s (pk, ck) VALUES (0, 0)" },
+        };
+        for (String memtable : new String[]{ "TrieMemtable", "SkipListMemtable" })
+        {
+            for (String[] history : histories)
+            {
+                createTable("CREATE TABLE %s (pk int, ck int, val vector<float, 2>, PRIMARY KEY(pk, ck)) WITH memtable = {'class': '" + memtable + "'}");
+                createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function': 'euclidean'}");
+                for (String statement : history)
+                    execute(statement);
+                execute("UPDATE %s SET val = [2.0, 2.0] WHERE pk = 0 AND ck = 0");
+                execute("INSERT INTO %s (pk, ck, val) VALUES (1, 0, [3.0, 3.0])");
+
+                beforeAndAfterFlush(() -> {
+                    assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 0 ORDER BY val ANN OF [2.0, 2.0] LIMIT 3"), row(0, 0));
+                    assertRows(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [2.0, 2.0] LIMIT 1"), row(0, 0));
+                });
+            }
+        }
+    }
+
     @Test
     public void rangeDeletedInOtherSSTablesTest()
     {
