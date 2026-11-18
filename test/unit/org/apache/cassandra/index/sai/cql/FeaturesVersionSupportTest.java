@@ -26,6 +26,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.RequestFailureReason;
@@ -208,6 +209,95 @@ public class FeaturesVersionSupportTest extends VectorTester
                           .isInstanceOf(InvalidRequestException.class)
                           .hasMessageContaining(String.format(QueryController.INDEX_VERSION_DOES_NOT_SUPPORT_BM25, index));
             }
+        });
+    }
+
+    /**
+     * Test that ordering (generic ORDER BY, by itself or sorting the rows selected by other indexes) on tables with
+     * clustering columns is supported with on-disk format versions from {@link Version#ROW_AWARE_EARLIEST}. Versions
+     * that index partitions rather than rows reject these queries with
+     * {@link RequestFailureReason#FEATURE_NEEDS_INDEX_REBUILD} until the sstables are upgraded.
+     */
+    @Test
+    public void testOrderingOnTableWithClustering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, c int, val int, str text, a int, PRIMARY KEY(pk, c))");
+        String valIndex = createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+        String strIndex = createIndex("CREATE CUSTOM INDEX ON %s(str) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(a) USING 'StorageAttachedIndex'");
+
+        // the values decrease with the clustering, so the first row of the partition is the last one in the order
+        for (int c = 0; c < 10; c++)
+            execute("INSERT INTO %s (pk, c, val, str, a) VALUES (0, ?, ?, ?, ?)", c, 9 - c, "s" + (9 - c), c % 2);
+        for (int c = 0; c < 3; c++)
+            execute("INSERT INTO %s (pk, c, val, str, a) VALUES (1, ?, ?, ?, ?)", c, 20 + c, "t" + c, c % 2);
+
+        boolean isRowAware = version.onOrAfter(Version.ROW_AWARE_EARLIEST);
+        beforeAndAfterFlush(() -> assertOrderingOnTableWithClustering(isRowAware, valIndex, strIndex));
+        if (isRowAware)
+            return;
+
+        // the old sstables still reject the queries
+        SAIUtil.setCurrentVersion(Version.LATEST);
+        execute("INSERT INTO %s (pk, c, val, str, a) VALUES (0, 0, 9, 's9', 0)");
+        assertOrderingOnTableWithClustering(false, valIndex, strIndex);
+
+        // after the upgrade they are supported
+        upgradeSSTables();
+        verifySAIVersionInUse(KEYSPACE, currentTable(), Version.LATEST);
+        beforeAndAfterFlush(() -> assertOrderingOnTableWithClustering(true, valIndex, strIndex));
+    }
+
+    private void assertOrderingOnTableWithClustering(boolean supported, String valIndex, String strIndex)
+    {
+        // index ordering
+        assertOrdering(supported, valIndex, "SELECT c FROM %s WHERE pk = 0 ORDER BY val ASC LIMIT 3", row(9), row(8), row(7));
+        assertOrdering(supported, valIndex, "SELECT pk, c FROM %s ORDER BY val DESC LIMIT 4", row(1, 2), row(1, 1), row(1, 0), row(0, 0));
+        assertOrdering(supported, strIndex, "SELECT pk, c FROM %s ORDER BY str ASC LIMIT 3", row(0, 9), row(0, 8), row(0, 7));
+
+        // ordering of the rows selected by another index
+        assertOrdering(supported, valIndex, "SELECT pk, c FROM %s WHERE a = 0 ORDER BY val ASC LIMIT 3", row(0, 8), row(0, 6), row(0, 4));
+        assertOrdering(supported, strIndex, "SELECT pk, c FROM %s WHERE a = 1 ORDER BY str DESC LIMIT 2", row(1, 1), row(0, 1));
+    }
+
+    private void assertOrdering(boolean supported, String index, String query, Object[]... expectedRows)
+    {
+        if (supported)
+        {
+            assertRows(execute(query), expectedRows);
+        }
+        else
+        {
+            Assertions.assertThatThrownBy(() -> execute(query))
+                      .isInstanceOf(InvalidRequestException.class)
+                      .hasMessageContaining(String.format(QueryController.INDEX_VERSION_DOES_NOT_SUPPORT_ORDERING_ROWS,
+                                                          index,
+                                                          KEYSPACE + '.' + currentTable(),
+                                                          Version.ROW_AWARE_EARLIEST,
+                                                          CassandraRelevantProperties.SAI_CURRENT_VERSION.getKey()));
+        }
+    }
+
+    /**
+     * Test that ordering on tables without clustering columns is supported with all on-disk format versions, since
+     * their partitions have a single row.
+     */
+    @Test
+    public void testOrderingOnTableWithoutClustering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, val int, str text, a int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(str) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(a) USING 'StorageAttachedIndex'");
+
+        for (int pk = 0; pk < 10; pk++)
+            execute("INSERT INTO %s (pk, val, str, a) VALUES (?, ?, ?, ?)", pk, 9 - pk, "s" + (9 - pk), pk % 2);
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk FROM %s ORDER BY val ASC LIMIT 3"), row(9), row(8), row(7));
+            assertRows(execute("SELECT pk FROM %s ORDER BY str DESC LIMIT 2"), row(0), row(1));
+            assertRows(execute("SELECT pk FROM %s WHERE a = 0 ORDER BY val ASC LIMIT 3"), row(8), row(6), row(4));
+            assertRows(execute("SELECT pk FROM %s WHERE a = 1 ORDER BY str ASC LIMIT 2"), row(9), row(7));
         });
     }
 
