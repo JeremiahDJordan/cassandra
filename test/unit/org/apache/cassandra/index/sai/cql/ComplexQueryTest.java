@@ -427,4 +427,71 @@ public class ComplexQueryTest extends SAITester
 
         assertRowCount(withoutSAI, 0);
     }
+
+    /**
+     * A null element of IN matches nothing on a regular or a static column, with or without an index, and on a filtered
+     * primary key column; it is rejected where the restriction selects the partitions or the clustering.
+     */
+    @Test
+    public void testInWithNullElements() throws Throwable
+    {
+        for (String schema : new String[]{ "CREATE TABLE %s (pk int, ck int, v int, u int, PRIMARY KEY (pk, ck))",
+                                           "CREATE TABLE %s (pk int, ck int, v int static, u int static, PRIMARY KEY (pk, ck))" })
+        {
+            // the unindexed column u holds the same values as the indexed column v
+            createTable(schema);
+            createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+            for (int i = 0; i < 3; i++)
+                execute("INSERT INTO %s (pk, ck, v, u) VALUES (?, 0, ?, ?)", i, i, i);
+            execute("INSERT INTO %s (pk, ck) VALUES (3, 0)");
+
+            beforeAndAfterFlush(() -> {
+                for (String column : new String[]{ "v", "u" })
+                {
+                    String select = "SELECT pk FROM %s WHERE " + column;
+                    String filtering = " ALLOW FILTERING";
+                    assertRows(execute(select + " IN (?, ?)" + filtering, 1, null), row(1));
+                    assertRows(execute(select + " IN (?, ?)" + filtering, null, null));
+                    assertRows(execute(select + " IN (1, null)" + filtering), row(1));
+                    assertRows(execute(select + " IN ?" + filtering, list(1, null)), row(1));
+                    assertRows(execute(select + " IN (?, ?) AND pk = 1" + filtering, 1, null), row(1));
+                    assertRows(execute(select + " IN (?, ?) AND pk = 2" + filtering, 1, null));
+                    assertRowsIgnoringOrder(execute(select + " IN (?, ?, ?) OR " + column + " = 2" + filtering, null, 0, null), row(0), row(2));
+                }
+                // the index serves IN without ALLOW FILTERING
+                assertRows(execute("SELECT pk FROM %s WHERE v IN (?, ?)", null, 2), row(2));
+                assertRows(execute("SELECT pk FROM %s WHERE v IN (?, ?)", null, null));
+            });
+        }
+
+        // On a primary key column, a null element is rejected where the restriction selects the partitions or the
+        // clustering, and matches nothing where the column is filtered.
+        String invalid = "Invalid null value in condition for column ";
+        createTable("CREATE TABLE %s (pk int, c1 int, c2 int, v int, PRIMARY KEY (pk, c1, c2))");
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (1, 1, 1, 1)");
+        execute("INSERT INTO %s (pk, c1, c2, v) VALUES (1, 2, 2, 2)");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT c2 FROM %s WHERE c2 IN (?, ?) ALLOW FILTERING", 1, null), row(1));
+            assertRows(execute("SELECT c2 FROM %s WHERE c2 IN (?, ?) ALLOW FILTERING", null, 2), row(2));
+            assertRows(execute("SELECT c2 FROM %s WHERE pk = 1 AND c2 IN (?, ?) ALLOW FILTERING", 1, null), row(1));
+            assertInvalidMessage(invalid + "c1", "SELECT * FROM %s WHERE pk = 1 AND c1 IN (?, ?)", 1, null);
+            assertInvalidMessage(invalid + "c2", "SELECT * FROM %s WHERE pk = 1 AND c1 = 1 AND c2 IN (?, ?)", 1, null);
+        });
+
+        createTable("CREATE TABLE %s (p1 int, p2 int, v int, PRIMARY KEY ((p1, p2)))");
+        execute("INSERT INTO %s (p1, p2, v) VALUES (1, 1, 1)");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT p1 FROM %s WHERE p1 IN (?, ?) ALLOW FILTERING", 1, null), row(1));
+            assertRows(execute("SELECT p1 FROM %s WHERE p2 IN (?, ?) ALLOW FILTERING", null, 1), row(1));
+            assertInvalidMessage(invalid + "p2", "SELECT * FROM %s WHERE p1 = 1 AND p2 IN (?, ?)", 1, null);
+        });
+
+        // an IN on the first clustering column selects the clustering, with or without an index on it
+        createTable("CREATE TABLE %s (pk int, ck int, v int, PRIMARY KEY (pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(ck) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (pk, ck, v) VALUES (1, 1, 1)");
+        assertInvalidMessage(invalid + "ck", "SELECT * FROM %s WHERE ck IN (?, ?)", 1, null);
+        assertInvalidMessage(invalid + "ck", "SELECT * FROM %s WHERE ck IN (?, ?) ALLOW FILTERING", null, 1);
+        assertInvalidMessage(invalid + "ck", "SELECT * FROM %s WHERE pk = 1 AND ck IN (?, ?)", 1, null);
+    }
 }

@@ -366,14 +366,17 @@ public class Operation
                 int offset = ListSerializer.sizeOfCollectionSize();
                 for (int index = 0; index < size; index++)
                 {
-                    node.add(new ExpressionNode(new RowFilter.SimpleExpression(expression.column(),
-                                                                               Operator.EQ,
-                                                                               ListSerializer.readValue(expression.getIndexValue(),
-                                                                                                        ByteBufferAccessor.instance,
-                                                                                                        offset),
-                                                                               expression.analyzer(),
-                                                                               expression.annOptions())));
-                    offset += TypeSizes.INT_SIZE + ByteBufferAccessor.instance.getInt(expression.getIndexValue(), offset);
+                    // a null element (which a coordinator of another version can send) matches nothing
+                    int length = ByteBufferAccessor.instance.getInt(expression.getIndexValue(), offset);
+                    if (length >= 0)
+                        node.add(new ExpressionNode(new RowFilter.SimpleExpression(expression.column(),
+                                                                                   Operator.EQ,
+                                                                                   ListSerializer.readValue(expression.getIndexValue(),
+                                                                                                            ByteBufferAccessor.instance,
+                                                                                                            offset),
+                                                                                   expression.analyzer(),
+                                                                                   expression.annOptions())));
+                    offset += TypeSizes.INT_SIZE + Math.max(0, length);
                 }
                 if (node.children().size() == 1)
                     return node.children().get(0);

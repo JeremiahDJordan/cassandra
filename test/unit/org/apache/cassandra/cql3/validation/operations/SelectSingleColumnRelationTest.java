@@ -1410,21 +1410,21 @@ public class SelectSingleColumnRelationTest extends CQLTester
 
         beforeAndAfterFlush(() -> {
             // a filtered IN, on a partition key component, a clustering column, a static column, a regular column
-            // and an indexed column, rejects a null element
+            // and an indexed column, ignores a null element, which matches nothing
             for (String column : new String[]{ "p1", "c2", "s", "u", "v" })
             {
-                String message = "Invalid null value for column " + column;
                 String select = "SELECT * FROM %s WHERE " + column;
-                assertInvalidThrowMessage(message, InvalidRequestException.class, select + " IN (1, null) ALLOW FILTERING");
-                assertInvalidThrowMessage(message, InvalidRequestException.class, select + " IN (null, 1) ALLOW FILTERING");
-                assertInvalidThrowMessage(message, InvalidRequestException.class, select + " IN (?, ?) ALLOW FILTERING", 1, null);
-                assertInvalidThrowMessage(message, InvalidRequestException.class, select + " IN ? ALLOW FILTERING", list(1, null));
+                assertRows(execute(select + " IN (1, null) ALLOW FILTERING"), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN (null, 1) ALLOW FILTERING"), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN (?, ?) ALLOW FILTERING", 1, null), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN ? ALLOW FILTERING", list(1, null)), row(1, 1, 1, 1, 1, 1, 1));
+                assertRows(execute(select + " IN (null, null) ALLOW FILTERING"));
                 assertRows(execute(select + " IN (1, 2) ALLOW FILTERING"), row(1, 1, 1, 1, 1, 1, 1));
             }
 
             // the index serves IN without ALLOW FILTERING
-            assertInvalidThrowMessage("Invalid null value for column v", InvalidRequestException.class, "SELECT * FROM %s WHERE v IN (1, null)");
-            assertInvalidThrowMessage("Invalid null value for column v", InvalidRequestException.class, "SELECT * FROM %s WHERE v IN (?, ?)", null, 1);
+            assertRows(execute("SELECT * FROM %s WHERE v IN (1, null)"), row(1, 1, 1, 1, 1, 1, 1));
+            assertRows(execute("SELECT * FROM %s WHERE v IN (?, ?)", null, 1), row(1, 1, 1, 1, 1, 1, 1));
 
             // where IN selects the clustering, a null element is rejected
             assertInvalidThrowMessage("Invalid null value in condition for column c1", InvalidRequestException.class,
