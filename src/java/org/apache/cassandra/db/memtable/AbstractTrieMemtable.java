@@ -31,6 +31,7 @@ import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.Slices;
@@ -102,6 +103,14 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
             logger.info("Scheduling flush for table {} due to {}", this.metadata.get(), flushReason);
             owner.signalFlushRequired(this, flushReason);
         }
+    }
+
+    @Override
+    public boolean appliesUpdatesAtomically()
+    {
+        // A failed update leaves the trie without any of the update's rows and deletions, and put() completes the index
+        // transaction under the shard lock.
+        return true;
     }
 
     @Override
@@ -509,9 +518,14 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
             acquireWriteLock();
             try
             {
+                // Merge columns before applying the update, because a reader may otherwise miss a column.
+                columns = columns.mergeTo(update.columns());
                 // The stats give the minimum local deletion time, which goes down before the update is visible, for the
                 // reads that purge the tombstones older than it
-                stats = stats.mergeWith(update.stats());
+                stats = stats.mergeWith(new EncodingStats(LivenessInfo.NO_TIMESTAMP,
+                                                          update.stats().minLocalDeletionTime,
+                                                          EncodingStats.NO_STATS.minTTL));
+                Throwable updateFailure = null;
                 try
                 {
                     indexer.start();
@@ -533,18 +547,29 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
                     finally
                     {
                         allocator.offHeap().adjust(data.usedSizeOffHeap() - offHeap, opGroup);
-                        allocator.onHeap().adjust((data.usedSizeOnHeap() - onHeap) + updater.heapSize, opGroup);
-                        partitionCount += getUpdaterPartitionsAdded(updater);
+                        allocator.onHeap().adjust(data.usedSizeOnHeap() - onHeap, opGroup);
                     }
-                }
-                finally
-                {
-                    indexer.commit();
+                    // A failed update leaves the trie unchanged, so the update's effects must not be applied.
+                    allocator.onHeap().adjust(updater.heapSize, opGroup);
+                    partitionCount += getUpdaterPartitionsAdded(updater);
                     updateMinTimestamp(update.stats().minTimestamp);
                     updateLiveDataSize(updater.dataSize);
                     updateCurrentOperations(update.operationCount());
-
-                    columns = columns.mergeTo(update.columns());
+                    stats = stats.mergeWith(update.stats());
+                }
+                catch (Throwable t)
+                {
+                    updateFailure = t;
+                    throw t;
+                }
+                finally
+                {
+                    // A failed update leaves the trie without any of its rows and deletions, so the indexes must
+                    // not see it either.
+                    if (updateFailure == null)
+                        indexer.commit();
+                    else
+                        abortIndexTransaction(indexer, updateFailure);
                 }
             }
             finally

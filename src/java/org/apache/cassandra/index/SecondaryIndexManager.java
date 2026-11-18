@@ -41,6 +41,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
+import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -1851,7 +1852,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                                     .filter(Objects::nonNull)
                                                     .toArray(Index.Indexer[]::new);
 
-        return indexers.length == 0 ? UpdateTransaction.NO_OP : new WriteTimeTransaction(indexers);
+        if (indexers.length == 0)
+            return UpdateTransaction.NO_OP;
+        return new WriteTimeTransaction(baseCfs, memtable != null && memtable.appliesUpdatesAtomically(), indexers);
     }
 
     private Predicate<Index> writableIndexSelector()
@@ -1904,13 +1907,21 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private static final class WriteTimeTransaction implements UpdateTransaction
     {
         private final Index.Indexer[] indexers;
+        /// Events not yet delivered to the indexers, or null if events are delivered as they arrive: on a memtable that
+        /// applies updates atomically, they are held until [#commit] and dropped by [#abort].
+        @Nullable
+        private final List<Consumer<Index.Indexer>> pendingEvents;
+        /// The table whose indexes this transaction updates, for the log.
+        private final ColumnFamilyStore table;
         final Row.Builder toRemove = BTreeRow.sortedBuilder();
         final Row.Builder toInsert = BTreeRow.sortedBuilder();
         boolean rowUpdated = false;
         boolean rowExisted = true;
 
-        private WriteTimeTransaction(Index.Indexer... indexers)
+        private WriteTimeTransaction(ColumnFamilyStore table, boolean holdEventsUntilCommit, Index.Indexer... indexers)
         {
+            this.table = table;
+            this.pendingEvents = holdEventsUntilCommit ? new ArrayList<>() : null;
             // don't allow null indexers, if we don't need any use a NullUpdater object
             for (Index.Indexer indexer : indexers) assert indexer != null;
             this.indexers = indexers;
@@ -1925,22 +1936,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         public void onPartitionDeletion(DeletionTime deletionTime)
         {
             maybeCompleteRow();
-            for (Index.Indexer indexer : indexers)
-                indexer.partitionDelete(deletionTime);
+            deliver(indexer -> indexer.partitionDelete(deletionTime));
         }
 
         public void onRangeTombstone(RangeTombstone tombstone)
         {
             maybeCompleteRow();
-            for (Index.Indexer indexer : indexers)
-                indexer.rangeTombstone(tombstone);
+            deliver(indexer -> indexer.rangeTombstone(tombstone));
         }
 
         public void onInserted(Row row)
         {
             maybeCompleteRow();
-            for (Index.Indexer indexer : indexers)
-                indexer.insertRow(row);
+            deliver(indexer -> indexer.insertRow(row));
         }
 
         public void onUpdated(Row existing, Row updated)
@@ -1970,6 +1978,17 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             maybeCompleteRow();
         }
 
+        private void deliver(Consumer<Index.Indexer> event)
+        {
+            if (pendingEvents != null)
+            {
+                pendingEvents.add(event);
+                return;
+            }
+            for (Index.Indexer indexer : indexers)
+                event.accept(indexer);
+        }
+
         private void maybeCompleteRow()
         {
             if (rowUpdated)
@@ -1979,14 +1998,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                     Row oldRow = toRemove.build();
                     Row newRow = toInsert.build();
                     if (newRow != null && !newRow.isEmpty())
-                        for (Index.Indexer indexer : indexers)
-                            indexer.updateRow(oldRow, newRow);
+                        deliver(indexer -> indexer.updateRow(oldRow, newRow));
                 }
                 else
                 {
                     Row newRow = toInsert.build();
-                    for (Index.Indexer indexer : indexers)
-                        indexer.insertRow(newRow);
+                    deliver(indexer -> indexer.insertRow(newRow));
                 }
                 rowUpdated = false;
             }
@@ -2030,9 +2047,74 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         public void commit()
         {
-            maybeCompleteRow();
+            IndexerFailures failures = new IndexerFailures(table);
+            try
+            {
+                maybeCompleteRow();
+            }
+            catch (Throwable t)
+            {
+                failures.add(t);
+            }
+
+            if (pendingEvents != null)
+            {
+                // The memtable has already applied the update, so an indexer that fails on one event must not cost
+                // the other events, or the other indexers: deliver everything, then report the first failure.
+                for (Consumer<Index.Indexer> event : pendingEvents)
+                {
+                    for (Index.Indexer indexer : indexers)
+                    {
+                        try
+                        {
+                            event.accept(indexer);
+                        }
+                        catch (Throwable t)
+                        {
+                            failures.add(t);
+                        }
+                    }
+                }
+                pendingEvents.clear();
+            }
+
+            finish(failures);
+            failures.maybeFail();
+        }
+
+        @Override
+        public void abort()
+        {
+            if (pendingEvents == null)
+            {
+                // The events were delivered as they arrived and cannot be taken back.
+                commit();
+                return;
+            }
+
+            // Drop the events, including the row being built. The indexers saw begin(), so end with finish(), as an
+            // update with no events.
+            rowUpdated = false;
+            pendingEvents.clear();
+            IndexerFailures failures = new IndexerFailures(table);
+            finish(failures);
+            failures.maybeFail();
+        }
+
+        /// Calls finish() on every indexer, even if some fail, and records their failures.
+        private void finish(IndexerFailures failures)
+        {
             for (Index.Indexer indexer : indexers)
-                indexer.finish();
+            {
+                try
+                {
+                    indexer.finish();
+                }
+                catch (Throwable t)
+                {
+                    failures.add(t);
+                }
+            }
         }
 
         private boolean shouldCleanupOldValue(Cell oldCell, Cell newCell)

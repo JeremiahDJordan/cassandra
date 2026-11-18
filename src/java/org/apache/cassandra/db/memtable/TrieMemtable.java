@@ -324,6 +324,14 @@ public class TrieMemtable extends AbstractShardedMemtable
     }
 
     @Override
+    public boolean appliesUpdatesAtomically()
+    {
+        // A failed merge leaves the trie without any of the update's rows and deletions, and put() completes the index
+        // transaction under the shard lock.
+        return true;
+    }
+
+    @Override
     @VisibleForTesting
     public void overwriteAllData()
     {
@@ -868,6 +876,7 @@ public class TrieMemtable extends AbstractShardedMemtable
                 // reads that purge the tombstones older than it
                 stats = stats.mergeWith(update.stats());
 
+                Throwable mergeFailure = null;
                 try
                 {
                     this.cellDataBufferManager.opOrderGroup = opGroup;
@@ -879,12 +888,28 @@ public class TrieMemtable extends AbstractShardedMemtable
                                                       updater);
                     partitionCount += partitionsAdded;
                 }
+                catch (Throwable t)
+                {
+                    mergeFailure = t;
+                    throw t;
+                }
                 finally
                 {
-                    indexer.commit();
-                    updateMinTimestamp(update.stats().minTimestamp);
-                    updateLiveDataSize(updater.dataSize);
-                    updateCurrentOperations(update.operationCount());
+                    try
+                    {
+                        // A failed merge leaves the trie without any of the update's rows and deletions, so the
+                        // indexes must not see it either.
+                        if (mergeFailure == null)
+                            indexer.commit();
+                        else
+                            abortIndexTransaction(indexer, mergeFailure);
+                    }
+                    finally
+                    {
+                        updateMinTimestamp(update.stats().minTimestamp);
+                        updateLiveDataSize(updater.dataSize);
+                        updateCurrentOperations(update.operationCount());
+                    }
                 }
                 this.cellDataBufferManager.opOrderGroup = null;
             }
