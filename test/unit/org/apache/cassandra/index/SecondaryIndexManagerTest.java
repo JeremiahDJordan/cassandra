@@ -18,6 +18,7 @@
 package org.apache.cassandra.index;
 
 import java.io.FileNotFoundException;
+import java.lang.reflect.Method;
 import java.net.SocketException;
 import java.util.Collection;
 import java.util.Collections;
@@ -26,6 +27,7 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.common.collect.Sets;
@@ -787,6 +789,111 @@ public class SecondaryIndexManagerTest extends CQLTester
         }
     }
 
+    /**
+     * A build of an index is marked as building after the index is dropped: the index can be created again with the
+     * same name, it is built, and the end of the build of the dropped index changes nothing for it.
+     */
+    @Test
+    public void buildOfDroppedIndexMarkedBeforeCreateLeavesNewIndexBuilt() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        String indexName = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", TestingIndex.class.getName()));
+        SecondaryIndexManager manager = getCurrentColumnFamilyStore().indexManager;
+        Index dropped = manager.getIndexByName(indexName);
+        dropIndex("DROP INDEX %s." + indexName);
+        manager.markIndexesBuilding(Collections.singleton(dropped), true, false);
+
+        createIndex(String.format("CREATE CUSTOM INDEX %s ON %%s(c) USING '%s'", indexName, TestingIndex.class.getName()));
+        assertFalse(manager.isIndexBuilding(indexName));
+        assertMarkedAsBuilt(indexName);
+
+        markIndexFailed(manager, dropped);
+        assertFalse(manager.isIndexBuilding(indexName));
+        assertFalse(manager.needsFullRebuild(indexName));
+        assertTrue(tryRebuild(indexName, false));
+        assertMarkedAsBuilt(indexName);
+    }
+
+    /**
+     * Two builds of an index are marked as building, one before the index is dropped and a partial one after, and both
+     * fail before the index is created again with the same name: the new index is built.
+     */
+    @Test
+    public void buildsOfDroppedIndexMarkedAcrossDropEndBeforeCreate() throws Throwable
+    {
+        testBuildsOfDroppedIndexMarkedAcrossDrop(false);
+    }
+
+    /**
+     * Same, with the index created again before the second build fails.
+     */
+    @Test
+    public void buildsOfDroppedIndexMarkedAcrossDropEndAcrossCreate() throws Throwable
+    {
+        testBuildsOfDroppedIndexMarkedAcrossDrop(true);
+    }
+
+    private void testBuildsOfDroppedIndexMarkedAcrossDrop(boolean createBeforeSecondEnds) throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        String indexName = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", TestingIndex.class.getName()));
+        SecondaryIndexManager manager = getCurrentColumnFamilyStore().indexManager;
+        Index dropped = manager.getIndexByName(indexName);
+        manager.markIndexesBuilding(Collections.singleton(dropped), true, false);
+        dropIndex("DROP INDEX %s." + indexName);
+        manager.markIndexesBuilding(Collections.singleton(dropped), false, false);
+        assertFalse(manager.isIndexBuilding(indexName));
+        markIndexFailed(manager, dropped);
+        assertFalse(manager.isIndexBuilding(indexName));
+
+        String createQuery = String.format("CREATE CUSTOM INDEX %s ON %%s(c) USING '%s'", indexName, TestingIndex.class.getName());
+        if (createBeforeSecondEnds)
+            createIndex(createQuery);
+        markIndexFailed(manager, dropped);
+        if (!createBeforeSecondEnds)
+        {
+            assertFalse(manager.isIndexBuilding(indexName));
+            createIndex(createQuery);
+        }
+        assertFalse(manager.isIndexBuilding(indexName));
+        assertFalse(manager.needsFullRebuild(indexName));
+        assertMarkedAsBuilt(indexName);
+        assertTrue(tryRebuild(indexName, false));
+        assertMarkedAsBuilt(indexName);
+    }
+
+    /**
+     * Builds of an index are marked as building, then the index is dropped and created again with an index of the same
+     * name that doesn't register itself, whose build is marked as building: the ends of the builds of the dropped index
+     * leave the new one building, and its own end marks it as built.
+     */
+    @Test
+    public void buildsOfDroppedIndexEndWithoutChangingUnregisteredReplacement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        String indexName = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", TestingIndex.class.getName()));
+        SecondaryIndexManager manager = getCurrentColumnFamilyStore().indexManager;
+        Index dropped = manager.getIndexByName(indexName);
+        manager.markIndexesBuilding(Collections.singleton(dropped), true, false);
+        manager.markIndexesBuilding(Collections.singleton(dropped), false, false);
+        dropIndex("DROP INDEX %s." + indexName);
+
+        createIndexAsync(String.format("CREATE CUSTOM INDEX %s ON %%s(c) USING '%s'", indexName, UnregisteredIndex.class.getName()));
+        Index replacement = UnregisteredIndex.lastInstance;
+        waitForAssert(() -> assertFalse(manager.isIndexBuilding(indexName)), 60, TimeUnit.SECONDS);
+        manager.markIndexesBuilding(Collections.singleton(replacement), true, false);
+
+        manager.markIndexBuilt(dropped, true);
+        assertTrue(manager.isIndexBuilding(indexName));
+        markIndexFailed(manager, dropped);
+        assertTrue(manager.isIndexBuilding(indexName));
+        assertFalse(manager.needsFullRebuild(indexName));
+
+        manager.markIndexBuilt(replacement, true);
+        assertFalse(manager.isIndexBuilding(indexName));
+        assertMarkedAsBuilt(indexName);
+    }
+
     private static void assertMarkedAsBuilt(String indexName)
     {
         List<String> indexes = SystemKeyspace.getBuiltIndexes(KEYSPACE, Collections.singleton(indexName));
@@ -798,6 +905,13 @@ public class SecondaryIndexManagerTest extends CQLTester
     {
         List<String> indexes = SystemKeyspace.getBuiltIndexes(KEYSPACE, Collections.singleton(indexName));
         assertTrue(indexes.isEmpty());
+    }
+
+    private static void markIndexFailed(SecondaryIndexManager manager, Index index) throws Exception
+    {
+        Method markIndexFailed = SecondaryIndexManager.class.getDeclaredMethod("markIndexFailed", Index.class, boolean.class);
+        markIndexFailed.setAccessible(true);
+        markIndexFailed.invoke(manager, index, false);
     }
 
     private boolean tryRebuild(String indexName, boolean wait) throws Throwable
@@ -984,6 +1098,23 @@ public class SecondaryIndexManagerTest extends CQLTester
         public boolean shouldBuildBlocking()
         {
             return true;
+        }
+    }
+
+    /** An index that doesn't register itself. */
+    public static class UnregisteredIndex extends StubIndex
+    {
+        static volatile Index lastInstance;
+
+        public UnregisteredIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+            lastInstance = this;
+        }
+
+        @Override
+        public void register(IndexRegistry registry)
+        {
         }
     }
 
