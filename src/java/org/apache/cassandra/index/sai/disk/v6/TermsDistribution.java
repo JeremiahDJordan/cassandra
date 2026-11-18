@@ -21,6 +21,7 @@ package org.apache.cassandra.index.sai.disk.v6;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.MathContext;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,6 +40,8 @@ import javax.annotation.concurrent.NotThreadSafe;
 import javax.annotation.concurrent.ThreadSafe;
 
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.DoubleType;
+import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.NumberType;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.io.IndexInput;
@@ -201,16 +204,16 @@ public class TermsDistribution
         // Estimate the fraction of the bucket on the left side of the term.
         // We assume terms are distributed evenly.
         BigDecimal termValue = toBigDecimal(term).min(bucketMaxValue).max(bucketMinValue);
-        double termDistance = termValue.subtract(bucketMinValue).doubleValue();
-        double bucketSize = bucketMaxValue.subtract(bucketMinValue).doubleValue();
+        BigDecimal termDistance = termValue.subtract(bucketMinValue);
+        BigDecimal bucketSize = bucketMaxValue.subtract(bucketMinValue);
 
         // Edge case: this can theoretically happen if our big decimals have insufficient resolution
         // to distinguish terms. If we didn't return early in this case,
         // the later interpolation logic would divide by 0.
-        if (bucketSize < Double.MIN_NORMAL)
+        if (bucketSize.signum() <= 0)
             return new Bucket(term, bucket.cumulativePointCount, bucket.cumulativeRowCount);
 
-        double fraction = termDistance / bucketSize;
+        double fraction = divide(termDistance, bucketSize);
         assert fraction >= 0.0 && fraction <= 1.0: "Invalid fraction value: " + fraction;
 
         // Total number of points and rows in this bucket:
@@ -256,9 +259,18 @@ public class TermsDistribution
         return toBigDecimal(value, termType, indexVersion, byteComparableVersion);
     }
 
+    // Infinite and NaN floating point values have no big decimal value: they convert to values beyond those of all the
+    // finite ones, in the order of their byte-comparable representations: -NaN < -Infinity < finite < Infinity < NaN
+    private static final BigDecimal MAX_FINITE_DOUBLE = new BigDecimal(Double.MAX_VALUE);
+    private static final BigDecimal POSITIVE_INFINITY = MAX_FINITE_DOUBLE.multiply(BigDecimal.valueOf(2));
+    private static final BigDecimal NEGATIVE_INFINITY = POSITIVE_INFINITY.negate();
+    private static final BigDecimal POSITIVE_NAN = MAX_FINITE_DOUBLE.multiply(BigDecimal.valueOf(4));
+    private static final BigDecimal NEGATIVE_NAN = POSITIVE_NAN.negate();
+
     /**
-     * Converts the term value stored in the index to a big decimal value. Preserves order.
-     * If the type represents a number, the correspondence is linear.
+     * Converts the term value stored in the index to a big decimal value, preserving the order of the terms in the
+     * index. If the type represents a number, the correspondence is linear (negated for a reversed type; infinite and
+     * NaN values convert to values beyond the finite ones).
      * For non-number types, it reinterprets a bytecomparable serialization as a number,
      * so it is not necessarily linear, but still preserves the order.
      */
@@ -267,13 +279,17 @@ public class TermsDistribution
                                           Version indexVersion,
                                           ByteComparable.Version byteComparableVersion)
     {
-        if (termType instanceof NumberType)
+        AbstractType<?> baseType = termType.unwrap();
+        if (baseType instanceof NumberType)
         {
-            // For numbers we decode the number back to the raw C* representation and then convert it to BigDecimal
-            var numberType = (NumberType<?>) termType;
+            // For numbers we decode the number back to the raw C* representation and then convert it to BigDecimal.
+            // The term is encoded with the column type, reversed or not, so it is decoded with it.
+            var numberType = (NumberType<?>) baseType;
             var saiEncoded = indexVersion.onDiskFormat().decodeFromTrie(value, termType);
             var raw = TypeUtil.decode(saiEncoded, termType);
-            return numberType.toBigDecimal(raw);
+            BigDecimal decimal = toBigDecimal(numberType, raw);
+            // The terms of a reversed type sort by decreasing value
+            return termType.isReversed() ? decimal.negate() : decimal;
         }
 
         // For non numbers we just reinterpret the bytecomparable representation as decimal of fixed width.
@@ -284,6 +300,37 @@ public class TermsDistribution
         // By flipping it, we correctly get values starting with 0 bit smaller than the ones starting with 1.
         fixedLengthBytes[0] ^= (byte) 0x80;
         return new BigDecimal(new BigInteger(fixedLengthBytes));
+    }
+
+    /**
+     * Divides big decimals rather than doubles: the distances between the values standing for infinite and NaN floating
+     * point values, or between the largest finite ones, overflow a double.
+     */
+    public static double divide(BigDecimal dividend, BigDecimal divisor)
+    {
+        return dividend.divide(divisor, MathContext.DECIMAL64).doubleValue();
+    }
+
+    /**
+     * Converts a number to a big decimal, like {@link NumberType#toBigDecimal(ByteBuffer)}, but converts the infinite
+     * and NaN floating point values, which have no big decimal value, to values beyond those of all the finite ones.
+     */
+    private static BigDecimal toBigDecimal(NumberType<?> type, ByteBuffer raw)
+    {
+        if (type instanceof DoubleType || type instanceof FloatType)
+        {
+            Number number = type.compose(raw);
+            double d = number.doubleValue();
+            if (Double.isInfinite(d))
+                return d > 0 ? POSITIVE_INFINITY : NEGATIVE_INFINITY;
+            if (Double.isNaN(d))
+            {
+                boolean negative = number instanceof Double ? Double.doubleToRawLongBits(d) < 0
+                                                            : Float.floatToRawIntBits(number.floatValue()) < 0;
+                return negative ? NEGATIVE_NAN : POSITIVE_NAN;
+            }
+        }
+        return type.toBigDecimal(raw);
     }
 
     /**
