@@ -58,6 +58,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.storage.StorageProvider;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.lucene.store.BufferedChecksumIndexInput;
@@ -130,6 +131,18 @@ public class IndexDescriptor
         SSTableIndexComponentsState discovered = IndexComponentDiscovery.instance().discoverComponents(sstable);
         IndexDescriptor descriptor = new IndexDescriptor(sstable.descriptor,
                                                          sstable.metadata().comparator);
+        descriptor.initialize(indices, discovered);
+        return descriptor;
+    }
+
+    /**
+     * Loads the descriptor of an SSTable that isn't open (e.g. one about to be imported); not cached. Prefer
+     * {@link #load(SSTableReader, Set)} when the SSTable is open.
+     */
+    public static IndexDescriptor load(Descriptor sstableDescriptor, TableMetadata metadata, Set<IndexContext> indices)
+    {
+        SSTableIndexComponentsState discovered = IndexComponentDiscovery.instance().discoverComponents(sstableDescriptor, metadata);
+        IndexDescriptor descriptor = new IndexDescriptor(sstableDescriptor, metadata.comparator);
         descriptor.initialize(indices, discovered);
         return descriptor;
     }
