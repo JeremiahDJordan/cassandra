@@ -119,6 +119,15 @@ Upgrading
       to cassandra.sai.max_analyzed_size_kb (8KiB) is accepted unindexed. String, frozen and analyzed terms over 32766
       bytes are never indexed, and client writes of them are rejected; such terms already on disk (e.g. from Apache
       Cassandra 5.0) are left out of the index, with a warning, on compaction or index rebuild.
+    - Writes of a map entry whose key is larger than 65534 bytes, or whose value is larger than 65535 bytes, to a map
+      with a storage-attached index (SAI) on its entries are now rejected with an InvalidRequestException. Before,
+      they failed with a write failure after their data had been written, and an index created on a table holding
+      such an entry couldn't be built. Rows that already hold such an entry (written before this version, or
+      arriving without that validation, through hints, commit log replay, streaming or repair) are kept, but the
+      entry is left out of the index, with a warning in the log, like other terms too large to be indexed: queries
+      served by the index don't return such a row for restrictions on that entry's key (e.g. m[k] > v, m[k] != v),
+      while the same restriction with ALLOW FILTERING on an unindexed column does. Delete or rewrite such entries to
+      make them queryable again.
 
 5.0.7
 ======

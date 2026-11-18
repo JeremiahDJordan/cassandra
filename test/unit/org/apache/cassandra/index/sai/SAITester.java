@@ -968,6 +968,23 @@ public class SAITester extends CQLTester
         assertEquals(expected, rs.all().size());
     }
 
+    /**
+     * Returns the partition keys (int column pk) of the rows of the query, sorted.
+     */
+    protected List<Integer> keys(String query)
+    {
+        List<Integer> keys = new ArrayList<>();
+        for (UntypedResultSet.Row row : execute(query))
+            keys.add(row.getInt("pk"));
+        keys.sort(Integer::compareTo);
+        return keys;
+    }
+
+    protected void assertKeys(String query, Integer... expected)
+    {
+        assertEquals(query, List.of(expected), keys(query));
+    }
+
     protected static Injection newFailureOnEntry(String name, Class<?> invokeClass, String method, Class<? extends Throwable> exception)
     {
         return Injections.newCustom(name)
