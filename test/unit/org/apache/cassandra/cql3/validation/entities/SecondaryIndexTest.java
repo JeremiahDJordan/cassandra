@@ -1221,6 +1221,8 @@ public class SecondaryIndexTest extends CQLTester
         execute("INSERT INTO %s (pk, ck, value) VALUES (?, ?, ?)", 2, 1, 1);
         assertEquals(2, index.rowsInserted.size());
         dropIndex(format("DROP INDEX %s.%s", KEYSPACE, indexName));
+        // DROP INDEX switches the memtable without waiting for the flush; the rebuild below needs its sstable
+        flush();
 
         // On bad initial build writes are forwarded to the index
         WriteOnlyOnFailureIndex.failInit = true;
