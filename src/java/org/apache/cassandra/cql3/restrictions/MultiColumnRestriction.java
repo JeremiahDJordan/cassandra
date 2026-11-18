@@ -104,6 +104,12 @@ public abstract class MultiColumnRestriction implements SingleRestriction
 
     protected abstract SingleRestriction doMergeWith(SingleRestriction otherRestriction);
 
+    /** Returns the elements of the bound tuple; a tuple bound to {@code null} is handled as a tuple of null elements. */
+    protected List<ByteBuffer> getElements(Term.MultiItemTerminal tuple)
+    {
+        return tuple == null ? Collections.nCopies(columnDefs.size(), null) : tuple.getElements();
+    }
+
     /**
      * Returns the names of the columns that are specified within this <code>Restrictions</code> and the other one
      * as a comma separated <code>String</code>.
@@ -233,8 +239,7 @@ public abstract class MultiColumnRestriction implements SingleRestriction
         @Override
         public MultiClusteringBuilder appendTo(MultiClusteringBuilder builder, QueryOptions options)
         {
-            Tuples.Value t = ((Tuples.Value) term.bind(options));
-            List<ByteBuffer> values = t.getElements();
+            List<ByteBuffer> values = getElements((Tuples.Value) term.bind(options));
             for (int i = 0, m = values.size(); i < m; i++)
             {
                 ColumnMetadata column = columnDefs.get(i);
@@ -251,8 +256,7 @@ public abstract class MultiColumnRestriction implements SingleRestriction
                                          ANNOptions annOptions,
                                          IndexHints indexHints)
         {
-            Tuples.Value t = ((Tuples.Value) term.bind(options));
-            List<ByteBuffer> values = t.getElements();
+            List<ByteBuffer> values = getElements((Tuples.Value) term.bind(options));
 
             for (int i = 0, m = columnDefs.size(); i < m; i++)
             {
@@ -618,10 +622,10 @@ public abstract class MultiColumnRestriction implements SingleRestriction
             return bounds;
         }
 
-        private static List<ByteBuffer> bindTuple(Terminal terminal, QueryOptions options)
+        private List<ByteBuffer> bindTuple(Terminal terminal, QueryOptions options)
         {
-            return terminal instanceof Tuples.Value
-                ? ((Tuples.Value) terminal).getElements()
+            return terminal == null || terminal instanceof Tuples.Value
+                ? getElements((Tuples.Value) terminal)
                 : Collections.singletonList(terminal.get(options.getProtocolVersion()));
         }
 

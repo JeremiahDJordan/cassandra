@@ -20,10 +20,14 @@ package org.apache.cassandra.cql3.validation.operations;
 import org.junit.Test;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.TupleType;
+import org.apache.cassandra.serializers.ListSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public class SelectMultiColumnRelationTest extends CQLTester
@@ -1112,6 +1116,82 @@ public class SelectMultiColumnRelationTest extends CQLTester
                              "SELECT * from %s WHERE (i, j) IN (?, ?) ALLOW FILTERING", unset(), tuple(1, 1));
         assertInvalidMessage("Invalid unset value for in(i,j)",
                              "SELECT * from %s WHERE (i, j) IN ? ALLOW FILTERING", unset());
+    }
+
+    @Test
+    public void testWithNullTupleValues() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, i int, j int, s text, PRIMARY KEY(k,i,j))");
+        execute("INSERT INTO %s (k, i, j, s) VALUES (?, ?, ?, ?)", 0, 1, 1, "a");
+        execute("INSERT INTO %s (k, i, j, s) VALUES (?, ?, ?, ?)", 0, 1, 2, "b");
+        execute("INSERT INTO %s (k, i, j, s) VALUES (?, ?, ?, ?)", 0, 2, 1, "c");
+
+        beforeAndAfterFlush(() -> {
+            assertInvalidMessage("Invalid null value for column i",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i, j) = ?", (Object) null);
+            assertInvalidMessage("Invalid null value for column i",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i) = ?", (Object) null);
+            assertInvalidMessage("Invalid null value in condition for column i",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i, j) > ?", (Object) null);
+            assertInvalidMessage("Invalid null value in condition for column i",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i, j) > (?, ?) AND (i, j) < ?", 1, 1, null);
+            assertInvalidMessage("Invalid null value in condition for columns: [i, j]",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i, j) IN (?, ?)", null, tuple(1, 1));
+            assertInvalidMessage("Invalid null value in condition for columns: [i, j]",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i, j) IN (?, ?)", tuple(1, 1), null);
+            assertInvalidMessage("Invalid null value in condition for columns: [i]",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i) IN (?, ?)", null, tuple(1));
+            assertInvalidMessage("Invalid null value in condition for columns: [j]",
+                                 "SELECT * FROM %s WHERE k = 0 AND i = 1 AND (j) IN (?, ?)", null, tuple(1));
+            assertInvalidMessage("Invalid null value in condition for columns: [i, j]",
+                                 "SELECT * FROM %s WHERE (i, j) IN (?, ?) ALLOW FILTERING", null, tuple(1, 1));
+            assertInvalidMessage("Invalid null value in condition for columns: [i, j]",
+                                 "SELECT * FROM %s WHERE k = 0 AND (i, j) IN ?",
+                                 listOfTuples(null, TupleType.buildValue(Int32Type.instance.decompose(1),
+                                                                         Int32Type.instance.decompose(1))));
+            assertInvalidMessage("Invalid null value in condition for columns: [i, j]",
+                                 "DELETE FROM %s WHERE k = 0 AND (i, j) IN (?, ?)", null, tuple(1, 1));
+            assertInvalidMessage("Invalid null value for column i",
+                                 "UPDATE %s SET s = 'x' WHERE k = 0 AND (i, j) = ?", (Object) null);
+            assertInvalidMessage("Invalid null value in condition for column i",
+                                 "DELETE FROM %s WHERE k = 0 AND (i, j) > ?", (Object) null);
+
+            // In NOT IN, a null tuple is handled like a tuple with null elements, which excludes no row
+            assertRows(execute("SELECT * FROM %s WHERE k = 0 AND (i, j) NOT IN ((null, null), (1, 1))"),
+                       row(0, 1, 2, "b"),
+                       row(0, 2, 1, "c"));
+            assertRows(execute("SELECT * FROM %s WHERE k = 0 AND (i, j) NOT IN (?, ?)", null, tuple(1, 1)),
+                       row(0, 1, 2, "b"),
+                       row(0, 2, 1, "c"));
+            assertRows(execute("SELECT * FROM %s WHERE k = 0 AND (i, j) NOT IN ?",
+                               listOfTuples(null, TupleType.buildValue(Int32Type.instance.decompose(1),
+                                                                       Int32Type.instance.decompose(1)))),
+                       row(0, 1, 2, "b"),
+                       row(0, 2, 1, "c"));
+
+            // When used for filtering, a null tuple is handled like a tuple with a null element
+            assertInvalidMessage("Unsupported null value for column j",
+                                 "SELECT * FROM %s WHERE (j) = ? ALLOW FILTERING", (Object) null);
+            assertRows(execute("SELECT * FROM %s WHERE (j) IN (?, ?) ALLOW FILTERING", tuple(2), null),
+                       row(0, 1, 2, "b"));
+            assertRows(execute("SELECT * FROM %s WHERE k = 0 AND (j) IN (?, ?) ALLOW FILTERING", tuple(2), null),
+                       row(0, 1, 2, "b"));
+            assertRows(execute("SELECT * FROM %s WHERE (j) IN ((?), (?)) ALLOW FILTERING", 2, null),
+                       row(0, 1, 2, "b"));
+            assertRows(execute("SELECT * FROM %s WHERE (j) IN ? ALLOW FILTERING",
+                               listOfTuples(TupleType.buildValue(Int32Type.instance.decompose(2)), null)),
+                       row(0, 1, 2, "b"));
+        });
+
+        assertRows(execute("SELECT * FROM %s"),
+                   row(0, 1, 1, "a"),
+                   row(0, 1, 2, "b"),
+                   row(0, 2, 1, "c"));
+    }
+
+    private static ByteBuffer listOfTuples(ByteBuffer... tuples)
+    {
+        return ListSerializer.pack(Arrays.asList(tuples), tuples.length);
     }
 
     @Test
