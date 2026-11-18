@@ -348,7 +348,12 @@ public class Expression
             return false;
         }
 
-        Value value = new Value(columnValue, validator);
+        // The encoded form of a literal value isn't used to check it (validateStringValue and comparePostFilter compare
+        // literal values as they are), and can be costly to compute (the canonical form of a frozen value). Vectors,
+        // which TypeUtil.isLiteral takes for frozen values, need their decomposed vector.
+        Value value = TypeUtil.isLiteral(validator) && !validator.isVector()
+                      ? new Value(columnValue, columnValue, null)
+                      : new Value(columnValue, validator);
 
         if (operation == Op.BOUNDED_ANN)
         {
@@ -838,6 +843,43 @@ public class Expression
     }
 
     /**
+     * For an expression on map entries, a frozen type or a varint (see {@link TypeUtil#hasCanonicalIndexTerms}), the
+     * same expression with its bounds as written (see {@link TypeUtil#asIndexBytesAsWritten}), to also find the
+     * values an index holds as written. Returns {@code null} if the bounds are already in that form, if they are in
+     * the wrong order in that form, or for a non-equality expression.
+     */
+    public Expression withUncanonicalizedBounds()
+    {
+        if (!TypeUtil.hasCanonicalIndexTerms(validator) || operation == null || operation.isNonEquality())
+            return null;
+
+        Bound uncanonicalizedLower = lower == null ? null : lower.uncanonicalized(validator);
+        Bound uncanonicalizedUpper = upper == null ? null
+                                                   : upper == lower ? uncanonicalizedLower
+                                                                    : upper.uncanonicalized(validator);
+        if (uncanonicalizedLower == lower && uncanonicalizedUpper == upper)
+            return null;
+
+        // A range whose bounds as written are in the wrong order (vi > 0x000001 AND vi <= 255: as written, the lower
+        // bound has 3 bytes and sorts after the upper one) matches nothing in an index holding the values as written,
+        // and the memtable index rejects such a range.
+        if (uncanonicalizedLower != null && uncanonicalizedUpper != null && uncanonicalizedLower != uncanonicalizedUpper
+            && !TypeUtil.isComposite(validator)
+            && TypeUtil.compare(uncanonicalizedLower.value.encoded, uncanonicalizedUpper.value.encoded,
+                                validator, context.version()) > 0)
+            return null;
+
+        Expression result = new Expression(context);
+        result.operation = operation;
+        result.lower = uncanonicalizedLower;
+        result.upper = uncanonicalizedUpper;
+        result.lowerInclusive = lowerInclusive;
+        result.upperInclusive = upperInclusive;
+        result.exclusions.addAll(exclusions);
+        return result;
+    }
+
+    /**
      * Returns an expression that matches keys not matched by this expression.
      */
     public Expression negated()
@@ -887,6 +929,13 @@ public class Expression
             this.vector = type.isVector() ? TypeUtil.decomposeVector(type, raw) : null;
         }
 
+        private Value(ByteBuffer raw, ByteBuffer encoded, float[] vector)
+        {
+            this.raw = raw;
+            this.encoded = encoded;
+            this.vector = vector;
+        }
+
         @Override
         public boolean equals(Object other)
         {
@@ -916,6 +965,25 @@ public class Expression
         {
             this.value = new Value(value, type);
             this.inclusive = inclusive;
+        }
+
+        private Bound(Value value, boolean inclusive)
+        {
+            this.value = value;
+            this.inclusive = inclusive;
+        }
+
+        /**
+         * This bound with its value as written (see {@link TypeUtil#asIndexBytesAsWritten}), or this bound if equal.
+         */
+        private Bound uncanonicalized(AbstractType<?> type)
+        {
+            if (value.raw == null)
+                return this;
+            ByteBuffer asWritten = TypeUtil.asIndexBytesAsWritten(value.raw, type);
+            if (asWritten.equals(value.encoded))
+                return this;
+            return new Bound(new Value(value.raw, asWritten, value.vector), inclusive);
         }
 
         @Override

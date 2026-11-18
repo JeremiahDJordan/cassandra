@@ -256,7 +256,7 @@ public class TrieMemoryIndex extends MemoryIndex
     {
         // The terms the sstable writers produce (see SegmentBuilder#analyzeAndAdd), so a value is indexed the same way
         // in memtables and sstables.
-        value = TypeUtil.asIndexBytes(value, indexContext.getValidator());
+        value = indexContext.asIndexTerm(value);
         List<ByteBuffer> terms = ByteLimitedMaterializer.materializeTokens(indexContext.getAnalyzerFactory().create(), value, indexContext, primaryKey);
         final long initialSizeOnHeap = data.usedSizeOnHeap();
         final long initialSizeOffHeap = data.usedSizeOffHeap();

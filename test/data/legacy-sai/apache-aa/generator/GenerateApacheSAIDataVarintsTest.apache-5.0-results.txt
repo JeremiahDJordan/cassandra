@@ -1,0 +1,21 @@
+row pk 1 | vi = 1
+row pk 2 | vi = blobAsVarint(0x0001)
+row pk 3 | vi = blobAsVarint(0x000001)
+row pk 4 | vi = 255
+row pk 5 | vi = blobAsVarint(0x0000ff)
+row pk 6 | vi = -1
+row pk 7 | vi = blobAsVarint(0xffff)
+row pk 8 | vi = 2
+row pk 9 | vi = 300
+row pk 10 | vi = 0
+vi = 1 | index [1] | ALLOW FILTERING on v [1]
+vi = blobAsVarint(0x0001) | index [2] | ALLOW FILTERING on v [2]
+vi = blobAsVarint(0x000001) | index [3] | ALLOW FILTERING on v [3]
+vi = 255 | index [4] | ALLOW FILTERING on v [4]
+vi = blobAsVarint(0x0000ff) | index [5] | ALLOW FILTERING on v [5]
+vi = -1 | index [6] | ALLOW FILTERING on v [6]
+vi = blobAsVarint(0xffff) | index [7] | ALLOW FILTERING on v [7]
+vi > 0 AND vi < 3 | index [1, 8] | ALLOW FILTERING on v [1, 8]
+vi >= blobAsVarint(0x0001) AND vi <= blobAsVarint(0x000002) | index [2, 3] | ALLOW FILTERING on v [2, 3]
+vi >= 1 | index [1, 2, 3, 4, 5, 8, 9] | ALLOW FILTERING on v [1, 2, 3, 4, 5, 8, 9]
+vi <= 1 | index [1, 6, 7, 10] | ALLOW FILTERING on v [1, 6, 7, 10]

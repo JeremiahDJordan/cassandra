@@ -1,0 +1,107 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.index.sai;
+
+import java.io.FileWriter;
+import java.io.PrintWriter;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Stream;
+
+import org.junit.Test;
+
+import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
+
+/**
+ * Writes, with Apache Cassandra 5.0, an SSTable with an SAI index on a varint column holding
+ * varints with redundant sign bytes, and records what Apache returns for queries on them.
+ */
+public class GenerateApacheSAIDataVarintsTest extends SAITester
+{
+    static final String DIR = "/tmp/apache-varint-gen/"; // needs an out/ directory
+
+    static final String[] QUERIES = {
+    "vi = 1", "vi = blobAsVarint(0x0001)", "vi = blobAsVarint(0x000001)",
+    "vi = 255", "vi = blobAsVarint(0x0000ff)",
+    "vi = -1", "vi = blobAsVarint(0xffff)",
+    "vi > 0 AND vi < 3", "vi >= blobAsVarint(0x0001) AND vi <= blobAsVarint(0x000002)", "vi >= 1", "vi <= 1",
+    };
+
+    @Test
+    public void generate() throws Throwable
+    {
+        String ks = "apache_sai";
+        schemaChange("CREATE KEYSPACE IF NOT EXISTS " + ks + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+        schemaChange("CREATE TABLE " + ks + ".varints (pk int PRIMARY KEY, vi varint, v int)");
+        schemaChange("CREATE INDEX varints_vi ON " + ks + ".varints(vi) USING 'sai'");
+        String[] values = { "1", "blobAsVarint(0x0001)", "blobAsVarint(0x000001)", "255", "blobAsVarint(0x0000ff)",
+                            "-1", "blobAsVarint(0xffff)", "2", "300", "0" };
+        for (int i = 0; i < values.length; i++)
+            execute("INSERT INTO " + ks + ".varints (pk, vi, v) VALUES (" + (i + 1) + ", " + values[i] + ", " + (i + 1) + ")");
+        flush(ks, "varints");
+
+        try (PrintWriter out = new PrintWriter(new FileWriter(DIR + "out/apachefixture-apache-5.0.txt")))
+        {
+            for (int i = 0; i < values.length; i++)
+                out.println("row pk " + (i + 1) + " | vi = " + values[i]);
+            for (String q : QUERIES)
+            {
+                out.println(q + " | index " + keys("SELECT pk FROM " + ks + ".varints WHERE " + q)
+                            + " | ALLOW FILTERING on v " + keys("SELECT pk FROM " + ks + ".varints WHERE v > 0 AND " + q + " ALLOW FILTERING"));
+            }
+        }
+
+        ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(ks, "varints");
+        Path dir = new File(DIR + "apache-gen/varints").toPath();
+        Files.createDirectories(dir);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            Path data = sstable.descriptor.fileFor(SSTableFormat.Components.DATA).toPath();
+            String prefix = data.getFileName().toString().replace("Data.db", "");
+            try (Stream<Path> files = Files.list(data.getParent()))
+            {
+                for (Path src : (Iterable<Path>) files.filter(f -> f.getFileName().toString().startsWith(prefix))::iterator)
+                    Files.copy(src, dir.resolve(src.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+    }
+
+    private String keys(String query)
+    {
+        try
+        {
+            List<Integer> keys = new ArrayList<>();
+            for (UntypedResultSet.Row row : execute(query))
+                keys.add(row.getInt("pk"));
+            keys.sort(Integer::compareTo);
+            return keys.toString();
+        }
+        catch (Throwable t)
+        {
+            return "FAILED " + t.getClass().getSimpleName() + ": " + String.valueOf(t.getMessage()).split("\n")[0];
+        }
+    }
+}

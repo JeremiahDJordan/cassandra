@@ -162,6 +162,60 @@ public class ApacheIndexUpgradeTest extends ApacheIndexTester
     }
 
     /**
+     * Varints written with redundant sign bytes (e.g. {@code blobAsVarint(0x0001)} for 1). On Apache's index a literal
+     * finds the rows written the same way, and with our reader the minimal ones too; after a rebuild in our format
+     * every equal varint is found. Apache's own results (recorded with the data set) must be in ours.
+     */
+    @Test
+    public void testVarintsWithRedundantSignBytes() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, vi varint, v int)");
+        disableCompaction();
+        createIndex("CREATE INDEX varints_vi ON %s(vi) USING 'sai'");
+        waitForTableIndexesQueryable();
+        loadApacheSSTables("varints");
+        assertReadFromApacheComponents("varints_vi");
+        // pk 1: 1, 2: 0x0001, 3: 0x000001, 4: 255, 5: 0x0000ff, 6: -1, 7: 0xffff, 8: 2, 9: 300, 10: 0
+
+        // query, Apache's results, ours on Apache's index, ours after a rebuild
+        Object[][] queries = {
+            { "vi = 1", List.of(1), List.of(1), List.of(1, 2, 3) },
+            { "vi = blobAsVarint(0x0001)", List.of(2), List.of(1, 2), List.of(1, 2, 3) },
+            { "vi = blobAsVarint(0x000001)", List.of(3), List.of(1, 3), List.of(1, 2, 3) },
+            { "vi = 255", List.of(4), List.of(4), List.of(4, 5) },
+            { "vi = blobAsVarint(0x0000ff)", List.of(5), List.of(4, 5), List.of(4, 5) },
+            { "vi = -1", List.of(6), List.of(6), List.of(6, 7) },
+            { "vi = blobAsVarint(0xffff)", List.of(7), List.of(6, 7), List.of(6, 7) },
+            { "vi > 0 AND vi < 3", List.of(1, 8), List.of(1, 8), List.of(1, 2, 3, 8) },
+            { "vi >= blobAsVarint(0x0001) AND vi <= blobAsVarint(0x000002)", List.of(2, 3), List.of(1, 2, 3, 8),
+              List.of(1, 2, 3, 8) },
+            { "vi >= 1", List.of(1, 2, 3, 4, 5, 8, 9), List.of(1, 2, 3, 4, 5, 8, 9), List.of(1, 2, 3, 4, 5, 8, 9) },
+            { "vi <= 1", List.of(1, 6, 7, 10), List.of(1, 6, 7, 10), List.of(1, 2, 3, 6, 7, 10) },
+        };
+        List<String> expected = new ArrayList<>();
+        List<String> actual = new ArrayList<>();
+        for (Object[] query : queries)
+        {
+            List<Integer> keys = keys("SELECT pk FROM %s WHERE " + query[0]);
+            assertThat(keys).as("%s on Apache's index: Apache's results", query[0])
+                            .containsAll((Iterable<Integer>) query[1]);
+            expected.add(query[0] + ": " + query[2]);
+            actual.add(query[0] + ": " + keys);
+        }
+        assertThat(actual).as("on Apache's index").isEqualTo(expected);
+
+        rebuildTableIndexes();
+        expected.clear();
+        actual.clear();
+        for (Object[] query : queries)
+        {
+            expected.add(query[0] + ": " + query[3]);
+            actual.add(query[0] + ": " + keys("SELECT pk FROM %s WHERE " + query[0]));
+        }
+        assertThat(actual).as("after a rebuild").isEqualTo(expected);
+    }
+
+    /**
      * @return the provided results of queries, without the queries that need an index (ORDER BY, LIKE)
      */
     private static Map<String, Object> unindexable(Map<String, Object> results)

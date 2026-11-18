@@ -160,8 +160,8 @@ public class ApacheNumericIndexSearcher extends IndexSearcher
         }
         // Truncated values (varint, decimal) can't be excluded on their terms: the query filters them.
         boolean rounding = termType.supportsRounding();
-        return new RangeQueryVisitor(lower == null ? null : termType.asNumericTerm(lower.value.raw), lower != null && !lower.inclusive && !rounding,
-                                     upper == null ? null : termType.asNumericTerm(upper.value.raw), upper != null && !upper.inclusive && !rounding);
+        return new RangeQueryVisitor(lower == null ? null : termType.asNumericTerm(lower.value), lower != null && !lower.inclusive && !rounding,
+                                     upper == null ? null : termType.asNumericTerm(upper.value), upper != null && !upper.inclusive && !rounding);
     }
 
     @Override

@@ -19,6 +19,7 @@ Cassandra's `cassandra-5.0` branch at fb7f1b7aee, for the tests of
 | `mismatch` | `(pk int PRIMARY KEY, s text, v int, x text)` | `mismatch_s`; the first row (by token) only has a deleted `s`, so the row ids of Apache's index are one less than those of an index built here |
 | `negative` | `(pk int PRIMARY KEY, st set<text>, v int)` | `negative_st`; the second sstable deletes the set of pk 1 (whose row stays alive) |
 | `dot`      | `(pk int PRIMARY KEY, v vector<float, 8>)` | `dot_v` (DOT_PRODUCT, with product quantization), 4000 gaussian vectors, the first 200 of them scaled by 10 |
+| `varints`  | `(pk int PRIMARY KEY, vi varint, v int)` | `varints_vi`; varints written with redundant sign bytes (`blobAsVarint(0x0001)`, `blobAsVarint(0x0000ff)`, `blobAsVarint(0xffff)`), which Apache indexes as written |
 
 The several segments come from lowering `V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER` while building the indexes of an
 existing sstable.
@@ -28,8 +29,15 @@ The `generator` directory has the source of the tests that wrote them, at the sa
 - `GenerateApacheSAIDataDeletionsTest`: `tombs` and `vectors2`;
 - `GenerateApacheSAIDataMismatchTest`: `mismatch`, and `GenerateApacheSAIDataNegativeDotTest`: `negative` and `dot`
   (both into `/tmp/apache-sai-gen/data/<name>`);
+- `GenerateApacheSAIDataVarintsTest`: `varints`;
 - `GenerateApacheSAIDataExtendedTest`: the others.
 
 To regenerate, copy them to `test/unit/org/apache/cassandra/index/sai/` of an Apache Cassandra 5.0 checkout (with the
 `.java` extension), build it with `ant jar build-test`, list the test in a file and run
 `ant testclasslist -Dtest.classlistfile=<file> -Dtest.classlistprefix=unit -Dtest.jvm.args="-Dsai.out=<dir>"`.
+`GenerateApacheSAIDataVarintsTest` ignores `-Dsai.out`: it writes under the directory of its `DIR` constant
+(`/tmp/apache-varint-gen/`), which must have an `out` subdirectory before the run. It puts the sstable in
+`<DIR>/apache-gen/varints`, committed here as `varints`, and what Apache returns for its queries in
+`<DIR>/out/apachefixture-apache-5.0.txt`, committed as
+`generator/GenerateApacheSAIDataVarintsTest.apache-5.0-results.txt` (the "index" column; the "ALLOW FILTERING on v" one
+isn't an independent check, since Apache still uses the `vi` index for those queries).

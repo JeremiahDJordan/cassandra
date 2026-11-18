@@ -379,15 +379,37 @@ Upgrading
       per tenant or per document ingests on one thread per partition). A legacy or custom index on such a table also
       runs under the lock. An SAI index that fails on a write now leaves the write applied and fails it, as on the
       trie memtables; the failing index misses the row until it is rebuilt.
+    - Storage-attached indexes (SAI) on the entries of a map with decimal keys or values now find the entries whose
+      decimal equals the queried one whatever its scale (2.5 and 2.50), for indexes written at the on-disk versions
+      before "db" (e.g. "aa"). Before, they only found the entries written with the queried bytes, and after a
+      compaction an entry whose decimal key was written as 2.5 wasn't found at all. The SSTable indexes written by an
+      earlier version still find the entries queried with the bytes they were written with, but not with another
+      scale, so results on such maps can be incomplete until those indexes are rebuilt with nodetool rebuild_index,
+      or rewritten by compaction. Conversely, the indexes this version writes hold the decimals in a canonical form
+      (that of 2.5 is 2.50), which a node of an earlier version looks up as written: after a downgrade, or for
+      SSTables streamed with their indexes to a node not upgraded yet, rebuild the indexes on that node.
+    - Storage-attached indexes (SAI) on varints and on frozen values (tuples, UDTs, frozen collections, as columns,
+      set or list elements, map keys or values) and map entries holding decimals or varints now find the values equal
+      to the queried one whatever the serialization of their decimals and varints (2.5 and 2.50, 0x0001 and 0x01), at
+      every on-disk version. The SSTable indexes written by an earlier version only find the values queried as they
+      were written: rebuild every index of these types with nodetool rebuild_index after upgrading (compaction also
+      rewrites them), and on a node that gets SSTables with their indexes from this version before it is upgraded. The
+      term size guardrails and the maximum indexed term size apply to the canonical form of such a term, which can be
+      larger (2.50 for 2.5, a tuple given its missing fields) or smaller (a varint with redundant sign bytes) than the
+      value as written; the error, and a second warning, say so when the sizes differ. A value that only fits as
+      written, written without these checks or already on disk, is indexed as written, except where the trie memtable
+      stores it in canonical form: a set element or map key is then left out of the index once its SSTable is
+      compacted or its index rebuilt, and a frozen clustering column value is never indexed.
     - Writes of a map entry whose key is larger than 65534 bytes, or whose value is larger than 65535 bytes, to a map
-      with a storage-attached index (SAI) on its entries are now rejected with an InvalidRequestException. Before,
-      they failed with a write failure after their data had been written, and an index created on a table holding
-      such an entry couldn't be built. Rows that already hold such an entry (written before this version, or
-      arriving without that validation, through hints, commit log replay, streaming or repair) are kept, but the
-      entry is left out of the index, with a warning in the log, like other terms too large to be indexed: queries
-      served by the index don't return such a row for restrictions on that entry's key (e.g. m[k] > v, m[k] != v),
-      while the same restriction with ALLOW FILTERING on an unindexed column does. Delete or rewrite such entries to
-      make them queryable again.
+      with a storage-attached index (SAI) on its entries are now rejected with an InvalidRequestException. The sizes are
+      those of the key and value in canonical form when they hold decimals or varints (see above); an entry already
+      stored that only fits as written is indexed as written, as before this version. Before, such writes failed with a
+      write failure after their data had been written, and an index created on a table holding such an entry couldn't be
+      built. Rows that already hold an entry too large as written (written before this version, or arriving without that
+      validation, through hints, commit log replay, streaming or repair) are kept, but the entry is left out of the
+      index, with a warning in the log, like other terms too large to be indexed: queries served by the index don't
+      return such a row for restrictions on that entry's key (e.g. m[k] > v, m[k] != v), while the same restriction with
+      ALLOW FILTERING on an unindexed column does. Delete or rewrite such entries to make them queryable again.
 
 5.0.9
 =====

@@ -31,6 +31,7 @@ import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.StringType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -159,6 +160,22 @@ public class ApacheTermType
     }
 
     /**
+     * The term to look up in Apache's balanced tree for a query bound: the encoded bound for a varint (a query also
+     * searches the bound as written, see Expression#withUncanonicalizedBounds, which finds the varints Apache stored
+     * with redundant sign bytes), the value for other types, which have a single serialization.
+     */
+    public byte[] asNumericTerm(Expression.Value value)
+    {
+        if (indexType.unwrap() instanceof IntegerType)
+        {
+            byte[] bytes = new byte[fixedSizeOf()];
+            ByteBufferUtil.copyBytes(value.encoded, value.encoded.position(), bytes, 0, bytes.length);
+            return bytes;
+        }
+        return asNumericTerm(value.raw);
+    }
+
+    /**
      * The term of a numeric value in Apache's balanced tree (Apache's {@code IndexTermType#asIndexBytes} then
      * {@code IndexTermType#toComparableBytes}).
      */
@@ -183,7 +200,7 @@ public class ApacheTermType
         if (baseType instanceof InetAddressType)
             return encodeInetAddress(value);
         else if (baseType instanceof IntegerType)
-            return TypeUtil.encodeBigInteger(value); // same encoding as Apache's
+            return TypeUtil.encodeBigIntegerAsWritten(value); // Apache's encoding, which keeps redundant sign bytes
         else if (baseType instanceof DecimalType)
             return encodeDecimal(value);
         return value;
