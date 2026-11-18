@@ -19,9 +19,11 @@
 package org.apache.cassandra.index.sai;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -67,6 +69,7 @@ import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.IPartitioner;
@@ -142,6 +145,11 @@ public class IndexContext
     public static final String ANALYZED_VALUE_NOT_INDEXED_WARNING =
     "The analyzed terms of the value of column %s add up to %s, which reaches the limit of %s " +
     "(cassandra.sai.max_analyzed_size_kb): the value is written, but not indexed by %s.";
+
+    private static final String MAP_ENTRY_OVERSIZE_LOG_MESSAGE =
+    "Can't add an entry of map column {} to its ENTRIES index: {}.";
+    private static final String MAP_ENTRY_OVERSIZE_ERROR_MESSAGE =
+    "An entry of map column %s is too large for the ENTRIES index %s: %s.";
 
     private static final String ANALYZED_TERM_OVERSIZE_ERROR_MESSAGE =
     "Term's analyzed size for column %s exceeds the cumulative limit for index. Max allowed size %s.";
@@ -1101,7 +1109,12 @@ public class IndexContext
                 if (!row.isStatic())
                     return null;
             case REGULAR:
-                return TypeUtil.collectionIterator(validator, row.getComplexColumnData(column), column, indexType, nowInSecs);
+                return TypeUtil.collectionIterator(validator,
+                                                   row.getComplexColumnData(column),
+                                                   column,
+                                                   indexType,
+                                                   nowInSecs,
+                                                   this::logUnindexableMapEntry);
 
             default:
                 return null;
@@ -1129,12 +1142,69 @@ public class IndexContext
     }
 
     /**
+     * Logs that the given map entry isn't indexed, because its key or its value is too large to be part of an entry
+     * term (see {@link TypeUtil#isIndexableMapEntry(Cell)}). Client writes of such entries are rejected (see
+     * {@link #validateIndexableMapEntries(Row)}), but those written otherwise, or before that validation, still
+     * reach the index, which leaves them out like other oversized terms.
+     */
+    private void logUnindexableMapEntry(Cell<?> cell)
+    {
+        noSpamLogger.warn(logMessage(MAP_ENTRY_OVERSIZE_LOG_MESSAGE), getColumnName(), describeOversizedMapEntry(cell));
+    }
+
+    /**
+     * Describes what is too large in the given map entry for an entries index: e.g. "its key is 65536 bytes, more than
+     * the 65534 bytes an entry key can hold".
+     */
+    private static String describeOversizedMapEntry(Cell<?> cell)
+    {
+        List<String> parts = new ArrayList<>(2);
+        int keySize = cell.path().get(0).remaining();
+        if (keySize > TypeUtil.MAX_MAP_ENTRY_KEY_SIZE)
+            parts.add(String.format("its key is %d bytes, more than the %d bytes an entry key can hold",
+                                    keySize, TypeUtil.MAX_MAP_ENTRY_KEY_SIZE));
+        int valueSize = cell.valueSize();
+        if (valueSize > TypeUtil.MAX_MAP_ENTRY_VALUE_SIZE)
+            parts.add(String.format("its value is %d bytes, more than the %d bytes an entry value can hold",
+                                    valueSize, TypeUtil.MAX_MAP_ENTRY_VALUE_SIZE));
+        return String.join(", and ", parts);
+    }
+
+    /**
+     * Rejects a write of a map entry that an entries index can't hold: its key over
+     * {@link TypeUtil#MAX_MAP_ENTRY_KEY_SIZE} or its value over {@link TypeUtil#MAX_MAP_ENTRY_VALUE_SIZE} bytes. Not a
+     * size limit a guardrail or property can change.
+     *
+     * @param row a row of a client mutation, possibly the static row, or {@code null}
+     */
+    public void validateIndexableMapEntries(@Nullable Row row)
+    {
+        if (row == null || indexType != IndexTarget.Type.KEYS_AND_VALUES || !isNonFrozenCollection())
+            return;
+
+        ComplexColumnData data = row.getComplexColumnData(column);
+        if (data == null)
+            return;
+
+        for (Cell<?> cell : data)
+        {
+            if (!cell.isTombstone() && !TypeUtil.isIndexableMapEntry(cell))
+                throw new InvalidRequestException(String.format(MAP_ENTRY_OVERSIZE_ERROR_MESSAGE,
+                                                                column.name,
+                                                                getIndexName(),
+                                                                describeOversizedMapEntry(cell)));
+        }
+    }
+
+    /**
      * Validates the given row of a mutation at the coordinator: its terms are checked with the term size guardrail,
      * unless the legacy {@code cassandra.sai.validate_max_term_size_at_coordinator} property is set: {@code true}
      * rejects any term over {@link #maxTermSize()} whoever writes it, {@code false} checks nothing.
      */
     public void validate(DecoratedKey key, Row row, @Nullable ClientState state)
     {
+        validateIndexableMapEntries(row);
+
         // Validate the size of the inserted term.
         if (!SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.isPresent())
             guardTermSizeForRow(key, row, state);
