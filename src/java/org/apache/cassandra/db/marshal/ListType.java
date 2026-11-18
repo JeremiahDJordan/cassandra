@@ -137,6 +137,10 @@ public class ListType<T> extends CollectionType<List<T>>
         int offset = 0;
         int size = CollectionSerializer.readCollectionSize(data, accessor);
         offset += CollectionSerializer.sizeOfCollectionSize();
+        // each element takes at least the 4 bytes of its length: don't allocate for a count the value can't hold
+        if (size < 0 || size > (accessor.size(data) - offset) / 4)
+            throw new MarshalException("Invalid list: " + size + " elements declared in " + accessor.size(data) +
+                                       " bytes");
         ByteSource[] srcs = new ByteSource[size];
         for (int i = 0; i < size; ++i)
         {
