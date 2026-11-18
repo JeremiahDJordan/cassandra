@@ -888,6 +888,15 @@ public class StorageAttachedIndex implements Index
     }
 
     @Override
+    public boolean notifyIndexerAboutRowsInFullyExpiredSSTables()
+    {
+        // The index components of a fully expired SSTable are deleted together with it, and the index doesn't need to
+        // hear about its rows (indexerFor doesn't even return an indexer for compaction), so don't make compaction
+        // read the whole SSTable just to drop it.
+        return false;
+    }
+
+    @Override
     public Optional<ColumnFamilyStore> getBackingTable()
     {
         return Optional.empty();
