@@ -444,7 +444,12 @@ public class TrieBackedPartitionStage3 implements Partition
 
     public boolean isEmpty()
     {
-        return rowCountIncludingStatic + tombstoneCount == 0;
+        // The counters are updated in place while an update is merged and are not restored when the merge fails and
+        // the trie is rolled back, so a sum of zero does not prove that the partition is empty. Flush skips empty
+        // partitions, so confirm with the trie before reporting one.
+        return rowCountIncludingStatic + tombstoneCount == 0
+               && !trie.hasDeletionBranchAtRoot()
+               && !trie.contentOnlyTrie().filteredValues(RowData.class).iterator().hasNext();
     }
 
     private boolean hasStaticRow()
