@@ -1090,6 +1090,32 @@ public class Util
         return collision;
     }
 
+    /** Distinct keys that share a token: {@code prefix} with {@code count} suffixes, in SSTable order. */
+    public static List<DecoratedKey> murmurCollisions(IPartitioner partitioner, String prefix, int count)
+    {
+        List<DecoratedKey> keys = new ArrayList<>();
+        for (int i = 0; i < count; i++)
+            keys.add(partitioner.decorateKey(generateMurmurCollision(ByteBufferUtil.bytes(prefix), (byte) i)));
+        Collections.sort(keys);
+        return keys;
+    }
+
+    /**
+     * The first {@code count} keys of {@code ByteBufferUtil.bytes(0), bytes(1), ...} whose tokens are strictly between
+     * the given ones.
+     */
+    public static List<DecoratedKey> keysBetweenTokens(IPartitioner partitioner, Token low, Token high, int count)
+    {
+        List<DecoratedKey> keys = new ArrayList<>();
+        for (int i = 0; keys.size() < count; i++)
+        {
+            DecoratedKey key = partitioner.decorateKey(ByteBufferUtil.bytes(i));
+            if (key.getToken().compareTo(low) > 0 && key.getToken().compareTo(high) < 0)
+                keys.add(key);
+        }
+        return keys;
+    }
+
     // Assumes a and b are positive
     private static BigInteger[] xgcd(BigInteger a, BigInteger b) {
         BigInteger x = a, y = b;
