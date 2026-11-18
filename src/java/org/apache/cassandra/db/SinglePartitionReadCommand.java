@@ -676,8 +676,10 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
                 var wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable)) : iter;
 
-                // Memtable data is always considered unrepaired
-                controller.updateMinOldestUnrepairedTombstone(partition.stats().minLocalDeletionTime);
+                // Memtable data is always considered unrepaired; EncodingStats uses a synthetic epoch for no local
+                // deletion time
+                if (partition.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+                    controller.updateMinOldestUnrepairedTombstone(partition.stats().minLocalDeletionTime);
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false));
 
                 mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone,
@@ -911,6 +913,11 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             if (partition == null)
                 continue;
 
+            // Memtable data is always considered unrepaired; EncodingStats uses a synthetic epoch for no local
+            // deletion time
+            if (partition.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+                controller.updateMinOldestUnrepairedTombstone(partition.stats().minLocalDeletionTime);
+
             try (UnfilteredRowIterator iter = filter.getUnfilteredRowIterator(columnFilter(), partition))
             {
                 if (iter.isEmpty())
@@ -966,6 +973,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             {
                 if (!hasRequiredStatics && !intersects && !iter.partitionLevelDeletion().isLive()) // => partitionLevelDelections == true
                 {
+                    if (!sstable.isRepaired())
+                        controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
                     result = add(UnfilteredRowIterators.noRowsIterator(iter.metadata(),
                                                                        iter.partitionKey(),
                                                                        Rows.EMPTY_STATIC_ROW,
@@ -1007,7 +1016,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
     private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, boolean isRepaired, ReadExecutionController controller)
     {
-        if (!isRepaired)
+        // EncodingStats uses a synthetic epoch for no local deletion time
+        if (!isRepaired && iter.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
             controller.updateMinOldestUnrepairedTombstone(iter.stats().minLocalDeletionTime);
 
         int maxRows = Math.max(filter.requestedRows().size(), 1);
