@@ -61,8 +61,19 @@ public class PrimaryKeyListUtil
         if (index < 0)
             return ~index;
 
-        // When findMax is true, we are finding an exclusive upper bound, but binary search is inclusive, so we
-        // increment by 1 to get the exclusive upper bound.
-        return findMax ? index + 1 : index;
+        // Several keys can compare equal to the bound: a key without clustering (a static row or a whole partition)
+        // compares equal to all the keys of its partition. The binary search finds any of them, so we move to the
+        // first one for the lower bound, and to the last one for the upper bound, to keep all of them in range.
+        if (findMax)
+        {
+            while (index + 1 < keys.size() && keys.get(index + 1).compareTo(key) == 0)
+                index++;
+            // We are finding an exclusive upper bound, but binary search is inclusive, so we increment by 1.
+            return index + 1;
+        }
+
+        while (index > 0 && keys.get(index - 1).compareTo(key) == 0)
+            index--;
+        return index;
     }
 }
