@@ -98,6 +98,18 @@ New features
 
 Upgrading
 ---------
+    - GROUP BY queries with a limit or a page size, at consistency levels that read several replicas, now make short
+      read protection requests when a replica returns as many groups as the limit and stops within a partition or at
+      the end of its data, even when the replicas agree: such a replica may have more groups, and it used to be taken
+      for a replica without more data, so groups were lost. This applies to queries over several partitions, and to
+      queries restricted to one partition when the replicas' digests don't match, and adds one or two requests to each
+      replica for each page. These requests count in the shortReadProtectionRequests table metric and in the message
+      "Requesting ... extra rows from ... for short read protection", logged at INFO level at most once a minute, so
+      for GROUP BY queries neither means that the replicas differ.
+    - Replica filtering protection now caches whole partitions for GROUP BY queries with a filter that are restricted
+      to one partition, as it already did for queries over several partitions, and the rows of the short read
+      protection requests above add to the rows it caches, so GROUP BY queries with a filter can now reach the
+      cached_rows_fail_threshold of replica_filtering_protection.
     - Breaking change in CQL LIKE patterns: every '%' is now a wildcard wherever it appears (previously only the
       leading and trailing ones), '_' is now a single-character wildcard (previously a literal character), and a
       pattern without wildcards matches only equal values. Queries whose pattern contains '_' or an inner '%' may
