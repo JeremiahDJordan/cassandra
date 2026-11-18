@@ -45,6 +45,7 @@ import org.apache.cassandra.db.partitions.BTreePartitionUpdate;
 import org.apache.cassandra.db.partitions.BTreePartitionUpdater;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
@@ -395,7 +396,7 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
         {
             int minLocalDeletionTime = Integer.MAX_VALUE;
             for (AtomicBTreePartition partition : source.values())
-                minLocalDeletionTime = Math.min(minLocalDeletionTime, partition.stats().minLocalDeletionTime);
+                minLocalDeletionTime = EncodingStats.mergeMinLocalDeletionTime(minLocalDeletionTime, partition.stats());
 
             return minLocalDeletionTime;
         }
