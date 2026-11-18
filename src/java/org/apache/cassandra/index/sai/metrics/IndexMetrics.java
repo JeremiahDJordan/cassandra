@@ -44,6 +44,8 @@ public class IndexMetrics extends AbstractMetrics
     public final Counter compactionCount;
     public final Counter compactionTermsProcessedCount;
     public final Counter memtableIndexFlushErrors;
+    /** Row ids that more than one vector claimed when a vector memtable index was flushed (see CassandraOnHeapGraph#preFlush) */
+    public final Counter memtableIndexFlushVectorRowIdConflicts;
     public final Counter segmentFlushErrors;
     public final Counter queriesCount;
     
@@ -68,6 +70,7 @@ public class IndexMetrics extends AbstractMetrics
         compactionCount = Metrics.counter(createMetricName("CompactionCount"));
         compactionTermsProcessedCount = Metrics.counter(createMetricName("CompactionTermsProcessedCount"));
         memtableIndexFlushErrors = Metrics.counter(createMetricName("MemtableIndexFlushErrors"));
+        memtableIndexFlushVectorRowIdConflicts = Metrics.counter(createMetricName("MemtableIndexFlushVectorRowIdConflicts"));
         segmentFlushErrors = Metrics.counter(createMetricName("CompactionSegmentFlushErrors"));
         queriesCount = Metrics.counter(createMetricName("QueriesCount"));
         liveMemtableIndexWriteCount = Metrics.register(createMetricName("LiveMemtableIndexWriteCount"), context::liveMemtableWriteCount);

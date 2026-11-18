@@ -33,6 +33,7 @@ import java.util.concurrent.atomic.LongAdder;
 import java.util.function.ToIntFunction;
 import javax.annotation.Nullable;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.Runnables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -47,7 +48,15 @@ import org.agrona.collections.IntHashSet;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.Slice;
+import org.apache.cassandra.db.Slices;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.partitions.Partition;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
@@ -64,6 +73,7 @@ import org.apache.cassandra.index.sai.utils.PrimaryKeyWithScore;
 import org.apache.cassandra.index.sai.utils.PrimaryKeyWithSortKey;
 import org.apache.cassandra.index.sai.utils.RangeUtil;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.CloseableIterator;
@@ -105,6 +115,12 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     public Memtable getMemtable()
     {
         return memtable;
+    }
+
+    @VisibleForTesting
+    public CassandraOnHeapGraph<PrimaryKey> getGraph()
+    {
+        return graph;
     }
 
     @Override
@@ -459,7 +475,32 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     /** returns true if the index is non-empty and should be flushed */
     public boolean preFlush(ToIntFunction<PrimaryKey> ordinalMapper)
     {
-        return graph.preFlush(ordinalMapper);
+        return graph.preFlush(ordinalMapper, this::flushedValue);
+    }
+
+    // The indexed value of the key's row in this memtable, or null. An expired value counts (as in
+    // IndexContext#update); shadowing deletions are not applied, so queries discard the posting when they read the row.
+    private ByteBuffer flushedValue(PrimaryKey key)
+    {
+        Partition data = memtable.getPartition(key.partitionKey());
+        if (data == null)
+            return null;
+
+        ColumnMetadata column = indexContext.getDefinition();
+        Slices slices = column.isStatic() ? Slices.NONE : Slices.with(indexContext.comparator(), Slice.make(key.clustering()));
+        ColumnFilter columnFilter = ColumnFilter.selection(RegularAndStaticColumns.of(column));
+        try (UnfilteredRowIterator partition = data.unfilteredIterator(columnFilter, slices, false))
+        {
+            if (column.isStatic())
+                return indexContext.getValueOf(key.partitionKey(), partition.staticRow(), 0);
+            while (partition.hasNext())
+            {
+                Unfiltered unfiltered = partition.next();
+                if (unfiltered.isRow())
+                    return indexContext.getValueOf(key.partitionKey(), (Row) unfiltered, 0);
+            }
+            return null;
+        }
     }
 
     @Override
