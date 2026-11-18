@@ -860,6 +860,12 @@ public class IndexContext
         return this.config == null ? null : config.name;
     }
 
+    @Nullable
+    public IndexMetadata getIndexMetadata()
+    {
+        return config;
+    }
+
     public int getIntOption(String name, int defaultValue)
     {
         String value = this.config.options.get(name);

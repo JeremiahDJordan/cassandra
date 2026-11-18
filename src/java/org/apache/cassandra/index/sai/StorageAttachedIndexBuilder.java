@@ -22,6 +22,7 @@
 package org.apache.cassandra.index.sai;
 
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
@@ -45,8 +46,10 @@ import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.index.SecondaryIndexBuilder;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.ComponentsBuildId;
+import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
@@ -209,7 +212,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             // build the per-index components
             boolean perIndexComponentsOnly = perSSTableFileLock == null;
             for (StorageAttachedIndex index : indexes)
+            {
                 prepareForRebuild(indexDescriptor.perIndexComponents(index.getIndexContext()), replacedComponents);
+                deleteLeftoversUnderNewBuildNames(indexDescriptor, index.getIndexContext());
+            }
 
             long keyCount = SSTableReader.getApproximateKeyCount(Set.of(sstable));
             indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes, txn, keyCount, perIndexComponentsOnly, group.table().metric);
@@ -331,6 +337,20 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             }
         }
         return null;
+    }
+
+    /**
+     * Without immutable components, the new build of an index writes the files of generation 0, and most of them are
+     * opened to append. Deletes any file there may be under those names, of any component type, so that the build doesn't
+     * append to the files of another build (e.g. left by a crash, or by a dropped index of the same name).
+     */
+    private static void deleteLeftoversUnderNewBuildNames(IndexDescriptor indexDescriptor, IndexContext context)
+    {
+        Version version = indexDescriptor.versionForNewComponents();
+        if (version.useImmutableComponentFiles())
+            return;
+        indexDescriptor.perIndexComponentsOfBuild(context, ComponentsBuildId.forNewSSTable(version), EnumSet.allOf(IndexComponentType.class))
+                       .forceDeleteAllComponents();
     }
 
     private static void prepareForRebuild(IndexComponents.ForRead components, Set<Component> replacedComponents)

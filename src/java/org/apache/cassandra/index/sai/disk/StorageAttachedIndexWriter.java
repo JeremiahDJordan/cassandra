@@ -289,9 +289,18 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         }
         finally
         {
+            // only once the TOC is final for every index: rewriting it would drop the components that an index of the
+            // same name, created since, has listed
+            releaseOwnership();
             totalTimeSpent += (Clock.Global.nanoTime() - startComplete);
             tableMetrics.updateStorageAttachedIndexWritingTime(totalTimeSpent, opType);
         }
+    }
+
+    private void releaseOwnership()
+    {
+        for (PerIndexWriter perIndexWriter : perIndexWriters)
+            perIndexWriter.releaseOwnership();
     }
 
     /**
@@ -318,35 +327,42 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         // Mark the write aborted, so we can short-circuit any further operations on the component writers.
         aborted = true;
 
-        // For non-compaction and non-flush, make any indexes involved in this transaction non-queryable,
-        // as they will likely not match the backing table.
-        // For compaction and flush: the task should be aborted and new sstables will not be added to tracker.
-        // We do not want to mark the index as non-queryable on compaction and flush because otherwise
-        // the index status would be propagated to the other nodes and that would make querying the index impossible
-        // also on the other nodes. If the problem with compaction or flush repeats, then it is better to fail
-        // on this node only and let the rest of the cluster operate normally.
-        if (fromIndex && opType != OperationType.COMPACTION && opType != OperationType.FLUSH)
-            indices.forEach(StorageAttachedIndex::makeIndexNonQueryable);
-
-        for (PerIndexWriter perIndexWriter : perIndexWriters)
+        try
         {
-            try
+            // For non-compaction and non-flush, make any indexes involved in this transaction non-queryable,
+            // as they will likely not match the backing table.
+            // For compaction and flush: the task should be aborted and new sstables will not be added to tracker.
+            // We do not want to mark the index as non-queryable on compaction and flush because otherwise
+            // the index status would be propagated to the other nodes and that would make querying the index impossible
+            // also on the other nodes. If the problem with compaction or flush repeats, then it is better to fail
+            // on this node only and let the rest of the cluster operate normally.
+            if (fromIndex && opType != OperationType.COMPACTION && opType != OperationType.FLUSH)
+                indices.forEach(StorageAttachedIndex::makeIndexNonQueryable);
+
+            for (PerIndexWriter perIndexWriter : perIndexWriters)
             {
-                perIndexWriter.abort(accumulator);
-            }
-            catch (Throwable t)
-            {
-                if (accumulator != null)
+                try
                 {
-                    accumulator.addSuppressed(t);
+                    perIndexWriter.abort(accumulator);
+                }
+                catch (Throwable t)
+                {
+                    if (accumulator != null)
+                    {
+                        accumulator.addSuppressed(t);
+                    }
                 }
             }
-        }
 
-        if (!tokenOffsetWriterCompleted)
+            if (!tokenOffsetWriterCompleted)
+            {
+                // If the token/offset files have already been written successfully, they can be reused later.
+                perSSTableWriter.abort(accumulator);
+            }
+        }
+        finally
         {
-            // If the token/offset files have already been written successfully, they can be reused later.
-            perSSTableWriter.abort(accumulator);
+            releaseOwnership();
         }
 
         // If the abort was from an index error, propagate the error upstream so index builds, compactions, and

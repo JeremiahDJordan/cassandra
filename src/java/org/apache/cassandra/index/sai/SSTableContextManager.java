@@ -236,6 +236,12 @@ public class SSTableContextManager
         });
     }
 
+    void forgetPerIndexComponentsOfName(String indexName)
+    {
+        for (IndexDescriptor descriptor : sstableDescriptors.values())
+            descriptor.forgetPerIndexComponentsOfName(indexName);
+    }
+
     @VisibleForTesting
     public int getDescriptorCount()
     {

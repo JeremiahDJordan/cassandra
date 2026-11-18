@@ -100,6 +100,10 @@ public class IndexFileUtils
     public IndexOutputWriter openOutput(File file, ByteOrder order, boolean append, Version version) throws IOException
     {
         assert writerOption.finishOnClose() : "IndexOutputWriter relies on close() to sync with disk.";
+        // SequentialWriter doesn't truncate an existing file: delete a leftover of the same name (files opened to
+        // append are deleted before a build, see StorageAttachedIndexBuilder#deleteLeftoversUnderNewBuildNames).
+        if (!append)
+            file.deleteIfExists();
         var checksumWriter = new IncrementalChecksumSequentialWriter(file, writerOption, version, append);
         return new IndexOutputWriter(checksumWriter, order, version);
     }

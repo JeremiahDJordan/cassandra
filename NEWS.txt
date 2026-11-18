@@ -245,6 +245,18 @@ Upgrading
       node and every node builds the index. A node whose messaging version isn't known counts even when it's down (or
       unknown to system.peers): after a restart of the coordinator, wait for all the nodes to be up. Before
       downgrading to Apache Cassandra 5.0 or to a version without blob indexes, drop them. (CASSANDRA-20012)
+    - The completion marker of the files of a storage-attached index (SAI) on an sstable now holds a digest of the index
+      definition (its kind and options), and an index doesn't use files whose marker holds the digest of another
+      definition: it builds the sstable from the data instead. So the files written for a dropped index, e.g. by a
+      flush, compaction or stream that completes after CREATE INDEX of the same name or after a restart, are no longer
+      used by a new index of that name and another column or other options. Markers written before the upgrade are
+      empty: their files are used as before. An index created on an existing table (CREATE INDEX) always builds from
+      the table's data: it deletes the files of its name already on the table's sstables, and an entire-sstable stream
+      that is sending those sstables at that time fails. Files written before the upgrade can still be used by an index
+      of the same name and another definition on a node that receives DROP INDEX and CREATE INDEX as one schema change
+      (e.g. it was down), on sstables imported or streamed once it exists, and after a restart that follows a CREATE
+      INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes
+      concerned. Older versions ignore the content of the marker.
 
 5.0.9
 =====

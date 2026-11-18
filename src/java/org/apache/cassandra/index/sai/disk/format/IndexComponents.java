@@ -76,15 +76,17 @@ import org.apache.cassandra.utils.bytecomparable.ByteComparable;
  * (per-sstable and per-index), the "complete" (see next paragraph) set of components with the highest version, and
  * highest generation within that version.
  * <p>
- * A group of components may or may not be "complete" ({@link #isComplete()}): it is complete if the completion marker
- * component for that group is present. Groups are temporarily incomplete during writing, but can also be more
- * permanently incomplete for 2 main reasons: a build may fail mid-way, leaving one or more group incomplete, or we can
- * have some corruption of the component files of some sort (corruption could here mean that a file is mistakenly
- * deleted, or that the content of the file is corrupted somehow; the later triggers a removal of the corrupted file and
- * of the completion marker, but not of the other component of the group). The bumping of generations takes incomplete
- * groups into account, and so incomplete groups are not overridden either. Essentially, the generation used by a new
- * build is always one more than the highest generation of any component found on disk (for the group in question, and
- * the version we writting, usually {@link Version#current(String)}).
+ * A group of components may or may not be "complete" ({@link #isComplete()}): it is complete if the completion
+ * marker component for that group is present and, for a per-index group, says the group was built for the definition
+ * of its index: it holds the digest of that definition (see {@link IndexDefinitionDigest}) or, written before the
+ * digest, is empty. Groups are temporarily incomplete during writing, but can also be more
+ * permanently incomplete for 2 main reasons: a build may fail mid-way, leaving one or more group incomplete, or we
+ * can have some corruption of the component files of some sort (corruption could here mean that a file is mistakenly
+ * deleted, or that the content of the file is corrupted somehow; the later triggers a removal of the corrupted file
+ * and of the completion marker, but not of the other component of the group). The bumping of generations takes
+ * incomplete groups into account, and so incomplete groups are not overridden either. Essentially, the generation
+ * used by a new build is always one more than the highest generation of any component found on disk (for the group
+ * in question, and the version we writting, usually {@link Version#current(String)}).
  */
 public interface IndexComponents
 {
@@ -168,7 +170,8 @@ public interface IndexComponents
     boolean has(IndexComponentType component);
 
     /**
-     * Whether this group is complete, meaning that is has a completion marker.
+     * Whether this group is complete, meaning that it has a completion marker, which, for a per-index group, says it
+     * was built for the definition of its index (see the class javadoc).
      */
     default boolean isComplete()
     {
