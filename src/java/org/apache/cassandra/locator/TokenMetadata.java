@@ -43,6 +43,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.BiMultiValMap;
@@ -417,6 +418,7 @@ public class TokenMetadata
 
             endpointToHostIdMap.remove(existing);
             endpointToHostIdMap.forcePut(current, hostId);
+            PeerCheckCache.peersChanged();
         }
         finally
         {
@@ -444,6 +446,8 @@ public class TokenMetadata
             logger.warn("Changing {}'s host ID from {} to {}", endpoint, storedId, hostId);
 
         endpointToHostIdMap.forcePut(endpoint, hostId);
+        if (!hostId.equals(storedId) || !endpoint.equals(storedEp))
+            PeerCheckCache.peersChanged();
     }
 
     /** Return the unique host ID for an end-point. */
@@ -650,7 +654,8 @@ public class TokenMetadata
             {
                 logger.debug("Node {} failed during replace.", endpoint);
             }
-            endpointToHostIdMap.remove(endpoint);
+            if (endpointToHostIdMap.remove(endpoint) != null)
+                PeerCheckCache.peersChanged();
             Collection<Token> removedTokens = tokenToEndpointMap.removeValue(endpoint);
             if (removedTokens != null && !removedTokens.isEmpty())
             {
@@ -1573,6 +1578,7 @@ public class TokenMetadata
     {
         ringVersion++;
         cachedTokenMap.set(null);
+        PeerCheckCache.peersChanged();
     }
 
     public DecoratedKey decorateKey(ByteBuffer key)

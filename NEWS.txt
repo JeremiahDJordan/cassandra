@@ -107,6 +107,18 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - SELECT queries using the parts of the WHERE and ORDER BY clauses that only DataStax supports, or that nodes on a
+      messaging version below DS 10, such as Apache Cassandra 5.0 nodes, would evaluate differently, are rejected
+      with an InvalidRequestException while the query can contact such a node: the OR operator (nested
+      restrictions), NOT CONTAINS and NOT CONTAINS KEY, map entry comparisons other than = (e.g. m['a'] > 1),
+      GEO_DISTANCE, BM25 and SAI ORDER BY on non-clustering columns, and the : operator, which is what = means on an
+      analyzed index by default (equals_behaviour_when_analyzed), unless every index of the column that supports it
+      is only case_sensitive, normalize or ascii and also supports =. NOT IN, != and ANN queries are accepted. A query
+      can contact the nodes of the local datacenter at LOCAL_ONE, LOCAL_QUORUM and LOCAL_SERIAL, and every node in
+      the ring at the other consistency levels. Nodes known to be below DS 10 count, and so do live nodes whose
+      version isn't known yet. A read that still reaches such a node fails for that node. LIKE is accepted, but its
+      reads fail for such nodes. Queries that only run locally, such as internal queries on non-system keyspaces,
+      are rejected too.
 
 5.0.7
 ======

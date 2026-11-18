@@ -19,7 +19,9 @@ package org.apache.cassandra.cql3;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -124,6 +126,27 @@ public class OperatorTest
                           .isInstanceOf(UnsupportedOperationException.class)
                           .hasMessageContaining(operator + " operation does not support analyzers");
             }
+        }
+    }
+
+    /**
+     * {@link Operator#isDataStaxOnly()} must be false exactly for the operators of Apache Cassandra 5.0, which have the
+     * same binary representation (0 to 15) there.
+     */
+    @Test
+    public void testDataStaxOnlyOperators()
+    {
+        Set<Operator> apache50Operators = EnumSet.of(Operator.EQ, Operator.GTE, Operator.GT, Operator.LTE, Operator.LT,
+                                                     Operator.CONTAINS, Operator.CONTAINS_KEY, Operator.IN, Operator.NEQ,
+                                                     Operator.IS_NOT, Operator.LIKE_PREFIX, Operator.LIKE_SUFFIX,
+                                                     Operator.LIKE_CONTAINS, Operator.LIKE_MATCHES, Operator.LIKE,
+                                                     Operator.ANN);
+        for (Operator operator : Operator.values())
+        {
+            boolean apache = apache50Operators.contains(operator);
+            Assertions.assertThat(operator.isDataStaxOnly()).as(operator.name()).isEqualTo(!apache);
+            if (apache)
+                Assertions.assertThat(operator.getValue()).as(operator.name()).isBetween(0, 15);
         }
     }
 }

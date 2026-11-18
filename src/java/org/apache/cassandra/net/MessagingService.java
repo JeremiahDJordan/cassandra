@@ -29,6 +29,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.IntPredicate;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -826,6 +827,31 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
                 nodes.add(node);
         }
         return nodes;
+    }
+
+    /**
+     * Whether any of our messaging connections to the given node uses a version the given predicate doesn't accept.
+     * A connection that isn't established yet uses the version we know the node announced, capped to ours.
+     *
+     * @param node a node
+     * @param accepted the accepted messaging versions
+     * @return {@code true} if a connection to {@code node} uses a version that isn't accepted
+     */
+    public boolean hasConnectionWithVersionNotMatching(InetAddressAndPort node, IntPredicate accepted)
+    {
+        OutboundConnections connections = getOutbound(node, false);
+
+        if (connections == null)
+            return false;
+
+        for (ConnectionType type : ConnectionType.MESSAGING_TYPES)
+        {
+            OutboundConnection connection = connections.connectionFor(type);
+            if (connection != null && !accepted.test(connection.messagingVersion()))
+                return true;
+        }
+
+        return false;
     }
 
     private boolean hasConnectionWithVersionBelow(InetAddressAndPort node, int version)
