@@ -393,7 +393,7 @@ public class AtomicBTreePartitionUpdateBench
                         ThreadLocalRandom.current().nextLong();
                 }
                 invokeBefore.accept(this);
-                update.addAll(insert[index], cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP);
+                update.addAll(insert[index], cloner, NO_ORDER.getCurrent(), UpdateTransaction.NO_OP, applied -> {});
                 return true;
             }
             finally
