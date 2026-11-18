@@ -93,6 +93,50 @@ public class CompressedChunkReaderTest
         });
     }
 
+    @Test
+    public void fileHandleScanReaderUsesReadAhead() throws Exception
+    {
+        ListenableFileSystem fs = FileSystems.newGlobalInMemoryFileSystem();
+
+        File f = new File("/file.bin");
+        AtomicInteger reads = new AtomicInteger();
+        fs.onPostRead(f.path::equals, (p, c, pos, dst, r) -> reads.incrementAndGet());
+        long length = 1 << 18;
+        CompressionMetadata metadata;
+        SequentialWriterOption option = SequentialWriterOption.newBuilder().finishOnClose(false).bufferSize(1 << 10).build();
+        try (CompressedSequentialWriter writer = new CompressedSequentialWriter(f, new File("/file.offset"), new File("/file.digest"), ChecksumType.CRC32, option, CompressionParams.noop(), new MetadataCollector(new ClusteringComparator())))
+        {
+            for (long i = 0; i < length; i++)
+                writer.writeLong(i);
+
+            writer.sync();
+            metadata = writer.open(0);
+        }
+
+        try (FileHandle fileHandle = new FileHandle.Builder(f).withCompressionMetadata(metadata).complete();
+             metadata)
+        {
+            readAll(fileHandle.createReader(ReadPattern.SEQUENTIAL), length);
+            int sequentialReads = reads.getAndSet(0);
+
+            readAll(fileHandle.createReaderForScan(), length);
+            int scanReads = reads.getAndSet(0);
+
+            Assertions.assertThat(sequentialReads).isEqualTo(length * Long.BYTES / metadata.chunkLength());
+            Assertions.assertThat(scanReads).isEqualTo(length * Long.BYTES / DatabaseDescriptor.getCompressedReadAheadBufferSize() + 1);
+        }
+    }
+
+    private static void readAll(RandomAccessReader reader, long length) throws Exception
+    {
+        try (reader)
+        {
+            for (long expected = 0; expected < length; expected++)
+                Assertions.assertThat(reader.readLong()).isEqualTo(expected);
+            Assert.assertTrue(reader.isEOF());
+        }
+    }
+
     private void doReads(File f, CompressionMetadata metadata, long length, boolean useReadAhead)
     {
         ByteBuffer buffer = ByteBuffer.allocateDirect(metadata.chunkLength());

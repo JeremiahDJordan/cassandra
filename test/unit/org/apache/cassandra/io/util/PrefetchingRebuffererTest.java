@@ -38,6 +38,8 @@ import org.mockito.Mockito;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertThrows;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -89,7 +91,7 @@ public class PrefetchingRebuffererTest
     @Test
     public void testPrefetchSamePage()
     {
-        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source);
+        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source, false);
         assertNotNull(rebufferer);
         assertSame(PrefetchingRebufferer.class, rebufferer.getClass());
 
@@ -121,6 +123,20 @@ public class PrefetchingRebuffererTest
             assertTrue(buffer.released); // make sure closeReader is effective in releasing prefetched buffers
 
         verify(source, times(1)).close();
+    }
+
+    @Test
+    public void testPrefetchingIgnoresScan()
+    {
+        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source, true);
+        assertSame(PrefetchingRebufferer.class, rebufferer.getClass());
+
+        rebufferer.rebuffer(0).release();
+        rebufferer.closeReader();
+        rebufferer.close();
+
+        verify(source, atLeastOnce()).instantiateRebufferer(false);
+        verify(source, never()).instantiateRebufferer(true);
     }
 
     @Test
@@ -169,7 +185,7 @@ public class PrefetchingRebuffererTest
         // including the end of the file.
         when(source.fileLength()).thenReturn((long)numPages * PAGE_SIZE);
 
-        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source);
+        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source, false);
         assertNotNull(rebufferer);
 
         for (int i = 0; i < numPages; i++)
@@ -212,7 +228,7 @@ public class PrefetchingRebuffererTest
     @Test
     public void testNonSequentialAccess()
     {
-        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source);
+        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source, false);
         assertNotNull(rebufferer);
 
         long[] offsets = new long[] { 0, PAGE_SIZE * 2, PAGE_SIZE };
@@ -300,7 +316,7 @@ public class PrefetchingRebuffererTest
     @Test(expected = CorruptSSTableException.class)
     public void testExceptionInSourceRebuffer()
     {
-        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source);
+        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source, false);
         assertNotNull(rebufferer);
 
         when(source.instantiateRebufferer(false)).thenAnswer(__ -> {
@@ -315,7 +331,7 @@ public class PrefetchingRebuffererTest
     @Test
     public void testExceptionInSourceRebufferDuringPrefetch()
     {
-        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source);
+        Rebufferer rebufferer = PrefetchingRebufferer.withPrefetching(source, false);
         assertNotNull(rebufferer);
 
         when(source.instantiateRebufferer(false)).thenAnswer(__ -> {

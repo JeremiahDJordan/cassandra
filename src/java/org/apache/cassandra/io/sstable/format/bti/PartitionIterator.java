@@ -27,6 +27,7 @@ import org.apache.cassandra.io.sstable.KeyReader;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.FileDataInput;
 import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Throwables;
 
@@ -232,7 +233,7 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
     private void seekDataInput(long pos) throws IOException
     {
         if (dataInput == null)
-            dataInput = dataFile.createReader(pos, true);
+            dataInput = dataFile.createReader(pos, ReadPattern.SEQUENTIAL);
         else
             dataInput.seek(pos);
     }
