@@ -151,8 +151,8 @@ public class V1SearchableIndex implements SearchableIndex
         }
         catch (Throwable t)
         {
+            // The SSTableContext is shared with the other indexes of the group: don't close it.
             FileUtils.closeQuietly(indexFiles);
-            FileUtils.closeQuietly(sstableContext);
             throw Throwables.unchecked(t);
         }
     }
