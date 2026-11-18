@@ -39,6 +39,7 @@ import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
@@ -53,6 +54,7 @@ import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.AbstractBounds;
@@ -62,6 +64,7 @@ import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.disk.format.IndexFeatureSet;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
+import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.index.sai.disk.vector.VectorValidation;
 import org.apache.cassandra.index.sai.iterators.KeyRangeAntiJoinIterator;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
@@ -289,7 +292,13 @@ public class IndexContext
 
         long start = System.nanoTime();
 
-        if (isNonFrozenCollection())
+        if (indexesVectorCells())
+        {
+            Cell<?> cell = vectorCell(row);
+            if (cell != null)
+                ((VectorMemtableIndex) target).update(key, row.clustering(), cell, memtable, opGroup);
+        }
+        else if (isNonFrozenCollection())
         {
             Iterator<ByteBuffer> bufferIterator = getValuesOf(row, FBUtilities.nowInSeconds());
             if (bufferIterator != null)
@@ -426,6 +435,16 @@ public class IndexContext
         if (target == null)
             return;
 
+        if (indexesVectorCells())
+        {
+            // The rows passed here only hold the cells the write changed, so the vector index gets the cell of every
+            // write and reconciles it itself, see VectorMemtableIndex#update(..., Cell, ...).
+            Cell<?> cell = vectorCell(newRow);
+            if (cell != null)
+                ((VectorMemtableIndex) target).update(key, newRow.clustering(), cell, memtable, opGroup);
+            return;
+        }
+
         // Use 0 for nowInSecs to get the value(s) from the oldRow regardless of its liveness status. To get to this point,
         // C* has already determined this is the current represntation of the oldRow in the memtable, and that means
         // we need to add the newValue to the index and remove the oldValue from it, even if it has already expired via
@@ -442,6 +461,28 @@ public class IndexContext
             ByteBuffer newValue = getValueOf(key, newRow, FBUtilities.nowInSeconds());
             target.update(key, oldRow.clustering(), oldValue, newValue, memtable, opGroup);
         }
+    }
+
+    private boolean indexesVectorCells()
+    {
+        return isVector()
+               && !isNonFrozenCollection()
+               && (column.kind == ColumnMetadata.Kind.REGULAR || column.kind == ColumnMetadata.Kind.STATIC);
+    }
+
+    // the vector cell of the row or, if it has none, a tombstone for its row deletion, which may shadow the vector
+    private Cell<?> vectorCell(Row row)
+    {
+        // the cell of a static column is only in the static row, and a row deletion doesn't delete it
+        if (column.isStatic() != row.isStatic())
+            return null;
+
+        Cell<?> cell = row.getCell(column);
+        if (cell != null || row.deletion().isLive())
+            return cell;
+
+        DeletionTime deletion = row.deletion().time();
+        return BufferCell.tombstone(column, deletion.markedForDeleteAt(), deletion.localDeletionTime());
     }
 
     public void renewMemtable(Memtable renewed)
