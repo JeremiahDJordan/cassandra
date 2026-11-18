@@ -297,7 +297,8 @@ public class Expression
             // suffix check
             if (TypeUtil.isLiteral(validator))
             {
-                if (!validateStringValue(value.raw, lower.value.raw))
+                // a value of which the analyzer makes no term holds no term equal to the requested one
+                if (!validateStringValue(value.raw, lower.value.raw, operation.isNonEquality()))
                     return false;
             }
             else
@@ -322,7 +323,7 @@ public class Expression
             // string (prefix or suffix) check
             if (TypeUtil.isLiteral(validator))
             {
-                if (!validateStringValue(value.raw, upper.value.raw))
+                if (!validateStringValue(value.raw, upper.value.raw, false))
                     return false;
             }
             else
@@ -338,7 +339,7 @@ public class Expression
         // this covers EQ/RANGE with exclusions.
         for (ByteBuffer term : exclusions)
         {
-            if (TypeUtil.isLiteral(validator) && validateStringValue(value.raw, term) ||
+            if (TypeUtil.isLiteral(validator) && validateStringValue(value.raw, term, false) ||
                 TypeUtil.comparePostFilter(new Value(term, validator), value, validator) == 0)
                 return false;
         }
@@ -448,14 +449,16 @@ public class Expression
         return success;
     }
 
-    private boolean validateStringValue(ByteBuffer columnValue, ByteBuffer requestedValue)
+    private boolean validateStringValue(ByteBuffer columnValue, ByteBuffer requestedValue, boolean satisfiedWithoutTerms)
     {
         AbstractAnalyzer analyzer = analyzerFactory.create();
         analyzer.reset(columnValue);
         try
         {
+            boolean hasTerms = false;
             while (analyzer.hasNext())
             {
+                hasTerms = true;
                 final ByteBuffer term = analyzer.next();
 
                 boolean isMatch = false;
@@ -486,7 +489,7 @@ public class Expression
                 if (isMatch)
                     return true;
             }
-            return false;
+            return !hasTerms && satisfiedWithoutTerms;
         }
         finally
         {
