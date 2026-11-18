@@ -76,6 +76,10 @@ public class ExpiredOnArrivalTest extends SAITester
         // 3: a map value expired on arrival, then the same key written again with the same value
         writeExpired(table, 3, "mv", Collections.singletonMap("k1", "a"));
         write(table, "UPDATE %s SET mv['k1'] = 'a' WHERE pk = 3");
+        // 4: a map value expired on arrival, another key with the same value, then the expired one replaced
+        writeExpired(table, 4, "mv", Collections.singletonMap("k1", "a"));
+        write(table, "UPDATE %s SET mv['k2'] = 'a' WHERE pk = 4");
+        write(table, "UPDATE %s SET mv['k1'] = 'x' WHERE pk = 4");
         // 5: a value expired on arrival, and nothing else
         writeExpired(table, 5, "v", "a");
         writeExpired(table, 5, "n", 5);
