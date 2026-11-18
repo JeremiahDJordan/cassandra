@@ -15,6 +15,10 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+
 import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -174,6 +178,37 @@ public class IndexFailureAfterApplyTest extends SAITester
             flush();
             assertRows(execute("SELECT ck, v, x, y FROM %s WHERE pk = 0"), row(0, 0, "old", null), row(1, 1, null, "new"));
         }
+    }
+
+    /** A rebuild flushes the memtable first, so that it indexes the row of the failed write the index missed. */
+    @Test
+    public void testRebuildRepairsTheFailedWriteInTheMemtable()
+    {
+        List<String> missing = new ArrayList<>();
+        for (String memtable : MEMTABLES)
+        {
+            createTable("CREATE TABLE %s (pk int, ck int, v int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
+            disableCompaction();
+            String index = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+            execute("INSERT INTO %s (pk, ck, v) VALUES (0, 0, 1)");
+
+            failingWrite("INSERT INTO %s (pk, ck, v) VALUES (0, 1, 1)");
+
+            // the write is applied, and the index misses it (so the failure was injected where it matters)
+            assertRows(execute("SELECT ck, v FROM %s WHERE pk = 0"), row(0, 1), row(1, 1));
+            assertRows(execute("SELECT ck FROM %s WHERE v = 1"), row(0));
+            assertEquals(memtable, 0, getCurrentColumnFamilyStore().getLiveSSTables().size());
+
+            rebuildIndexes(index);
+            if (execute("SELECT ck FROM %s WHERE v = 1").size() != 2)
+                missing.add(memtable + " after the rebuild");
+
+            flush();
+            if (execute("SELECT ck FROM %s WHERE v = 1").size() != 2)
+                missing.add(memtable + " after the flush that followed the rebuild");
+            assertRowsIgnoringOrder(execute("SELECT ck FROM %s WHERE pk = 0"), row(0), row(1));
+        }
+        assertEquals("the index misses the row of the failed write", Collections.emptyList(), missing);
     }
 
     /** The partition is in the row cache when a write of a new row of it fails after it was applied. */
