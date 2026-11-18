@@ -21,7 +21,6 @@ package org.apache.cassandra.db.guardrails;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
@@ -66,7 +65,6 @@ public class GuardrailSaiFrozenTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testTuple() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, t tuple<text, text>)");
@@ -77,7 +75,6 @@ public class GuardrailSaiFrozenTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testFrozenUDT() throws Throwable
     {
         String udt = createType("CREATE TYPE %s (a text, b text)");
@@ -93,7 +90,6 @@ public class GuardrailSaiFrozenTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testFrozenList() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, fl frozen<list<text>>)");

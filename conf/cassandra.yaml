@@ -2308,6 +2308,10 @@ drop_compact_storage_enabled: false
 # before emitting a failure (defaults to -1 to disable)
 #sai_sstable_indexes_per_query_fail_threshold: -1
 
+# The fail thresholds of the three SAI term size guardrails below are also the maximum size of a term SAI indexes:
+# larger terms written by superusers or internally, which guardrails don't apply to, are not indexed. String and frozen
+# terms are never indexed over 32766 bytes, the most the index files can hold: client writes of larger ones are rejected
+# whatever the fail threshold.
 # Guardrail specifying warn/fail thresholds for the size of string terms written to an SAI index
 # sai_string_term_size_warn_threshold: 1KiB
 # sai_string_term_size_fail_threshold: 8KiB

@@ -441,7 +441,8 @@ public class StorageAttachedIndex implements Index
 
             // vectors of fixed length types are fixed length too, so we can reject the index creation
             // if that fixed length is over the max term size for vectors
-            if (type.isValueLengthFixed() && IndexContext.MAX_VECTOR_TERM_SIZE < type.valueLengthIfFixed())
+            long maxVectorTermSize = IndexContext.maxVectorTermSize();
+            if (type.isValueLengthFixed() && maxVectorTermSize < type.valueLengthIfFixed())
             {
                 AbstractType<?> elementType = ((VectorType<?>) type).elementType;
                 var error = String.format("Vector index created with %s will produce terms of %s, " +
@@ -449,8 +450,8 @@ public class StorageAttachedIndex implements Index
                                           "That sets an implicit limit of %d dimensions for %s vectors.",
                                           type.asCQL3Type(),
                                           FBUtilities.prettyPrintMemory(type.valueLengthIfFixed()),
-                                          FBUtilities.prettyPrintMemory(IndexContext.MAX_VECTOR_TERM_SIZE),
-                                          IndexContext.MAX_VECTOR_TERM_SIZE / elementType.valueLengthIfFixed(),
+                                          FBUtilities.prettyPrintMemory(maxVectorTermSize),
+                                          maxVectorTermSize / elementType.valueLengthIfFixed(),
                                           elementType.asCQL3Type());
                 // VSTODO until we can safely differentiate client and system requests, we can only log here
                 // Ticket for this: https://github.com/riptano/VECTOR-SEARCH/issues/85
@@ -914,8 +915,17 @@ public class StorageAttachedIndex implements Index
             return;
 
         DecoratedKey key = update.partitionKey();
-        for (Row row : update.rows())
-            indexContext.validate(key, row);
+        if (indexContext.getDefinition().isStatic())
+        {
+            Row staticRow = update.staticRow();
+            if (!staticRow.isEmpty())
+                indexContext.validate(key, staticRow, state);
+        }
+        else
+        {
+            for (Row row : update.rows())
+                indexContext.validate(key, row, state);
+        }
     }
 
 

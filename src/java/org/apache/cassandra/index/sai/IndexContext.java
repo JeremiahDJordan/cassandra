@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -39,6 +40,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
+import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DataStorageSpec;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ClusteringComparator;
@@ -47,6 +50,9 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.guardrails.GuardrailsConfig;
+import org.apache.cassandra.db.guardrails.MaxThreshold;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
@@ -66,6 +72,7 @@ import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.ByteLimitedMaterializer;
 import org.apache.cassandra.index.sai.analyzer.LuceneAnalyzer;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.IndexFeatureSet;
@@ -91,11 +98,16 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MonotonicClock;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.concurrent.OpOrder;
+import org.apache.lucene.util.ByteBlockPool;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_ANALYZED_SIZE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_FROZEN_TERM_SIZE;
@@ -115,17 +127,23 @@ public class IndexContext
     private static final Logger logger = LoggerFactory.getLogger(IndexContext.class);
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
 
+    // The values of the legacy cassandra.sai.max_*_size_kb system properties. A term size limit only uses them if the
+    // property is set, or if the corresponding guardrail is disabled: see #maxTermSize().
     public static final int MAX_STRING_TERM_SIZE = SAI_MAX_STRING_TERM_SIZE.getInt() * 1024;
     public static final int MAX_FROZEN_TERM_SIZE = SAI_MAX_FROZEN_TERM_SIZE.getInt() * 1024;
     public static final int MAX_VECTOR_TERM_SIZE = SAI_MAX_VECTOR_TERM_SIZE.getInt() * 1024;
     public static final int MAX_ANALYZED_SIZE = SAI_MAX_ANALYZED_SIZE.getInt() * 1024;
+    // The largest term RAMStringIndexer's BytesRefHash holds; larger ones would fail flushes and compactions.
+    public static final long MAX_ON_DISK_TERM_SIZE = ByteBlockPool.BYTE_BLOCK_SIZE - 2;
     private static final String TERM_OVERSIZE_LOG_MESSAGE =
     "Can't add term of column {} to index for key: {}, term size {} max allowed size {}.";
     private static final String TERM_OVERSIZE_ERROR_MESSAGE =
     "Term of column %s exceeds the byte limit for index. Term size %s. Max allowed size %s.";
 
-    private static final String ANALYZED_TERM_OVERSIZE_LOG_MESSAGE =
-    "Term's analyzed size for column {} exceeds the cumulative limit for index. Max allowed size {}.";
+    public static final String ANALYZED_VALUE_NOT_INDEXED_WARNING =
+    "The analyzed terms of the value of column %s add up to %s, which reaches the limit of %s " +
+    "(cassandra.sai.max_analyzed_size_kb): the value is written, but not indexed by %s.";
+
     private static final String ANALYZED_TERM_OVERSIZE_ERROR_MESSAGE =
     "Term's analyzed size for column %s exceeds the cumulative limit for index. Max allowed size %s.";
 
@@ -166,7 +184,12 @@ public class IndexContext
     private final PrimaryKey.Factory primaryKeyFactory;
 
     private final Version version;
-    private final int maxTermSize;
+
+    // the term size guardrail of this index and the limits it falls back to, see #maxTermSize()
+    private final MaxThreshold termSizeGuardrail;
+    private final Function<GuardrailsConfig, DataStorageSpec.LongBytesBound> termSizeFailThreshold;
+    private final long maxTermSizeOverride;
+    private final long maxTermSizeWithoutGuardrail;
 
     private volatile boolean dropped = false;
 
@@ -230,9 +253,27 @@ public class IndexContext
             this.columnQueryMetrics = null;
         }
 
-        this.maxTermSize = isVector() ? MAX_VECTOR_TERM_SIZE
-                                      : isAnalyzed ? MAX_ANALYZED_SIZE
-                                                   : isFrozen() ? MAX_FROZEN_TERM_SIZE : MAX_STRING_TERM_SIZE;
+        CassandraRelevantProperties maxTermSizeProperty;
+        if (isVector())
+        {
+            this.termSizeGuardrail = Guardrails.saiVectorTermSize;
+            this.termSizeFailThreshold = GuardrailsConfig::getSaiVectorTermSizeFailThreshold;
+            maxTermSizeProperty = SAI_MAX_VECTOR_TERM_SIZE;
+        }
+        else if (isFrozen())
+        {
+            this.termSizeGuardrail = Guardrails.saiFrozenTermSize;
+            this.termSizeFailThreshold = GuardrailsConfig::getSaiFrozenTermSizeFailThreshold;
+            maxTermSizeProperty = SAI_MAX_FROZEN_TERM_SIZE;
+        }
+        else
+        {
+            this.termSizeGuardrail = Guardrails.saiStringTermSize;
+            this.termSizeFailThreshold = GuardrailsConfig::getSaiStringTermSizeFailThreshold;
+            maxTermSizeProperty = isAnalyzed ? SAI_MAX_ANALYZED_SIZE : SAI_MAX_STRING_TERM_SIZE;
+        }
+        this.maxTermSizeOverride = maxTermSizeOverride(maxTermSizeProperty);
+        this.maxTermSizeWithoutGuardrail = maxTermSizeWithoutGuardrail(maxTermSizeProperty, isVector());
 
 
         logger.debug(logMessage("Initialized index context with index writer config: {}"), indexWriterConfig);
@@ -307,7 +348,7 @@ public class IndexContext
         {
             Cell<?> cell = vectorCell(row);
             if (cell != null)
-                ((VectorMemtableIndex) target).update(key, row.clustering(), cell, mt, opGroup);
+                ((VectorMemtableIndex) target).update(key, row.clustering(), withoutOversizedVector(key, cell), mt, opGroup);
         }
         else if (isNonFrozenCollection())
         {
@@ -323,7 +364,7 @@ public class IndexContext
         }
         else
         {
-            ByteBuffer value = getValueOf(key, row, FBUtilities.nowInSeconds());
+            ByteBuffer value = withoutOversizedVector(key, getValueOf(key, row, FBUtilities.nowInSeconds()));
             target.index(key, row.clustering(), value, mt, opGroup);
         }
         indexMetrics.flatMap(metrics -> metrics.memtableIndexWriteLatency).ifPresent(timer ->
@@ -331,7 +372,176 @@ public class IndexContext
     }
 
     /**
-     * Validate maximum term size for given row. Throw an exception when invalid.
+     * The maximum size of a term of this index: the legacy cassandra.sai.max_*_size_kb system property of its kind if
+     * set, else the failure threshold of its term size guardrail if enabled, else the property's default. Except for
+     * vectors, it is at most {@link #MAX_ON_DISK_TERM_SIZE}.
+     */
+    public long maxTermSize()
+    {
+        long maxTermSize = maxTermSize(maxTermSizeOverride, termSizeFailThreshold, maxTermSizeWithoutGuardrail);
+        return isVector() ? maxTermSize : Math.min(maxTermSize, MAX_ON_DISK_TERM_SIZE);
+    }
+
+    /** The size of a term as the sstable index writers hold it: map entries are byte-comparable encoded, larger. */
+    private long onDiskTermSize(ByteBuffer term)
+    {
+        int size = term.remaining();
+        if (!TypeUtil.isComposite(getValidator()) || size <= MAX_ON_DISK_TERM_SIZE / 2)
+            return size;
+        return ByteComparable.length(version.onDiskFormat().encodeForTrie(term, getValidator()),
+                                     TypeUtil.byteComparableVersionForTermsData(version));
+    }
+
+    /** Whether the term is within {@link #maxTermSize()} and, unless a vector, what the sstable index writers hold. */
+    private boolean fitsMaxTermSize(ByteBuffer term, long maxTermSize)
+    {
+        return term.remaining() <= maxTermSize && (isVector() || onDiskTermSize(term) <= MAX_ON_DISK_TERM_SIZE);
+    }
+
+    /**
+     * Returns the maximum size of the terms of a vector index, see {@link #maxTermSize()}.
+     */
+    public static long maxVectorTermSize()
+    {
+        return maxTermSize(maxTermSizeOverride(SAI_MAX_VECTOR_TERM_SIZE),
+                           GuardrailsConfig::getSaiVectorTermSizeFailThreshold,
+                           maxTermSizeWithoutGuardrail(SAI_MAX_VECTOR_TERM_SIZE, true));
+    }
+
+    private static long maxTermSize(long override,
+                                    Function<GuardrailsConfig, DataStorageSpec.LongBytesBound> failThreshold,
+                                    long withoutGuardrail)
+    {
+        if (override >= 0)
+            return override;
+
+        GuardrailsConfig config = Guardrails.CONFIG_PROVIDER.getOrCreate(null);
+        DataStorageSpec.LongBytesBound threshold = config == null ? null : failThreshold.apply(config);
+        if (threshold != null && threshold.toBytes() > 0)
+            return threshold.toBytes();
+
+        return withoutGuardrail;
+    }
+
+    private static long maxTermSizeOverride(CassandraRelevantProperties property)
+    {
+        return property.isPresent() ? property.getInt() * 1024L : -1;
+    }
+
+    private static long maxTermSizeWithoutGuardrail(CassandraRelevantProperties property, boolean isVector)
+    {
+        // Without a failure threshold, vectors are unbounded (their dimensions bound them), and strings and frozen
+        // terms keep the default of the legacy property: the on-disk terms dictionary can't hold terms over 32KiB.
+        return isVector ? Long.MAX_VALUE : Integer.parseInt(property.getDefaultValue()) * 1024L;
+    }
+
+    /**
+     * Returns the given vector value, or {@code null} if it is over {@link #maxTermSize()}, so that the memtable index
+     * leaves it out exactly as the sstable index writers do (see {@link #validateMaxTermSize(DecoratedKey, ByteBuffer)}).
+     * Other values are returned as they are: the memtable index checks their (analyzed) terms itself.
+     */
+    @Nullable
+    private ByteBuffer withoutOversizedVector(DecoratedKey key, @Nullable ByteBuffer value)
+    {
+        if (value == null || !isVector() || validateMaxTermSize(key, value))
+            return value;
+        return null;
+    }
+
+    // the cell of an oversized vector is indexed as the cell of no vector, see withoutOversizedVector(DecoratedKey, ByteBuffer)
+    private Cell<?> withoutOversizedVector(DecoratedKey key, Cell<?> cell)
+    {
+        if (cell.isTombstone() || withoutOversizedVector(key, cell.buffer()) != null)
+            return cell;
+        return cell.withUpdatedValue(ByteBufferUtil.EMPTY_BYTE_BUFFER);
+    }
+
+    /**
+     * Applies the term size guardrail of this index to the terms of the given row written by a client mutation: warns
+     * the client about terms over its warning threshold, and rejects the mutation if a term is over its failure
+     * threshold, so that the write doesn't succeed without being fully indexed (CASSANDRA-19493).
+     *
+     * @throws org.apache.cassandra.db.guardrails.GuardrailViolatedException if a term is over the failure threshold
+     */
+    private void guardTermSizeForRow(DecoratedKey key, Row row, @Nullable ClientState state)
+    {
+        // Like any guardrail, these don't apply to superusers and internal writes, nor to the anonymous user when
+        // authentication is disabled (whatever cassandra.enable_guardrails_for_anonymous_user says).
+        if (state != null && state.isSuper())
+            return;
+
+        if (isNonFrozenCollection())
+        {
+            Iterator<ByteBuffer> bufferIterator = getValuesOf(row, FBUtilities.nowInSeconds());
+            while (bufferIterator != null && bufferIterator.hasNext())
+                guardTermSizeForCell(bufferIterator.next(), state);
+        }
+        else
+        {
+            guardTermSizeForCell(getValueOf(key, row, FBUtilities.nowInSeconds()), state);
+        }
+    }
+
+    private void guardTermSizeForCell(@Nullable ByteBuffer cellBuffer, @Nullable ClientState state)
+    {
+        if (cellBuffer == null || cellBuffer.remaining() == 0)
+            return;
+
+        // Only literal and vector terms have a max term size: the others are indexed with a fixed size (see
+        // TypeUtil#asIndexBytes), whatever the size of the value, so only the guardrail applies to them.
+        long maxTermSize = maxTermSize();
+        boolean hasMaxTermSize = (isLiteral() || isVector()) && (state == null || state.isOrdinaryUser());
+        boolean overMaxTermSize = hasMaxTermSize && !fitsMaxTermSize(cellBuffer, maxTermSize);
+        if (!overMaxTermSize && !termSizeGuardrail.triggersOn(cellBuffer.remaining(), state))
+            return;
+
+        AbstractAnalyzer analyzer = getAnalyzerFactory().create();
+        analyzer.reset(cellBuffer.duplicate());
+        try
+        {
+            int termCount = 0;
+            long termsSize = 0;
+            while (analyzer.hasNext())
+            {
+                ByteBuffer term = analyzer.next();
+                int size = term.remaining();
+                termCount++;
+                termsSize += size;
+
+                // A term under the failure threshold may still be over the max term size, if a legacy system property
+                // lowers it, if the guardrail is disabled, or if it's more than the sstable index writers can hold:
+                // reject it too, rather than not index it. The term may be larger than the value (lower-casing or
+                // normalizing can add bytes), so this doesn't depend on the size of the value.
+                if (hasMaxTermSize && !fitsMaxTermSize(term, maxTermSize) && !termSizeGuardrail.failsOn(size, state))
+                    throw new InvalidRequestException(
+                        String.format(TERM_OVERSIZE_ERROR_MESSAGE,
+                                      column.name,
+                                      FBUtilities.prettyPrintMemory(Math.max(size, onDiskTermSize(term))),
+                                      FBUtilities.prettyPrintMemory(maxTermSize)));
+
+                termSizeGuardrail.guard(size, getColumnName(), false, state);
+            }
+
+            // A value whose analyzed terms add up to the max analyzed size is accepted, but not indexed (see
+            // ByteLimitedMaterializer): tell the client, since we've analyzed the value anyway.
+            if (ByteLimitedMaterializer.exceedsMaxAnalyzedSize(termCount, termsSize))
+                ClientWarn.instance.warn(String.format(ANALYZED_VALUE_NOT_INDEXED_WARNING,
+                                                       getColumnName(),
+                                                       FBUtilities.prettyPrintMemory(termsSize),
+                                                       FBUtilities.prettyPrintMemory(MAX_ANALYZED_SIZE),
+                                                       getIndexName()));
+        }
+        finally
+        {
+            analyzer.end();
+        }
+    }
+
+    /**
+     * Validates the size of the terms of the given row against {@link #maxTermSize()}, and throws an exception if one
+     * of them is over it (and, for an analyzed index, if their cumulative size is over it). This is the legacy
+     * coordinator validation, used instead of the guardrail if {@code cassandra.sai.validate_max_term_size_at_coordinator}
+     * is {@code true}.
      */
     public void validateMaxTermSizeForRow(DecoratedKey key, Row row)
     {
@@ -357,28 +567,30 @@ public class IndexContext
         analyzer.reset(cellBuffer);
         try
         {
-            if (analyzer.transformValue())
+            // the same limits as when indexing (see ByteLimitedMaterializer#materializeTokens and
+            // SegmentBuilder#analyzeAndAdd): each term is bounded by the max term size, several by the max analyzed size
+            int tokenCount = 0;
+            long bytesCount = 0;
+            while (analyzer.hasNext())
             {
-                if (!validateCumulativeAnalyzedTermLimit(key, analyzer))
+                ByteBuffer term = analyzer.next();
+                int size = term.remaining();
+                if (!validateMaxTermSize(key, term))
                 {
-                    String error = String.format(ANALYZED_TERM_OVERSIZE_ERROR_MESSAGE,
-                                                 column.name, FBUtilities.prettyPrintMemory(maxTermSize));
+                    String error = String.format(TERM_OVERSIZE_ERROR_MESSAGE,
+                                                 column.name,
+                                                 FBUtilities.prettyPrintMemory(Math.max(size, onDiskTermSize(term))),
+                                                 FBUtilities.prettyPrintMemory(maxTermSize()));
                     throw new InvalidRequestException(error);
                 }
-            }
-            else
-            {
-                while (analyzer.hasNext())
+
+                tokenCount++;
+                bytesCount += size;
+                if (ByteLimitedMaterializer.exceedsMaxAnalyzedSize(tokenCount, bytesCount))
                 {
-                    int size = analyzer.next().remaining();
-                    if (!validateMaxTermSize(key, size))
-                    {
-                        String error = String.format(TERM_OVERSIZE_ERROR_MESSAGE,
-                                                     column.name,
-                                                     FBUtilities.prettyPrintMemory(size),
-                                                     FBUtilities.prettyPrintMemory(maxTermSize));
-                        throw new InvalidRequestException(error);
-                    }
+                    String error = String.format(ANALYZED_TERM_OVERSIZE_ERROR_MESSAGE,
+                                                 column.name, FBUtilities.prettyPrintMemory(MAX_ANALYZED_SIZE));
+                    throw new InvalidRequestException(error);
                 }
             }
         }
@@ -390,46 +602,23 @@ public class IndexContext
 
 
     /**
-     * Validate maximum term size for given term
-     * @return true if given term is valid; otherwise false.
+     * Validates the size of a term being indexed against {@link #maxTermSize()}, logging oversized terms.
+     * @return true if given term is valid and can be indexed; otherwise false.
      */
     public boolean validateMaxTermSize(DecoratedKey key, ByteBuffer term)
     {
-        return validateMaxTermSize(key, term.remaining());
-    }
-
-    private boolean validateMaxTermSize(DecoratedKey key, int termSize)
-    {
-        if (termSize > maxTermSize)
+        long maxTermSize = maxTermSize();
+        if (!fitsMaxTermSize(term, maxTermSize))
         {
             noSpamLogger.warn(logMessage(TERM_OVERSIZE_LOG_MESSAGE),
                               getColumnName(),
                               keyValidator().getString(key.getKey()),
-                              FBUtilities.prettyPrintMemory(termSize),
+                              FBUtilities.prettyPrintMemory(Math.max(term.remaining(),
+                                                                     isVector() ? 0 : onDiskTermSize(term))),
                               FBUtilities.prettyPrintMemory(maxTermSize));
             return false;
         }
 
-        return true;
-    }
-
-    private boolean validateCumulativeAnalyzedTermLimit(DecoratedKey key, AbstractAnalyzer analyzer)
-    {
-        int bytesCount = 0;
-        // VSTODO anayzer.hasNext copies the byteBuffer, but we don't need that here.
-        while (analyzer.hasNext())
-        {
-            final ByteBuffer token = analyzer.next();
-            bytesCount += token.remaining();
-            if (bytesCount > maxTermSize)
-            {
-                noSpamLogger.warn(logMessage(ANALYZED_TERM_OVERSIZE_LOG_MESSAGE),
-                                  getColumnName(),
-                                  keyValidator().getString(key.getKey()),
-                                  FBUtilities.prettyPrintMemory(maxTermSize));
-                return false;
-            }
-        }
         return true;
     }
 
@@ -452,7 +641,7 @@ public class IndexContext
             // write and reconciles it itself, see VectorMemtableIndex#update(..., Cell, ...).
             Cell<?> cell = vectorCell(newRow);
             if (cell != null)
-                ((VectorMemtableIndex) target).update(key, newRow.clustering(), cell, memtable, opGroup);
+                ((VectorMemtableIndex) target).update(key, newRow.clustering(), withoutOversizedVector(key, cell), memtable, opGroup);
             return;
         }
 
@@ -469,7 +658,7 @@ public class IndexContext
         else
         {
             ByteBuffer oldValue = getValueOf(key, oldRow, 0);
-            ByteBuffer newValue = getValueOf(key, newRow, FBUtilities.nowInSeconds());
+            ByteBuffer newValue = withoutOversizedVector(key, getValueOf(key, newRow, FBUtilities.nowInSeconds()));
             target.update(key, oldRow.clustering(), oldValue, newValue, memtable, opGroup);
         }
     }
@@ -939,10 +1128,17 @@ public class IndexContext
         return getValidator().isVector();
     }
 
-    public void validate(DecoratedKey key, Row row)
+    /**
+     * Validates the given row of a mutation at the coordinator: its terms are checked with the term size guardrail,
+     * unless the legacy {@code cassandra.sai.validate_max_term_size_at_coordinator} property is set: {@code true}
+     * rejects any term over {@link #maxTermSize()} whoever writes it, {@code false} checks nothing.
+     */
+    public void validate(DecoratedKey key, Row row, @Nullable ClientState state)
     {
         // Validate the size of the inserted term.
-        if (SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.getBoolean())
+        if (!SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.isPresent())
+            guardTermSizeForRow(key, row, state);
+        else if (SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.getBoolean())
             validateMaxTermSizeForRow(key, row);
 
         // Verify vector is valid.

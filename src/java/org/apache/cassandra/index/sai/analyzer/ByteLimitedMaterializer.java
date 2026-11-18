@@ -44,8 +44,20 @@ public class ByteLimitedMaterializer
                                                                 " for key: {}, analzyed term size {}, but max allowed size {}.";
 
     /**
+     * Whether the analyzed tokens of a value, given their number and total size, are too large to index the value:
+     * when there are several of them and they add up to {@link IndexContext#MAX_ANALYZED_SIZE}. A single token is not
+     * concerned, as it is already bounded by the max term size of the index (see {@link IndexContext#maxTermSize()}),
+     * like the term of an index without analyzer.
+     */
+    public static boolean exceedsMaxAnalyzedSize(int tokenCount, long bytesCount)
+    {
+        return tokenCount > 1 && bytesCount >= IndexContext.MAX_ANALYZED_SIZE;
+    }
+
+    /**
      * Using the configured analyzer, materialize the tokens for the given term. If the cumulative size of the analyzed
-     * term exceeds the configured maximum, an empty list is returned to prevent excessive memory/disk usage for a
+     * term exceeds the configured maximum (see {@link #exceedsMaxAnalyzedSize}), an empty list is returned to prevent
+     * excessive memory/disk usage for a
      * single term. If the analyzer does not transform the value, the analyzer's byte limit is ignored because indexes
      * already have a limit on the size of a single term.
      * @param analyzer the analyzer to use
@@ -70,7 +82,7 @@ public class ByteLimitedMaterializer
                 final ByteBuffer token = analyzer.next();
                 tokens.add(token);
                 bytesCount += token.remaining();
-                if (bytesCount >= IndexContext.MAX_ANALYZED_SIZE)
+                if (exceedsMaxAnalyzedSize(tokens.size(), bytesCount))
                 {
                     noSpamLogger.warn(indexContext.logMessage(ANALYZED_TERM_OVERSIZE_MESSAGE),
                                       indexContext.getColumnName(),

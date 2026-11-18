@@ -20,6 +20,7 @@ package org.apache.cassandra.index.sai.disk.v1;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ExecutorService;
@@ -484,7 +485,11 @@ public abstract class SegmentBuilder
         long totalSize = 0;
         if (TypeUtil.isLiteral(type))
         {
-            var terms = ByteLimitedMaterializer.materializeTokens(analyzer, rawTerm, components.context(), key);
+            // Like the memtable index (see TrieMemoryIndex#applyTransformer), index the analyzed terms within the max
+            // term size, so that a value is indexed the same way in memtables and sstables.
+            IndexContext context = components.context();
+            List<ByteBuffer> terms = new ArrayList<>(ByteLimitedMaterializer.materializeTokens(analyzer, rawTerm, context, key));
+            terms.removeIf(term -> !context.validateMaxTermSize(key.partitionKey(), term));
             totalSize += add(terms, key, sstableRowId);
             totalTermCount += terms.size();
             if (indexMetrics != null)

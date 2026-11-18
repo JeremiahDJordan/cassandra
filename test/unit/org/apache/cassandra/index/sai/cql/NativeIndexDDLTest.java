@@ -1978,12 +1978,14 @@ public class NativeIndexDDLTest extends SAITester
         String insert = "INSERT INTO %s (k, v) VALUES (0, ?)";
 
 
-        // insert an analyzed column with terms of cumulating up to the max possible size
-        String term = UTF8Type.instance.compose(ByteBuffer.allocate(IndexContext.MAX_ANALYZED_SIZE / 2));
+        // insert an analyzed column with terms adding up to just under the max analyzed size, which is indexed
+        String term = UTF8Type.instance.compose(ByteBuffer.allocate(IndexContext.MAX_ANALYZED_SIZE / 2 - 1));
         execute(insert, term + ' ' + term);
+        assertRows(execute("SELECT k FROM %s WHERE v : ?", term), row(0));
 
-        // insert a frozen term over the max possible size
-        assertThatThrownBy(() -> execute(insert, term + ' ' + term + ' ' + term))
+        // insert terms adding up to the max analyzed size, which wouldn't be indexed
+        String largerTerm = UTF8Type.instance.compose(ByteBuffer.allocate(IndexContext.MAX_ANALYZED_SIZE / 2));
+        assertThatThrownBy(() -> execute(insert, largerTerm + ' ' + largerTerm))
         .isInstanceOf(InvalidRequestException.class)
         .hasMessageContaining("Term's analyzed size for column v exceeds the cumulative limit for index");
     }
