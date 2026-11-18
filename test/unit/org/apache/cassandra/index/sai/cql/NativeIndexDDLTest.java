@@ -22,6 +22,7 @@ package org.apache.cassandra.index.sai.cql;
 
 
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -30,6 +31,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
@@ -94,6 +96,7 @@ import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.Future;
 import org.mockito.Mockito;
 
 import static java.util.Collections.singletonList;
@@ -691,6 +694,86 @@ public class NativeIndexDDLTest extends SAITester
         }
         rows = executeNet("SELECT id1 FROM %s WHERE v1 >= 5");
         assertEquals(5, rows.all().size());
+    }
+
+    /**
+     * The initialization task doesn't mark an index queryable without its initial build, even at startup with complete
+     * components on every SSTable, when the index doesn't use the components already on disk: an index added to an
+     * existing table (see StorageAttachedIndex#onAddedToExistingTable) must build from the data.
+     */
+    @Test
+    public void shouldNotMarkQueryableInInitializationTaskWhenNotUsingExistingComponents() throws Throwable
+    {
+        StorageAttachedIndex index = setUpIndexToInitializeAgain();
+        index.getIndexContext().setUsesApacheComponents(false);
+        assertInitializationTaskDoesNotMarkQueryable(index);
+
+        // its initial build makes it queryable
+        waitForIndexQueryable(index.getIndexMetadata().name);
+        assertEquals(5, executeNet("SELECT id1 FROM %s WHERE v1 >= 5").all().size());
+    }
+
+    /**
+     * Nor when the index can't be built (see StorageAttachedIndex#checkCanBuild), for instance because components of an
+     * index of the same name stand in the way: the initial build fails, and the index stays non-queryable.
+     */
+    @Test
+    public void shouldNotMarkQueryableInInitializationTaskWhenItCannotBuild() throws Throwable
+    {
+        StorageAttachedIndex index = setUpIndexToInitializeAgain();
+        Field cannotBuildReason = StorageAttachedIndex.class.getDeclaredField("cannotBuildReason");
+        cannotBuildReason.setAccessible(true);
+        cannotBuildReason.set(index, "components of an index of the same name stand in the way (test)");
+        Future<Void> initialization = assertInitializationTaskDoesNotMarkQueryable(index);
+
+        // its initial build fails, and leaves it non-queryable
+        assertThatThrownBy(() -> initialization.get(60, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
+        assertFalse(getCurrentColumnFamilyStore().indexManager.isIndexQueryable(index));
+    }
+
+    /**
+     * Builds an index on 10 SSTables and makes it non-queryable, so that initializing it again at startup would mark it
+     * queryable without an initial build.
+     */
+    private StorageAttachedIndex setUpIndexToInitializeAgain() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+        String indexName = createIndex(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+        for (int i = 0; i < 10; i++)
+        {
+            execute("INSERT INTO %s (id1, v1, v2) VALUES (?, ?, ?)", String.valueOf(i), i, String.valueOf(i));
+            flush();
+        }
+        assertEquals(5, executeNet("SELECT id1 FROM %s WHERE v1 >= 5").all().size());
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Index index = cfs.indexManager.getIndexByName(indexName);
+        cfs.indexManager.makeIndexNonQueryable(index, Index.Status.BUILD_FAILED);
+        return (StorageAttachedIndex) index;
+    }
+
+    /**
+     * Initializes the index again in STARTING mode, holding back its initial build: only the initialization task itself
+     * could make it queryable, and it must not.
+     */
+    private Future<Void> assertInitializationTaskDoesNotMarkQueryable(StorageAttachedIndex index) throws Throwable
+    {
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Injections.Barrier delayInitialBuild = delayInitialBuild();
+        Injections.inject(delayInitialBuild);
+        StorageService.instance.setStartingModeUnsafe();
+        try
+        {
+            Future<Void> initialization = cfs.indexManager.buildIndex(index);
+            assertFalse(cfs.indexManager.isIndexQueryable(index));
+            return initialization;
+        }
+        finally
+        {
+            StorageService.instance.setNormalModeUnsafe();
+            delayInitialBuild.countDown();
+        }
     }
 
     @Test

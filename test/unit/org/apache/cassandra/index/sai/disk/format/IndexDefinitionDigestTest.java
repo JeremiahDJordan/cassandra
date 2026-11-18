@@ -113,4 +113,19 @@ public class IndexDefinitionDigestTest
             FileUtils.deleteWithConfirm(file);
         }
     }
+
+    @Test
+    public void testApacheMarker()
+    {
+        byte[] index = Hex.hexToBytes("3fd76c1702616100c02893e80000000000000000af214a74");
+        byte[] empty = Hex.hexToBytes("3fd76c1702616101c02893e800000000000000005b1f9c3c");
+        assertThat(IndexDefinitionDigest.isApacheMarker(index)).isTrue();
+        assertThat(IndexDefinitionDigest.isApacheMarker(empty)).isTrue();
+
+        assertThat(IndexDefinitionDigest.isApacheMarker(new byte[0])).isFalse();
+        assertThat(IndexDefinitionDigest.isApacheMarker(Arrays.copyOf(index, index.length - 1))).isFalse();
+        byte[] otherChecksum = index.clone();
+        otherChecksum[otherChecksum.length - 1] ^= 1;
+        assertThat(IndexDefinitionDigest.isApacheMarker(otherChecksum)).isFalse();
+    }
 }

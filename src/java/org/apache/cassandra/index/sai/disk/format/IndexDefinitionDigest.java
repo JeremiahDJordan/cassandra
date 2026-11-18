@@ -32,6 +32,7 @@ import java.util.TreeMap;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.utils.Hex;
 
 /**
  * The content of the completion marker of the per-index components of an SSTable: a digest of the definition of the
@@ -42,12 +43,19 @@ import org.apache.cassandra.schema.IndexMetadata;
  * its options sorted by name, where the class name is the one its alias expands to (see
  * {@link IndexMetadata#expandAliases}). Each string is written as the int length of its UTF-8 bytes followed by
  * them, and the number of options precedes them. Markers written before the digest are empty.
+ * <p>
+ * The per-index components written by Apache Cassandra (version {@link Version#APACHE_AA}) don't say which definition
+ * they were built for either: their marker is a header, whether the index is empty, and a footer with the CRC32C of the
+ * bytes before it, so there are exactly two valid ones ({@link #isApacheMarker}).
  */
 public final class IndexDefinitionDigest
 {
     static final byte FORMAT = 1;
 
     private static final int SIZE = 1 + 32;
+
+    private static final byte[] APACHE_MARKER_OF_INDEX = Hex.hexToBytes("3fd76c1702616100c02893e80000000000000000af214a74");
+    private static final byte[] APACHE_MARKER_OF_EMPTY_INDEX = Hex.hexToBytes("3fd76c1702616101c02893e800000000000000005b1f9c3c");
 
     private IndexDefinitionDigest()
     {
@@ -92,6 +100,15 @@ public final class IndexDefinitionDigest
     public static boolean matches(byte[] markerContent, IndexMetadata index)
     {
         return markerContent.length == 0 || Arrays.equals(markerContent, markerContent(index));
+    }
+
+    /**
+     * @return whether the provided content of a completion marker is one that Apache Cassandra writes for its per-index
+     * components; anything else (e.g. a marker cut short by a crash) means they aren't complete
+     */
+    public static boolean isApacheMarker(byte[] markerContent)
+    {
+        return Arrays.equals(markerContent, APACHE_MARKER_OF_INDEX) || Arrays.equals(markerContent, APACHE_MARKER_OF_EMPTY_INDEX);
     }
 
     /**

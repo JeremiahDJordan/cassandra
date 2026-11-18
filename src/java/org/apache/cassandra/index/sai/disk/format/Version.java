@@ -33,6 +33,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.index.sai.IndexContext;
+import org.apache.cassandra.index.sai.disk.apache.ApacheOnDiskFormat;
 import org.apache.cassandra.index.sai.disk.v1.V1OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.v2.V2OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.v3.V3OnDiskFormat;
@@ -86,6 +87,12 @@ public class Version implements Comparable<Version>
     // uses key lookup store instead of sorted terms.
     public static final Version GA = new Version("ga", V9OnDiskFormat.instance, (c, i, g) -> stargazerFileNameFormat(c, i, g, "ga"));
 
+    /**
+     * The format Apache Cassandra 5.0 writes, read-only. Not in {@link #ALL} ("aa" parses as DSE 6.8's {@link #AA}),
+     * and ordered before every DataStax version, so a DataStax build of a group of components is always preferred.
+     */
+    public static final Version APACHE_AA = new Version("aa", ApacheOnDiskFormat.instance, ApacheOnDiskFormat::fileNameFormat, true);
+
     // These are in reverse-chronological order so that the latest version is first. Version matching tests
     // are more likely to match the latest version, so we want to test that one first.
     public static final List<Version> ALL = Lists.newArrayList(GA, FB, FA, ED, EC, EB, DC, DB, CA, BA, AA);
@@ -106,12 +113,19 @@ public class Version implements Comparable<Version>
     private final String version;
     private final OnDiskFormat onDiskFormat;
     private final FileNameFormatter fileNameFormatter;
+    private final boolean apache;
 
     private Version(String version, OnDiskFormat onDiskFormat, FileNameFormatter fileNameFormatter)
+    {
+        this(version, onDiskFormat, fileNameFormatter, false);
+    }
+
+    private Version(String version, OnDiskFormat onDiskFormat, FileNameFormatter fileNameFormatter, boolean apache)
     {
         this.version = version;
         this.onDiskFormat = onDiskFormat;
         this.fileNameFormatter = fileNameFormatter;
+        this.apache = apache;
     }
 
     public static Version parse(String input)
@@ -132,7 +146,10 @@ public class Version implements Comparable<Version>
     public static Version current(String keyspace)
     {
         assert keyspace != null : "Keyspace name must not be null";
-        return SELECTOR.select(keyspace);
+        Version version = SELECTOR.select(keyspace);
+        if (version.isApache())
+            throw new IllegalStateException("The SAI version selector selected " + version + " for keyspace " + keyspace + ", which is read-only");
+        return version;
     }
 
     /**
@@ -191,7 +208,7 @@ public class Version implements Comparable<Version>
     @Override
     public int hashCode()
     {
-        return Objects.hashCode(version);
+        return Objects.hashCode(version, apache);
     }
 
     @Override
@@ -200,24 +217,36 @@ public class Version implements Comparable<Version>
         if (this == o) return true;
         if (o == null || getClass() != o.getClass()) return false;
         Version other = (Version) o;
-        return Objects.equal(version, other.version);
+        return Objects.equal(version, other.version) && apache == other.apache;
+    }
+
+    /** @return the version string as written in file headers ("aa" for both {@link #AA} and {@link #APACHE_AA}) */
+    public String versionString()
+    {
+        return version;
     }
 
     @Override
     public String toString()
     {
-        return version;
+        return apache ? version + "(apache)" : version;
     }
 
     // Useful for handling features that need a two phase rollout.
     public boolean after(Version other)
     {
-        return version.compareTo(other.version) > 0;
+        return compareTo(other) > 0;
     }
 
     public boolean onOrAfter(Version other)
     {
-        return version.compareTo(other.version) >= 0;
+        return compareTo(other) >= 0;
+    }
+
+    /** @return whether this is {@link #APACHE_AA}, which is never used to write components */
+    public boolean isApache()
+    {
+        return apache;
     }
 
     public OnDiskFormat onDiskFormat()
@@ -239,6 +268,8 @@ public class Version implements Comparable<Version>
     @Override
     public int compareTo(Version other)
     {
+        if (this.apache != other.apache)
+            return this.apache ? -1 : 1;
         return this.version.compareTo(other.version);
     }
 
@@ -285,10 +316,23 @@ public class Version implements Comparable<Version>
         String componentStr = filename.substring(startOfComponent);
         if (componentStr.startsWith("SAI_"))
             return tryParseAAFileName(componentStr);
+        else if (componentStr.startsWith(APACHE_COMPONENT_PREFIX))
+            return CassandraRelevantProperties.SAI_READ_APACHE_FORMAT.getBoolean()
+                   ? tryParseApacheFileName(componentStr)
+                   : Optional.empty(); // ignored: see SAI_READ_APACHE_FORMAT
         else if (componentStr.startsWith("SAI" + SAI_SEPARATOR))
             return tryParseStargazerFileName(componentStr);
         else
             return Optional.empty();
+    }
+
+    /**
+     * Whether the file name (full, or its component part) is that of an SAI component written by Apache Cassandra 5.0.
+     */
+    public static boolean isApacheComponentFileName(String filename)
+    {
+        return filename.endsWith(EXTENSION)
+               && filename.substring(filename.lastIndexOf('-') + 1).startsWith(APACHE_COMPONENT_PREFIX);
     }
 
     public static class ParsedFileName
@@ -410,8 +454,14 @@ public class Version implements Comparable<Version>
     // Format: <sstable descriptor>-SAI+<version>(+<generation>)(+<index name>)+<component name>.db
     //
     public static final String SAI_DESCRIPTOR = "SAI";
-    private static final String SAI_SEPARATOR = "+";
-    private static final String EXTENSION = ".db";
+    public static final String SAI_SEPARATOR = "+";
+    public static final String EXTENSION = ".db";
+
+    /**
+     * Prefix of the component part of the file names written by Apache Cassandra 5.0. Our {@link #AA} (DSE 6.8)
+     * files use {@code SAI_} names (see {@link #aaFileNameFormat}), so these are always {@link #APACHE_AA} components.
+     */
+    public static final String APACHE_COMPONENT_PREFIX = "SAI+aa+";
 
     private static String stargazerFileNameFormat(IndexComponentType indexComponentType, @Nullable String indexName, int generation, String version)
     {
@@ -431,9 +481,30 @@ public class Version implements Comparable<Version>
 
     public ByteComparable.Version byteComparableVersionFor(IndexComponentType component, org.apache.cassandra.io.sstable.format.Version sstableFormatVersion)
     {
+        // Apache Cassandra 5.0 encodes its keys and terms in OSS50.
+        if (apache)
+            return ByteComparable.Version.OSS50;
         return this == AA && component == IndexComponentType.TERMS_DATA
                ? sstableFormatVersion.getByteComparableVersion()
                : TypeUtil.BYTE_COMPARABLE_VERSION;
+    }
+
+    /**
+     * Parses the component part of the name of a file written by Apache Cassandra 5.0:
+     * {@code SAI+aa(+<index name>)+<component name>.db}. There is no generation.
+     */
+    private static Optional<ParsedFileName> tryParseApacheFileName(String componentStr)
+    {
+        String[] splits = componentStr.substring(APACHE_COMPONENT_PREFIX.length(), componentStr.length() - EXTENSION.length()).split("\\+");
+        if (splits.length < 1 || splits.length > 2)
+            return Optional.empty();
+
+        IndexComponentType indexComponentType = ApacheOnDiskFormat.componentTypeFor(splits[splits.length - 1]);
+        if (indexComponentType == null)
+            return Optional.empty();
+
+        String indexName = splits.length == 2 ? splits[0] : null;
+        return Optional.of(new ParsedFileName(ComponentsBuildId.of(APACHE_AA, 0), indexComponentType, indexName));
     }
 
     private static Optional<ParsedFileName> tryParseStargazerFileName(String componentStr)

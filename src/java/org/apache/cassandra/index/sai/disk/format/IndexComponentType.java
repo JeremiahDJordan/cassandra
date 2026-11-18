@@ -43,6 +43,13 @@ public enum IndexComponentType
     KD_TREE_POSTING_LISTS("KDTreePostingLists"),
 
     /**
+     * Block balanced tree of the numeric indexes written by Apache Cassandra 5.0 (see
+     * {@link org.apache.cassandra.index.sai.disk.apache.ApacheOnDiskFormat}). Its postings are in
+     * {@link #POSTING_LISTS}. Read-only.
+     */
+    BALANCED_TREE("BalancedTree"),
+
+    /**
      * Vector index components
      */
     VECTOR("Vector"),

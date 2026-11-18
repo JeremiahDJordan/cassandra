@@ -33,7 +33,12 @@ public class ScanningPostingsReader extends PostingsReader
 {
     public ScanningPostingsReader(IndexInput input, BlocksSummary summary, boolean readFrequencies) throws IOException
     {
-        super(input, summary, readFrequencies, QueryEventListener.PostingListEventListener.NO_OP, InputCloser.NOOP);
+        this(input, summary, readFrequencies, false);
+    }
+
+    public ScanningPostingsReader(IndexInput input, BlocksSummary summary, boolean readFrequencies, boolean firstPostingBeforeFirstBlock) throws IOException
+    {
+        super(input, summary, readFrequencies, QueryEventListener.PostingListEventListener.NO_OP, InputCloser.NOOP, firstPostingBeforeFirstBlock);
     }
 
     @Override

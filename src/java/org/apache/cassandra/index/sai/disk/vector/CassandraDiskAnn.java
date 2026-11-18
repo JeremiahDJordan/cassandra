@@ -119,7 +119,9 @@ public class CassandraDiskAnn
             }
             else
             {
-                pqUnitVectors = true;
+                // Our components without PQ_MAGIC hold unit vectors. Apache's have this layout too but compress
+                // non-unit vectors, so their scores must use the index's similarity function.
+                pqUnitVectors = !indexFiles.usedPerIndexComponents().version().isApache();
                 reader.seek(pqSegmentOffset);
             }
 

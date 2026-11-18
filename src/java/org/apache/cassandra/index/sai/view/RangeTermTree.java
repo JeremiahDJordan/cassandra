@@ -35,6 +35,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SSTableIndex;
+import org.apache.cassandra.index.sai.disk.apache.ApacheOnDiskFormat;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.index.sai.utils.AutomatonQueries;
@@ -50,10 +51,15 @@ public class RangeTermTree implements TermTree
     protected final AbstractType<?> comparator;
     // Because each version can have different encodings, we group indexes by version.
     private final Map<Version, IntervalTree<Term, SSTableIndex, Interval<Term, SSTableIndex>>> rangeTrees;
+    // Indexes whose term range can't be compared with our bounds, and that are therefore always searched.
+    private final List<SSTableIndex> unprunable;
 
-    private RangeTermTree(Map<Version, IntervalTree<Term, SSTableIndex, Interval<Term, SSTableIndex>>> rangeTrees, AbstractType<?> comparator)
+    private RangeTermTree(Map<Version, IntervalTree<Term, SSTableIndex, Interval<Term, SSTableIndex>>> rangeTrees,
+                          List<SSTableIndex> unprunable,
+                          AbstractType<?> comparator)
     {
         this.rangeTrees = rangeTrees;
+        this.unprunable = unprunable;
         this.comparator = comparator;
     }
 
@@ -97,7 +103,7 @@ public class RangeTermTree implements TermTree
      */
     private Set<SSTableIndex> searchRange(Function<Version, Term> lower, Function<Version, Term> upper)
     {
-        Set<SSTableIndex> result = new HashSet<>();
+        Set<SSTableIndex> result = new HashSet<>(unprunable);
         rangeTrees.forEach((version, rangeTree) -> {
             Term minTerm = lower.apply(version);
             Term maxTerm = upper.apply(version);
@@ -112,6 +118,7 @@ public class RangeTermTree implements TermTree
     {
         // Because different indexes can have different encodings, we must track the versions of the indexes
         final Map<Version, List<Interval<Term, SSTableIndex>>> intervalsByVersion = new HashMap<>();
+        final List<SSTableIndex> unprunable = new ArrayList<>();
 
         protected Builder(AbstractType<?> comparator)
         {
@@ -120,6 +127,13 @@ public class RangeTermTree implements TermTree
 
         public void addIndex(SSTableIndex index)
         {
+            if (index.getVersion().isApache() && !ApacheOnDiskFormat.canPruneByTermRange(comparator))
+            {
+                // see ApacheOnDiskFormat#canPruneByTermRange
+                unprunable.add(index);
+                return;
+            }
+
             Interval<Term, SSTableIndex> interval =
                     Interval.create(new Term(index.minTerm(), comparator, index.getVersion()),
                                     new Term(index.maxTerm(), comparator, index.getVersion()),
@@ -148,7 +162,7 @@ public class RangeTermTree implements TermTree
         {
             Map<Version, IntervalTree<Term, SSTableIndex, Interval<Term, SSTableIndex>>> trees = new HashMap<>();
             intervalsByVersion.forEach((version, intervals) -> trees.put(version, IntervalTree.build(intervals)));
-            return new RangeTermTree(trees, comparator);
+            return new RangeTermTree(trees, unprunable, comparator);
         }
     }
 

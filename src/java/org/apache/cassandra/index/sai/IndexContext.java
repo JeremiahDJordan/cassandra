@@ -196,6 +196,7 @@ public class IndexContext
     private final long maxTermSizeWithoutGuardrail;
 
     private volatile boolean dropped = false;
+    private volatile boolean usesApacheComponents = true;
 
     public IndexContext(@Nonnull String keyspace,
                         @Nonnull String table,
@@ -729,10 +730,10 @@ public class IndexContext
     // but they are not a problem as post-filtering would get rid of them.
     // The keys matched in other indexes cannot be safely subtracted
     // as indexes may contain false positives caused by deletes and updates.
-    private KeyRangeIterator getNonEqIterator(QueryContext context, Collection<MemtableIndex> memtables, Expression expression, AbstractBounds<PartitionPosition> keyRange)
+    private KeyRangeIterator getNonEqIterator(QueryContext context, Collection<MemtableIndex> memtables, Expression expression, AbstractBounds<PartitionPosition> keyRange, boolean subtractMatches)
     {
         KeyRangeIterator allKeys = scanMemtable(keyRange, memtables);
-        if (TypeUtil.supportsRounding(expression.validator) || !version.onDiskFormat().indexFeatureSet().isRowAware())
+        if (!subtractMatches || TypeUtil.supportsRounding(expression.validator) || !version.onDiskFormat().indexFeatureSet().isRowAware())
         {
             return allKeys;
         }
@@ -746,9 +747,17 @@ public class IndexContext
 
     public KeyRangeIterator searchMemtable(QueryContext context, Collection<MemtableIndex> memtables, Expression expression, AbstractBounds<PartitionPosition> keyRange)
     {
+        return searchMemtable(context, memtables, expression, keyRange, true);
+    }
+
+    /**
+     * @param subtractMatches see {@link SSTableIndex#search(Expression, AbstractBounds, QueryContext, boolean, boolean)}
+     */
+    public KeyRangeIterator searchMemtable(QueryContext context, Collection<MemtableIndex> memtables, Expression expression, AbstractBounds<PartitionPosition> keyRange, boolean subtractMatches)
+    {
         if (expression.getOp().isNonEquality())
         {
-            return getNonEqIterator(context, memtables, expression, keyRange);
+            return getNonEqIterator(context, memtables, expression, keyRange, subtractMatches);
         }
 
         if (memtables.isEmpty())
@@ -937,6 +946,21 @@ public class IndexContext
     public boolean isDropped()
     {
         return dropped;
+    }
+
+    /**
+     * @return whether this index uses the components that Apache Cassandra wrote for an index of its name on an
+     * SSTable (see {@link IndexDescriptor}): not before the initial build of an index added to an existing table is
+     * over, as those components may belong to a dropped index of the same name; the initial build replaces them.
+     */
+    public boolean usesApacheComponents()
+    {
+        return usesApacheComponents;
+    }
+
+    public void setUsesApacheComponents(boolean usesApacheComponents)
+    {
+        this.usesApacheComponents = usesApacheComponents;
     }
 
     /**
@@ -1309,8 +1333,9 @@ public class IndexContext
             catch (Throwable e)
             {
                 // Components that pass validation but turn out to be corrupt when loaded are invalidated, so the
-                // index is rebuilt for this SSTable. Other failures say nothing about the components: the SSTable is
-                // left out of the view, and the initial build fails (see StorageAttachedIndex#findNonIndexedSSTables).
+                // index is rebuilt for this SSTable: Apache Cassandra's too. Other failures say nothing about the
+                // components: the SSTable is left out of the view, and the initial build fails (see
+                // StorageAttachedIndex#findNonIndexedSSTables).
                 if (!(e instanceof Error) && isCorruption(e))
                 {
                     try

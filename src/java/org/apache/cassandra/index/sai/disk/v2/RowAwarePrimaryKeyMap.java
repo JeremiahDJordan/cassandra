@@ -238,17 +238,18 @@ public class RowAwarePrimaryKeyMap implements PrimaryKeyMap
         if (key instanceof PrimaryKeyWithSource)
         {
             var pkws = (PrimaryKeyWithSource) key;
-            if (pkws.getSourceSstableId().equals(sstableId))
+            if (pkws.hasRowIdsOf(this))
                 return pkws.getSourceRowId();
         }
 
         if (clusteringComparator.size() == 0)
             return skinnyExactRowIdOrInvertedCeiling(key);
 
-        long pointId = cursor.getExactPointId(v -> key.asComparableBytes(v));
+        PrimaryKey ownKey = withOwnEncoding(key);
+        long pointId = cursor.getExactPointId(ownKey::asComparableBytes);
         if (pointId >= 0)
             return pointId;
-        long ceiling = cursor.ceiling(key::asComparableBytesMinPrefix);
+        long ceiling = cursor.ceiling(ownKey::asComparableBytesMinPrefix);
         // Use min value since inverting Long.MIN_VALUE gives Long.MAX_VALUE.
         return ceiling < 0 ? Long.MIN_VALUE : ~ceiling;
     }
@@ -259,7 +260,7 @@ public class RowAwarePrimaryKeyMap implements PrimaryKeyMap
         if (key instanceof PrimaryKeyWithSource)
         {
             var pkws = (PrimaryKeyWithSource) key;
-            if (pkws.getSourceSstableId().equals(sstableId))
+            if (pkws.hasRowIdsOf(this))
                 return pkws.getSourceRowId();
         }
 
@@ -275,13 +276,24 @@ public class RowAwarePrimaryKeyMap implements PrimaryKeyMap
                     return ~rowId;
         }
 
-        return cursor.ceiling(key::asComparableBytesMinPrefix);
+        return cursor.ceiling(withOwnEncoding(key)::asComparableBytesMinPrefix);
     }
 
     @Override
     public long floor(PrimaryKey key)
     {
-        return cursor.floor(key::asComparableBytesMaxPrefix);
+        return cursor.floor(withOwnEncoding(key)::asComparableBytesMaxPrefix);
+    }
+
+    // Keys of other factories (V9's, used by GA and the Apache components) are encoded without the token: re-create
+    // them as ours before looking them up.
+    private PrimaryKey withOwnEncoding(PrimaryKey key)
+    {
+        if (key instanceof PrimaryKeyWithSource)
+            key = ((PrimaryKeyWithSource) key).primaryKey();
+        if (key.isTokenOnly() || key.getClass() == V2RowAwarePrimaryKeyFactory.RowAwarePrimaryKey.class)
+            return key;
+        return primaryKeyFactory.create(key.partitionKey(), key.clustering());
     }
 
     @Override

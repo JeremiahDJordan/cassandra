@@ -1,0 +1,326 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai;
+
+import java.io.File;
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.net.InetAddress;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.Date;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Stream;
+
+import org.junit.Test;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.v1.MetadataSource;
+import org.apache.cassandra.index.sai.disk.v1.V1OnDiskFormat;
+import org.apache.cassandra.index.sai.disk.v1.segment.SegmentMetadata;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.TimeUUID;
+
+/**
+ * Generator of test data: writes more Apache 5.0 SAI indexes for the DataStax compatibility tests.
+ * Output: -Dsai.out=<dir>, one sub-directory per table.
+ */
+public class GenerateApacheSAIDataExtendedTest extends SAITester
+{
+    private static final String KS = "apache_sai2";
+    // small enough that index builds on existing sstables write several segments
+    private static final long SMALL_SEGMENTS = 1536 * 1024;
+
+    @Test
+    public void generate() throws Throwable
+    {
+        String out = System.getProperty("sai.out", "/tmp/apache-sai-data2");
+        schemaChange("CREATE KEYSPACE IF NOT EXISTS " + KS + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+
+        types();
+        descs();
+        analyzed();
+        collections();
+        statics();
+        vectors();
+
+        for (String table : new String[]{ "types", "descs", "analyzed", "colls", "statics", "vectors" })
+            copy(out, table);
+    }
+
+    /**
+     * All the types of numeric indexes, plus text/ascii/boolean, with nulls, empty strings, deleted rows and expired
+     * rows (Apache doesn't index rows without live data), in two sstables: the first one indexed by an index build
+     * with small segments (several segments), the second one flushed with its indexes.
+     */
+    private void types() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".types (pk int PRIMARY KEY, i int, bi bigint, si smallint, ti tinyint, f float, d double, " +
+                     "dec decimal, vi varint, dt date, tm time, ts timestamp, u uuid, tu timeuuid, ip inet, b boolean, t text, a ascii)");
+        String[] columns = { "i", "bi", "si", "ti", "f", "d", "dec", "vi", "dt", "tm", "ts", "u", "tu", "ip", "b", "t", "a" };
+
+        insertTypes(0, 2000);
+        flush(KS, "types");
+
+        V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER.setLimitBytes(SMALL_SEGMENTS);
+        for (String column : columns)
+            schemaChange("CREATE INDEX types_" + column + " ON " + KS + ".types(" + column + ") USING 'sai'");
+        waitForTableIndexesQueryable(KS, "types");
+        V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER.setLimitBytes(V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMIT);
+
+        insertTypes(2000, 2600);
+        flush(KS, "types");
+        report("types");
+    }
+
+    private void insertTypes(int from, int to) throws Throwable
+    {
+        for (int pk = from; pk < to; pk++)
+        {
+            boolean nulls = pk % 13 == 0;
+            execute("INSERT INTO " + KS + ".types (pk, i, bi, si, ti, f, d, dec, vi, dt, tm, ts, u, tu, ip, b, t, a) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    pk,
+                    nulls ? null : (pk * 7) % 1000 - 500,
+                    nulls ? null : pk * 1_000_003L - 2_000_000_000L,
+                    (short) (pk % 300 - 150),
+                    (byte) (pk % 200 - 100),
+                    nulls ? null : pk * 0.5f - 300,
+                    pk * 1.25 - 1000.0,
+                    nulls ? null : BigDecimal.valueOf(pk * 3L - 2000, 2 + pk % 3),
+                    nulls ? null : (pk % 2 == 0 ? BigInteger.valueOf(pk - 1500) : new BigInteger("123456789012345678901234567890").multiply(BigInteger.valueOf(pk - 1500))),
+                    (int) (Integer.MIN_VALUE + 20000L + pk), // date as unsigned days since the epoch shifted
+                    (long) pk * 1_000_000_000L % 86_399_000_000_000L,
+                    new Date(1_700_000_000_000L + pk * 60_000L),
+                    UUID.nameUUIDFromBytes(Integer.toString(pk % 100).getBytes()),
+                    TimeUUID.atUnixMicrosWithLsb(1_700_000_000_000_000L + pk * 1000L, 0x1234).asUUID(),
+                    InetAddress.getByAddress(pk % 2 == 0 ? new byte[]{ 10, 0, (byte) (pk / 256), (byte) pk }
+                                                         : new byte[]{ (byte) 0xfe, (byte) 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte) (pk / 256), (byte) pk }),
+                    pk % 3 == 0,
+                    pk % 17 == 0 ? "" : "t" + (pk % 50),
+                    "a" + (pk % 20));
+        }
+        // rows without live data, which Apache doesn't index
+        for (int pk = from; pk < to; pk += 50)
+            execute("DELETE FROM " + KS + ".types WHERE pk = ?", pk + 1);
+        for (int pk = from + 7; pk < to; pk += 100)
+            execute("INSERT INTO " + KS + ".types (pk, i, t) VALUES (?, ?, ?) USING TTL 1", pk + 100000, 1, "expired");
+        Thread.sleep(2000);
+    }
+
+    /**
+     * DESC clustering columns: bigint, inet, varint and decimal (that Apache stores unreversed, CASSANDRA-20100), int
+     * and text.
+     */
+    private void descs() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".descs (pk int, cb bigint, ci inet, cv varint, cd decimal, cn int, ct text, v int, " +
+                     "PRIMARY KEY (pk, cb, ci, cv, cd, cn, ct)) " +
+                     "WITH CLUSTERING ORDER BY (cb DESC, ci DESC, cv DESC, cd DESC, cn DESC, ct DESC)");
+        insertDescs(0, 20);
+        flush(KS, "descs");
+
+        V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER.setLimitBytes(SMALL_SEGMENTS / 6);
+        for (String column : new String[]{ "cb", "ci", "cv", "cd", "cn", "ct", "v" })
+            schemaChange("CREATE INDEX descs_" + column + " ON " + KS + ".descs(" + column + ") USING 'sai'");
+        waitForTableIndexesQueryable(KS, "descs");
+        V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER.setLimitBytes(V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMIT);
+
+        insertDescs(20, 40);
+        flush(KS, "descs");
+        report("descs");
+    }
+
+    private void insertDescs(int from, int to) throws Throwable
+    {
+        for (int pk = from; pk < to; pk++)
+        {
+            for (int c = 0; c < 25; c++)
+            {
+                long value = (pk * 25L + c) - 500;
+                execute("INSERT INTO " + KS + ".descs (pk, cb, ci, cv, cd, cn, ct, v) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        pk,
+                        value * 1_000_000_007L,
+                        InetAddress.getByAddress(c % 2 == 0 ? new byte[]{ 10, 1, (byte) pk, (byte) c }
+                                                            : new byte[]{ 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, (byte) pk, (byte) c }),
+                        BigInteger.valueOf(value).multiply(BigInteger.TEN.pow(c % 25)),
+                        BigDecimal.valueOf(value, c % 4),
+                        (int) value,
+                        "ct" + (c % 7),
+                        c);
+            }
+        }
+    }
+
+    /**
+     * Literal indexes with the non-tokenizing analyzer options.
+     */
+    private void analyzed() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".analyzed (pk int PRIMARY KEY, t_ci text, t_norm text, t_ascii text, t_all text, a_ci ascii)");
+        schemaChange("CREATE INDEX analyzed_ci ON " + KS + ".analyzed(t_ci) USING 'sai' WITH OPTIONS = {'case_sensitive': 'false'}");
+        schemaChange("CREATE INDEX analyzed_norm ON " + KS + ".analyzed(t_norm) USING 'sai' WITH OPTIONS = {'normalize': 'true'}");
+        schemaChange("CREATE INDEX analyzed_ascii ON " + KS + ".analyzed(t_ascii) USING 'sai' WITH OPTIONS = {'ascii': 'true'}");
+        schemaChange("CREATE INDEX analyzed_all ON " + KS + ".analyzed(t_all) USING 'sai' WITH OPTIONS = {'case_sensitive': 'false', 'normalize': 'true', 'ascii': 'true'}");
+        schemaChange("CREATE INDEX analyzed_aci ON " + KS + ".analyzed(a_ci) USING 'sai' WITH OPTIONS = {'case_sensitive': 'false'}");
+        waitForTableIndexesQueryable(KS, "analyzed");
+
+        String[] words = { "Alpha", "alpha", "ALPHA", "Ålpha", "Ålpha", "Beta", "béta", "béta", "Gamma", "gamma ray", "" };
+        for (int pk = 0; pk < 200; pk++)
+        {
+            String w = words[pk % words.length];
+            execute("INSERT INTO " + KS + ".analyzed (pk, t_ci, t_norm, t_ascii, t_all, a_ci) VALUES (?, ?, ?, ?, ?, ?)",
+                    pk, w, w, w, w, pk % 2 == 0 ? "Abc" + pk % 5 : "aBC" + pk % 5);
+        }
+        flush(KS, "analyzed");
+        report("analyzed");
+    }
+
+    /**
+     * Collections: values of lists and sets, keys, values and entries of maps, and frozen collections.
+     */
+    private void collections() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".colls (pk int PRIMARY KEY, l list<int>, st set<text>, m map<text, int>, " +
+                     "fm frozen<map<text, int>>, fl frozen<list<text>>)");
+        schemaChange("CREATE INDEX colls_l ON " + KS + ".colls(l) USING 'sai'");
+        schemaChange("CREATE INDEX colls_st ON " + KS + ".colls(st) USING 'sai'");
+        schemaChange("CREATE INDEX colls_mk ON " + KS + ".colls(KEYS(m)) USING 'sai'");
+        schemaChange("CREATE INDEX colls_mv ON " + KS + ".colls(VALUES(m)) USING 'sai'");
+        schemaChange("CREATE INDEX colls_me ON " + KS + ".colls(ENTRIES(m)) USING 'sai'");
+        schemaChange("CREATE INDEX colls_fm ON " + KS + ".colls(FULL(fm)) USING 'sai'");
+        schemaChange("CREATE INDEX colls_fl ON " + KS + ".colls(FULL(fl)) USING 'sai'");
+        waitForTableIndexesQueryable(KS, "colls");
+
+        for (int pk = 0; pk < 300; pk++)
+        {
+            execute("INSERT INTO " + KS + ".colls (pk, l, st, m, fm, fl) VALUES (?, ?, ?, ?, ?, ?)",
+                    pk,
+                    List.of(pk % 10, pk % 7, -(pk % 5)),
+                    Set.of("s" + pk % 6, "x" + pk % 4),
+                    Map.of("k" + pk % 8, pk % 30, "z" + pk % 3, -pk),
+                    Map.of("f" + pk % 4, pk % 3),
+                    List.of("l" + pk % 5, "m" + pk % 2));
+        }
+        flush(KS, "colls");
+        report("colls");
+    }
+
+    /**
+     * Static columns and partition key components, with partitions that only have a static row.
+     */
+    private void statics() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".statics (pk1 int, pk2 text, ck int, st text static, sti int static, v int, PRIMARY KEY ((pk1, pk2), ck))");
+        for (String column : new String[]{ "pk1", "pk2", "ck", "st", "sti", "v" })
+            schemaChange("CREATE INDEX statics_" + column + " ON " + KS + ".statics(" + column + ") USING 'sai'");
+        waitForTableIndexesQueryable(KS, "statics");
+
+        for (int p = 0; p < 100; p++)
+        {
+            String pk2 = "p" + (p % 10);
+            if (p % 9 != 0)
+                execute("UPDATE " + KS + ".statics SET st = ?, sti = ? WHERE pk1 = ? AND pk2 = ?", "st" + p % 4, p % 6, p / 10, pk2);
+            if (p % 11 == 0)
+                continue; // a partition with a static row only
+            for (int ck = 0; ck < 5; ck++)
+                execute("INSERT INTO " + KS + ".statics (pk1, pk2, ck, v) VALUES (?, ?, ?, ?)", p / 10, pk2, ck, (p * 5 + ck) % 37);
+        }
+        flush(KS, "statics");
+        report("statics");
+    }
+
+    /**
+     * Vector indexes big enough for product quantization (1024 vectors in a segment), in two sstables: the first one
+     * indexed by an index build with small segments, the second one flushed with its index.
+     */
+    private void vectors() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".vectors (pk int PRIMARY KEY, v vector<float, 8>, cat int)");
+        Random random = new Random(42);
+        insertVectors(random, 0, 2600);
+        flush(KS, "vectors");
+
+        V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER.setLimitBytes(1024 * 1024);
+        schemaChange("CREATE INDEX vectors_v ON " + KS + ".vectors(v) USING 'sai'");
+        schemaChange("CREATE INDEX vectors_cat ON " + KS + ".vectors(cat) USING 'sai'");
+        waitForTableIndexesQueryable(KS, "vectors");
+        V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMITER.setLimitBytes(V1OnDiskFormat.SEGMENT_BUILD_MEMORY_LIMIT);
+
+        insertVectors(random, 2600, 3800);
+        flush(KS, "vectors");
+        report("vectors");
+    }
+
+    private void insertVectors(Random random, int from, int to) throws Throwable
+    {
+        for (int pk = from; pk < to; pk++)
+        {
+            float[] v = new float[8];
+            for (int i = 0; i < v.length; i++)
+                v[i] = random.nextFloat() * 2 - 1;
+            v[0] += pk % 5; // some clustering
+            execute("INSERT INTO " + KS + ".vectors (pk, v, cat) VALUES (?, ?, ?)", pk, vector(v), pk % 10);
+        }
+    }
+
+    private void report(String table) throws Exception
+    {
+        ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(KS, table);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            IndexDescriptor descriptor = IndexDescriptor.create(sstable);
+            for (Index index : cfs.indexManager.listIndexes())
+            {
+                StorageAttachedIndex sai = (StorageAttachedIndex) index;
+                if (descriptor.isIndexEmpty(sai.termType(), sai.identifier()))
+                {
+                    System.out.println("SAIGEN " + table + ' ' + sstable.descriptor.id + ' ' + sai.identifier().indexName + " empty");
+                    continue;
+                }
+                List<SegmentMetadata> segments = SegmentMetadata.load(MetadataSource.loadColumnMetadata(descriptor, sai.identifier()), descriptor.primaryKeyFactory);
+                System.out.println("SAIGEN " + table + ' ' + sstable.descriptor.id + ' ' + sai.identifier().indexName + " segments=" + segments.size());
+            }
+        }
+    }
+
+    private void copy(String out, String table) throws Exception
+    {
+        ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(KS, table);
+        Path dir = new File(out, table).toPath();
+        Files.createDirectories(dir);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            Path data = sstable.descriptor.fileFor(SSTableFormat.Components.DATA).toPath();
+            String prefix = data.getFileName().toString().replace("Data.db", "");
+            try (Stream<Path> files = Files.list(data.getParent()))
+            {
+                for (Path src : (Iterable<Path>) files.filter(f -> f.getFileName().toString().startsWith(prefix))::iterator)
+                    Files.copy(src, dir.resolve(src.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        System.out.println("SAIGEN " + table + " -> " + dir + " : " + cfs.getLiveSSTables().size() + " sstables");
+    }
+}

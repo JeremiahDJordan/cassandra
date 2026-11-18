@@ -53,6 +53,7 @@ public class KeyLookup
     private final FileHandle keysFileHandle;
     private final KeyLookupMeta keyLookupMeta;
     private final LongArray.Factory keyBlockOffsetsFactory;
+    private final ByteComparable.Version byteComparableVersion;
 
     /**
      * Creates a new reader based on its data components.
@@ -70,9 +71,30 @@ public class KeyLookup
                      @Nonnull KeyLookupMeta keyLookupMeta,
                      @Nonnull NumericValuesMeta keyBlockOffsetsMeta) throws IOException
     {
+        this(keysFileHandle, keysBlockOffsets, keyLookupMeta, keyBlockOffsetsMeta, TypeUtil.BYTE_COMPARABLE_VERSION);
+    }
+
+    /**
+     * Same as above, for keys written with the provided byte-comparable version.
+     */
+    public KeyLookup(@Nonnull FileHandle keysFileHandle,
+                     @Nonnull FileHandle keysBlockOffsets,
+                     @Nonnull KeyLookupMeta keyLookupMeta,
+                     @Nonnull NumericValuesMeta keyBlockOffsetsMeta,
+                     @Nonnull ByteComparable.Version byteComparableVersion) throws IOException
+    {
         this.keysFileHandle = keysFileHandle;
         this.keyLookupMeta = keyLookupMeta;
         this.keyBlockOffsetsFactory = new MonotonicBlockPackedReader(keysBlockOffsets, keyBlockOffsetsMeta);
+        this.byteComparableVersion = byteComparableVersion;
+    }
+
+    /**
+     * @return the byte-comparable version the keys are encoded with.
+     */
+    public ByteComparable.Version byteComparableVersion()
+    {
+        return byteComparableVersion;
     }
 
     /**
@@ -405,7 +427,7 @@ public class KeyLookup
         {
             BytesRefBuilder builder = new BytesRefBuilder();
 
-            ByteSource byteSource = source.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION);
+            ByteSource byteSource = source.asComparableBytes(byteComparableVersion);
             int val;
             while ((val = byteSource.next()) != ByteSource.END_OF_STREAM)
                 builder.append((byte) val);
@@ -445,7 +467,7 @@ public class KeyLookup
                     advanceToNextKey();
             }
 
-            return ByteComparable.preencoded(TypeUtil.BYTE_COMPARABLE_VERSION, currentKey.bytes, currentKey.offset, currentKey.length);
+            return ByteComparable.preencoded(byteComparableVersion, currentKey.bytes, currentKey.offset, currentKey.length);
         }
 
         @Override

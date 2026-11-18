@@ -43,12 +43,12 @@ import org.apache.cassandra.index.sai.disk.v2.PrimaryKeyWithSource;
 import org.apache.cassandra.index.sai.disk.v9.keystore.KeyLookup;
 import org.apache.cassandra.index.sai.disk.v9.keystore.KeyLookupMeta;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
-import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.io.sstable.SSTableId;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 
@@ -79,6 +79,7 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
         @SuppressWarnings("unused")
         private final IndexComponents.ForRead perSSTableComponents;
         protected final SSTableId<?> sstableId;
+        protected final Object rowIdSpace;
         protected final boolean hasStaticColumns;
 
         protected final MetadataSource metadataSource;
@@ -87,6 +88,8 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
         protected final KeyLookup partitionKeyReader;
         protected final IPartitioner partitioner;
         protected final V9RowAwarePrimaryKeyFactory primaryKeyFactory;
+        // The byte-comparable version of the stored keys: ours, or OSS50 for Apache Cassandra's components.
+        protected final ByteComparable.Version byteComparableVersion;
 
         private final FileHandle rowToTokenFile;
         private final FileHandle rowToPartitionFile;
@@ -115,13 +118,15 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
                 KeyLookupMeta partitionKeysMeta = new KeyLookupMeta(metadataSource.get(perSSTableComponents.get(IndexComponentType.PARTITION_KEY_BLOCKS)));
                 partitionKeyBlocksFileLocal = perSSTableComponents.get(IndexComponentType.PARTITION_KEY_BLOCKS).createFileHandle();
                 partitionKeyBlockOffsetsFileLocal = perSSTableComponents.get(IndexComponentType.PARTITION_KEY_BLOCK_OFFSETS).createFileHandle();
-                this.partitionKeyReader = new KeyLookup(partitionKeyBlocksFileLocal, partitionKeyBlockOffsetsFileLocal, partitionKeysMeta, partitionKeyBlockOffsetsMeta);
+                this.partitionKeyReader = new KeyLookup(partitionKeyBlocksFileLocal, partitionKeyBlockOffsetsFileLocal, partitionKeysMeta, partitionKeyBlockOffsetsMeta,
+                                                        perSSTableComponents.byteComparableVersionFor(IndexComponentType.PARTITION_KEY_BLOCKS));
             }
             catch (IOException e)
             {
                 throw Throwables.unchecked(Throwables.close(e, rowToTokenFileLocal, rowToPartitionFileLocal, partitionKeyBlocksFileLocal, partitionKeyBlockOffsetsFileLocal));
             }
             this.perSSTableComponents = perSSTableComponents;
+            this.byteComparableVersion = partitionKeyReader.byteComparableVersion();
 
             this.rowToTokenFile = rowToTokenFileLocal;
             this.rowToPartitionFile = rowToPartitionFileLocal;
@@ -131,6 +136,7 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
             this.partitioner = sstable.metadata().partitioner;
             this.primaryKeyFactory = primaryKeyFactory;
             this.sstableId = sstable.getId();
+            this.rowIdSpace = perSSTableComponents.version().isApache() ? new ApacheRowIdSpace(sstableId) : sstableId;
             this.hasStaticColumns = sstable.metadata().hasStaticColumns();
         }
 
@@ -146,7 +152,9 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
                                            partitioner,
                                            primaryKeyFactory,
                                            sstableId,
-                                           hasStaticColumns);
+                                           rowIdSpace,
+                                           hasStaticColumns,
+                                           byteComparableVersion);
         }
 
         @Override
@@ -162,7 +170,9 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
     protected final IPartitioner partitioner;
     protected final V9RowAwarePrimaryKeyFactory primaryKeyFactory;
     protected final SSTableId<?> sstableId;
+    protected final Object rowIdSpace;
     private final boolean hasStaticColumns;
+    protected final ByteComparable.Version byteComparableVersion;
 
     protected SkinnyPrimaryKeyMap(LongArray rowIdToTokenArray,
                                   LongArray rowIdToPartitionIdArray,
@@ -170,14 +180,18 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
                                   IPartitioner partitioner,
                                   V9RowAwarePrimaryKeyFactory primaryKeyFactory,
                                   SSTableId<?> sstableId,
-                                  boolean hasStaticColumns)
+                                  Object rowIdSpace,
+                                  boolean hasStaticColumns,
+                                  ByteComparable.Version byteComparableVersion)
     {
+        this.byteComparableVersion = byteComparableVersion;
         this.rowIdToTokenArray = rowIdToTokenArray;
         this.rowIdToPartitionIdArray = rowIdToPartitionIdArray;
         this.partitionKeyCursor = partitionKeyCursor;
         this.partitioner = partitioner;
         this.primaryKeyFactory = primaryKeyFactory;
         this.sstableId = sstableId;
+        this.rowIdSpace = rowIdSpace;
         this.hasStaticColumns = hasStaticColumns;
     }
 
@@ -185,6 +199,12 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
     public SSTableId<?> getSSTableId()
     {
         return sstableId;
+    }
+
+    @Override
+    public Object rowIdSpace()
+    {
+        return rowIdSpace;
     }
 
     @Override
@@ -223,7 +243,7 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
         if (key instanceof PrimaryKeyWithSource)
         {
             PrimaryKeyWithSource pkws = (PrimaryKeyWithSource) key;
-            if (pkws.getSourceSstableId().equals(sstableId))
+            if (pkws.hasRowIdsOf(this))
                 return pkws.getSourceRowId();
         }
         long rowId = tokenLookup.applyAsLong(key.token().getLongValue());
@@ -308,7 +328,8 @@ public class SkinnyPrimaryKeyMap implements PrimaryKeyMap
     protected DecoratedKey readPartitionKey(long sstableRowId)
     {
         long partitionId = rowIdToPartitionIdArray.get(sstableRowId);
-        ByteSource.Peekable peekable = ByteSource.peekable(partitionKeyCursor.seekToPointId(partitionId).asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION));
+        ByteComparable key = partitionKeyCursor.seekToPointId(partitionId);
+        ByteSource.Peekable peekable = ByteSource.peekable(key.asComparableBytes(byteComparableVersion));
 
         byte[] keyBytes = ByteSourceInverse.getUnescapedBytes(peekable);
 

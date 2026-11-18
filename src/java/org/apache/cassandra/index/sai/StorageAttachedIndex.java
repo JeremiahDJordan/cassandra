@@ -622,6 +622,9 @@ public class StorageAttachedIndex implements Index
      * even while a stream or a rebuild holds the SSTable, as the build of this index would append to them (an
      * entire-SSTable stream sending them fails, and is retried). If a completion marker of them is still on disk
      * afterwards, the initial build of this index fails rather than use them.
+     * <p>
+     * The components Apache Cassandra wrote for an index of this name are discarded the same way (see
+     * {@link StorageAttachedIndexGroup#discardApacheIndexComponents}).
      */
     @Override
     public void onAddedToExistingTable()
@@ -655,6 +658,10 @@ public class StorageAttachedIndex implements Index
                     cannotBuildReason = "could not delete the components of an index of the same name on " + sstable.descriptor;
             }
 
+            indexContext.setUsesApacheComponents(false);
+            if (!StorageAttachedIndexGroup.discardApacheIndexComponents(baseCfs, indexContext.getIndexName(), sstables, filesOnDisk))
+                cannotBuildReason = "could not delete the Apache Cassandra components of an index of the same name";
+
             // A descriptor cached for another index of the table may still describe the deleted components, which
             // the new index would otherwise try to load
             StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
@@ -678,7 +685,8 @@ public class StorageAttachedIndex implements Index
         for (Component component : sstable.components())
         {
             Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(component.name);
-            if (parsed.isEmpty() || !name.equals(parsed.get().indexName))
+            // Apache Cassandra's are discarded by StorageAttachedIndexGroup#discardApacheIndexComponents
+            if (parsed.isEmpty() || !name.equals(parsed.get().indexName) || parsed.get().buildId.version().isApache())
                 continue;
             stale.add(component);
             builds.add(parsed.get().buildId);
@@ -686,7 +694,7 @@ public class StorageAttachedIndex implements Index
         for (String file : filesOnDisk)
         {
             Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(file);
-            if (parsed.isPresent() && name.equals(parsed.get().indexName))
+            if (parsed.isPresent() && name.equals(parsed.get().indexName) && !parsed.get().buildId.version().isApache())
                 builds.add(parsed.get().buildId);
         }
         if (builds.isEmpty())
@@ -785,8 +793,10 @@ public class StorageAttachedIndex implements Index
 
         // If we are starting up and the index is already built for every live SSTable, mark it queryable right away,
         // before gossip starts, so peers never see this node UP with a non-queryable index (CASSANDRA-20732).
-        // (Not if components of a same-name index stand in the way: the initial build then fails, see checkCanBuild.)
-        if (isStarting && !decision.skipped() && cannotBuildReason == null)
+        // Not for an index added to an existing table (see onAddedToExistingTable), which must build from the data: it
+        // doesn't use the components already on disk until its initial build is over, and fails that build if
+        // components of a same-name index stand in the way (see checkCanBuild).
+        if (isStarting && !decision.skipped() && cannotBuildReason == null && indexContext.usesApacheComponents())
         {
             try
             {
@@ -804,9 +814,17 @@ public class StorageAttachedIndex implements Index
         }
 
         return () -> {
-            checkCanBuild();
-            Object result = startInitialBuild(baseCfs, isStarting, decision.skipped()).get();
-            return result;
+            try
+            {
+                checkCanBuild();
+                Object result = startInitialBuild(baseCfs, isStarting, decision.skipped()).get();
+                return result;
+            }
+            finally
+            {
+                // The components written by Apache Cassandra of the SSTables that arrive from now on are this index's.
+                indexContext.setUsesApacheComponents(true);
+            }
         };
     }
 
@@ -1073,6 +1091,9 @@ public class StorageAttachedIndex implements Index
                 var components = sstableIndex.usedPerIndexComponents();
                 sstableIndex.getSSTable().unregisterComponents(components.allAsCustomComponents(), baseCfs.getTracker());
             }
+            // The SSTables not in the view may still have this index's Apache Cassandra components (e.g. while it is
+            // rebuilt, or after a failed build): they must not be left for an index created later with the same name.
+            StorageAttachedIndexGroup.removeApacheIndexComponents(baseCfs, indexContext.getIndexName());
 
             indexContext.invalidate(true);
             return null;

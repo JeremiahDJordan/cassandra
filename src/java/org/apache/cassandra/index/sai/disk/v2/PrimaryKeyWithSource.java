@@ -31,6 +31,8 @@ import org.apache.cassandra.utils.bytecomparable.ByteSource;
 public class PrimaryKeyWithSource implements PrimaryKey
 {
     private final SSTableId<?> sourceSstableId;
+    // see PrimaryKeyMap#rowIdSpace: the row id is only meaningful in maps of the same row id space
+    private final Object sourceRowIdSpace;
     private final long sourceRowId;
     private PrimaryKey delegatePrimaryKey;
     private PrimaryKeyMap primaryKeyMap;
@@ -41,12 +43,13 @@ public class PrimaryKeyWithSource implements PrimaryKey
     {
         this.primaryKeyMap = primaryKeyMap;
         this.sourceSstableId = primaryKeyMap.getSSTableId();
+        this.sourceRowIdSpace = primaryKeyMap.rowIdSpace();
         this.sourceRowId = sstableRowId;
         this.sourceSstableMinKey = sourceSstableMinKey;
         this.sourceSstableMaxKey = sourceSstableMaxKey;
     }
 
-    private PrimaryKey primaryKey()
+    PrimaryKey primaryKey()
     {
         if (delegatePrimaryKey == null)
         {
@@ -65,6 +68,15 @@ public class PrimaryKeyWithSource implements PrimaryKey
     public SSTableId<?> getSourceSstableId()
     {
         return sourceSstableId;
+    }
+
+    /**
+     * @return whether the source row id of this key is a row id of the provided map (see
+     * {@link PrimaryKeyMap#rowIdSpace()}), so the map doesn't need to look the key up
+     */
+    public boolean hasRowIdsOf(PrimaryKeyMap primaryKeyMap)
+    {
+        return sourceRowIdSpace.equals(primaryKeyMap.rowIdSpace());
     }
 
     @Override
@@ -123,7 +135,7 @@ public class PrimaryKeyWithSource implements PrimaryKey
         if (o instanceof PrimaryKeyWithSource)
         {
             PrimaryKeyWithSource other = (PrimaryKeyWithSource) o;
-            if (sourceSstableId.equals(other.sourceSstableId))
+            if (sourceRowIdSpace.equals(other.sourceRowIdSpace))
                 return Long.compare(sourceRowId, other.sourceRowId);
             // Compare to the other source sstable's min and max keys to determine if the keys are comparable.
             // Note that these are already loaded into memory as part of the segment's metadata, so the comparison
@@ -150,8 +162,9 @@ public class PrimaryKeyWithSource implements PrimaryKey
         if (o instanceof PrimaryKeyWithSource)
         {
             var other = (PrimaryKeyWithSource) o;
-            // If they are from the same source sstable, we can compare the row ids directly.
-            if (sourceSstableId.equals(other.sourceSstableId))
+            // If they are from the same source sstable (and row ids, see PrimaryKeyMap#rowIdSpace), we can compare the
+            // row ids directly.
+            if (sourceRowIdSpace.equals(other.sourceRowIdSpace))
                 return sourceRowId == other.sourceRowId;
 
             // If the source sstable primary key ranges do not intersect, the keys cannot be equal.

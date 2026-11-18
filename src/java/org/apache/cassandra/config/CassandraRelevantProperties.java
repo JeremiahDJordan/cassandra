@@ -942,6 +942,14 @@ public enum CassandraRelevantProperties
      */
     SAI_QUERY_PLAN_METRICS_ENABLED("cassandra.sai.metrics.query_plan.enabled", "true"),
 
+    /**
+     * Whether to read the SAI indexes Apache Cassandra 5.0 wrote (its on-disk version "aa", files named
+     * {@code SAI+aa+...}), which an SSTable carries after an upgrade from Apache Cassandra 5.0, an import, or
+     * entire-SSTable streaming. If false, those files are ignored, and the indexes of such SSTables are rebuilt in the
+     * current format (which then removes the Apache files).
+     */
+    SAI_READ_APACHE_FORMAT("cassandra.sai.read_apache_format", "true"),
+
     SAI_REDUCE_TOPK_ACROSS_SSTABLES("cassandra.sai.reduce_topk_across_sstables", "true"),
 
     /**

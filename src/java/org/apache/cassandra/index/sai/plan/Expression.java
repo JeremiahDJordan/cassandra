@@ -407,6 +407,15 @@ public class Expression
     }
 
     /**
+     * @return whether the bounds are reversed: for a DESC clustering column indexed reversed (see
+     * {@link TypeUtil#isIndexedUnreversed(AbstractType)}), the lower bound holds the greatest value of the range
+     */
+    public boolean hasReversedBounds()
+    {
+        return reversed;
+    }
+
+    /**
      * Returns the lower bound of the expression as a ByteComparable with an encoding based on the version and the
      * validator.
      * @param version the version of the index

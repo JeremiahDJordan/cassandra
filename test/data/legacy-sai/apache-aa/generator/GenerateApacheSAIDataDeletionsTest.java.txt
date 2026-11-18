@@ -1,0 +1,184 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai;
+
+import java.io.File;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.List;
+import java.util.Random;
+import java.util.Set;
+import java.util.stream.Stream;
+
+import org.junit.Test;
+
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.v1.MetadataSource;
+import org.apache.cassandra.index.sai.disk.v1.segment.SegmentMetadata;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+
+/**
+ * Writes Apache SAI test data with deletions: a wide table whose second sstable has row, range, partition, cell and
+ * collection deletions and expired cells (fragments without live data, which Apache's SAI doesn't index), and vector
+ * indexes (euclidean and dot product, vectors not of unit length) whose graphs had vectors deleted or replaced before
+ * being written.
+ */
+public class GenerateApacheSAIDataDeletionsTest extends SAITester
+{
+    private static final String KS = "apache_sai3";
+
+    @Test
+    public void generate() throws Throwable
+    {
+        String out = System.getProperty("sai.out", "/tmp/apache-sai-data3");
+        schemaChange("CREATE KEYSPACE IF NOT EXISTS " + KS + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+        tombs();
+        vectors2();
+        for (String table : new String[]{ "tombs", "vectors2" })
+            copy(out, table);
+    }
+
+    private void tombs() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".tombs (pk int, ck int, s text, n int, st set<text>, v int, PRIMARY KEY (pk, ck))");
+        disableCompaction(KS, "tombs");
+        for (String column : new String[]{ "s", "n", "st" })
+            schemaChange("CREATE INDEX tombs_" + column + " ON " + KS + ".tombs(" + column + ") USING 'sai'");
+        waitForTableIndexesQueryable(KS, "tombs");
+
+        for (int pk = 0; pk < 40; pk++)
+            for (int ck = 0; ck < 25; ck++)
+                execute("INSERT INTO " + KS + ".tombs (pk, ck, s, n, st, v) VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP 1000",
+                        pk, ck, "s" + (pk * ck) % 9, (pk * 25 + ck) % 200 - 100, Set.of("a" + ck % 4, "b" + pk % 3), ck);
+        flush(KS, "tombs");
+
+        String t = KS + ".tombs";
+        for (int pk = 0; pk < 40; pk++)
+        {
+            if (pk % 6 == 0)
+                execute("DELETE FROM " + t + " USING TIMESTAMP 2000 WHERE pk = ? AND ck >= 5 AND ck < 10", pk);
+            for (int ck = 0; ck < 25; ck++)
+            {
+                if ((pk * 7 + ck) % 11 == 0)
+                    execute("DELETE FROM " + t + " USING TIMESTAMP 2000 WHERE pk = ? AND ck = ?", pk, ck);
+                else if ((pk + ck) % 9 == 0)
+                    execute("DELETE s FROM " + t + " USING TIMESTAMP 2000 WHERE pk = ? AND ck = ?", pk, ck);
+                else if ((pk + 2 * ck) % 10 == 0)
+                    execute("DELETE st FROM " + t + " USING TIMESTAMP 2000 WHERE pk = ? AND ck = ?", pk, ck);
+                else if ((pk * 3 + ck) % 17 == 0)
+                    execute("UPDATE " + t + " USING TIMESTAMP 2000 AND TTL 1 SET s = 'gone' WHERE pk = ? AND ck = ?", pk, ck);
+                else if ((pk * ck) % 13 == 1)
+                    execute("UPDATE " + t + " USING TIMESTAMP 2000 SET n = ? WHERE pk = ? AND ck = ?", 1000 + pk, pk, ck);
+            }
+        }
+        // a partition deletion, with a row written after it
+        execute("DELETE FROM " + t + " USING TIMESTAMP 2000 WHERE pk = 13");
+        execute("INSERT INTO " + t + " (pk, ck, s, n, st, v) VALUES (13, 3, 's3', 3, {'a3'}, 3) USING TIMESTAMP 2001");
+        for (int pk = 40; pk < 50; pk++)
+            for (int ck = 0; ck < 25; ck++)
+                execute("INSERT INTO " + t + " (pk, ck, s, n, st, v) VALUES (?, ?, ?, ?, ?, ?) USING TIMESTAMP 2000",
+                        pk, ck, "s" + (pk * ck) % 9, (pk * 25 + ck) % 200 - 100, Set.of("a" + ck % 4, "b" + pk % 3), ck);
+        Thread.sleep(2000); // the TTL'd cells expire before the flush
+        flush(KS, "tombs");
+        report("tombs");
+    }
+
+    private void vectors2() throws Throwable
+    {
+        schemaChange("CREATE TABLE " + KS + ".vectors2 (pk int PRIMARY KEY, ve vector<float, 8>, vd vector<float, 8>)");
+        disableCompaction(KS, "vectors2");
+        schemaChange("CREATE INDEX vectors2_ve ON " + KS + ".vectors2(ve) USING 'sai' WITH OPTIONS = {'similarity_function': 'EUCLIDEAN'}");
+        schemaChange("CREATE INDEX vectors2_vd ON " + KS + ".vectors2(vd) USING 'sai' WITH OPTIONS = {'similarity_function': 'DOT_PRODUCT'}");
+        waitForTableIndexesQueryable(KS, "vectors2");
+
+        Random random = new Random(2024);
+        String t = KS + ".vectors2";
+        insertVectors(random, 0, 3000);
+        // in the memtable, so the graphs written by the flush had these vectors deleted or replaced
+        for (int pk = 0; pk < 3000; pk += 10)
+            execute("DELETE FROM " + t + " WHERE pk = ?", pk);
+        for (int pk = 5; pk < 3000; pk += 10)
+            execute("UPDATE " + t + " SET ve = ?, vd = ? WHERE pk = ?", vector(gaussian(random, 3)), vector(gaussian(random, 3)), pk);
+        flush(KS, "vectors2");
+
+        insertVectors(random, 3000, 4300);
+        for (int pk = 3; pk < 3000; pk += 20)
+            execute("DELETE FROM " + t + " WHERE pk = ?", pk);
+        flush(KS, "vectors2");
+        report("vectors2");
+    }
+
+    private void insertVectors(Random random, int from, int to) throws Throwable
+    {
+        for (int pk = from; pk < to; pk++)
+        {
+            float magnitude = pk % 15 == 0 ? 10 : 1;
+            execute("INSERT INTO " + KS + ".vectors2 (pk, ve, vd) VALUES (?, ?, ?)", pk, vector(gaussian(random, magnitude)), vector(gaussian(random, magnitude)));
+        }
+    }
+
+    private static float[] gaussian(Random random, float magnitude)
+    {
+        float[] v = new float[8];
+        for (int i = 0; i < v.length; i++)
+            v[i] = (float) random.nextGaussian() * magnitude;
+        return v;
+    }
+
+    private void report(String table) throws Exception
+    {
+        ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(KS, table);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            IndexDescriptor descriptor = IndexDescriptor.create(sstable);
+            for (Index index : cfs.indexManager.listIndexes())
+            {
+                StorageAttachedIndex sai = (StorageAttachedIndex) index;
+                if (descriptor.isIndexEmpty(sai.termType(), sai.identifier()))
+                {
+                    System.out.println("SAIGEN " + table + ' ' + sstable.descriptor.id + ' ' + sai.identifier().indexName + " empty");
+                    continue;
+                }
+                List<SegmentMetadata> segments = SegmentMetadata.load(MetadataSource.loadColumnMetadata(descriptor, sai.identifier()), descriptor.primaryKeyFactory);
+                System.out.println("SAIGEN " + table + ' ' + sstable.descriptor.id + ' ' + sai.identifier().indexName + " segments=" + segments.size() + " rows=" + segments.stream().mapToLong(s -> s.numRows).sum());
+            }
+        }
+    }
+
+    private void copy(String out, String table) throws Exception
+    {
+        ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(KS, table);
+        Path dir = new File(out, table).toPath();
+        Files.createDirectories(dir);
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            Path data = sstable.descriptor.fileFor(SSTableFormat.Components.DATA).toPath();
+            String prefix = data.getFileName().toString().replace("Data.db", "");
+            try (Stream<Path> files = Files.list(data.getParent()))
+            {
+                for (Path src : (Iterable<Path>) files.filter(f -> f.getFileName().toString().startsWith(prefix))::iterator)
+                    Files.copy(src, dir.resolve(src.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        System.out.println("SAIGEN " + table + " -> " + dir + " : " + cfs.getLiveSSTables().size() + " sstables");
+    }
+}

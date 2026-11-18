@@ -79,7 +79,8 @@ import org.apache.cassandra.utils.bytecomparable.ByteComparable;
  * A group of components may or may not be "complete" ({@link #isComplete()}): it is complete if the completion
  * marker component for that group is present and, for a per-index group, says the group was built for the definition
  * of its index: it holds the digest of that definition (see {@link IndexDefinitionDigest}) or, written before the
- * digest, is empty. Groups are temporarily incomplete during writing, but can also be more
+ * digest, is empty; a marker written by Apache Cassandra (version {@link Version#APACHE_AA}) holds no definition,
+ * and must be one of the two that it writes. Groups are temporarily incomplete during writing, but can also be more
  * permanently incomplete for 2 main reasons: a build may fail mid-way, leaving one or more group incomplete, or we
  * can have some corruption of the component files of some sort (corruption could here mean that a file is mistakenly
  * deleted, or that the content of the file is corrupted somehow; the later triggers a removal of the corrupted file

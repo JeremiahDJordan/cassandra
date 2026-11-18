@@ -23,7 +23,10 @@ import javax.annotation.Nullable;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.distributed.shared.WithProperties;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -138,6 +141,93 @@ public class VersionTest
         assertThat(Version.tryParseFileName("filemame-SAI_.db")).isEmpty();
         assertThat(Version.tryParseFileName("filemame-SAI.db")).isEmpty();
         assertThat(Version.tryParseFileName("filemame-SAI+foo.db")).isEmpty();
+    }
+
+    @Test
+    public void testApacheFileNames()
+    {
+        // Apache's "aa" files ("SAI+aa+" names) are APACHE_AA, not our AA ("SAI_" names)
+        assertApacheFileName("nb-1-big-SAI+aa+GroupComplete.db", IndexComponentType.GROUP_COMPLETION_MARKER, null);
+        assertApacheFileName("nb-1-big-SAI+aa+PartitionKeyBlocks.db", IndexComponentType.PARTITION_KEY_BLOCKS, null);
+        assertApacheFileName("nb-1-big-SAI+aa+ClusteringKeyBlockOffsets.db", IndexComponentType.CLUSTERING_KEY_BLOCK_OFFSETS, null);
+        assertApacheFileName("nb-1-big-SAI+aa+myIndex+Meta.db", IndexComponentType.META, "myIndex");
+        assertApacheFileName("nb-1-big-SAI+aa+myIndex+BalancedTree.db", IndexComponentType.BALANCED_TREE, "myIndex");
+        assertApacheFileName("SAI+aa+myIndex+CompressedVectors.db", IndexComponentType.PQ, "myIndex");
+        assertApacheFileName("SAI+aa+my_index+TermsData.db", IndexComponentType.TERMS_DATA, "my_index");
+
+        // our names for the components Apache names differently aren't Apache's
+        assertThat(Version.tryParseFileName("nb-1-big-SAI+aa+PKBlocks.db")).isEmpty();
+        assertThat(Version.tryParseFileName("nb-1-big-SAI+aa+myIndex+KDTree.db")).isEmpty();
+        // nor are generations
+        assertThat(Version.tryParseFileName("nb-1-big-SAI+aa+1+myIndex+Meta.db")).isEmpty();
+
+        for (Version version : Version.ALL)
+        {
+            for (IndexComponentType type : new IndexComponentType[]{ IndexComponentType.GROUP_COMPLETION_MARKER, IndexComponentType.META })
+            {
+                String name = "nb-1-big-" + version.fileNameFormatter().format(type, type == IndexComponentType.META ? "myIndex" : null, 0);
+                assertFalse(name, Version.isApacheComponentFileName(name));
+                assertThat(Version.tryParseFileName(name).get().buildId.version()).as(name).isEqualTo(version);
+            }
+        }
+        assertFalse(Version.isApacheComponentFileName("nb-1-big-Data.db"));
+    }
+
+    @Test
+    public void testApacheFileNamesIgnoredWhenNotReadingApacheFormat()
+    {
+        try (WithProperties properties = new WithProperties().set(CassandraRelevantProperties.SAI_READ_APACHE_FORMAT, false))
+        {
+            for (String name : new String[]{ "nb-1-big-SAI+aa+GroupComplete.db", "nb-1-big-SAI+aa+myIndex+Meta.db" })
+            {
+                assertThat(Version.tryParseFileName(name)).as(name).isEmpty();
+                assertTrue(name, Version.isApacheComponentFileName(name));
+            }
+        }
+    }
+
+    @Test
+    public void testApacheVersion()
+    {
+        assertEquals("aa", Version.APACHE_AA.versionString());
+        assertEquals("aa(apache)", Version.APACHE_AA.toString());
+        assertEquals("aa", Version.AA.toString());
+        assertEquals("aa(apache)@0", ComponentsBuildId.of(Version.APACHE_AA, 0).toString());
+        assertTrue(Version.APACHE_AA.isApache());
+        assertFalse(Version.AA.isApache());
+        assertThat(Version.APACHE_AA).isNotEqualTo(Version.AA);
+        assertThat(Version.ALL).doesNotContain(Version.APACHE_AA);
+        assertEquals(Version.AA, Version.parse("aa"));
+        assertThat(ComponentsBuildId.of(Version.APACHE_AA, 0)).isNotEqualTo(ComponentsBuildId.of(Version.AA, 0));
+
+        // ordered before all our versions, consistently
+        for (Version version : Version.ALL)
+        {
+            assertTrue(version.after(Version.APACHE_AA));
+            assertFalse(Version.APACHE_AA.onOrAfter(version));
+            assertThat(Version.APACHE_AA.compareTo(version)).isNegative();
+            assertThat(version.compareTo(Version.APACHE_AA)).isPositive();
+            assertThat(ComponentsBuildId.of(version, 0).compareTo(ComponentsBuildId.of(Version.APACHE_AA, 0))).isPositive();
+            assertThat(ComponentsBuildId.of(Version.APACHE_AA, 0).compareTo(ComponentsBuildId.of(version, 0))).isNegative();
+        }
+        assertEquals(0, Version.APACHE_AA.compareTo(Version.APACHE_AA));
+        assertEquals(ByteComparable.Version.OSS50, Version.APACHE_AA.byteComparableVersionFor(IndexComponentType.PARTITION_KEY_BLOCKS, null));
+
+        assertThatThrownBy(() -> Version.APACHE_AA.fileNameFormatter().format(IndexComponentType.META, "myIndex", 1)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> Version.APACHE_AA.fileNameFormatter().format(IndexComponentType.KD_TREE, "myIndex", 0)).isInstanceOf(IllegalArgumentException.class);
+    }
+
+    private void assertApacheFileName(String name, IndexComponentType componentType, @Nullable String indexName)
+    {
+        assertTrue(name, Version.isApacheComponentFileName(name));
+        Version.ParsedFileName parsed = Version.tryParseFileName(name).orElseThrow(() -> new AssertionError(name));
+        assertEquals(ComponentsBuildId.of(Version.APACHE_AA, 0), parsed.buildId);
+        assertEquals(componentType, parsed.component);
+        assertEquals(indexName, parsed.indexName);
+
+        // and back
+        String componentPart = name.substring(name.lastIndexOf('-') + 1);
+        assertEquals(componentPart, Version.APACHE_AA.fileNameFormatter().format(componentType, indexName, 0));
     }
 
     private void assertFileFormatting(String componentStr, Version version, int generation, IndexComponentType componentType, @Nullable String indexName)

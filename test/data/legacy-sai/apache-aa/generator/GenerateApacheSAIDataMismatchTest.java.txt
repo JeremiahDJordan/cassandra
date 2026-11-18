@@ -1,0 +1,72 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.stream.Stream;
+
+import org.junit.Test;
+
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+
+public class GenerateApacheSAIDataMismatchTest extends SAITester
+{
+    @Test
+    public void generate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, v int, x text)");
+        disableCompaction();
+        createIndex("CREATE INDEX mismatch_s ON %s(s) USING 'sai'");
+        List<Integer> keys = new ArrayList<>();
+        for (int i = 0; i < 10; i++)
+            keys.add(i);
+        keys.sort(Comparator.comparing(i -> Murmur3Partitioner.instance.decorateKey(Int32Type.instance.decompose(i))));
+        execute("DELETE s FROM %s USING TIMESTAMP 2000 WHERE pk=?", keys.get(0));
+        for (int n = 1; n < keys.size(); n++)
+        {
+            if (n == 1 || n == 2)
+                execute("INSERT INTO %s (pk,s,v) VALUES (?,'match',1) USING TIMESTAMP 1000", keys.get(n));
+            else
+                execute("INSERT INTO %s (pk,v) VALUES (?,1) USING TIMESTAMP 1000", keys.get(n));
+        }
+        flush();
+
+        Path out = Paths.get("/tmp/apache-sai-gen/data/mismatch");
+        Files.createDirectories(out);
+        for (SSTableReader s : getCurrentColumnFamilyStore().getLiveSSTables())
+        {
+            Path data = s.descriptor.fileFor(SSTableFormat.Components.DATA).toPath();
+            String prefix = data.getFileName().toString().replace("Data.db", "");
+            try (Stream<Path> files = Files.list(data.getParent()))
+            {
+                for (Path src : (Iterable<Path>) files.filter(f -> f.getFileName().toString().startsWith(prefix))::iterator)
+                    Files.copy(src, out.resolve(src.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        System.out.println("GENERATED MISMATCH keys=" + keys + " expected=" + keys.subList(1, 3));
+    }
+}

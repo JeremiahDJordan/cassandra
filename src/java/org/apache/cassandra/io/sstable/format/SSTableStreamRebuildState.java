@@ -18,9 +18,16 @@
 
 package org.apache.cassandra.io.sstable.format;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import javax.annotation.concurrent.ThreadSafe;
 
 import com.google.common.annotations.VisibleForTesting;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.apache.cassandra.utils.JVMStabilityInspector;
 
 /**
  * Coordination state between ZCS and SAI index rebuilds for a single logical SSTable.
@@ -31,6 +38,8 @@ import com.google.common.annotations.VisibleForTesting;
 @ThreadSafe
 public class SSTableStreamRebuildState
 {
+    private static final Logger logger = LoggerFactory.getLogger(SSTableStreamRebuildState.class);
+
     public enum State
     {
         NORMAL,
@@ -40,6 +49,8 @@ public class SSTableStreamRebuildState
 
     private State state = State.NORMAL;
     private int zcsStreamCount = 0;
+    // The actions to run when the state is next NORMAL (see runWhenNormal)
+    private List<Runnable> whenNormal = null;
 
     /**
      * Attempt to begin an entire-SSTable stream.
@@ -56,11 +67,17 @@ public class SSTableStreamRebuildState
         return true;
     }
 
-    public synchronized void endStreaming()
+    public void endStreaming()
     {
-        // Return to NORMAL when the last stream ends
-        if (zcsStreamCount > 0 && --zcsStreamCount == 0)
-            state = State.NORMAL;
+        List<Runnable> actions;
+        synchronized (this)
+        {
+            // Return to NORMAL when the last stream ends
+            if (zcsStreamCount > 0 && --zcsStreamCount == 0)
+                state = State.NORMAL;
+            actions = takeActionsIfNormal();
+        }
+        run(actions);
     }
 
     /**
@@ -77,10 +94,61 @@ public class SSTableStreamRebuildState
         return true;
     }
 
-    public synchronized void endRebuild()
+    public void endRebuild()
     {
-        if (state == State.REBUILDING)
-            state = State.NORMAL;
+        List<Runnable> actions;
+        synchronized (this)
+        {
+            if (state == State.REBUILDING)
+                state = State.NORMAL;
+            actions = takeActionsIfNormal();
+        }
+        run(actions);
+    }
+
+    /**
+     * Runs the provided action once neither a stream nor a rebuild holds the SSTable: right away (in the calling
+     * thread) if none does, otherwise when the last one ends, in the thread that ends it. So the action should be
+     * quick, e.g. schedule some work (which may then try to begin a rebuild, like any other).
+     */
+    public void runWhenNormal(Runnable action)
+    {
+        synchronized (this)
+        {
+            if (state != State.NORMAL)
+            {
+                if (whenNormal == null)
+                    whenNormal = new ArrayList<>();
+                whenNormal.add(action);
+                return;
+            }
+        }
+        action.run();
+    }
+
+    private List<Runnable> takeActionsIfNormal()
+    {
+        if (state != State.NORMAL || whenNormal == null)
+            return Collections.emptyList();
+        List<Runnable> actions = whenNormal;
+        whenNormal = null;
+        return actions;
+    }
+
+    private static void run(List<Runnable> actions)
+    {
+        for (Runnable action : actions)
+        {
+            try
+            {
+                action.run();
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                logger.warn("Failed to run an action waiting for the end of the streams and rebuilds of an SSTable", t);
+            }
+        }
     }
 
     public synchronized State state()

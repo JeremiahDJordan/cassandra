@@ -141,7 +141,21 @@ public abstract class IndexComponentDiscovery
                 continue;
 
             var prev = states.computeIfAbsent(indexName, k -> new StateBuilder(parsed.buildId));
-            if (!prev.buildId.equals(parsed.buildId))
+            if (!prev.buildId.equals(parsed.buildId) && prev.buildId.version().isApache() != parsed.buildId.version().isApache())
+            {
+                // The TOC lists both Apache's and our components of the group: we stopped while replacing Apache's,
+                // so use ours.
+                if (prev.buildId.version().isApache())
+                {
+                    prev = new StateBuilder(parsed.buildId);
+                    states.put(indexName, prev);
+                }
+                else
+                {
+                    continue;
+                }
+            }
+            else if (!prev.buildId.equals(parsed.buildId))
             {
                 logger.error("Found multiple versions/generations of SAI components in TOC for SSTable {}: cannot load {}",
                              descriptor, indexName == null ? "per-SSTable components" : "per-index components of " + indexName);
@@ -185,6 +199,11 @@ public abstract class IndexComponentDiscovery
                 // falling back conservatively feels reasonable.
                 if (!descriptor.fileFor(component).exists())
                 {
+                    // Apache lists components it may not write (e.g. those of an index without data in the
+                    // sstable): a missing file is a missing component.
+                    if (Version.isApacheComponentFileName(component.name))
+                        continue;
+
                     noSpamLogger.warn("The TOC file for SSTable {} lists SAI component {} but it doesn't exists. Assuming the TOC is corrupted somehow and falling back on disk scanning (which may be slower)", descriptor, component.name);
                     return null;
                 }

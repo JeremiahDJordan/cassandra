@@ -191,6 +191,16 @@ public class TermsReader implements Closeable
     }
 
     /**
+     * Range query that keeps the terms of the range accepted by the provided filter, which is given the bytes of each
+     * term as stored in the terms dictionary. A {@code null} bound is unbounded.
+     */
+    public PostingList filteredRangeMatch(Predicate<byte[]> termFilter, ByteComparable lower, ByteComparable upper, QueryEventListener.TrieIndexEventListener perQueryEventListener, QueryContext context)
+    {
+        perQueryEventListener.onSegmentHit();
+        return new RangeQuery(termFilter, lower, upper, false, perQueryEventListener, context).execute();
+    }
+
+    /**
      * Range query for scans whose only possible over-match is a term exactly equal to the upper bound: the end
      * bound of the trie scan is always inclusive, so instead of collecting and post-filtering every matched term
      * (see {@link #rangeMatch}), the postings of the single term equal to {@code upper}, if that term exists, are
@@ -335,7 +345,8 @@ public class TermsReader implements Closeable
         {
             PostingsReader.BlocksSummary header = new PostingsReader.BlocksSummary(postingsSummaryInput, offset);
 
-            return new PostingsReader(postingsInput, header, readFrequencies(), listener.postingListEventListener());
+            return new PostingsReader(postingsInput, header, readFrequencies(), listener.postingListEventListener(),
+                                      version.isApache());
         }
     }
 
@@ -498,7 +509,8 @@ public class TermsReader implements Closeable
                                       blocksSummary,
                                       readFrequencies(),
                                       listener.postingListEventListener(),
-                                      PostingsReader.InputCloser.NOOP);
+                                      PostingsReader.InputCloser.NOOP,
+                                      version.isApache());
         }
     }
 
@@ -548,7 +560,7 @@ public class TermsReader implements Closeable
         {
             assert entry != null;
             var blockSummary = new PostingsReader.BlocksSummary(postingsSummaryInput, entry.right, PostingsReader.InputCloser.NOOP);
-            return new ScanningPostingsReader(postingsInput, blockSummary, readFrequencies());
+            return new ScanningPostingsReader(postingsInput, blockSummary, readFrequencies(), version.isApache());
         }
 
         @Override
@@ -664,7 +676,7 @@ public class TermsReader implements Closeable
     {
         private ReverseTermsScanner()
         {
-            super(new ReverseTrieTermsDictionaryReader(termDictionaryFile.instantiateRebufferer(null, ReadPattern.SEQUENTIAL), termDictionaryRoot), null);
+            super(new ReverseTrieTermsDictionaryReader(termDictionaryFile.instantiateRebufferer(null, ReadPattern.SEQUENTIAL), termDictionaryRoot, termDictionaryFileEncodingVersion), null);
         }
 
         private ReverseTermsScanner(byte[] prefix, @Nullable CompiledAutomaton automaton)

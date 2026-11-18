@@ -56,7 +56,8 @@ public class MetadataSource
     private static MetadataSource load(ChecksumIndexInput input, Version expectedVersion, ByteOrder order) throws IOException
     {
         Map<String, Supplier<ByteArrayIndexInput>> components = new HashMap<>();
-        Version version = SAICodecUtils.checkHeader(input);
+        Version version = expectedVersion.isApache() ? SAICodecUtils.checkHeader(input, expectedVersion)
+                                                     : SAICodecUtils.checkHeader(input);
         if (version != expectedVersion)
             throw new IllegalStateException("Unexpected version " + version + " in " + input + ", expected " + expectedVersion);
 

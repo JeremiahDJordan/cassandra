@@ -36,6 +36,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SSTableContext;
+import org.apache.cassandra.index.sai.disk.apache.ApacheSegmentMetadata;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.ModernResettableByteBuffersIndexOutput;
 import org.apache.cassandra.index.sai.disk.PostingList;
@@ -115,18 +116,18 @@ public class SegmentMetadata implements Comparable<SegmentMetadata>
      */
     public final ComponentMetadataMap componentMetadatas;
 
-    SegmentMetadata(long segmentRowIdOffset,
-                    long numRows,
-                    long minSSTableRowId,
-                    long maxSSTableRowId,
-                    PrimaryKey minKey,
-                    PrimaryKey maxKey,
-                    ByteBuffer minTerm,
-                    ByteBuffer maxTerm,
-                    TermsDistribution termsDistribution,
-                    ComponentMetadataMap componentMetadatas,
-                    long totalTermCount,
-                    Version version)
+    public SegmentMetadata(long segmentRowIdOffset,
+                           long numRows,
+                           long minSSTableRowId,
+                           long maxSSTableRowId,
+                           PrimaryKey minKey,
+                           PrimaryKey maxKey,
+                           ByteBuffer minTerm,
+                           ByteBuffer maxTerm,
+                           TermsDistribution termsDistribution,
+                           ComponentMetadataMap componentMetadatas,
+                           long totalTermCount,
+                           Version version)
     {
         // numRows can exceed Integer.MAX_VALUE because it is the count of unique term and segmentRowId pairs.
         Objects.requireNonNull(minKey);
@@ -270,6 +271,9 @@ public class SegmentMetadata implements Comparable<SegmentMetadata>
      */
     private static List<SegmentMetadata> load(MetadataSource source, IndexContext context, SSTableContext sstableContext, boolean loadFullResolutionBounds) throws IOException
     {
+        // Apache Cassandra's segment metadata has its own layout.
+        if (source.getVersion().isApache())
+            return ApacheSegmentMetadata.load(source, context, loadFullResolutionBounds ? sstableContext : null);
 
         IndexInput input = source.get(NAME);
 

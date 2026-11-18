@@ -35,7 +35,12 @@ public class ReverseTrieTermsDictionaryReader extends ReverseValueIterator<Rever
 {
     public ReverseTrieTermsDictionaryReader(Rebufferer rebufferer, long root)
     {
-        super(rebufferer, root, true, TypeUtil.BYTE_COMPARABLE_VERSION);
+        this(rebufferer, root, TypeUtil.BYTE_COMPARABLE_VERSION);
+    }
+
+    public ReverseTrieTermsDictionaryReader(Rebufferer rebufferer, long root, ByteComparable.Version version)
+    {
+        super(rebufferer, root, true, version);
     }
 
     /**

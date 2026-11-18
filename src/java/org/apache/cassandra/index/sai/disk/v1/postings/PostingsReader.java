@@ -71,6 +71,9 @@ public class PostingsReader implements OrdinalPostingList
     private int postingsDecoded = 0;
     private int currentFrequency = Integer.MIN_VALUE;
     private final boolean readFrequencies;
+    // Apache Cassandra's postings start their first block with the first posting (and deltas from it), ours with
+    // the delta from 0.
+    private final boolean firstPostingBeforeFirstBlock;
 
     @VisibleForTesting
     public PostingsReader(IndexInput input, long summaryOffset, QueryEventListener.PostingListEventListener listener) throws IOException
@@ -94,6 +97,11 @@ public class PostingsReader implements OrdinalPostingList
 
     public PostingsReader(IndexInput input, BlocksSummary summary, boolean readFrequencies, QueryEventListener.PostingListEventListener listener) throws IOException
     {
+        this(input, summary, readFrequencies, listener, false);
+    }
+
+    public PostingsReader(IndexInput input, BlocksSummary summary, boolean readFrequencies, QueryEventListener.PostingListEventListener listener, boolean firstPostingBeforeFirstBlock) throws IOException
+    {
         this(input, summary, readFrequencies, listener, () -> {
             try
             {
@@ -103,13 +111,25 @@ public class PostingsReader implements OrdinalPostingList
             {
                 summary.close();
             }
-        });
+        }, firstPostingBeforeFirstBlock);
     }
 
     public PostingsReader(IndexInput input, BlocksSummary summary, boolean readFrequencies, QueryEventListener.PostingListEventListener listener, InputCloser runOnClose) throws IOException
     {
+        this(input, summary, readFrequencies, listener, runOnClose, false);
+    }
+
+    public PostingsReader(IndexInput input,
+                          BlocksSummary summary,
+                          boolean readFrequencies,
+                          QueryEventListener.PostingListEventListener listener,
+                          InputCloser runOnClose,
+                          boolean firstPostingBeforeFirstBlock) throws IOException
+    {
         assert input instanceof IndexInputReader;
+        assert !(readFrequencies && firstPostingBeforeFirstBlock) : "Apache Cassandra postings have no frequencies";
         logger.trace("Opening postings reader for {}", input);
+        this.firstPostingBeforeFirstBlock = firstPostingBeforeFirstBlock;
         this.readFrequencies = readFrequencies;
         this.input = input;
         this.seekingInput = new SeekingRandomAccessInput(input);
@@ -427,6 +447,9 @@ public class PostingsReader implements OrdinalPostingList
 
     private void readFoRBlock(IndexInput in) throws IOException
     {
+        if (firstPostingBeforeFirstBlock && postingsBlockIdx == 0)
+            actualSegmentRowId = Math.toIntExact(in.readVLong());
+
         final byte bitsPerValue = in.readByte();
 
         currentPosition = in.getFilePointer();

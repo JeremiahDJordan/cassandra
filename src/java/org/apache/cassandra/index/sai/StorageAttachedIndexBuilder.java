@@ -31,6 +31,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 
 import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.utils.Clock;
@@ -59,6 +60,7 @@ import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.CountDownLatch;
 import org.apache.cassandra.utils.concurrent.Ref;
@@ -79,6 +81,18 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     // make sure only one builder can write to per sstable files when multiple storage-attached indexes are created simultaneously.
     private static final Map<SSTableReader, CountDownLatch> inProgress = Maps.newConcurrentMap();
 
+    // Held by a build that rebuilds every index of an SSTable (Apache components replaced, see withAllIndexes) until
+    // it has published them; the other builders of the SSTable wait.
+    private static final Map<SSTableReader, CountDownLatch> rebuildingAllIndexes = Maps.newConcurrentMap();
+
+    /**
+     * @return whether a build is replacing the components written by Apache Cassandra of the provided SSTable
+     */
+    static boolean isRebuildingAllIndexesOf(SSTableReader sstable)
+    {
+        return rebuildingAllIndexes.containsKey(sstable);
+    }
+
     private final StorageAttachedIndexGroup group;
     private final TableMetadata metadata;
     private final Tracker tracker;
@@ -90,6 +104,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     private final Set<SSTableReader> outstandingReservations;
 
     private final SortedMap<SSTableReader, Set<StorageAttachedIndex>> sstables;
+
+    // Whether the build of the current sstable has registered its components (see completeSSTable).
+    private boolean registered;
 
     private long bytesProcessed = 0;
     private final long totalSizeInBytes;
@@ -202,11 +219,55 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         IndexDescriptor indexDescriptor = group.descriptorFor(sstable);
 
         Set<Component> replacedComponents = new HashSet<>();
+        // the indexes we were asked to build, without the ones we also rebuild with them (see withAllIndexes)
+        Set<StorageAttachedIndex> requestedIndexes = indexes;
+        CountDownLatch replacingApache = null;
+        registered = false;
+        boolean succeeded = false;
 
         try (RandomAccessReader dataFile = sstable.openDataReader(ReadPattern.SEQUENTIAL);
              LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.INDEX_BUILD, sstable))
         {
-            perSSTableFileLock = shouldWritePerSSTableFiles(sstable, indexDescriptor, replacedComponents);
+            while (true)
+            {
+                if (isStopRequested())
+                    throw new CompactionInterruptedException(getProgress(), trigger());
+
+                // Another builder is replacing the Apache Cassandra components of this SSTable, along with every index
+                // that uses them (see below). Building any of those indexes at the same time would write the same
+                // files, so we wait until it has published its components, and build on its result.
+                CountDownLatch replacing = rebuildingAllIndexes.get(sstable);
+                if (replacing != null)
+                {
+                    replacing.await(100, TimeUnit.MILLISECONDS);
+                    continue;
+                }
+
+                indexDescriptor = group.descriptorFor(sstable);
+                perSSTableFileLock = shouldWritePerSSTableFiles(sstable, indexDescriptor, replacedComponents);
+                if (perSSTableFileLock != null && hasApacheComponents(indexDescriptor.perSSTableComponents()))
+                {
+                    replacingApache = CountDownLatch.newCountDownLatch(1);
+                    rebuildingAllIndexes.put(sstable, replacingApache);
+                }
+                // Either we write the per-SSTable components, or they are ours (complete, or being written by
+                // another builder, as usual). Otherwise, another builder has just got the latch to replace the
+                // Apache Cassandra components, and is about to say so above.
+                if (perSSTableFileLock != null || !hasApacheComponents(indexDescriptor.perSSTableComponents()))
+                    break;
+                Thread.sleep(10);
+            }
+            if (replacingApache != null)
+            {
+                // The per-SSTable components were written by Apache Cassandra, and we're replacing them with ours, so
+                // no index can use its current components on this sstable afterwards: rebuild all of them. The Apache
+                // files are removed once the build is complete (see StorageAttachedIndexGroup#removeApacheComponents).
+                indexes = withAllIndexes(indexes, indexDescriptor, "Apache Cassandra components are replaced");
+                Set<StorageAttachedIndex> others = Sets.difference(indexes, requestedIndexes);
+                if (!others.isEmpty())
+                    SSTableWatcher.instance.onIndexBuild(sstable, others);
+            }
+
             // If we were unable to get the per-SSTable file lock it means that the
             // per-SSTable components are already being built so we only want to
             // build the per-index components
@@ -218,7 +279,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             }
 
             long keyCount = SSTableReader.getApproximateKeyCount(Set.of(sstable));
-            indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes, txn, keyCount, perIndexComponentsOnly, group.table().metric);
+            // If the build fails, only the indexes we were asked to build become non-queryable: the others keep using
+            // the Apache Cassandra components, which are only removed once the build has succeeded.
+            indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes, requestedIndexes, txn, keyCount, perIndexComponentsOnly, group.table().metric);
 
             indexWriter.begin();
 
@@ -256,12 +319,13 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                     previousBytesRead = bytesRead;
                 }
 
-                completeSSTable(txn, indexWriter, indexDescriptor, sstable, indexes, perSSTableFileLock, replacedComponents);
+                completeSSTable(txn, indexWriter, indexDescriptor, sstable, requestedIndexes, indexes, perSSTableFileLock, replacedComponents);
             }
             long timeTaken = Clock.Global.nanoTime() - startTimeNanos;
             group.table().metric.updateStorageAttachedIndexBuildTime(timeTaken);
             logger.trace("Completed indexing sstable {} in {} seconds", sstable.descriptor, TimeUnit.NANOSECONDS.toSeconds(timeTaken));
 
+            succeeded = true;
             return false;
         }
         catch (Throwable t)
@@ -299,12 +363,21 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         }
         finally
         {
+            // A build that replaces the Apache Cassandra components and fails before registering ours leaves them as
+            // they were, so that their indexes keep using them, and the next build replaces them all again.
+            if (replacingApache != null && !succeeded && !registered)
+                restoreApacheComponents(sstable, indexDescriptor, indexes);
             ref.release();
             // release current lock in case of error
             if (perSSTableFileLock != null)
             {
                 inProgress.remove(sstable);
                 perSSTableFileLock.decrement();
+            }
+            if (replacingApache != null)
+            {
+                rebuildingAllIndexes.remove(sstable);
+                replacingApache.decrement();
             }
         }
     }
@@ -326,8 +399,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
      */
     private CountDownLatch shouldWritePerSSTableFiles(SSTableReader sstable, IndexDescriptor indexDescriptor, Set<Component> replacedComponents)
     {
-        // if per-table files are incomplete or checksum failed during full rebuild.
-        if (!indexDescriptor.perSSTableComponents().isComplete() || isFullRebuild)
+        // if per-table files are incomplete or checksum failed during full rebuild, or if they were written by Apache
+        // Cassandra (we never write new components in that format, see IndexDescriptor#versionForNewComponents).
+        if (!indexDescriptor.perSSTableComponents().isComplete() || isFullRebuild || hasApacheComponents(indexDescriptor.perSSTableComponents()))
         {
             CountDownLatch latch = CountDownLatch.newCountDownLatch(1);
             if (inProgress.putIfAbsent(sstable, latch) == null)
@@ -355,6 +429,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
     private static void prepareForRebuild(IndexComponents.ForRead components, Set<Component> replacedComponents)
     {
+        // Apache Cassandra's components are never overwritten (we write other file names), and they are streamable,
+        // so they stay in the TOC and on disk until the build is complete, and StorageAttachedIndexGroup#removeApacheComponents removes them.
+        if (components.version().isApache())
+            return;
+
         // The current components are "replaced" (by "other" components) if the build create different components than
         // the existing ones. This will happen in the following cases:
         // 1. if we use immutable components, that's the point of immutable components.
@@ -388,6 +467,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                                  StorageAttachedIndexWriter indexWriter,
                                  IndexDescriptor indexDescriptor,
                                  SSTableReader sstable,
+                                 Set<StorageAttachedIndex> requestedIndexes,
                                  Set<StorageAttachedIndex> indexes,
                                  CountDownLatch latch,
                                  Set<Component> replacedComponents) throws InterruptedException
@@ -410,7 +490,19 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 latch.await();
         }
 
-        Set<StorageAttachedIndex> existing = validateIndexes(indexes, sstable.descriptor);
+        // A full rebuild stops if one of the indexes it was asked to build was dropped (see validateIndexes), but the
+        // indexes we also built because they used the Apache Cassandra components we replace (see withAllIndexes)
+        // can be dropped meanwhile: we just drop what we built for them.
+        Set<StorageAttachedIndex> existing = validateIndexes(requestedIndexes, sstable.descriptor);
+        for (StorageAttachedIndex index : indexes)
+        {
+            if (requestedIndexes.contains(index))
+                continue;
+            if (group.containsIndex(index))
+                existing.add(index);
+            else
+                indexDescriptor.perIndexComponents(index.getIndexContext()).forWrite().forceDeleteAllComponents();
+        }
         if (existing.isEmpty())
         {
             logger.debug(logMessage("{} dropped during index build"), indexes);
@@ -420,22 +512,36 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         // Register components from the descriptor that owns the writers. The context cache may have been
         // evicted before this point, and a reader lookup would reconstruct a descriptor from the pre-build TOC.
         sstable.registerComponents(group.activeComponents(indexDescriptor), tracker);
-        if (!replacedComponents.isEmpty())
-            sstable.unregisterComponents(replacedComponents, tracker);
+        registered = true;
+        Set<StorageAttachedIndex> incomplete;
+        try
+        {
+            if (!replacedComponents.isEmpty())
+                sstable.unregisterComponents(replacedComponents, tracker);
+            // Our components replace any Apache Cassandra ones now (see withAllIndexes).
+            group.removeApacheComponents(sstable, outstandingReservations.contains(sstable));
 
-        /**
-         * During memtable flush, it completes the transaction first which opens the flushed sstable,
-         * and then notify the new sstable to SAI. Here we should do the same.
-         */
-        txn.trackNewAttachedIndexFiles(sstable);
-        // there is nothing to commit. Close() effectively abort the transaction.
-        txn.close();
+            /**
+             * During memtable flush, it completes the transaction first which opens the flushed sstable,
+             * and then notify the new sstable to SAI. Here we should do the same.
+             */
+            txn.trackNewAttachedIndexFiles(sstable);
+            // there is nothing to commit. Close() effectively abort the transaction.
+            txn.close();
 
-        // A streamed or imported SSTable that isn't live yet joins the index views only once it is added to the table
-        if (!tracker.getView().liveSSTables().contains(sstable))
-            return;
+            // A streamed or imported SSTable that isn't live yet joins the index views only once it is added to the table
+            if (!tracker.getView().liveSSTables().contains(sstable))
+                return;
 
-        Set<StorageAttachedIndex> incomplete = group.onSSTableChanged(Collections.emptyList(), Collections.singleton(sstable), existing, false);
+            incomplete = group.onSSTableChanged(Collections.emptyList(), Collections.singleton(sstable), existing, false);
+        }
+        catch (Throwable t)
+        {
+            // Our components are registered, and may have replaced Apache Cassandra ones that the other indexes we
+            // built used, so none of them can be trusted anymore.
+            existing.forEach(StorageAttachedIndex::makeIndexNonQueryable);
+            throw t;
+        }
         if (!incomplete.isEmpty())
         {
             // If this occurs during an initial index build, there is only one index in play, and
@@ -446,6 +552,55 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             // then non-queryable until a restart or other incremental rebuild occurs.
             throw new RuntimeException(logMessage("Failed to update views on column indexes " + incomplete + " on indexes " + indexes + "."));
         }
+    }
+
+    /**
+     * Deletes what a build replacing the Apache Cassandra components of the SSTable wrote before it failed to register
+     * ours, and reloads the descriptor from the TOC, so the indexes keep using the Apache components until the next
+     * build replaces them all.
+     */
+    private void restoreApacheComponents(SSTableReader sstable, IndexDescriptor descriptor, Set<StorageAttachedIndex> indexes)
+    {
+        try
+        {
+            IndexComponents.ForRead perSSTable = descriptor.perSSTableComponents();
+            if (!perSSTable.version().isApache())
+                perSSTable.forWrite().forceDeleteAllComponents();
+            for (StorageAttachedIndex index : indexes)
+            {
+                IndexComponents.ForRead perIndex = descriptor.perIndexComponents(index.getIndexContext());
+                if (!perIndex.version().isApache())
+                    perIndex.forWrite().forceDeleteAllComponents();
+            }
+            descriptor.reload(sstable, group.getIndexes().stream().map(StorageAttachedIndex::getIndexContext).collect(Collectors.toSet()));
+        }
+        catch (Throwable t)
+        {
+            JVMStabilityInspector.inspectThrowable(t);
+            logger.warn(logMessage("Could not restore the Apache Cassandra SAI components of {} after a failed build"), sstable.descriptor, t);
+        }
+    }
+
+    private static boolean hasApacheComponents(IndexComponents.ForRead components)
+    {
+        return components.isComplete() && components.version().isApache();
+    }
+
+    /**
+     * @return the provided indexes, plus all the other indexes of the group, to build on the sstable of the provided
+     * descriptor, whose per-SSTable components are replaced: no index can use its current components on it afterwards
+     */
+    private Set<StorageAttachedIndex> withAllIndexes(Set<StorageAttachedIndex> indexes, IndexDescriptor indexDescriptor,
+                                                     String reason)
+    {
+        Set<StorageAttachedIndex> withAllIndexes = new HashSet<>(indexes);
+        for (StorageAttachedIndex index : group.getIndexes())
+        {
+            if (withAllIndexes.add(index))
+                logger.info(logMessage("Also rebuilding index {} on {}, whose {}"),
+                            index.getIndexContext().getIndexName(), indexDescriptor.descriptor, reason);
+        }
+        return withAllIndexes;
     }
 
     /**

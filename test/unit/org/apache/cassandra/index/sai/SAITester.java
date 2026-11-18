@@ -404,6 +404,21 @@ public class SAITester extends CQLTester
         }
     }
 
+    /**
+     * Flips the bits of the byte in the middle of the file: its header and footer stay valid, its checksum doesn't.
+     */
+    protected static void flipMiddleByte(File file) throws IOException
+    {
+        try (RandomAccessFile raf = new RandomAccessFile(file.toJavaIOFile(), "rw"))
+        {
+            long position = file.length() / 2;
+            raf.seek(position);
+            int b = raf.read();
+            raf.seek(position);
+            raf.write(~b);
+        }
+    }
+
     protected boolean verifyChecksum(IndexContext context)
     {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable());

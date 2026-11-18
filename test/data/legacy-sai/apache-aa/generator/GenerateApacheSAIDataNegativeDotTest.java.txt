@@ -1,0 +1,82 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.index.sai;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.stream.Stream;
+
+import org.junit.Test;
+
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+
+public class GenerateApacheSAIDataNegativeDotTest extends SAITester
+{
+    @Test
+    public void generate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, st set<text>, v int)");
+        disableCompaction();
+        createIndex("CREATE INDEX negative_st ON %s(st) USING 'sai'");
+        execute("INSERT INTO %s (pk, st, v) VALUES (1, {'x'}, 1) USING TIMESTAMP 1000");
+        execute("INSERT INTO %s (pk, st, v) VALUES (2, {'y'}, 1) USING TIMESTAMP 1000");
+        flush();
+        execute("DELETE st FROM %s USING TIMESTAMP 2000 WHERE pk = 1");
+        execute("INSERT INTO %s (pk, st, v) VALUES (3, {'z'}, 1) USING TIMESTAMP 1000");
+        flush();
+        copy("negative");
+
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v vector<float, 8>)");
+        disableCompaction();
+        createIndex("CREATE INDEX dot_v ON %s(v) USING 'sai' WITH OPTIONS = {'similarity_function': 'DOT_PRODUCT'}");
+        Random rnd = new Random(12345);
+        for (int i = 0; i < 4000; i++)
+        {
+            List<Float> v = new ArrayList<>();
+            float magnitude = i < 200 ? 10f : 1f;
+            for (int d = 0; d < 8; d++)
+                v.add((float) rnd.nextGaussian() * magnitude);
+            execute("INSERT INTO %s (pk, v) VALUES (?, ?)", i, vector(v.toArray(new Float[0])));
+        }
+        flush();
+        copy("dot");
+    }
+
+    void copy(String name) throws Exception
+    {
+        Path out = Paths.get("/tmp/apache-sai-gen/data", name);
+        Files.createDirectories(out);
+        for (SSTableReader s : getCurrentColumnFamilyStore().getLiveSSTables())
+        {
+            Path data = s.descriptor.fileFor(SSTableFormat.Components.DATA).toPath();
+            String prefix = data.getFileName().toString().replace("Data.db", "");
+            try (Stream<Path> files = Files.list(data.getParent()))
+            {
+                for (Path src : (Iterable<Path>) files.filter(f -> f.getFileName().toString().startsWith(prefix))::iterator)
+                    Files.copy(src, out.resolve(src.getFileName()), StandardCopyOption.REPLACE_EXISTING);
+            }
+        }
+        System.out.println("GENERATED " + out);
+    }
+}

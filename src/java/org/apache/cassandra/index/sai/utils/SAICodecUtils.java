@@ -126,7 +126,7 @@ public class SAICodecUtils
             {
                 throw new CorruptIndexException("codec header mismatch: actual header=" + actualMagic + " vs expected header=" + CODEC_MAGIC, in);
             }
-            final Version actualVersion = Version.parse(in.readString());
+            final Version actualVersion = parseHeaderVersion(in.readString(), earliest);
             if (!actualVersion.onOrAfter(earliest))
             {
                 throw new IOException("Unsupported version: " + actualVersion);
@@ -144,6 +144,17 @@ public class SAICodecUtils
                 throw th;
             }
         }
+    }
+
+    /**
+     * The header of a file only names its version, and Apache Cassandra 5.0's files say "aa" like our {@link Version#AA}.
+     * Files we expect to be Apache's (from their file name) are therefore {@link Version#APACHE_AA}.
+     */
+    private static Version parseHeaderVersion(String versionString, Version expected)
+    {
+        if (expected.isApache() && versionString.equals(expected.versionString()))
+            return expected;
+        return Version.parse(versionString);
     }
 
     public static long checkFooter(ChecksumIndexInput in) throws IOException

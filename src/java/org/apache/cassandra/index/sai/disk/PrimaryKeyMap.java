@@ -77,6 +77,44 @@ public interface PrimaryKeyMap extends Closeable
     SSTableId<?> getSSTableId();
 
     /**
+     * Identifies the row ids of this map: maps with equal row id spaces give the same row id to the same key.
+     * The SSTable id by default; the components written by Apache Cassandra skip the rows without live data, so they
+     * use {@link ApacheRowIdSpace}.
+     */
+    default Object rowIdSpace()
+    {
+        return getSSTableId();
+    }
+
+    final class ApacheRowIdSpace
+    {
+        private final SSTableId<?> sstableId;
+
+        public ApacheRowIdSpace(SSTableId<?> sstableId)
+        {
+            this.sstableId = sstableId;
+        }
+
+        @Override
+        public boolean equals(Object o)
+        {
+            return o instanceof ApacheRowIdSpace && sstableId.equals(((ApacheRowIdSpace) o).sstableId);
+        }
+
+        @Override
+        public int hashCode()
+        {
+            return sstableId.hashCode() * 31 + 1;
+        }
+
+        @Override
+        public String toString()
+        {
+            return sstableId + "(apache)";
+        }
+    }
+
+    /**
      * Returns a {@link PrimaryKey} for a row ID
      *
      * @param sstableRowId the row Id to lookup

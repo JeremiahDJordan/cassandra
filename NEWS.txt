@@ -250,13 +250,24 @@ Upgrading
       definition: it builds the sstable from the data instead. So the files written for a dropped index, e.g. by a
       flush, compaction or stream that completes after CREATE INDEX of the same name or after a restart, are no longer
       used by a new index of that name and another column or other options. Markers written before the upgrade are
-      empty: their files are used as before. An index created on an existing table (CREATE INDEX) always builds from
-      the table's data: it deletes the files of its name already on the table's sstables, and an entire-sstable stream
-      that is sending those sstables at that time fails. Files written before the upgrade can still be used by an index
-      of the same name and another definition on a node that receives DROP INDEX and CREATE INDEX as one schema change
-      (e.g. it was down), on sstables imported or streamed once it exists, and after a restart that follows a CREATE
-      INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes
-      concerned. Older versions ignore the content of the marker.
+      empty, and the markers of the index files written by Apache Cassandra 5.0 don't hold a definition either: their
+      files are used as before. An index created on an existing table (CREATE INDEX) always builds from the table's
+      data: it deletes the files of its name already on the table's sstables, and an entire-sstable stream that is
+      sending those sstables at that time fails. Files written before the upgrade, or by Apache Cassandra, can still be
+      used by an index of the same name and another definition on a node that receives DROP INDEX and CREATE INDEX as
+      one schema change (e.g. it was down), on sstables imported or streamed once it exists, and after a restart that
+      follows a CREATE INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on
+      the nodes concerned. Older versions ignore the content of the marker.
+    - Storage-attached indexes (SAI) read the index files Apache Cassandra 5.0 wrote (on-disk version "aa", files
+      named SAI+aa+...) instead of rebuilding them: after an in-place upgrade from Apache Cassandra 5.0, the indexes
+      that exist when the node starts use them, as do these indexes for sstables imported (nodetool import) or
+      streamed into the table. CREATE INDEX on an existing table never uses Apache files already on disk, which may be
+      left by a dropped index of the same name: it removes those of its name and builds the index from the data, so
+      importing Apache sstables into a table without indexes and then creating the indexes rebuilds them. Apache files
+      are never written: any index build on an sstable that has them (CREATE INDEX, rebuild_index, a rebuild after
+      corruption) replaces all of them for every index of the table, and compaction writes the current format. DROP
+      INDEX deletes that index's Apache files. -Dcassandra.sai.read_apache_format=false ignores Apache's files, which
+      are then rebuilt like missing ones.
 
 5.0.9
 =====

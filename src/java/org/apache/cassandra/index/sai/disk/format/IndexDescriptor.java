@@ -46,6 +46,7 @@ import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.disk.apache.ApacheOnDiskFormat;
 import org.apache.cassandra.index.sai.disk.io.IndexFileUtils;
 import org.apache.cassandra.index.sai.disk.io.IndexInput;
 import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
@@ -171,7 +172,43 @@ public class IndexDescriptor
     private void initializeIndexes(Set<IndexContext> indices, SSTableIndexComponentsState discovered)
     {
         for (var context : indices)
-            perIndexes.put(context, initializeGroup(context, discovered.perIndexBuild(context.getIndexName())));
+            perIndexes.put(context, initializeGroup(context, usablePerIndexBuild(context, discovered)));
+    }
+
+    /**
+     * The discovered per-index build of the index, or null if it can't be used: a per-index group is usable only if it
+     * is Apache's exactly when the per-sstable group is (their row ids differ), and if Apache's, only if it is readable
+     * and the index uses the Apache components on disk (see {@link IndexContext#usesApacheComponents}).
+     */
+    private @Nullable ComponentsBuildId usablePerIndexBuild(IndexContext context, SSTableIndexComponentsState discovered)
+    {
+        ComponentsBuildId build = discovered.perIndexBuild(context.getIndexName());
+        if (build == null)
+            return null;
+
+        boolean apacheIndex = build.version().isApache();
+        boolean apacheSSTable = perSSTable.isComplete() && perSSTable.version().isApache();
+        if (apacheIndex != apacheSSTable)
+        {
+            logger.info(logMessage("Ignoring the per-index components of {} for SSTable {} ({}): they don't match its per-SSTable components ({}), so the index will be rebuilt"),
+                        context.getIndexName(), descriptor, build, perSSTable.buildId());
+            return null;
+        }
+
+        if (apacheIndex && !context.usesApacheComponents())
+        {
+            logger.info(logMessage("Not using the Apache Cassandra components of {} for SSTable {}: they were on disk before the index was created, so the index will be built"),
+                        context.getIndexName(), descriptor);
+            return null;
+        }
+
+        if (apacheIndex && !ApacheOnDiskFormat.instance.isReadable(context))
+        {
+            logger.info(logMessage("Cannot read the Apache Cassandra components of index {} for SSTable {}, so the index will be rebuilt"),
+                        context.getIndexName(), descriptor);
+            return null;
+        }
+        return build;
     }
 
     private Set<IndexComponentType> expectedComponentsForVersion(Version version, @Nullable IndexContext context)
@@ -305,7 +342,7 @@ public class IndexDescriptor
         Preconditions.checkArgument(sstable.getDescriptor().equals(this.descriptor));
         SSTableIndexComponentsState discovered = IndexComponentDiscovery.instance().discoverComponents(sstable);
         for (var context : indices)
-            perIndexes.computeIfAbsent(context, k -> initializeGroup(context, discovered.perIndexBuild(context.getIndexName())));
+            perIndexes.computeIfAbsent(context, k -> initializeGroup(context, usablePerIndexBuild(context, discovered)));
         return this;
     }
 
@@ -321,11 +358,14 @@ public class IndexDescriptor
     /**
      * Returns the version that should be used for new components for the sstable of this descriptor.
      * It is the version of the per-sstable components, which is either the version of the existing per-sstable
-     * components if any, or the current version if there is no existing components.
+     * components if any, or the current version if there is no existing components or if they were written by
+     * Apache Cassandra (whose format is read-only).
      */
     public Version versionForNewComponents()
     {
-        return perSSTableComponents().version();
+        Version version = perSSTableComponents().version();
+        // We never write Apache Cassandra's format: new components for an sstable that has some replace them.
+        return version.isApache() ? Version.current(descriptor.ksname) : version;
     }
 
     public IndexComponents.ForRead perSSTableComponents()
@@ -513,13 +553,26 @@ public class IndexDescriptor
             Boolean built = builtForDefinition;
             if (built == null)
             {
-                IndexMetadata index = context.getIndexMetadata();
-                byte[] content = index == null ? null : components.get(completionMarkerComponent()).readContent();
-                built = index == null || (content != null && IndexDefinitionDigest.matches(content, index));
-                if (content != null && !built)
-                    logger.info(logMessage("Per-index SAI components of SSTable {} were built for another " +
-                                           "definition of the index and won't be used"),
-                                descriptor);
+                if (buildId.version().isApache())
+                {
+                    // Apache Cassandra's markers don't hold a definition: accepted as those written before the digest
+                    byte[] content = components.get(completionMarkerComponent()).readContent();
+                    built = content != null && IndexDefinitionDigest.isApacheMarker(content);
+                    if (content != null && !built)
+                        logger.warn(logMessage("Per-index SAI components of SSTable {} written by Apache Cassandra have " +
+                                               "an invalid completion marker and won't be used"),
+                                    descriptor);
+                }
+                else
+                {
+                    IndexMetadata index = context.getIndexMetadata();
+                    byte[] content = index == null ? null : components.get(completionMarkerComponent()).readContent();
+                    built = index == null || (content != null && IndexDefinitionDigest.matches(content, index));
+                    if (content != null && !built)
+                        logger.info(logMessage("Per-index SAI components of SSTable {} were built for another " +
+                                               "definition of the index and won't be used"),
+                                    descriptor);
+                }
                 builtForDefinition = built;
             }
             return built;
@@ -831,6 +884,8 @@ public class IndexDescriptor
             {
                 if (buildId.version() == Version.AA)
                     return new EndiannessReverserChecksumIndexInput(indexInput, buildId.version());
+                else if (buildId.version().isApache())
+                    return IndexFileUtils.getBufferedChecksumIndexInput(indexInput, buildId.version()); // CRC32C
                 else
                     return new BufferedChecksumIndexInput(indexInput);
             }

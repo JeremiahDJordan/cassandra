@@ -341,15 +341,15 @@ public class InvertedIndexSearcher extends IndexSearcher
     }
 
     /**
-     * An iterator that iterates over a source
+     * An iterator over the row ids of the postings of each term of a source, with their term.
      */
-    private static class RowIdWithTermsIterator extends AbstractIterator<RowIdWithByteComparable>
+    public static class RowIdWithTermsIterator extends AbstractIterator<RowIdWithByteComparable>
     {
         private final TermsIterator source;
         private PostingList currentPostingList = PostingList.EMPTY;
         private ByteComparable currentTerm = null;
 
-        RowIdWithTermsIterator(TermsIterator source)
+        public RowIdWithTermsIterator(TermsIterator source)
         {
             this.source = source;
         }

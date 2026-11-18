@@ -72,11 +72,24 @@ public class KeyRangeTermIterator extends KeyRangeIterator
         return new KeyRangeTermIterator(rangeIterator, view.sstableIndexes, queryContext);
     }
 
+    private static boolean hasApacheIndex(QueryView view)
+    {
+        for (SSTableIndex index : view.sstableIndexes)
+            if (index.getVersion().isApache())
+                return true;
+        return false;
+    }
+
     private static KeyRangeIterator buildRangeIterator(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer)
     {
         final List<KeyRangeIterator> tokens = new ArrayList<>(1 + view.sstableIndexes.size());
 
-        KeyRangeIterator memtableIterator = e.context.searchMemtable(queryContext, view.memtableIndexes, e, keyRange);
+        // A negation subtracts, per source, the keys matching the negated expression; a row that doesn't match is
+        // still found through a source holding a fragment of it that doesn't match. Apache-written indexes leave out
+        // fragments without live data, so with one of them no source subtracts: the coordinator filters the rows.
+        boolean subtractMatches = e.getOp().isNonEquality() && !hasApacheIndex(view);
+
+        KeyRangeIterator memtableIterator = e.context.searchMemtable(queryContext, view.memtableIndexes, e, keyRange, subtractMatches);
         if (memtableIterator != null)
             tokens.add(memtableIterator);
 
@@ -89,7 +102,7 @@ public class KeyRangeTermIterator extends KeyRangeIterator
                 queryContext.addSstablesHit(1);
                 assert !index.isReleased();
 
-                keyIterator = index.search(e, keyRange, queryContext, defer);
+                keyIterator = index.search(e, keyRange, queryContext, defer, subtractMatches);
 
                 if (keyIterator == null)
                     continue;

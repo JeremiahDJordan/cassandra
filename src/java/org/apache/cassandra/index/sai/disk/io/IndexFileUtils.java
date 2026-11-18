@@ -149,8 +149,8 @@ public class IndexFileUtils
 
     public static Supplier<Checksum> getChecksumFactory(Version version)
     {
-        // TODO Use the version to determine which checksum algorithm to use
-        return LEGACY_CHECKSUM_FACTORY;
+        // Apache Cassandra 5.0 checksums its files with CRC32C (CASSANDRA-18836). All our versions use CRC32.
+        return version.isApache() ? CHECKSUM_FACTORY : LEGACY_CHECKSUM_FACTORY;
     }
 
     public interface ChecksumWriter

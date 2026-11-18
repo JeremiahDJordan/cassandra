@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -40,6 +41,7 @@ import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
@@ -55,6 +57,8 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexerFailures;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
+import org.apache.cassandra.index.sai.disk.apache.ApacheOnDiskFormat;
+import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
@@ -64,11 +68,14 @@ import org.apache.cassandra.index.sai.metrics.TableQueryMetrics;
 import org.apache.cassandra.index.sai.metrics.TableStateMetrics;
 import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
 import org.apache.cassandra.index.transactions.IndexTransaction;
+import org.apache.cassandra.io.FSError;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.SSTableWatcher;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.notifications.INotification;
 import org.apache.cassandra.notifications.INotificationConsumer;
 import org.apache.cassandra.notifications.MemtableDiscardedNotification;
@@ -76,7 +83,9 @@ import org.apache.cassandra.notifications.MemtableRenewedNotification;
 import org.apache.cassandra.notifications.SSTableAddedNotification;
 import org.apache.cassandra.notifications.SSTableListChangedNotification;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.lucene.index.CorruptIndexException;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_TABLE_STATE_METRICS_ENABLED;
@@ -411,6 +420,14 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     public synchronized Set<StorageAttachedIndex> onSSTableChanged(Collection<SSTableReader> removed, Iterable<SSTableReader> added,
                                                             Set<StorageAttachedIndex> indexes, boolean validate)
     {
+        // An SSTable can still list Apache Cassandra components that our components have replaced, if they couldn't
+        // be removed then (e.g. a stream held the SSTable, and we restarted since).
+        for (SSTableReader sstable : added)
+        {
+            if (!apacheComponents(sstable).isEmpty())
+                ScheduledExecutors.optionalTasks.execute(() -> removeReplacedApacheComponents(sstable));
+        }
+
         Optional<Set<SSTableContext>> optValid = contextManager.update(removed, added, validate, indices);
         if (optValid.isEmpty())
         {
@@ -433,6 +450,265 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             }
         }
         return incomplete;
+    }
+
+    /**
+     * Removes the SAI components written by Apache Cassandra 5.0 that the provided SSTable lists, once our components
+     * have replaced them (see {@link StorageAttachedIndexBuilder}): unregisters them from the TOC, then deletes them.
+     * They are streamable, so this runs under the SSTable's stream/rebuild reservation (CASSANDRA-21520), which the
+     * caller may already hold; without it, the removal is retried once no stream or rebuild holds the SSTable.
+     *
+     * @param reserved whether the caller holds the stream/rebuild reservation of the SSTable
+     */
+    void removeApacheComponents(SSTableReader sstable, boolean reserved)
+    {
+        Set<Component> apacheComponents = apacheComponents(sstable);
+        if (apacheComponents.isEmpty())
+            return;
+
+        if (!reserved && !sstable.streamRebuildState().tryBeginRebuild())
+        {
+            logger.debug(logMessage("Not removing the Apache Cassandra SAI components of {} while it is " +
+                                    "being streamed or rebuilt; will retry when it is not"),
+                         sstable.descriptor);
+            sstable.streamRebuildState().runWhenNormal(() -> ScheduledExecutors.optionalTasks.execute(() -> removeReplacedApacheComponents(sstable)));
+            return;
+        }
+
+        try
+        {
+            sstable.unregisterComponents(apacheComponents, baseCfs.getTracker());
+            // Apache Cassandra also writes a PartitionToSize component for tables without clustering columns, but
+            // doesn't list it in the TOC.
+            if (!baseCfs.metadata().hasClustering())
+                apacheComponents.add(new Component(SSTableFormat.Components.Types.CUSTOM,
+                                                   ApacheOnDiskFormat.fileNameFormat(IndexComponentType.PARTITION_TO_SIZE, null, 0)));
+            // Another removal may have deleted them already, which is fine.
+            deleteFiles(sstable, apacheComponents);
+            logger.debug(logMessage("Removed the Apache Cassandra SAI components of {}"), sstable.descriptor);
+        }
+        finally
+        {
+            if (!reserved)
+                sstable.streamRebuildState().endRebuild();
+        }
+    }
+
+    /**
+     * Removes the Apache Cassandra components of the provided SSTable if it is live and its TOC lists our complete
+     * per-SSTable components, which replaced them (see {@link #removeApacheComponents}). Otherwise, they are either
+     * still used, or the build that replaces them removes them. The TOC, not the cached descriptor, says so: a build
+     * links our components to the descriptor as soon as it writes them, before registering them, and may still fail.
+     * SSTables being replaced (see {@link StorageAttachedIndexBuilder#isRebuildingAllIndexesOf}) are left to the
+     * build that replaces them.
+     */
+    private void removeReplacedApacheComponents(SSTableReader sstable)
+    {
+        Ref<? extends SSTableReader> ref = sstable.tryRef();
+        if (ref == null)
+            return; // gone
+        try
+        {
+            if (apacheComponents(sstable).isEmpty()
+                || sstable.isMarkedCompacted()
+                || !baseCfs.getLiveSSTables().contains(sstable)
+                || indices.isEmpty()
+                || StorageAttachedIndexBuilder.isRebuildingAllIndexesOf(sstable)
+                || !hasRegisteredPerSSTableComponents(sstable))
+                return;
+            removeApacheComponents(sstable, false);
+        }
+        catch (Throwable t)
+        {
+            JVMStabilityInspector.inspectThrowable(t);
+            logger.warn(logMessage("Failed to remove the replaced Apache Cassandra SAI components of {}"), sstable.descriptor, t);
+        }
+        finally
+        {
+            ref.release();
+        }
+    }
+
+    /**
+     * @return whether the TOC of the provided SSTable lists the completion marker of per-SSTable components of ours
+     */
+    private static boolean hasRegisteredPerSSTableComponents(SSTableReader sstable)
+    {
+        for (Component component : sstable.components())
+        {
+            Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(component.name);
+            if (parsed.isPresent()
+                && parsed.get().indexName == null
+                && parsed.get().component == IndexComponentType.GROUP_COMPLETION_MARKER
+                && !parsed.get().buildId.version().isApache())
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * Removes the components written by Apache Cassandra for the provided dropped index from every live SSTable of the
+     * table: unregisters them from the TOC right away, so that no index adopts them, and deletes them under the
+     * SSTable's stream/rebuild reservation (see {@link #deleteFilesWhenNotStreamed}). DROP INDEX only cleans up the
+     * SSTables in the index's view, which misses them while the index is rebuilt or after a failed build.
+     */
+    static void removeApacheIndexComponents(ColumnFamilyStore cfs, String indexName)
+    {
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+        {
+            Set<Component> components = apacheIndexComponents(sstable, indexName);
+            if (components.isEmpty())
+                continue;
+            Ref<? extends SSTableReader> ref = sstable.tryRef();
+            if (ref == null)
+                continue;
+            try
+            {
+                sstable.unregisterComponents(components, cfs.getTracker());
+                logger.debug("[{}.{}.{}] Unregistered the Apache Cassandra SAI components of the dropped index from {}",
+                             cfs.getKeyspaceName(), cfs.name, indexName, sstable.descriptor);
+                deleteFilesWhenNotStreamed(sstable, components);
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                logger.warn("[{}.{}.{}] Failed to remove the Apache Cassandra SAI components of the dropped index from {}",
+                            cfs.getKeyspaceName(), cfs.name, indexName, sstable.descriptor, t);
+            }
+            finally
+            {
+                ref.release();
+            }
+        }
+    }
+
+    /**
+     * Discards the components written by Apache Cassandra for the provided index name from every live SSTable of the
+     * table, for an index of that name added to it: found from the TOC and the files on disk, unregistered and deleted
+     * right away, even if the TOC can't be rewritten, as {@link StorageAttachedIndex#onAddedToExistingTable} does for
+     * our components.
+     *
+     * @param sstables the live SSTables of the table
+     * @param filesOnDisk the names of the SAI component files on disk of those SSTables
+     * @return false if the completion marker of such components is still on disk on an SSTable
+     */
+    static boolean discardApacheIndexComponents(ColumnFamilyStore cfs, String indexName,
+                                                Collection<SSTableReader> sstables,
+                                                Map<SSTableReader, Set<String>> filesOnDisk)
+    {
+        String prefix = Version.APACHE_COMPONENT_PREFIX + indexName + Version.SAI_SEPARATOR;
+        boolean discarded = true;
+        for (SSTableReader sstable : sstables)
+        {
+            Set<Component> listed = apacheIndexComponents(sstable, indexName);
+            Set<Component> components = new HashSet<>(listed);
+            for (String file : filesOnDisk.getOrDefault(sstable, Collections.emptySet()))
+                if (file.startsWith(prefix))
+                    components.add(new Component(SSTableFormat.Components.Types.CUSTOM, file));
+            if (components.isEmpty())
+                continue;
+            Ref<? extends SSTableReader> ref = sstable.tryRef();
+            if (ref == null)
+                continue;
+            try
+            {
+                try
+                {
+                    if (!listed.isEmpty())
+                        sstable.unregisterComponents(listed, cfs.getTracker());
+                }
+                catch (Throwable t)
+                {
+                    JVMStabilityInspector.inspectThrowable(t);
+                    logger.warn("[{}.{}.{}] Failed to unregister the Apache Cassandra SAI components of an index " +
+                                "of the same name from {}. Deleting their files.",
+                                cfs.getKeyspaceName(), cfs.name, indexName, sstable.descriptor, t);
+                }
+                deleteFiles(sstable, components);
+                String markerName = ApacheOnDiskFormat.fileNameFormat(IndexComponentType.COLUMN_COMPLETION_MARKER,
+                                                                      indexName, 0);
+                File marker = sstable.descriptor.fileFor(new Component(SSTableFormat.Components.Types.CUSTOM,
+                                                                       markerName));
+                if (marker.exists())
+                {
+                    discarded = false;
+                    logger.error("[{}.{}.{}] Could not delete {}, the completion marker of the Apache Cassandra SAI " +
+                                 "components of an index of the same name",
+                                 cfs.getKeyspaceName(), cfs.name, indexName, marker);
+                }
+                else
+                {
+                    logger.info("[{}.{}.{}] Discarded the Apache Cassandra SAI components of an index of the same name on {}",
+                                cfs.getKeyspaceName(), cfs.name, indexName, sstable.descriptor);
+                }
+            }
+            finally
+            {
+                ref.release();
+            }
+        }
+        return discarded;
+    }
+
+    private static Set<Component> apacheIndexComponents(SSTableReader sstable, String indexName)
+    {
+        String prefix = Version.APACHE_COMPONENT_PREFIX + indexName + Version.SAI_SEPARATOR;
+        return sstable.components()
+                      .stream()
+                      .filter(c -> c.name.startsWith(prefix))
+                      .collect(Collectors.toCollection(HashSet::new));
+    }
+
+    /**
+     * Deletes the files of the provided (unregistered) components of the provided SSTable under its stream/rebuild
+     * reservation, now if possible, or once no stream or rebuild holds it.
+     */
+    static void deleteFilesWhenNotStreamed(SSTableReader sstable, Set<Component> components)
+    {
+        if (sstable.streamRebuildState().tryBeginRebuild())
+        {
+            try
+            {
+                deleteFiles(sstable, components);
+            }
+            finally
+            {
+                sstable.streamRebuildState().endRebuild();
+            }
+        }
+        else
+        {
+            sstable.streamRebuildState().runWhenNormal(() -> ScheduledExecutors.optionalTasks.execute(
+                () -> deleteFilesWhenNotStreamed(sstable, components)));
+        }
+    }
+
+    private static void deleteFiles(SSTableReader sstable, Set<Component> components)
+    {
+        for (Component component : components)
+        {
+            try
+            {
+                sstable.descriptor.fileFor(component).deleteIfExists();
+            }
+            catch (FSError e)
+            {
+                logger.warn("Could not delete the Apache Cassandra SAI component {} of {}", component.name, sstable.descriptor, e);
+            }
+        }
+    }
+
+    private static Set<Component> apacheComponents(SSTableReader sstable)
+    {
+        return sstable.components()
+                      .stream()
+                      .filter(c -> Version.isApacheComponentFileName(c.name))
+                      .collect(Collectors.toCollection(HashSet::new));
+    }
+
+    private String logMessage(String message)
+    {
+        return String.format("[%s.%s.*] %s", baseCfs.getKeyspaceName(), baseCfs.name, message);
     }
 
     public void validateComponents(SSTableReader sstable, boolean validateChecksum) throws CorruptIndexException
@@ -651,8 +927,9 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     }
 
     /**
-     * @return the minimum index version among all the per-sstable index components of this group,
-     * or the current version if there are no sstable indexes.
+     * @return the minimum version that new per-index components of this group would be written in on its sstables
+     * (that of their per-sstable components, see {@link IndexDescriptor#versionForNewComponents()}), or the current
+     * version if there are no sstable indexes.
      */
     public Version getMinVersion()
     {
@@ -664,7 +941,9 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             IndexDescriptor indexDescriptor = indexGroup.descriptorFor(sstable);
             assert indexDescriptor != null;
 
-            Version version = indexDescriptor.perSSTableComponents().version();
+            // The version new indexes would be written in, which isn't that of the per-sstable components if those
+            // were written by Apache Cassandra (whose format we don't write).
+            Version version = indexDescriptor.versionForNewComponents();
             if (minVersion == null || version.compareTo(minVersion) < 0)
                 minVersion = version;
         }

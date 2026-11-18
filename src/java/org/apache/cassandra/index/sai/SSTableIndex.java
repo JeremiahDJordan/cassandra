@@ -248,13 +248,18 @@ public class SSTableIndex implements Comparable<SSTableIndex>
     // but they are not a problem as post-filtering would get rid of them.
     // The keys matched in other indexes cannot be safely subtracted
     // as indexes may contain false positives caused by deletes and updates.
+    //
+    // This relies on every source of the query (sstables and memtables) providing the keys of all its rows, so the
+    // caller can ask not to subtract (see KeyRangeTermIterator).
     private KeyRangeIterator getNonEqIterator(Expression expression,
                                               AbstractBounds<PartitionPosition> keyRange,
                                               QueryContext context,
-                                              boolean defer) throws IOException
+                                              boolean defer,
+                                              boolean subtractMatches) throws IOException
     {
         KeyRangeIterator allKeys = allSSTableKeys(keyRange);
-        if (TypeUtil.supportsRounding(expression.validator)
+        if (!subtractMatches
+            || TypeUtil.supportsRounding(expression.validator)
             || !this.getVersion().onDiskFormat().indexFeatureSet().isRowAware())
         {
             return allKeys;
@@ -272,9 +277,22 @@ public class SSTableIndex implements Comparable<SSTableIndex>
                                    QueryContext context,
                                    boolean defer) throws IOException
     {
+        return search(expression, keyRange, context, defer, true);
+    }
+
+    /**
+     * @param subtractMatches for a negative expression (NEQ, NOT_CONTAINS_KEY, NOT_CONTAINS_VALUE), whether to leave
+     *                        out the keys whose row matches the negated expression, when possible, or return all keys
+     */
+    public KeyRangeIterator search(Expression expression,
+                                   AbstractBounds<PartitionPosition> keyRange,
+                                   QueryContext context,
+                                   boolean defer,
+                                   boolean subtractMatches) throws IOException
+    {
         if (expression.getOp().isNonEquality())
         {
-            return getNonEqIterator(expression, keyRange, context, defer);
+            return getNonEqIterator(expression, keyRange, context, defer, subtractMatches);
         }
 
         return searchableIndex.search(expression, keyRange, context, defer);
@@ -354,12 +372,21 @@ public class SSTableIndex implements Comparable<SSTableIndex>
              */
             if (indexWasDropped.get())
             {
-                // A storage-attached index created since with the same name has deleted these files already (see
-                // StorageAttachedIndex#onAddedToExistingTable), and its own have the same names.
-                synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+                // Apache Cassandra's components are streamable: delete their files under the stream/rebuild
+                // reservation of the SSTable. We never write files of those names, so a late deletion is safe.
+                if (perIndexComponents.version().isApache())
                 {
-                    if (!hasStorageAttachedIndexNamed(sstable.metadata(), indexContext.getIndexName()))
-                        SSTableWatcher.instance.onIndexDropped(sstable.metadata(), perIndexComponents.forWrite());
+                    StorageAttachedIndexGroup.deleteFilesWhenNotStreamed(sstable, perIndexComponents.allAsCustomComponents());
+                }
+                else
+                {
+                    // A storage-attached index created since with the same name has deleted these files already (see
+                    // StorageAttachedIndex#onAddedToExistingTable), and its own have the same names.
+                    synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+                    {
+                        if (!hasStorageAttachedIndexNamed(sstable.metadata(), indexContext.getIndexName()))
+                            SSTableWatcher.instance.onIndexDropped(sstable.metadata(), perIndexComponents.forWrite());
+                    }
                 }
             }
         }

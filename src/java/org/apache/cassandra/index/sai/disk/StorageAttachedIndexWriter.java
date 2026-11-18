@@ -63,6 +63,7 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
     private final RowMapping rowMapping;
     private final OperationType opType;
     private final TableMetrics tableMetrics;
+    private final Collection<StorageAttachedIndex> nonQueryableOnAbort;
 
     private DecoratedKey currentKey;
     private boolean tokenOffsetWriterCompleted = false;
@@ -89,6 +90,23 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                       boolean perIndexComponentsOnly,
                                       TableMetrics tableMetrics) throws IOException
     {
+        this(indexDescriptor, tableMetadata, indices, indices, lifecycleNewTracker, keyCount, perIndexComponentsOnly, tableMetrics);
+    }
+
+    /**
+     * @param nonQueryableOnAbort the indexes to make non-queryable if the write is aborted because of an index error
+     *                            (see {@link #abort(Throwable, boolean)}), usually all the indexes written
+     */
+    public StorageAttachedIndexWriter(IndexDescriptor indexDescriptor,
+                                      TableMetadata tableMetadata,
+                                      Collection<StorageAttachedIndex> indices,
+                                      Collection<StorageAttachedIndex> nonQueryableOnAbort,
+                                      LifecycleNewTracker lifecycleNewTracker,
+                                      long keyCount,
+                                      boolean perIndexComponentsOnly,
+                                      TableMetrics tableMetrics) throws IOException
+    {
+        this.nonQueryableOnAbort = nonQueryableOnAbort;
         // We always use the version of the existing per-sstable components, if any, or the configured current version
         // if there are no previously existing per-sstable components.
         OnDiskFormat onDiskFormat = indexDescriptor.versionForNewComponents().onDiskFormat();
@@ -337,7 +355,7 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
             // also on the other nodes. If the problem with compaction or flush repeats, then it is better to fail
             // on this node only and let the rest of the cluster operate normally.
             if (fromIndex && opType != OperationType.COMPACTION && opType != OperationType.FLUSH)
-                indices.forEach(StorageAttachedIndex::makeIndexNonQueryable);
+                nonQueryableOnAbort.forEach(StorageAttachedIndex::makeIndexNonQueryable);
 
             for (PerIndexWriter perIndexWriter : perIndexWriters)
             {

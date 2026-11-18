@@ -38,12 +38,12 @@ import org.apache.cassandra.index.sai.disk.v2.PrimaryKeyWithSource;
 import org.apache.cassandra.index.sai.disk.v9.keystore.KeyLookup;
 import org.apache.cassandra.index.sai.disk.v9.keystore.KeyLookupMeta;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
-import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.io.sstable.SSTableId;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
 /**
@@ -96,7 +96,8 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
                 NumericValuesMeta clusteringKeyBlockOffsetsMeta = new NumericValuesMeta(metadataSource.get(perSSTableComponents.get(IndexComponentType.CLUSTERING_KEY_BLOCK_OFFSETS)));
                 KeyLookupMeta clusteringKeyMeta = new KeyLookupMeta(metadataSource.get(perSSTableComponents.get(IndexComponentType.CLUSTERING_KEY_BLOCKS)));
                 this.clusteringKeyReader = new KeyLookup(clustingingKeyBlocksFileLocal, clusteringKeyBlockOffsetsFileLocal,
-                                                         clusteringKeyMeta, clusteringKeyBlockOffsetsMeta);
+                                                         clusteringKeyMeta, clusteringKeyBlockOffsetsMeta,
+                                                         byteComparableVersion);
             }
             catch (IOException e)
             {
@@ -126,7 +127,9 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
                                          primaryKeyFactory,
                                          clusteringComparator,
                                          sstableId,
-                                         hasStaticColumns);
+                                         rowIdSpace,
+                                         hasStaticColumns,
+                                         byteComparableVersion);
         }
 
         @Override
@@ -150,10 +153,12 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
                               V9RowAwarePrimaryKeyFactory primaryKeyFactory,
                               ClusteringComparator clusteringComparator, 
                               SSTableId<?> sstableId,
-                              boolean hasStaticColumns)
+                              Object rowIdSpace,
+                              boolean hasStaticColumns,
+                              ByteComparable.Version byteComparableVersion)
     {
         super(rowIdToTokenArray, rowIdToPartitionIdArray, partitionKeyCursor, partitioner, primaryKeyFactory,
-              sstableId, hasStaticColumns);
+              sstableId, rowIdSpace, hasStaticColumns, byteComparableVersion);
 
         this.partitionIdToSizeArray = partitionIdToSizeArray;
         this.clusteringComparator = clusteringComparator;
@@ -174,7 +179,7 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
         if (key instanceof PrimaryKeyWithSource)
         {
             PrimaryKeyWithSource pkws = (PrimaryKeyWithSource) key;
-            if (pkws.getSourceSstableId().equals(sstableId))
+            if (pkws.hasRowIdsOf(this))
                 return pkws.getSourceRowId();
         }
 
@@ -188,7 +193,7 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
 
         // Handle token collisions by comparing partition keys using partitionKeyCursor
         rowId = tokenCeilingCollisionDetection(key, rowId);
-        if (key.clustering().isEmpty())
+        if (isPartitionKey(key))
             return rowId;
 
         // Now search within the partition for the clustering key
@@ -257,7 +262,7 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
         if (key instanceof PrimaryKeyWithSource)
         {
             PrimaryKeyWithSource pkws = (PrimaryKeyWithSource) key;
-            if (pkws.getSourceSstableId().equals(sstableId))
+            if (pkws.hasRowIdsOf(this))
                 return pkws.getSourceRowId();
         }
 
@@ -268,7 +273,7 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
         {
             // If the key is a prefix (token-only or partition-only), 
             // the floor is the *greatest* row ID associated with this prefix.
-            if (key.isTokenOnly() || key.clustering().isEmpty())
+            if (key.isTokenOnly() || isPartitionKey(key))
                 return startOfNextPartition(rowId) - 1;
 
             // If STATIC CLUSTERING, then rowID is the last row in the matching partition.
@@ -305,14 +310,22 @@ public class WidePrimaryKeyMap extends SkinnyPrimaryKeyMap
     private Clustering<?> readClusteringKey(long sstableRowId)
     {
         ByteSource.Peekable peekable = ByteSource.peekable(clusteringKeyCursor.seekToPointId(sstableRowId)
-                                                                              .asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION));
+                                                                              .asComparableBytes(byteComparableVersion));
 
-        Clustering<?> clustering = clusteringComparator.clusteringFromByteComparable(ByteBufferAccessor.instance, v -> peekable, TypeUtil.BYTE_COMPARABLE_VERSION);
+        Clustering<?> clustering = clusteringComparator.clusteringFromByteComparable(ByteBufferAccessor.instance, v -> peekable, byteComparableVersion);
 
         if (clustering == null)
             clustering = Clustering.EMPTY;
 
         return clustering;
+    }
+
+    // Whether the key designates the whole partition: empty or null clustering (RowAwarePrimaryKeyMap keys designate
+    // the static row with null).
+    private static boolean isPartitionKey(PrimaryKey key)
+    {
+        Clustering<?> clustering = key.clustering();
+        return clustering == null || clustering.isEmpty();
     }
 
     // Returns the rowId of the next partition or the number of rows if supplied rowId is in the last partition.
