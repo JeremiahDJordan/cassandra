@@ -194,6 +194,18 @@ public class RowAwareTokenCollisionPrimaryKeyMapTest extends SAITester.Versioned
                 assertThat(lookup(factory, m -> m.ceiling(target.key))).as("ceiling, %s", targetDescription).isEqualTo(ceiling);
                 assertThat(lookup(factory, m -> m.floor(target.key))).as("floor, %s", targetDescription).isEqualTo(floor);
 
+                // a skip starts at ceilingOfToken and passes the rows that are before the key
+                try (PrimaryKeyMap map = factory.newPerSSTablePrimaryKeyMap())
+                {
+                    long end = ceiling < 0 ? rows.size() : ceiling;
+                    long start = map.ceilingOfToken(target.key);
+                    start = start < 0 ? rows.size() : start;
+                    assertThat(start).as("ceilingOfToken, %s", targetDescription).isLessThanOrEqualTo(end);
+                    for (long rowId = start; rowId < rows.size(); rowId++)
+                        assertThat(map.isBefore(rowId, target.key)).as("isBefore %d, %s", rowId, targetDescription)
+                                                                   .isEqualTo(rowId < end);
+                }
+
                 // A key that designates several rows (a token, or a partition of a wide table) is found by the V9 maps
                 // at its first row, and not found by the others, where only full keys have exact matches.
                 boolean prefix = target.partitionKey == null || (wide && target.clustering == NO_CLUSTERING);
