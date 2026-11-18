@@ -290,6 +290,13 @@ Upgrading
       after upgrading it, with nodetool rebuild_index. The index on a DESC text, varchar, ascii, boolean or uuid
       clustering column doesn't serve != and NOT IN, nor range restrictions on uuid, like the index on an ASC column:
       such queries need ALLOW FILTERING or another index.
+    - Non-analyzed storage-attached indexes (SAI) on text, varchar, ascii, boolean, frozen tuple and frozen UDT
+      columns, and on the elements of collections of those types, now index the empty value written by an update of
+      a row already in the memtable, e.g. UPDATE ... SET v = '' on a row that had another value or none. Earlier
+      versions skipped it, so restrictions such as v = '' missed the row, from the memtable and from the SSTable it
+      was flushed to. If you query such columns for the empty value, rebuild those indexes on each node after
+      upgrading it, with nodetool rebuild_index: the SSTables flushed before the upgrade keep missing such rows until
+      then, or until compacted.
 
 5.0.9
 =====

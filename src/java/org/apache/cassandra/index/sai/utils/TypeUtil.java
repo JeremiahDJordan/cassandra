@@ -28,6 +28,8 @@ import java.util.Set;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
 
+import javax.annotation.Nullable;
+
 import com.googlecode.concurrenttrees.radix.ConcurrentRadixTree;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
@@ -676,6 +678,16 @@ public class TypeUtil
     public static boolean skipsEmptyValue(AbstractType<?> type)
     {
         return !baseType(type).allowsEmpty() || !isLiteral(type);
+    }
+
+    /**
+     * @return {@code true} if the given value of the given type belongs in the index: a non-null value, which is not
+     * empty unless the type indexes empty values (see {@link #skipsEmptyValue(AbstractType)}). Inserts and updates must
+     * agree on this, so that an update adds and removes exactly the values an insert would index.
+     */
+    public static boolean indexesValue(@Nullable ByteBuffer value, AbstractType<?> type)
+    {
+        return value != null && (value.hasRemaining() || !skipsEmptyValue(type));
     }
 
     /**
