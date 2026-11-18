@@ -144,6 +144,16 @@ Upgrading
       to one partition, as it already did for queries over several partitions, and the rows of the short read
       protection requests above add to the rows it caches, so GROUP BY queries with a filter can now reach the
       cached_rows_fail_threshold of replica_filtering_protection. (CASSANDRA-XXXXX)
+    - Storage-attached indexes (SAI) on DESC clustering columns of type inet, varint or decimal now index their values
+      in non-reversed order, as Apache Cassandra 5.0 does, so range queries through them return the right rows, and
+      flushing an inet or varint index and querying a flushed decimal one work (CASSANDRA-20100). The
+      sstable indexes of a DESC decimal column flushed by an earlier version can't be read: the initial build of the
+      index on restart, imports and nodetool rebuild_index rebuild them, and an index that finds one in any other way
+      is not queryable until it is rebuilt. Entire-SSTable streaming of such an sstable fails, as the receiver
+      validates the streamed index; stream_entire_sstables: false on the sending nodes avoids that. Such an sstable
+      index whose min and max terms are both raw decimals of exactly 24 bytes (a 20-byte unscaled value) is not
+      detected and gives incomplete results: rebuild the indexes of DESC decimal columns holding such values with
+      nodetool rebuild_index after upgrading.
 
 5.0.9
 =====

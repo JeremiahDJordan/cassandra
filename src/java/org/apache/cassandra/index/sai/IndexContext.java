@@ -67,6 +67,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.analyzer.LuceneAnalyzer;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.IndexFeatureSet;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
@@ -1046,6 +1047,17 @@ public class IndexContext
             if (!perSSTableComponents.isComplete() || !perIndexComponents.isComplete())
             {
                 logger.debug(logMessage("An on-disk index build for SSTable {} has not completed (per-index components={})."), context.descriptor(), perIndexComponents.all());
+                return;
+            }
+
+            // Refused until rebuilt: builds consider them unbuilt (see IndexDescriptor#isIndexBuildCompleteOnDisk)
+            if (IndexDescriptor.hasObsoleteEncoding(perIndexComponents))
+            {
+                logger.error(logMessage("The index of SSTable {} was written with an obsolete encoding (the reversed " +
+                                        "encoding of a DESC decimal clustering column) and can't be used. It will " +
+                                        "be rebuilt by the next initial build of the index, on restart, or by " +
+                                        "nodetool rebuild_index."), context.descriptor());
+                invalid.add(context);
                 return;
             }
 
