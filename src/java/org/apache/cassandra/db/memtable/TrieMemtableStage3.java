@@ -259,12 +259,6 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
         {
             return HEAP_SIZE;
         }
-
-        public void clearStats()
-        {
-            rowCountIncludingStatic = 0;
-            tombstoneCount = 0;
-        }
     }
 
     class KeySizeAndCountCollector extends TrieEntriesWalker<Object, Void>
