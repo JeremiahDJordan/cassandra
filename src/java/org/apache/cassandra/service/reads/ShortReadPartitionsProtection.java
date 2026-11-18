@@ -231,7 +231,8 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         DataLimits newLimits = cmd.limits().forShortReadRetry(toQuery);
 
         // lastPartitionKey is null when the replica hasn't returned any partition of the range, as when the only one was
-        // cut by a GROUP BY limit: read the range again
+        // cut by a GROUP BY limit, or, with endpoint grouping, when the replica reached the limit before getting to the
+        // range (see EndpointGroupingCoordinator): read the range again
         DataRange newDataRange = cmd.dataRange();
         if (lastPartitionKey != null)
         {
