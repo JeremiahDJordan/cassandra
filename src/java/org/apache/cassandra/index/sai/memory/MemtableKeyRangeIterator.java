@@ -52,6 +52,7 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
     private final ColumnFilter columns;
     private UnfilteredPartitionIterator partitionIterator;
     private UnfilteredRowIterator rowIterator;
+    private PrimaryKey lastKey;
 
     public MemtableKeyRangeIterator(Memtable memtable,
                                     PrimaryKey.Factory pkFactory,
@@ -91,6 +92,10 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
     @Override
     protected void performSkipTo(PrimaryKey nextKey)
     {
+        // Never go back: a key without clustering (e.g. a static key) compares equal to every key of its partition.
+        if (lastKey != null && lastKey.compareTo(nextKey) >= 0)
+            return;
+
         PartitionPosition start = nextKey.isTokenOnly()
                                   ? nextKey.token().minKeyBound()
                                   : nextKey.partitionKey();
@@ -145,7 +150,8 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
             if (unfiltered.isRow())
             {
                 Row row = (Row) unfiltered;
-                return pkFactory.create(rowIterator.partitionKey(), row.clustering());
+                lastKey = pkFactory.create(rowIterator.partitionKey(), row.clustering());
+                return lastKey;
             }
         }
         return endOfData();
