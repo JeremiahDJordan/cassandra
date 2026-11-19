@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
 import com.google.common.base.Charsets;
@@ -43,12 +44,15 @@ import org.apache.lucene.analysis.Analyzer;
 import org.apache.lucene.analysis.core.WhitespaceAnalyzer;
 import org.apache.lucene.analysis.en.EnglishAnalyzer;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 
 public class LuceneAnalyzerTest
 {
+    private static final AtomicBoolean notAnAnalyzerInitialized = new AtomicBoolean();
+
     @Test
     public void testCzechStem() throws Exception
     {
@@ -221,6 +225,24 @@ public class LuceneAnalyzerTest
                       "\"filters\":[{\"name\":\"synonym\", \"args\": " +
                       "{\"synonyms\": \"as => like\", \"analyzer\":\"not-a-class\"}}]}";
         tokenize("irrelevant text", json);
+    }
+
+    @Test
+    public void testAnalyzerClassNotInitializedBeforeTypeCheck()
+    {
+        String json = "{\"tokenizer\":{\"name\" : \"keyword\"}," +
+                      "\"filters\":[{\"name\":\"synonym\", \"args\": " +
+                      "{\"synonyms\": \"as => like\", \"analyzer\":\"" + NotAnAnalyzer.class.getName() + "\"}}]}";
+        assertThatThrownBy(() -> tokenize("irrelevant text", json)).isInstanceOf(RuntimeException.class);
+        assertFalse(notAnAnalyzerInitialized.get());
+    }
+
+    public static class NotAnAnalyzer
+    {
+        static
+        {
+            notAnAnalyzerInitialized.set(true);
+        }
     }
 
     public static List<String> tokenize(String testString, String json) throws Exception
