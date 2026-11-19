@@ -42,7 +42,7 @@ import org.apache.cassandra.index.SecondaryIndexBuilder;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.io.sstable.Descriptor;
-import org.apache.cassandra.io.sstable.KeyIterator;
+import org.apache.cassandra.io.sstable.KeyReader;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -208,9 +208,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
             long previousBytesRead = 0;
 
-            try (KeyIterator keys = sstable.keyIterator())
+            try (KeyReader keys = sstable.keyReaderForScan())
             {
-                while (keys.hasNext())
+                while (!keys.isExhausted())
                 {
                     if (isStopRequested())
                     {
@@ -218,12 +218,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                         throw new CompactionInterruptedException(getCompactionInfo());
                     }
 
-                    DecoratedKey key = keys.next();
+                    DecoratedKey key = sstable.decorateKey(keys.key());
 
                     indexWriter.startPartition(key, -1, -1);
 
-                    long position = sstable.getPosition(key, SSTableReader.Operator.EQ);
-                    dataFile.seek(position);
+                    dataFile.seek(keys.dataPosition());
                     ByteBufferUtil.readWithShortLength(dataFile); // key
 
                     try (SSTableIdentityIterator partition = SSTableIdentityIterator.create(sstable, dataFile, key))
@@ -235,7 +234,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                         while (partition.hasNext())
                             indexWriter.nextUnfilteredCluster(partition.next());
                     }
-                    long bytesRead = keys.getBytesRead();
+                    long bytesRead = keys.advance() ? keys.dataPosition() : sstable.uncompressedLength();
                     bytesProcessed += bytesRead - previousBytesRead;
                     previousBytesRead = bytesRead;
                 }

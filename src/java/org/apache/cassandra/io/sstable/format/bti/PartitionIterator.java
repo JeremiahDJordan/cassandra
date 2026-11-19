@@ -49,6 +49,7 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
     private final FileHandle dataFile;
     private final FileHandle rowIndexFile;
     private final Version version;
+    private final boolean forScan;
 
     private FileDataInput dataInput;
     private FileDataInput indexInput;
@@ -61,6 +62,27 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
     static PartitionIterator create(PartitionIndex partitionIndex, IPartitioner partitioner, FileHandle rowIndexFile, FileHandle dataFile,
                                     PartitionPosition left, int inclusiveLeft, PartitionPosition right, int exclusiveRight, Version version) throws IOException
     {
+        return create(partitionIndex, partitioner, rowIndexFile, dataFile, left, inclusiveLeft, right, exclusiveRight, version, false);
+    }
+
+    static PartitionIterator create(PartitionIndex partitionIndex, IPartitioner partitioner, FileHandle rowIndexFile, FileHandle dataFile, Version version) throws IOException
+    {
+        return create(partitionIndex, partitioner, rowIndexFile, dataFile, partitionIndex.firstKey(), -1, partitionIndex.lastKey(), 0, version);
+    }
+
+    /**
+     * Creates an iterator over all keys of the sstable, for a pass over the whole file: it also reads the row index
+     * through a scan reader, which bypasses the chunk cache.
+     */
+    static PartitionIterator createForScan(PartitionIndex partitionIndex, IPartitioner partitioner, FileHandle rowIndexFile, FileHandle dataFile, Version version) throws IOException
+    {
+        return create(partitionIndex, partitioner, rowIndexFile, dataFile, partitionIndex.firstKey(), -1, partitionIndex.lastKey(), 0, version, true);
+    }
+
+    private static PartitionIterator create(PartitionIndex partitionIndex, IPartitioner partitioner, FileHandle rowIndexFile, FileHandle dataFile,
+                                            PartitionPosition left, int inclusiveLeft, PartitionPosition right, int exclusiveRight, Version version,
+                                            boolean forScan) throws IOException
+    {
         PartitionIterator partitionIterator = null;
         PartitionIndex partitionIndexCopy = null;
         FileHandle dataFileCopy = null;
@@ -72,7 +94,7 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
             dataFileCopy = dataFile.sharedCopy();
             rowIndexFileCopy = rowIndexFile.sharedCopy();
 
-            partitionIterator = new PartitionIterator(partitionIndexCopy, partitioner, rowIndexFileCopy, dataFileCopy, left, right, exclusiveRight, version);
+            partitionIterator = new PartitionIterator(partitionIndexCopy, partitioner, rowIndexFileCopy, dataFileCopy, left, right, exclusiveRight, version, forScan);
 
             partitionIterator.readNext();
             // Because the index stores prefixes, the first value can be in any relationship with the left bound.
@@ -97,18 +119,13 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
         }
     }
 
-    static PartitionIterator create(PartitionIndex partitionIndex, IPartitioner partitioner, FileHandle rowIndexFile, FileHandle dataFile, Version version) throws IOException
-    {
-        return create(partitionIndex, partitioner, rowIndexFile, dataFile, partitionIndex.firstKey(), -1, partitionIndex.lastKey(), 0, version);
-    }
-
     static PartitionIterator empty(PartitionIndex partitionIndex)
     {
         return new PartitionIterator(partitionIndex.sharedCopy(), null);
     }
 
     private PartitionIterator(PartitionIndex partitionIndex, IPartitioner partitioner, FileHandle rowIndexFile, FileHandle dataFile,
-                              PartitionPosition left, PartitionPosition right, int exclusiveRight, Version version)
+                              PartitionPosition left, PartitionPosition right, int exclusiveRight, Version version, boolean forScan)
     {
         super(partitionIndex, left, right);
         this.partitionIndex = partitionIndex;
@@ -118,6 +135,7 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
         this.rowIndexFile = rowIndexFile;
         this.dataFile = dataFile;
         this.version = version;
+        this.forScan = forScan;
     }
 
     private PartitionIterator(PartitionIndex partitionIndex, Version version)
@@ -135,6 +153,7 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
         this.nextEntry = null;
         this.nextKey = null;
         this.version = version;
+        this.forScan = false;
     }
 
     @Override
@@ -224,7 +243,7 @@ class PartitionIterator extends PartitionIndex.IndexPosIterator implements KeyRe
     private void seekIndexInput(long pos) throws IOException
     {
         if (indexInput == null)
-            indexInput = rowIndexFile.createReader(pos);
+            indexInput = rowIndexFile.createReader(pos, forScan);
         else
             indexInput.seek(pos);
     }
