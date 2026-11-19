@@ -23,6 +23,8 @@ import java.util.Collections;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.datastax.driver.core.exceptions.InvalidQueryException;
+
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
@@ -217,7 +219,7 @@ public class VectorInvalidQueryTest extends SAITester
     }
 
     @Test
-    public void disallowClusteringColumnPredicateWithoutSupportingIndex()
+    public void allowClusteringColumnPredicateWithoutSupportingIndex()
     {
         createTable("CREATE TABLE %s (pk int, num int, v vector<float, 2>, PRIMARY KEY(pk, num))");
         createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
@@ -225,19 +227,56 @@ public class VectorInvalidQueryTest extends SAITester
         execute("INSERT INTO %s (pk, num, v) VALUES (3, 4, [1,4])");
         flush();
 
-        // If we didn't have the query planner fail this query, we would get incorrect results for both queries
-        // because the clustering columns are not yet available to restrict the ANN result set.
-        assertThatThrownBy(() -> execute("SELECT num FROM %s WHERE pk=3 AND num > 3 ORDER BY v ANN OF [1,1] LIMIT 1"))
-        .isInstanceOf(InvalidRequestException.class)
-        .hasMessage(StatementRestrictions.NON_CLUSTER_ORDERING_REQUIRES_ALL_RESTRICTED_NON_PARTITION_KEY_COLUMNS_INDEXED_MESSAGE);
+        // The clustering column restrictions are applied by the clustering index filter (CASSANDRA-19544), so the ANN
+        // search skips the closer row num=1, which isn't selected.
+        assertRows(execute("SELECT num FROM %s WHERE pk=3 AND num > 3 ORDER BY v ANN OF [1,1] LIMIT 1"), row(4));
+        assertRows(execute("SELECT num FROM %s WHERE pk=3 AND num = 4 ORDER BY v ANN OF [1,1] LIMIT 1"), row(4));
+        assertRows(execute("SELECT num FROM %s WHERE pk=3 AND num IN (4) ORDER BY v ANN OF [1,1] LIMIT 1"), row(4));
 
-        assertThatThrownBy(() -> execute("SELECT num FROM %s WHERE pk=3 AND num = 4 ORDER BY v ANN OF [1,1] LIMIT 1"))
-        .isInstanceOf(InvalidRequestException.class)
-        .hasMessage(StatementRestrictions.NON_CLUSTER_ORDERING_REQUIRES_ALL_RESTRICTED_NON_PARTITION_KEY_COLUMNS_INDEXED_MESSAGE);
+        // Without a restricted partition key, the clustering column restrictions need filtering
+        assertThatThrownBy(() -> execute("SELECT num FROM %s WHERE num = 4 ORDER BY v ANN OF [1,1] LIMIT 1"))
+        .isInstanceOf(InvalidRequestException.class);
 
         // Cover the alternative code path
         createIndex("CREATE CUSTOM INDEX ON %s(num) USING 'StorageAttachedIndex'");
         assertRows(execute("SELECT num FROM %s WHERE pk=3 AND num > 3 ORDER BY v ANN OF [1,1] LIMIT 1"), row(4));
+        assertRows(execute("SELECT num FROM %s WHERE pk=3 AND num = 4 ORDER BY v ANN OF [1,1] LIMIT 1"), row(4));
+    }
+
+    @Test
+    public void canOrderWithWhereOnPrimaryColumns()
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, v vector<float, 2>, PRIMARY KEY ((a,b),c,d))");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+
+        execute("INSERT INTO %s (a, b, c, d, v) VALUES (1, 2, 1, 2, [6.0,1.0])");
+
+        ResultSet result = execute("SELECT * FROM %s WHERE a = 1 AND b = 2 ORDER BY v ANN OF [2.0,1.0] LIMIT 1", ConsistencyLevel.ONE);
+        assertEquals(1, result.size());
+        result = execute("SELECT * FROM %s WHERE a = 1 AND b = 2 AND c = 1 ORDER BY v ANN OF [2.0,1.0] LIMIT 1", ConsistencyLevel.ONE);
+        assertEquals(1, result.size());
+        result = execute("SELECT * FROM %s WHERE a = 1 AND b = 2 AND c = 1 AND d = 2 ORDER BY v ANN OF [2.0,1.0] LIMIT 1", ConsistencyLevel.ONE);
+        assertEquals(1, result.size());
+
+        assertThatThrownBy(() -> executeNet("SELECT * FROM %s WHERE a = 1 AND b = 2 AND d = 2 ORDER BY v ANN OF [2.0,1.0] LIMIT 1"))
+            .isInstanceOf(InvalidQueryException.class).hasMessage(StatementRestrictions.NON_CLUSTER_ORDERING_REQUIRES_ALL_RESTRICTED_NON_PARTITION_KEY_COLUMNS_INDEXED_MESSAGE);
+
+        createIndex("CREATE CUSTOM INDEX c_idx ON %s(c) USING 'StorageAttachedIndex'");
+
+        assertThatThrownBy(() -> executeNet("SELECT * FROM %s WHERE a = 1 AND b = 2 AND d = 2 ORDER BY v ANN OF [2.0,1.0] LIMIT 1"))
+            .isInstanceOf(InvalidQueryException.class).hasMessage(StatementRestrictions.NON_CLUSTER_ORDERING_REQUIRES_ALL_RESTRICTED_NON_PARTITION_KEY_COLUMNS_INDEXED_MESSAGE);
+
+        dropIndex("DROP INDEX %s.c_idx");
+        createIndex("CREATE CUSTOM INDEX ON %s(d) USING 'StorageAttachedIndex'");
+
+        result = execute("SELECT * FROM %s WHERE a = 1 AND b = 2 AND c = 1 ORDER BY v ANN OF [2.0,1.0] LIMIT 1", ConsistencyLevel.ONE);
+        assertEquals(1, result.size());
+        result = execute("SELECT * FROM %s WHERE a = 1 AND b = 2 AND c = 1 AND d = 2 ORDER BY v ANN OF [2.0,1.0] LIMIT 1", ConsistencyLevel.ONE);
+        assertEquals(1, result.size());
+        result = execute("SELECT * FROM %s WHERE a = 1 AND b = 2 AND d = 2 ORDER BY v ANN OF [2.0,1.0] LIMIT 1", ConsistencyLevel.ONE);
+        assertEquals(1, result.size());
+        result = execute("SELECT * FROM %s WHERE a = 1 AND b = 2 AND c > 0 ORDER BY v ANN OF [2.0,1.0] LIMIT 1", ConsistencyLevel.ONE);
+        assertEquals(1, result.size());
     }
 
     @Test
