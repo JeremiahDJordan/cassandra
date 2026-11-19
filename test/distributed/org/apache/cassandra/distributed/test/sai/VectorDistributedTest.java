@@ -58,6 +58,8 @@ import org.assertj.core.data.Percentage;
 
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
+import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 import static org.apache.cassandra.index.sai.SAITester.getRandom;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -95,7 +97,7 @@ public class VectorDistributedTest extends TestBaseImpl
     {
         cluster = Cluster.build(NUM_REPLICAS)
                          .withTokenCount(1) // VSTODO in-jvm-test in CC branch doesn't support multiple tokens
-                         .withDataDirCount(1) // VSTODO vector memtable flush doesn't support multiple directories yet
+                         .withDataDirCount(3)
                          .withConfig(config -> config.with(GOSSIP).with(NETWORK))
                          .start();
 
@@ -211,6 +213,34 @@ public class VectorDistributedTest extends TestBaseImpl
             return computeRecall(queryVector, allVectors, getVectors(result));
         });
         assertThat(recall).isGreaterThanOrEqualTo(MIN_RECALL_AVG);
+    }
+
+    @Test
+    public void testFlushWithSeveralDataDirectories()
+    {
+        // UCS splits the flush with its shard tracker, size-tiered compaction with a flush per data directory
+        for (String compaction : new String[]{ "UnifiedCompactionStrategy", "SizeTieredCompactionStrategy" })
+        {
+            cluster.schemaChange(formatQuery("DROP TABLE IF EXISTS %s"));
+            cluster.schemaChange(formatQuery(String.format(CREATE_TABLE, 2) + " WITH compaction = {'class': '" + compaction + "'}"));
+            cluster.schemaChange(formatQuery(String.format(CREATE_INDEX, "val") + " WITH OPTIONS = {'similarity_function' : 'euclidean'}"));
+            SAIUtil.waitForIndexQueryableOnFirstNode(cluster, KEYSPACE);
+            String tableName = table;
+            cluster.forEach(n -> n.runOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName).disableAutoCompaction()));
+
+            int vectorCount = 500;
+            for (int pk = 0; pk < vectorCount; pk++)
+                execute("INSERT INTO %s (pk, val) VALUES (" + pk + ", [" + pk + ".0, 1.0])");
+            cluster.forEach(n -> n.flush(KEYSPACE));
+
+            cluster.forEach(n -> assertThat(n.callOnInstance(() -> Keyspace.open(KEYSPACE)
+                                                                         .getColumnFamilyStore(tableName)
+                                                                         .getLiveSSTables()
+                                                                         .size())).isEqualTo(1));
+            assertRows(execute("SELECT pk FROM %s ORDER BY val ANN OF [0.0, 1.0] LIMIT 3"), row(0), row(1), row(2));
+            assertRows(execute("SELECT pk FROM %s ORDER BY val ANN OF [499.0, 1.0] LIMIT 3"), row(499), row(498), row(497));
+            assertThat(execute("SELECT pk FROM %s")).hasNumberOfRows(vectorCount);
+        }
     }
 
     @Test
