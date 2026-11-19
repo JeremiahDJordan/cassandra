@@ -129,6 +129,23 @@ run_case "${cassandra_dir}/.build/docker/_docker_run.sh" no-such.docker build-ja
 expect_rc "_docker_run.sh rejects a missing dockerfile" 1
 expect_out "_docker_run.sh names the missing dockerfile" "no-such.docker must exist"
 
+# ci/generate-ci-summary.sh lists the build parameters, which only reach it through the container's environment
+reset_stub
+BUILD_TAG=jenkins-Cassandra-trunk-7 repository=https://github.com/apache/cassandra jdk=11 profile_custom_regexp= \
+  run_case "${cassandra_dir}/.build/docker/_docker_run.sh" debian-build.docker ci/generate-ci-summary.sh
+expect_rc "_docker_run.sh runs generate-ci-summary.sh" 0
+expect_invocation "_docker_run.sh passes the build tag to generate-ci-summary.sh" "docker run .*\-\-env BUILD_TAG "
+expect_invocation "_docker_run.sh passes the repository to generate-ci-summary.sh" "docker run .*\-\-env repository "
+expect_invocation "_docker_run.sh passes the jdk to generate-ci-summary.sh" "docker run .*\-\-env jdk "
+expect_invocation "_docker_run.sh passes a parameter that is empty" "docker run .*\-\-env profile_custom_regexp "
+expect_no_invocation "_docker_run.sh passes no unset parameter" "docker run .*\-\-env branch "
+
+# other scripts keep the environment they had: _build-debian.sh, for one, reads $branch
+reset_stub
+branch=trunk jdk=11 run_case "${cassandra_dir}/.build/docker/_docker_run.sh" debian-build.docker build-jars.sh
+expect_rc "_docker_run.sh runs build-jars.sh with Jenkins parameters set" 0
+expect_no_invocation "_docker_run.sh passes no build parameter to build-jars.sh" "docker run .*\-\-env "
+
 # docker accepts [a-zA-Z0-9][a-zA-Z0-9_.-] in a container name only. four call sites pass a
 # run_script that holds a directory, so the name must not carry the directory separator
 reset_stub

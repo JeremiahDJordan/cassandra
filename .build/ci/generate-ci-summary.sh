@@ -37,6 +37,9 @@ command -v ant >/dev/null 2>&1 || { echo >&2 "ant needs to be installed"; exit 1
 [ -f "${CASSANDRA_DIR}/build.xml" ] || { echo >&2 "${CASSANDRA_DIR}/build.xml must exist"; exit 1; }
 [ -d "${DIST_DIR}" ] || { mkdir -p "${DIST_DIR}" ; }
 
+# The build parameters below are the Jenkins job's, which Jenkins sets in lower case as environment variables; when
+# one is unset, the same name in upper case.  .build/docker/_docker_run.sh passes both into the container.
+
 # a value as html text
 html() {
   printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
@@ -49,24 +52,24 @@ cat >${DIST_DIR}/ci_summary.html <<EOL
 <html>
 <head></head>
 <body>
-<h1>CI Summary ${BUILD_TAG}</h1>
+<h1>CI Summary $(html "${BUILD_TAG}")</h1>
 <h2>Build State</h2>
 <ul>
   <li>sha:  $(git -C ${CASSANDRA_DIR} rev-parse HEAD)</li>
-  <li>repo: $(git -C ${CASSANDRA_DIR} remote get-url origin)</li>
-  <li>branch: $(git -C ${CASSANDRA_DIR} branch --remote --verbose --no-abbrev --contains | sed -rne 's/^[^\/]*\/([^\ ]+).*$/\1/p')</li>
+  <li>repo: $(html "$(git -C ${CASSANDRA_DIR} remote get-url origin)")</li>
+  <li>branch: $(html "$(git -C ${CASSANDRA_DIR} branch --remote --verbose --no-abbrev --contains | sed -rne 's/^[^\/]*\/([^\ ]+).*$/\1/p')")</li>
   <li>date: $(date)</li>
 </ul>
 <h2>Build Parameters</h2>
 <ul>
-  <li>repository: ${REPOSITORY}</li>
-  <li>branch: ${BRANCH}</li>
-  <li>profile: ${PROFILE}</li>
-  <li>profile_custom_regexp: ${PROFILE_CUSTOM_REGEXP}</li>
-  <li>architecture: ${ARCHITECTURE}</li>
-  <li>jdk: ${JDK}</li>
-  <li>dtest_repository: $(html "${DTEST_REPOSITORY}")</li>
-  <li>dtest_branch: ${DTEST_BRANCH}</li>
+  <li>repository: $(html "${repository-${REPOSITORY}}")</li>
+  <li>branch: $(html "${branch-${BRANCH}}")</li>
+  <li>profile: $(html "${profile-${PROFILE}}")</li>
+  <li>profile_custom_regexp: $(html "${profile_custom_regexp-${PROFILE_CUSTOM_REGEXP}}")</li>
+  <li>architecture: $(html "${architecture-${ARCHITECTURE}}")</li>
+  <li>jdk: $(html "${jdk-${JDK}}")</li>
+  <li>dtest_repository: $(html "${dtest_repository-${DTEST_REPOSITORY}}")</li>
+  <li>dtest_branch: $(html "${dtest_branch-${DTEST_BRANCH}}")</li>
 </ul>
 </body>
 </html>

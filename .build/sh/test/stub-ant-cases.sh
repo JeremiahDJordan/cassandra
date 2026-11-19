@@ -491,4 +491,47 @@ else
   echo "skip  ci_summary.html through ci_parser.py: python3 has no bs4 and jinja2 (pip install -r .build/ci/requirements.txt)"
 fi
 
+# Jenkins sets its job's parameters in lower case
+reset_stub
+run_case env CASSANDRA_DIR="${summary_dir}" DIST_DIR="${summary_dist}" BUILD_TAG=jenkins-Cassandra-trunk-7 \
+  repository=https://github.com/apache/cassandra branch=trunk profile=skinny profile_custom_regexp= \
+  architecture=amd64 jdk=11 dtest_repository=https://github.com/apache/cassandra-dtest dtest_branch=trunk \
+  PROFILE=pre-commit PROFILE_CUSTOM_REGEXP=ignored sh "${summary_dir}/.build/ci/generate-ci-summary.sh"
+expect_rc "generate-ci-summary.sh writes the summary with the Jenkins parameters" 0
+run_case cat "${summary_dist}/ci_summary.html"
+expect_out "generate-ci-summary.sh shows the build tag" "<h1>CI Summary jenkins-Cassandra-trunk-7</h1>"
+expect_out "generate-ci-summary.sh shows the Jenkins repository" "<li>repository: https://github.com/apache/cassandra</li>"
+expect_out "generate-ci-summary.sh shows the Jenkins branch" "<li>branch: trunk</li>"
+expect_out "generate-ci-summary.sh shows the Jenkins jdk" "<li>jdk: 11</li>"
+expect_out "generate-ci-summary.sh shows the Jenkins dtest branch" "<li>dtest_branch: trunk</li>"
+expect_out "generate-ci-summary.sh prefers the Jenkins parameter to the upper case name" "<li>profile: skinny</li>"
+expect_out "generate-ci-summary.sh shows a Jenkins parameter that is empty" "<li>profile_custom_regexp: </li>"
+
+# the upper case name, for a parameter Jenkins did not set
+reset_stub
+run_case env CASSANDRA_DIR="${summary_dir}" DIST_DIR="${summary_dist}" PROFILE=pre-commit \
+  sh "${summary_dir}/.build/ci/generate-ci-summary.sh"
+run_case cat "${summary_dist}/ci_summary.html"
+expect_out "generate-ci-summary.sh reads an unset parameter in upper case" "<li>profile: pre-commit</li>"
+
+# values escaped once: as written, and as ci_parser.py publishes them
+summary_regexp='(?<step>stress-test)|a&b'
+summary_regexp_html='(?&lt;step&gt;stress-test)|a&amp;b'
+reset_stub
+run_case env CASSANDRA_DIR="${summary_dir}" DIST_DIR="${summary_dist}" profile_custom_regexp="${summary_regexp}" \
+  sh "${summary_dir}/.build/ci/generate-ci-summary.sh"
+run_case cat "${summary_dist}/ci_summary.html"
+expect_out "generate-ci-summary.sh escapes the parameters" "<li>profile_custom_regexp: ${summary_regexp_html}</li>"
+if python3 -c 'import bs4, jinja2' 2>/dev/null ; then
+  mkdir -p "${summary_dist}/test/output/test"
+  printf '<testsuite name="a.B"><testcase classname="a.B" name="c" time="1"/></testsuite>\n' \
+    > "${summary_dist}/test/output/test/TEST-a.B.xml"
+  reset_stub
+  run_case env CASSANDRA_DIR="${summary_parsed}" DIST_DIR="${summary_dist}" profile_custom_regexp="${summary_regexp}" \
+    sh "${summary_parsed}/.build/ci/generate-ci-summary.sh"
+  run_case cat "${summary_dist}/ci_summary.html"
+  expect_out "ci_parser.py keeps the parameters escaped" "profile_custom_regexp: ${summary_regexp_html}"
+  rm -rf "${summary_dist}/test"
+fi
+
 report stub-ant

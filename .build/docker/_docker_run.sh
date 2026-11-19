@@ -130,6 +130,14 @@ run_script_name="${run_script_name#_}"
 container_name="cassandra_${dockerfile/.docker/}_${run_script_name}_jdk${java_version}__${random_string}"
 
 [ $DEBUG ] && docker_envs="${docker_envs} --env DEBUG=1"
+# the build tag and build parameters ci/generate-ci-summary.sh lists, as Jenkins sets them, or set by hand; an
+# empty parameter is passed too
+if [ "${run_script}" == "ci/generate-ci-summary.sh" ] ; then
+    for summary_var in BUILD_TAG REPOSITORY BRANCH PROFILE PROFILE_CUSTOM_REGEXP ARCHITECTURE JDK DTEST_REPOSITORY DTEST_BRANCH \
+                       repository branch profile profile_custom_regexp architecture jdk dtest_repository dtest_branch ; do
+        [ -n "${!summary_var+set}" ] && docker_envs="${docker_envs} --env ${summary_var}"
+    done
+fi
 
 # Docker commands:
 #  change ant's build directory to $DIST_DIR
