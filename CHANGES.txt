@@ -1,4 +1,5 @@
 5.0.10
+ * The empty literal {} for a descending frozen map clustering column fails with ClassCastException (CASSANDRA-XXXXX)
  * Assorted fixes for SAI replica reconciliation with multi-cell collections and range tombstones (CASSANDRA-21897)
  * Harden client STARTUP options (CASSANDRA-21755)
  * Assorted fixes for post-filtering on collection elements and inet columns (CASSANDRA-21863)
