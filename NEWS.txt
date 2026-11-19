@@ -117,6 +117,14 @@ Upgrading
       index whose min and max terms are both raw decimals of exactly 24 bytes (a 20-byte unscaled value) is not
       detected and gives incomplete results: rebuild the indexes of DESC decimal columns holding such values with
       nodetool rebuild_index after upgrading.
+    - Storage-attached indexes (SAI) on a clustering column ordered DESC now behave as on the same column ordered ASC,
+      as Apache Cassandra 5.0's do. An index on a DESC text, varchar, ascii or boolean clustering column, or on a DESC
+      frozen tuple or UDT clustering column, indexes the empty value, so c = '' or c IN ('', 'a') find the rows whose
+      clustering value is empty. Indexes built by earlier DataStax versions lack those entries until they are rebuilt
+      or their SSTables compacted: if you query such columns for the empty value, rebuild those indexes on each node
+      after upgrading it, with nodetool rebuild_index. The index on a DESC text, varchar, ascii, boolean or uuid
+      clustering column doesn't serve != and NOT IN, nor range restrictions on uuid, like the index on an ASC column:
+      such queries need ALLOW FILTERING or another index.
 
 5.0.7
 ======
