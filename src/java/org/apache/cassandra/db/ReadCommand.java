@@ -43,6 +43,7 @@ import org.apache.cassandra.cql3.statements.SelectOptions;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.IndexHints;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
 import org.apache.cassandra.db.marshal.Redaction;
@@ -67,7 +68,9 @@ import org.apache.cassandra.guardrails.DefaultGuardrail;
 import org.apache.cassandra.guardrails.Guardrails;
 import org.apache.cassandra.guardrails.Threshold;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexNotAvailableException;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -117,6 +120,14 @@ public abstract class ReadCommand extends AbstractReadQuery
 
     @Nullable
     protected final Index.QueryPlan indexQueryPlan;
+
+    /**
+     * Whether this node is missing an index that this command was built with: the index the command names, an index its
+     * hints include, or an index for an expression of its row filter that only an index can evaluate (see
+     * {@link RowFilter#hasIndexOnlyOperator()}).
+     * This isn't serialized: {@link Serializer#deserialize} sets it.
+     */
+    private boolean missingIndex;
 
     private Supplier<ExecutionInfo> executionInfoSupplier = ExecutionInfo.EMPTY_SUPPLIER;
 
@@ -454,6 +465,12 @@ public abstract class ReadCommand extends AbstractReadQuery
                                   cfs.metadata.keyspace, cfs.metadata.name, Index.joinNames(indexes));
                 }
             }
+        }
+        // a read must use all its included indexes, and other indexes may evaluate it differently
+        else if (rowFilter().indexHints.includesUnknownIndex
+                 || (missingIndex ? rowFilter().hasIndexOnlyOperator() : rowFilter().requiresIndex()))
+        {
+            throw new IndexNotAvailableException(metadata());
         }
 
         Context context = Context.from(this);
@@ -1091,18 +1108,81 @@ public abstract class ReadCommand extends AbstractReadQuery
             RowFilter rowFilter = RowFilter.serializer.deserialize(in, version, metadata);
             DataLimits limits = DataLimits.serializer.deserialize(in, version,  metadata.comparator);
             Index.QueryPlan indexQueryPlan = null;
-            if (hasIndex)
+            IndexMetadata index = hasIndex ? deserializeIndexMetadata(in, version, metadata) : null;
+            boolean missingIndex = rowFilter.indexHints.includesUnknownIndex;
+            if (hasIndex && !missingIndex)
             {
-                IndexMetadata index = deserializeIndexMetadata(in, version, metadata);
-                if (index != null)
+                SecondaryIndexManager indexManager = Keyspace.openAndGetStore(metadata).indexManager;
+                Index.Group indexGroup = index == null ? null : indexManager.getIndexGroup(index);
+                // a plan without the index of an expression that only an index can evaluate would drop the expression,
+                // or fail to order by it
+                if (indexGroup == null || !hasIndexesForIndexOnlyExpressions(rowFilter, indexManager, indexGroup))
                 {
-                    Index.Group indexGroup = Keyspace.openAndGetStore(metadata).indexManager.getIndexGroup(index);
-                    if (indexGroup != null)
-                        indexQueryPlan = indexGroup.queryPlanFor(rowFilter);
+                    missingIndex = true;
+                }
+                else
+                {
+                    indexQueryPlan = indexGroup.queryPlanFor(rowFilter);
+                    if (indexQueryPlan != null && !evaluatesIndexOnlyExpressions(indexQueryPlan, rowFilter, indexGroup))
+                    {
+                        indexQueryPlan = null;
+                        missingIndex = true;
+                    }
                 }
             }
 
-            return kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion, acceptsTransient, metadata, nowInSec, columnFilter, rowFilter, limits, indexQueryPlan);
+            ReadCommand command = kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion, acceptsTransient, metadata, nowInSec, columnFilter, rowFilter, limits, indexQueryPlan);
+            command.missingIndex = missingIndex;
+            return command;
+        }
+
+        private static boolean hasIndexesForIndexOnlyExpressions(RowFilter rowFilter, SecondaryIndexManager indexManager, Index.Group indexGroup)
+        {
+            for (RowFilter.Expression expression : rowFilter.expressions())
+            {
+                if (!expression.hasIndexOnlyOperator())
+                    continue;
+
+                // the plan of the named index's group orders the results, so that group must have an index for it
+                boolean hasIndex = expression.isOrderingExpression()
+                                   ? hasIndexInGroup(indexGroup, expression, rowFilter.indexHints)
+                                   : indexManager.getBestIndexFor(expression, rowFilter.indexHints, Index.class).isPresent();
+                if (!hasIndex)
+                    return false;
+            }
+            return true;
+        }
+
+        /**
+         * Whether the plan can evaluate each ":" expression: one it leaves to the row filter if the expression it leaves
+         * has an analyzer, and any other with an index of the plan's group.
+         */
+        private static boolean evaluatesIndexOnlyExpressions(Index.QueryPlan plan, RowFilter rowFilter, Index.Group indexGroup)
+        {
+            List<RowFilter.Expression> postIndexExpressions = plan.postIndexQueryFilter().expressions();
+            for (RowFilter.Expression expression : rowFilter.expressions())
+            {
+                if (!expression.hasIndexOnlyOperator() || expression.isOrderingExpression())
+                    continue;
+
+                int residual = postIndexExpressions.indexOf(expression);
+                boolean evaluated = residual >= 0
+                                    ? !postIndexExpressions.get(residual).requiresIndex()
+                                    : hasIndexInGroup(indexGroup, expression, rowFilter.indexHints);
+                if (!evaluated)
+                    return false;
+            }
+            return true;
+        }
+
+        private static boolean hasIndexInGroup(Index.Group indexGroup, RowFilter.Expression expression, IndexHints hints)
+        {
+            for (Index index : indexGroup.getIndexes())
+            {
+                if (!hints.excludes(index) && index.supportsExpression(expression))
+                    return true;
+            }
+            return false;
         }
 
         private @Nullable IndexMetadata deserializeIndexMetadata(DataInputPlus in, int version, TableMetadata metadata) throws IOException
@@ -1116,7 +1196,8 @@ public abstract class ReadCommand extends AbstractReadQuery
                 logger.info("Couldn't find a defined index on {}.{} with the id {}. " +
                             "If an index was just created, this is likely due to the schema not " +
                             "being fully propagated. Local read will proceed without using the " +
-                            "index. Please wait for schema agreement after index creation.",
+                            "index, or fail as index not available if one of its expressions needs " +
+                            "the index. Please wait for schema agreement after index creation.",
                             metadata.keyspace, metadata.name, e.indexId);
                 return null;
             }
