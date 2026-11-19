@@ -31,7 +31,6 @@ import java.util.stream.Collectors;
 
 import com.google.common.collect.Maps;
 
-import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.TimeUUID;
 import org.slf4j.Logger;
@@ -49,11 +48,11 @@ import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.KeyReader;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.SSTableWatcher;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.RandomAccessReader;
-import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Throwables;
@@ -152,7 +151,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
         Set<Component> replacedComponents = new HashSet<>();
 
-        try (RandomAccessReader dataFile = sstable.openDataReader(ReadPattern.SEQUENTIAL);
+        try (RandomAccessReader dataFile = sstable.openDataReaderForScan();
              LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.INDEX_BUILD, sstable))
         {
             perSSTableFileLock = shouldWritePerSSTableFiles(sstable, indexDescriptor, replacedComponents);
@@ -170,9 +169,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
             long previousBytesRead = 0;
 
-            try (KeyIterator keys = sstable.keyIterator())
+            try (KeyReader keys = sstable.keyReaderForScan())
             {
-                while (keys.hasNext())
+                while (!keys.isExhausted())
                 {
                     if (isStopRequested())
                     {
@@ -180,8 +179,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                         throw new CompactionInterruptedException(getProgress(), trigger());
                     }
 
-                    DecoratedKey key = keys.next();
-                    long position = sstable.getPosition(key, SSTableReader.Operator.EQ);
+                    DecoratedKey key = sstable.decorateKey(keys.key());
+                    long position = keys.dataPosition();
 
                     indexWriter.startPartition(key, position, position);
 
@@ -197,7 +196,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                         while (partition.hasNext())
                             indexWriter.nextUnfilteredCluster(partition.next());
                     }
-                    long bytesRead = keys.getBytesRead();
+                    long bytesRead = keys.advance() ? keys.dataPosition() : sstable.uncompressedLength();
                     bytesProcessed += bytesRead - previousBytesRead;
                     previousBytesRead = bytesRead;
                 }

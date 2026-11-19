@@ -249,9 +249,21 @@ public abstract class ForwardingSSTableReader extends SSTableReader
     }
 
     @Override
+    public KeyReader keyReaderForScan() throws IOException
+    {
+        return delegate.keyReaderForScan();
+    }
+
+    @Override
     public KeyIterator keyIterator() throws IOException
     {
         return delegate.keyIterator();
+    }
+
+    @Override
+    public KeyIterator keyIteratorForScan() throws IOException
+    {
+        return delegate.keyIteratorForScan();
     }
 
     @Override

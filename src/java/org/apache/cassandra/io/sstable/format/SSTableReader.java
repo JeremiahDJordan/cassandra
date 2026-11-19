@@ -1072,11 +1072,30 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
     public abstract KeyReader keyReader() throws IOException;
 
     /**
+     * Returns a {@link KeyReader} over all keys in the sstable that reads through scan readers, for a pass over the
+     * whole sstable that shouldn't populate the chunk cache. A scan reader of a compressed file holds a read-ahead
+     * buffer, so passes that keep the keys of many sstables open at once should use {@link #keyReader()}.
+     */
+    public KeyReader keyReaderForScan() throws IOException
+    {
+        return keyReader();
+    }
+
+    /**
      * Returns a {@link KeyIterator} over all keys in the sstable.
      */
     public KeyIterator keyIterator() throws IOException
     {
         return new KeyIterator(keyReader(), getPartitioner(), uncompressedLength(), new ReentrantReadWriteLock());
+    }
+
+    /**
+     * Returns a {@link KeyIterator} over all keys in the sstable that reads through scan readers, see
+     * {@link #keyReaderForScan()}.
+     */
+    public KeyIterator keyIteratorForScan() throws IOException
+    {
+        return new KeyIterator(keyReaderForScan(), getPartitioner(), uncompressedLength(), new ReentrantReadWriteLock());
     }
 
     /**

@@ -159,6 +159,12 @@ public class BigTableReader extends SSTableReaderWithFilter implements IndexSumm
         return BigTableKeyReader.create(ifile, rowIndexEntrySerializer);
     }
 
+    @Override
+    public KeyReader keyReaderForScan() throws IOException
+    {
+        return BigTableKeyReader.createForScan(ifile, rowIndexEntrySerializer);
+    }
+
     /**
      * Finds and returns the first key beyond a given token in this SSTable or null if no such key exists.
      */
