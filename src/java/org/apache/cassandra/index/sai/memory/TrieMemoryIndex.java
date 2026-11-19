@@ -60,7 +60,7 @@ import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.IndexContext;
-import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
+import org.apache.cassandra.index.sai.analyzer.ByteLimitedMaterializer;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
 import org.apache.cassandra.index.sai.disk.v6.TermsDistribution;
@@ -255,69 +255,62 @@ public class TrieMemoryIndex extends MemoryIndex
                                   LongConsumer offHeapAllocationsTracker,
                                   InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey> transformer)
     {
-        AbstractAnalyzer analyzer = indexContext.getAnalyzerFactory().create();
-        try
+        // The terms the sstable writers produce (see SegmentBuilder#analyzeAndAdd), so a value is indexed the same way
+        // in memtables and sstables.
+        value = TypeUtil.asIndexBytes(value, indexContext.getValidator());
+        List<ByteBuffer> terms = ByteLimitedMaterializer.materializeTokens(indexContext.getAnalyzerFactory().create(), value, indexContext, primaryKey);
+        final long initialSizeOnHeap = data.usedSizeOnHeap();
+        final long initialSizeOffHeap = data.usedSizeOffHeap();
+        final long initialPrimaryKeysHeapAllocations = primaryKeysHeapAllocations.longValue();
+
+        int tokenCount = 0;
+        for (ByteBuffer term : terms)
         {
-            value = TypeUtil.asIndexBytes(value, indexContext.getValidator());
-            analyzer.reset(value);
-            final long initialSizeOnHeap = data.usedSizeOnHeap();
-            final long initialSizeOffHeap = data.usedSizeOffHeap();
-            final long initialPrimaryKeysHeapAllocations = primaryKeysHeapAllocations.longValue();
+            if (!indexContext.validateMaxTermSize(primaryKey.partitionKey(), term))
+                continue;
 
-            int tokenCount = 0;
-            while (analyzer.hasNext())
+            tokenCount++;
+
+            // Note that this term is already encoded once by the TypeUtil.encode call above.
+            setMinMaxTerm(term.duplicate());
+
+            final ByteComparable encodedTerm = asByteComparable(term.duplicate());
+
+            try
             {
-                final ByteBuffer term = analyzer.next();
-                if (!indexContext.validateMaxTermSize(primaryKey.partitionKey(), term))
-                    continue;
-
-                tokenCount++;
-
-                // Note that this term is already encoded once by the TypeUtil.encode call above.
-                setMinMaxTerm(term.duplicate());
-
-                final ByteComparable encodedTerm = asByteComparable(term.duplicate());
-
-                try
-                {
-                    data.putSingleton(encodedTerm, primaryKey, transformer, term.remaining() <= MAX_RECURSIVE_KEY_LENGTH);
-                }
-                catch (TrieSpaceExhaustedException e)
-                {
-                    Throwables.throwAsUncheckedException(e);
-                }
+                data.putSingleton(encodedTerm, primaryKey, transformer, term.remaining() <= MAX_RECURSIVE_KEY_LENGTH);
             }
-
-            Object prev = docLengths.put(primaryKey, tokenCount);
-            if (prev != null)
+            catch (TrieSpaceExhaustedException e)
             {
-                // An update first transforms with Accumulator to the new value,
-                // then transforms with Remover from the old value.
-                if (transformer instanceof PrimaryKeysAccumulator)
-                    totalTermCount += tokenCount;
-                if (transformer instanceof PrimaryKeysRemover)
-                    totalTermCount -= tokenCount;
-                // heap used for doc lengths
-                long heapUsed = RamUsageEstimator.HASHTABLE_RAM_BYTES_PER_ENTRY
-                                + primaryKey.ramBytesUsed() // TODO do we count these bytes?
-                                + Integer.BYTES;
-                onHeapAllocationsTracker.accept(heapUsed);
+                Throwables.throwAsUncheckedException(e);
             }
-            else
-            {
-                indexedRows++;
+        }
+
+        Object prev = docLengths.put(primaryKey, tokenCount);
+        if (prev != null)
+        {
+            // An update first transforms with Accumulator to the new value,
+            // then transforms with Remover from the old value.
+            if (transformer instanceof PrimaryKeysAccumulator)
                 totalTermCount += tokenCount;
-            }
-
-            // memory used by the trie
-            onHeapAllocationsTracker.accept((data.usedSizeOnHeap() - initialSizeOnHeap) +
-                                            (primaryKeysHeapAllocations.longValue() - initialPrimaryKeysHeapAllocations));
-            offHeapAllocationsTracker.accept(data.usedSizeOffHeap() - initialSizeOffHeap);
+            if (transformer instanceof PrimaryKeysRemover)
+                totalTermCount -= tokenCount;
+            // heap used for doc lengths
+            long heapUsed = RamUsageEstimator.HASHTABLE_RAM_BYTES_PER_ENTRY
+                            + primaryKey.ramBytesUsed() // TODO do we count these bytes?
+                            + Integer.BYTES;
+            onHeapAllocationsTracker.accept(heapUsed);
         }
-        finally
+        else
         {
-            analyzer.end();
+            indexedRows++;
+            totalTermCount += tokenCount;
         }
+
+        // memory used by the trie
+        onHeapAllocationsTracker.accept((data.usedSizeOnHeap() - initialSizeOnHeap) +
+                                        (primaryKeysHeapAllocations.longValue() - initialPrimaryKeysHeapAllocations));
+        offHeapAllocationsTracker.accept(data.usedSizeOffHeap() - initialSizeOffHeap);
     }
 
     @Override

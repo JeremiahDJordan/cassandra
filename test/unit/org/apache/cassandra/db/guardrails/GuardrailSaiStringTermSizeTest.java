@@ -21,7 +21,6 @@ package org.apache.cassandra.db.guardrails;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
@@ -66,7 +65,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testCompositePartitionKey() throws Throwable
     {
         createTable("CREATE TABLE %s (k1 int, k2 text, v int, PRIMARY KEY((k1, k2)))");
@@ -77,7 +75,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testSimpleClustering() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, c text, v int, PRIMARY KEY(k, c))");
@@ -88,7 +85,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testRegularColumn() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
@@ -99,7 +95,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testStaticColumn() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, c int, s text STATIC, r int, PRIMARY KEY(k, c))");
@@ -112,7 +107,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testList() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, l list<text>)");
@@ -134,7 +128,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testBatch() throws Throwable
     {
         createTable("CREATE TABLE %s (k text, c text, r text, s text STATIC, PRIMARY KEY(k, c))");
@@ -153,7 +146,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testCASWithIfNotExistsCondition() throws Throwable
     {
         createTable("CREATE TABLE %s (k text, c text, v text, s text STATIC, PRIMARY KEY(k, c))");
@@ -206,7 +198,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testFailingTermOnBuild()
     {
         ByteBuffer oversizedTerm = allocate(failThreshold() + 1);
