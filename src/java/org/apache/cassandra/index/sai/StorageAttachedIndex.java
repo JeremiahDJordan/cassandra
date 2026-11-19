@@ -67,6 +67,7 @@ import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
@@ -112,6 +113,7 @@ import static org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig.MAX_TOP_K
 
 public class StorageAttachedIndex implements Index
 {
+    public static final String VECTOR_NON_FLOAT_ERROR = "SAI ANN indexes are only allowed on vector columns with float elements";
     public static final String NGRAM_WITHOUT_QUERY_ANALYZER_WARNING =
     "Using an ngram analyzer without defining a query_analyzer. " +
     "This means that the same ngram analyzer will be applied to both indexed and queried column values. " +
@@ -257,6 +259,25 @@ public class StorageAttachedIndex implements Index
                                              target.right,
                                              config,
                                              baseCfs);
+    }
+
+    /**
+     * Rejects the creation of an index on vectors whose elements aren't floats ({@link #VECTOR_NON_FLOAT_ERROR}). Such
+     * columns only exist with {@code -Dcassandra.float_only_vectors=false}. Only checked when the index is created, so
+     * that an index created on such a column by an earlier version stays in the schema and doesn't block schema
+     * changes.
+     */
+    public static void validateVectorElementType(TableMetadata table, IndexMetadata index)
+    {
+        // This runs before validateOptions (see CreateIndexStatement), which reports invalid targets
+        String targetColumn = index.options.get(IndexTarget.TARGET_OPTION_NAME);
+        Pair<ColumnMetadata, IndexTarget.Type> target = targetColumn == null ? null : TargetParser.parse(table, targetColumn);
+        if (target == null)
+            return;
+
+        AbstractType<?> type = TypeUtil.cellValueType(target.left, target.right);
+        if (type.isVector() && !(((VectorType<?>) type).elementType instanceof FloatType))
+            throw new InvalidRequestException(VECTOR_NON_FLOAT_ERROR);
     }
 
     /**
