@@ -264,10 +264,9 @@ Upgrading
       files are used as before. An index created on an existing table (CREATE INDEX) deletes the files of its name on
       the table's sstables that weren't built for its definition, so that it also builds over such files from the data.
       Files written before the upgrade, or by Apache Cassandra, can still be used by an index of the same name and
-      another definition on a node that receives DROP INDEX and CREATE INDEX as one schema change (e.g. it was down),
-      on sstables imported or streamed once it exists, and after a restart that follows a CREATE INDEX that couldn't
-      list the sstable files (an error is logged): run nodetool rebuild_index on the nodes concerned. Older versions
-      ignore the content of the marker.
+      another definition on sstables imported or streamed once it exists, and after a restart that follows a CREATE
+      INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes
+      concerned. Older versions ignore the content of the marker.
     - Storage-attached indexes (SAI) read the index files Apache Cassandra 5.0 wrote (on-disk version "aa", files
       named SAI+aa+...) instead of rebuilding them: after an in-place upgrade from Apache Cassandra 5.0, the indexes
       that exist when the node starts use them, as do these indexes for sstables imported (nodetool import) or

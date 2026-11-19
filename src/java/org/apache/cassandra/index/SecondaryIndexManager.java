@@ -381,10 +381,18 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      */
     public synchronized Future<?> addIndex(IndexMetadata indexDef, boolean isNewCF)
     {
-        if (indexes.containsKey(indexDef.name))
-            return reloadIndex(indexDef);
-        else
+        Index registered = indexes.get(indexDef.name);
+        if (registered == null)
             return createIndex(indexDef, isNewCF);
+
+        // the index was dropped and created again with another definition, and this node got both as one schema change
+        if (!registered.getIndexMetadata().equals(indexDef))
+        {
+            removeIndex(indexDef.name);
+            return createIndex(indexDef, isNewCF);
+        }
+
+        return reloadIndex(indexDef);
     }
 
     /**

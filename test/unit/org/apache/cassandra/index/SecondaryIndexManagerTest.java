@@ -23,6 +23,7 @@ import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -65,6 +66,8 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.notifications.SSTableAddedNotification;
 import org.apache.cassandra.notifications.SSTableListChangedNotification;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
 import org.apache.cassandra.utils.ClassLoadingTestSupport;
@@ -230,6 +233,30 @@ public class SecondaryIndexManagerTest extends CQLTester
         // create the index again and verify that it's added to the built indexes table
         createIndex(String.format("CREATE INDEX %s ON %%s(c)", indexName));
         assertMarkedAsBuilt(indexName);
+    }
+
+    @Test
+    public void redefiningIndexInOneSchemaChangeReplacesIt() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, t text)");
+        execute("INSERT INTO %s (k, t) VALUES (0, 'Quick')");
+        flush();
+        createIndex("CREATE CUSTOM INDEX t_idx ON %s (t) USING 'StorageAttachedIndex' WITH OPTIONS = {'case_sensitive': 'false'}");
+        waitForTableIndexesQueryable();
+        assertRows(execute("SELECT k FROM %s WHERE t = 'quick'"), row(0));
+
+        // the index dropped and created again with other options, applied as one schema change
+        TableMetadata table = currentTableMetadata();
+        IndexMetadata old = table.indexes.get("t_idx").get();
+        Map<String, String> options = new HashMap<>(old.options);
+        options.put("case_sensitive", "true");
+        IndexMetadata redefined = IndexMetadata.fromSchemaMetadata("t_idx", old.kind, options);
+        SchemaTestUtil.announceTableUpdate(table.unbuild().indexes(table.indexes.replace(redefined)).build());
+        waitForTableIndexesQueryable();
+
+        assertEquals(redefined, getCurrentColumnFamilyStore().indexManager.getIndexByName("t_idx").getIndexMetadata());
+        assertEmpty(execute("SELECT k FROM %s WHERE t = 'quick'"));
+        assertRows(execute("SELECT k FROM %s WHERE t = 'Quick'"), row(0));
     }
 
     @Test
