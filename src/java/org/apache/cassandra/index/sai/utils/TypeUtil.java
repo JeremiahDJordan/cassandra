@@ -21,8 +21,11 @@ package org.apache.cassandra.index.sai.utils;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Set;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -51,7 +54,9 @@ import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FastByteOperations;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -165,6 +170,13 @@ public class TypeUtil
                             return CompositeType.getInstance(collection.nameComparator(), collection.valueComparator());
                     }
             }
+        }
+        if (isFrozenCollection(type) && (indexType == IndexTarget.Type.KEYS || indexType == IndexTarget.Type.VALUES))
+        {
+            CollectionType<?> collection = (CollectionType<?>) baseType(type);
+            return collection.kind == CollectionType.Kind.SET || indexType == IndexTarget.Type.KEYS
+                   ? collection.nameComparator()
+                   : collection.valueComparator();
         }
         return type;
     }
@@ -336,6 +348,37 @@ public class TypeUtil
             stream = stream.sorted((c1, c2) -> compareInet(encodeInetAddress(c1), encodeInetAddress(c2)));
 
         return stream.iterator();
+    }
+
+    /**
+     * Returns the elements of a serialized frozen collection: the keys of a map for {@link IndexTarget.Type#KEYS}, and
+     * otherwise its values, or the elements of a list or a set.
+     */
+    public static Iterator<ByteBuffer> frozenCollectionIterator(AbstractType<?> type, ByteBuffer value, IndexTarget.Type indexType)
+    {
+        if (!value.hasRemaining())
+            return Collections.emptyIterator();
+
+        boolean hasKeys = ((CollectionType<?>) baseType(type)).kind == CollectionType.Kind.MAP;
+        boolean getKeys = hasKeys && indexType == IndexTarget.Type.KEYS;
+        int size = CollectionSerializer.readCollectionSize(value, ByteBufferAccessor.instance, ProtocolVersion.V3);
+        int offset = CollectionSerializer.sizeOfCollectionSize(size, ProtocolVersion.V3);
+        List<ByteBuffer> elements = new ArrayList<>(size);
+        for (int i = 0; i < size; i++)
+        {
+            if (hasKeys)
+            {
+                ByteBuffer key = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset, ProtocolVersion.V3);
+                if (getKeys)
+                    elements.add(key);
+                offset += CollectionSerializer.sizeOfValue(key, ByteBufferAccessor.instance, ProtocolVersion.V3);
+            }
+            ByteBuffer element = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset, ProtocolVersion.V3);
+            if (!getKeys)
+                elements.add(element);
+            offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance, ProtocolVersion.V3);
+        }
+        return elements.iterator();
     }
 
     private static boolean useFastByteOperations(AbstractType<?> type, Version version)
