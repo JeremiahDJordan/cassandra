@@ -1269,7 +1269,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                       iterator.metadata().enforceStrictLiveness());
             }
 
-            // Index searches read the base table, and lower the controller's value, after this is created
+            // Index searches, and writes to the memtables the read opened, lower the controller's value after this is created
             @Override
             protected long oldestUnrepairedTombstone()
             {
