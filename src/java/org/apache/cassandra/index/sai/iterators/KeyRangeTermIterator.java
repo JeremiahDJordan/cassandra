@@ -68,8 +68,27 @@ public class KeyRangeTermIterator extends KeyRangeIterator
     @SuppressWarnings("resource")
     public static KeyRangeTermIterator build(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer)
     {
-        KeyRangeIterator rangeIterator = buildRangeIterator(e, view, keyRange, queryContext, defer);
+        KeyRangeIterator rangeIterator = buildRangeIterator(e.searchedRanges(), view, keyRange, queryContext, defer);
         return new KeyRangeTermIterator(rangeIterator, view.sstableIndexes, queryContext);
+    }
+
+    private static KeyRangeIterator buildRangeIterator(List<Expression> ranges, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer)
+    {
+        if (ranges.size() == 1)
+            return buildRangeIterator(ranges.get(0), view, keyRange, queryContext, defer);
+
+        List<KeyRangeIterator> iterators = new ArrayList<>(ranges.size());
+        try
+        {
+            for (Expression range : ranges)
+                iterators.add(buildRangeIterator(range, view, keyRange, queryContext, defer));
+        }
+        catch (Throwable t)
+        {
+            FileUtils.closeQuietly(iterators);
+            throw t;
+        }
+        return KeyRangeUnionIterator.build(iterators);
     }
 
     private static KeyRangeIterator buildRangeIterator(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer)

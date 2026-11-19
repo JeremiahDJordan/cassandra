@@ -371,7 +371,8 @@ public class SegmentMetadata implements Comparable<SegmentMetadata>
             case NOT_CONTAINS_VALUE:
             {
                 // The search returns all the rows when it can't subtract the matches of the negated expression
-                if (TypeUtil.supportsRounding(predicate.validator) || !IndexContext.canSubtractMatches(predicate))
+                if (TypeUtil.supportsRounding(predicate.validator) || TypeUtil.isInetAddress(predicate.validator)
+                    || !IndexContext.canSubtractMatches(predicate))
                     return numRows;
                 else
                 {
