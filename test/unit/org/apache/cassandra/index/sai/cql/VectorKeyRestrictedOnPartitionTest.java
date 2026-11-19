@@ -18,9 +18,11 @@
 
 package org.apache.cassandra.index.sai.cql;
 
+import java.lang.ref.WeakReference;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -30,9 +32,13 @@ import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.metrics.ColumnQueryMetrics;
 import org.apache.cassandra.index.sai.utils.Glove;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 public class VectorKeyRestrictedOnPartitionTest extends VectorKeyRestrictedTester
 {
@@ -88,6 +94,37 @@ public class VectorKeyRestrictedOnPartitionTest extends VectorKeyRestrictedTeste
             float[] queryVector = word2vec.vector(word2vec.word(getRandom().nextIntBetween(0, vectorCount - 1)));
             searchWithNonExistingKey(queryVector, nonExistingKey);
         }
+    }
+
+    @Test
+    public void flushedMemtableNotRetainedByPartitionRestrictedSearchTest()
+    {
+        createTable(String.format("CREATE TABLE %%s (pk int, str_val text, val vector<float, %d>, PRIMARY KEY(pk))", word2vec.dimension()));
+        createVectorIndex("%s", "val");
+
+        int vectorCount = 100;
+        for (int pk = 0; pk < vectorCount; pk++)
+            execute("INSERT INTO %s (pk, str_val, val) VALUES (?, 'A', " + vectorString(word2vec.vector(word2vec.word(pk))) + " )", pk);
+
+        var store = getCurrentColumnFamilyStore();
+        WeakReference<Memtable> memtable = new WeakReference<>(store.getTracker().getView().getCurrentMemtable());
+        var index = (StorageAttachedIndex) store.indexManager.listIndexes().iterator().next();
+        var metrics = (ColumnQueryMetrics.VectorIndexMetrics) index.getIndexContext().getColumnQueryMetrics();
+
+        // graph search of the memtable index, filtered to the restricted partition
+        setMaxBruteForceRows(0);
+        for (int key = 0; key < vectorCount; key++)
+            execute("SELECT * FROM %s WHERE pk = ? ORDER BY val ann of ? LIMIT 10", key, vector(word2vec.vector(word2vec.word(key))));
+
+        assertThat(metrics.annGraphSearches.getCount()).isPositive();
+        assertThat(store.getLiveSSTables()).isEmpty();
+        assertThat(store.getTracker().getView().getCurrentMemtable()).isSameAs(memtable.get());
+        flush();
+
+        await().atMost(15, TimeUnit.SECONDS).until(() -> {
+            System.gc();
+            return memtable.get() == null;
+        });
     }
 
     @Test
