@@ -425,6 +425,9 @@ public class TrackerTest
         tracker.replaceFlushed(prev1, Collections.emptyList(), Optional.empty());
         Assert.assertEquals(1, tracker.getView().flushingMemtables.size());
         Assert.assertTrue(tracker.getView().flushingMemtables.contains(prev2));
+        Assert.assertEquals(1, listener.received.size());
+        Assert.assertEquals(prev1, ((MemtableDiscardedNotification) listener.received.get(0)).memtable);
+        listener.received.clear();
 
         SSTableReader reader = MockSchema.sstable(0, 10, false, cfs);
         tracker.replaceFlushed(prev2, singleton(reader), Optional.empty());
