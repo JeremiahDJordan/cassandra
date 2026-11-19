@@ -20,6 +20,7 @@
  */
 package org.apache.cassandra.index.sai.functional;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -30,6 +31,7 @@ import org.apache.cassandra.index.sai.SSTableContext;
 import org.apache.cassandra.index.sai.utils.SuppressLeakCheck;
 import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.service.StorageService;
 import org.assertj.core.api.Assertions;
 
 import static org.junit.Assert.assertEquals;
@@ -37,6 +39,12 @@ import static org.junit.Assert.assertEquals;
 @SuppressLeakCheck(reason="The SSTableContext.<init> error is synthetic and can't happen in a live environment")
 public class FailureTest extends SAITester
 {
+    @BeforeClass
+    public static void setup()
+    {
+        StorageService.instance.setNormalModeUnsafe(); // Ensure the node has advanced out of STARTING mode
+    }
+
     @Test
     public void shouldMakeIndexNonQueryableOnSSTableContextFailureDuringFlush() throws Throwable
     {
