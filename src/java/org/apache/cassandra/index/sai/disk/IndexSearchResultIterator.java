@@ -76,15 +76,19 @@ public class IndexSearchResultIterator extends KeyRangeIterator
                                                   boolean includeMemtables,
                                                   Runnable onClose)
     {
-        int size = sstableIndexes.size() + (includeMemtables ? memtableIndexes.size() : 0);
+        List<Expression> ranges = expression.searchedRanges();
+        int size = (sstableIndexes.size() + (includeMemtables ? memtableIndexes.size() : 0)) * ranges.size();
         List<KeyRangeIterator> subIterators = new ArrayList<>(size);
 
         if (includeMemtables)
         {
             for (MemtableIndex memtableIndex : memtableIndexes)
             {
-                KeyRangeIterator memtableIterator = memtableIndex.search(queryContext, expression, keyRange);
-                subIterators.add(memtableIterator);
+                for (Expression range : ranges)
+                {
+                    KeyRangeIterator memtableIterator = memtableIndex.search(queryContext, range, keyRange);
+                    subIterators.add(memtableIterator);
+                }
             }
         }
 
@@ -98,16 +102,20 @@ public class IndexSearchResultIterator extends KeyRangeIterator
                 if (sstableIndex.isReleased())
                     throw new IllegalStateException(sstableIndex.getIndexIdentifier().logMessage("Index was released from the view during the query"));
 
-                List<KeyRangeIterator> indexIterators = sstableIndex.search(expression, keyRange, queryContext);
+                for (Expression range : ranges)
+                {
+                    List<KeyRangeIterator> indexIterators = sstableIndex.search(range, keyRange, queryContext);
 
-                if (!indexIterators.isEmpty())
-                    subIterators.addAll(indexIterators);
+                    if (!indexIterators.isEmpty())
+                        subIterators.addAll(indexIterators);
+                }
             }
             catch (Throwable e)
             {
                 if (!(e instanceof QueryCancelledException))
                     logger.debug(sstableIndex.getIndexIdentifier().logMessage(String.format("Failed search an index %s, aborting query.", sstableIndex.getSSTable())), e);
 
+                FileUtils.closeQuietly(subIterators);
                 throw Throwables.cleaned(e);
             }
         }

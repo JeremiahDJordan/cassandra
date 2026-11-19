@@ -20,8 +20,11 @@ package org.apache.cassandra.index.sai.view;
 
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.apache.cassandra.index.sai.disk.SSTableIndex;
 import org.apache.cassandra.index.sai.plan.Expression;
@@ -70,7 +73,14 @@ public class View implements Iterable<SSTableIndex>
         if (expression.getIndexOperator() == Expression.IndexOperator.ANN)
             return getIndexes();
 
-        return rangeTermTree.search(expression);
+        List<Expression> ranges = expression.searchedRanges();
+        if (ranges.size() == 1)
+            return rangeTermTree.search(ranges.get(0));
+
+        Set<SSTableIndex> indexes = new HashSet<>();
+        for (Expression range : ranges)
+            indexes.addAll(rangeTermTree.search(range));
+        return indexes;
     }
 
     @Override
