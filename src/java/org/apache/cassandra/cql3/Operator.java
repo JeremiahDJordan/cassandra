@@ -396,6 +396,10 @@ public enum Operator
         @Override
         public boolean isSatisfiedByAnalyzed(AbstractType<?> type, List<ByteBuffer> leftTokens, List<ByteBuffer> rightTokens)
         {
+            // a value the analyzer makes no terms of, such as stop words, matches no row, as with the index
+            if (rightTokens.isEmpty())
+                return false;
+
             Iterator<ByteBuffer> it = rightTokens.iterator();
 
             do
