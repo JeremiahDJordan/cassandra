@@ -30,7 +30,7 @@ import io.github.jbellis.jvector.graph.GraphSearcher;
  * to only use it in a single search at a time.
  */
 @NotThreadSafe
-public class GraphSearcherAccessManager
+public class GraphSearcherAccessManager implements AutoCloseable
 {
     private final GraphSearcher searcher;
     private final AtomicBoolean locked;
@@ -72,6 +72,7 @@ public class GraphSearcherAccessManager
     /**
      * Close the {@link GraphSearcher} instance.  It cannot be used again after being closed.
      */
+    @Override
     public void close() throws IOException
     {
         searcher.close();
