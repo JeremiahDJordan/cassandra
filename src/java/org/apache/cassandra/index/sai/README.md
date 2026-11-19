@@ -19,27 +19,30 @@
 # Storage-Attached Indexing
 
 ## Overview
-Storage-attached indexes are a new column-based secondary indexing apparatus for DSE.
+Storage-attached indexing is a column based local secondary index implementation for Cassandra.
 
-The project was inspired by OSS SASI (SSTable-Attached Secondary Indexes) and retains some of its high-level
+The project was inspired by SASI (SSTable-Attached Secondary Indexes) and retains some of its high-level
 architectural character (and even some actual code), but makes significant improvements in a number of areas:
 
 - The on-disk/SSTable index formats for both string and numeric data have been completely replaced. Strings are indexed
-  on disk using our proprietary on-disk byte-ordered trie data structure, while numeric types are indexed using Lucene's
-  balanced kd-tree.
+  on disk using a byte-ordered trie data structure, while numeric types are indexed using a balanced kd-tree. Vectors
+  are indexed in a graph for approximate nearest neighbor (ANN) search.
 - While indexes continue to be managed at the column level from the user's perspective, the storage design at the column
   index level is row-based, with related offset and token information stored only once at the SSTable level. This
   drastically reduces our on-disk footprint when several columns are indexed on the same table.
-- The query path is synchronous and index searches run on IO threads.
-- Tracing, metrics, virtual table-based metadata, RLAC, and snapshot-based backup/restore are supported out of the box.
+- Tracing, metrics, virtual table-based metadata and snapshot-based backup/restore are supported out of the box.
+- On-disk index components can be streamed completely when entire SSTable streaming is enabled.
+- Incremental index building is supported, and on-disk index components are included in snapshots.
 
 Many similarities with standard secondary indexes remain:
 
 - The full set of C* consistency levels is supported for both reads and writes.
 - Index updates are synchronous with mutations and do not require any kind of read-before-write.
-- Queries are implemented on the back of C* range reads.
+- Global queries are implemented on the back of C* range reads.
 - Paging is supported.
-- Only token ordering of results is supported.
+- Results are in token order, unless the query orders them with ORDER BY: by similarity to a vector (ANN), by BM25
+  relevance for an analyzed regular text column (from SAI version EC), or by the values of an eligible regular column
+  with a non-analyzed index.
 - Index builds are visible to operators as compactions and are executed on compaction threads.
 - All DML and DDL statements are CQL-based.
 - Single-node management operations are available via nodetool. (ex. stop & rebuild_index)
@@ -48,37 +51,23 @@ Many similarities with standard secondary indexes remain:
 
 The following short tutorial will get you up-and-running with storage-attached indexing.
 
-### Build and Start DSE
+### Build and Start Cassandra
 
-1.) Make sure you've created the following directories and given yourself permissions on them:
-
-`/var/log/cassandra`
-
-`/var/lib/cassandra`
-
-2.) From the bdp root directory, run the following commands:
-
-`./gradlew jar`
-
-`bin/dse cassandra`
-
-3.) When the node stabilizes, open up `cqlsh` from the bdp root directory.
-
-`bin/cqlsh`
+Follow the instructions to build and start Cassandra in README.asc in root folder of the Cassandra repository
 
 ### Create a Simple Data Model
 
 1.) Run the following DDL statements to create a table and two indexes:
 
-`CREATE KEYSPACE test WITH replication = {'class': 'NetworkTopologyStrategy' , 'Cassandra': '1'};`
+`CREATE KEYSPACE test WITH replication = {'class': 'SimpleStrategy', 'replication_factor': '1'};`
 
 `USE test;`
 
 `CREATE TABLE person (id int, name text, age int, PRIMARY KEY (id));`
 
-`CREATE CUSTOM INDEX ON person (name) USING 'StorageAttachedIndex' WITH OPTIONS = {'case_sensitive': false};`
+`CREATE INDEX ON person (name) USING 'sai' WITH OPTIONS = {'case_sensitive': false};`
 
-`CREATE CUSTOM INDEX ON person (age) USING 'StorageAttachedIndex';`
+`CREATE INDEX ON person (age) USING 'sai';`
 
 2.) Add some data.
 
@@ -103,7 +92,7 @@ The following short tutorial will get you up-and-running with storage-attached i
   2 |  50 | john
 ```
 
-2.) Query for everyone between the ages of 18 and 25.
+2.) Query for everyone between the ages of 18 and 35.
 
 `SELECT * FROM person WHERE age >= 18 AND age <= 35;`
 
@@ -121,9 +110,10 @@ The following short tutorial will get you up-and-running with storage-attached i
 - Zhao Yang
 - Jason Rutherglen
 - Maciej Zasada
-- Andrew de la Peña
+- Andres de la Peña
 - Mike Adamson
 - Zahir Patni
 - Tomek Lasica
 - Berenguer Blasi
 - Rocco Varela
+- Piotr Kołaczkowski
