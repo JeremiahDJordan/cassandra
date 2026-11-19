@@ -26,6 +26,7 @@ import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -56,6 +57,7 @@ import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.VectorType;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.SecondaryIndexManager;
@@ -68,6 +70,8 @@ import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.bitpack.NumericValuesWriter;
 import org.apache.cassandra.index.sai.disk.v1.segment.SegmentBuilder;
+import org.apache.cassandra.index.sai.memory.MemtableIndex;
+import org.apache.cassandra.index.sai.memory.MemtableIndexManager;
 import org.apache.cassandra.index.sai.utils.IndexIdentifier;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.index.sai.view.View;
@@ -597,6 +601,51 @@ public class StorageAttachedIndexDDLTest extends SAITester
         assertEquals(1, rows.all().size());
 
         assertZeroSegmentBuilderUsage();
+    }
+
+    @Test
+    public void shouldNotKeepMemtableIndexOfMemtableTruncatedDuringWrite() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v vector<float, 2>)");
+        String indexName = createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StorageAttachedIndex index = (StorageAttachedIndex) cfs.indexManager.getIndexByName(indexName);
+        Memtable truncated = cfs.getTracker().getView().getCurrentMemtable();
+
+        // hold a write that has picked the memtable until truncation has switched it out
+        Injections.Barrier writeBarrier = Injections.newBarrier("writeDuringTruncate", 2, false)
+                                                    .add(InvokePointBuilder.newInvokePoint()
+                                                                           .onClass(MemtableIndexManager.class)
+                                                                           .onMethod("index")
+                                                                           .atEntry())
+                                                    .build();
+        Injections.Counter memtableRenewals = Injections.newCounter("memtableRenewalsDuringTruncate")
+                                                       .add(InvokePointBuilder.newInvokePoint()
+                                                                              .onClass(MemtableIndexManager.class)
+                                                                              .onMethod("renewMemtable")
+                                                                              .atExit())
+                                                       .build();
+        Injections.inject(writeBarrier, memtableRenewals);
+
+        CompletableFuture<Void> write = CompletableFuture.runAsync(() -> execute("INSERT INTO %s (pk, v) VALUES (0, [1.0, 2.0])"));
+        CompletableFuture<Void> truncate = CompletableFuture.completedFuture(null);
+        try
+        {
+            waitForAssert(() -> assertEquals(1, writeBarrier.getCount()), 10, TimeUnit.SECONDS);
+            truncate = CompletableFuture.runAsync(() -> truncate(false));
+            waitForAssert(() -> assertEquals(1, memtableRenewals.get()), 10, TimeUnit.SECONDS);
+        }
+        finally
+        {
+            writeBarrier.countDown();
+            CompletableFuture.allOf(write, truncate).get(30, TimeUnit.SECONDS);
+        }
+
+        assertEmpty(execute("SELECT pk FROM %s"));
+        assertEmpty(execute("SELECT pk FROM %s ORDER BY v ANN OF [1.0, 2.0] LIMIT 10"));
+        Assertions.assertThat(index.memtableIndexManager().getLiveMemtableIndexesSnapshot())
+                  .extracting(MemtableIndex::getMemtable)
+                  .doesNotContain(truncated);
     }
 
     @Test
