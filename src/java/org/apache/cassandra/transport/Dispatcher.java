@@ -400,7 +400,9 @@ public class Dispatcher implements CQLMessageHandler.MessageConsumer<Message.Req
         if (queueTime > DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS))
         {
             ClientMetrics.instance.markTimedOutBeforeProcessing();
-            return ImmediateFuture.success(ErrorMessage.fromException(new OverloadedException("Query timed out before it could start")));
+            ErrorMessage error = ErrorMessage.fromException(new OverloadedException("Query timed out before it could start"));
+            error.setStreamId(request.getStreamId());
+            return ImmediateFuture.success(error);
         }
 
         if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
