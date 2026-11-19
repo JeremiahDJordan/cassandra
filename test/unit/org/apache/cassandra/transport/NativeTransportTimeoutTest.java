@@ -52,19 +52,19 @@ public class NativeTransportTimeoutTest extends CQLTester
     static Semaphore WAIT_BARRIER;
 
     @Test
-    @BMRules(rules = { @BMRule(name = "Delay Message execution on NTR stage",
-                       targetClass = "org.apache.cassandra.transport.Message$Request",
-                       targetMethod = "execute",
+    @BMRules(rules = { @BMRule(name = "Delay request processing on NTR stage",
+                       targetClass = "org.apache.cassandra.transport.Dispatcher$RequestProcessor",
+                       targetMethod = "run",
                        targetLocation = "AT ENTRY",
-                       condition = "$this.getCustomPayload() != null",
+                       condition = "$0.request.getCustomPayload() != null",
                        action = "org.apache.cassandra.transport.NativeTransportTimeoutTest.WAIT_BARRIER.release(); " +
                                 "org.apache.cassandra.transport.NativeTransportTimeoutTest.EXECUTE_BARRIER.acquire(); " +
                                 "flag(Thread.currentThread());"),
-                       @BMRule(name = "Mock NTR timeout from Request.execute",
+                       @BMRule(name = "Mock NTR timeout from Dispatcher.processRequest",
                        targetClass = "org.apache.cassandra.config.DatabaseDescriptor",
                        targetMethod = "getNativeTransportTimeout",
                        targetLocation = "AT ENTRY",
-                       condition = "flagged(Thread.currentThread()) && callerEquals(\"Message$Request.execute\", true)",
+                       condition = "flagged(Thread.currentThread()) && callerEquals(\"Dispatcher.processRequest\", true)",
                        action = "clear(Thread.currentThread()); " +
                                 "return 10000000;") })
     public void testNativeTransportLoadShedding() throws Throwable
