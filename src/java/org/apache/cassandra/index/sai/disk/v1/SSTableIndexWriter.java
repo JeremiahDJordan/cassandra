@@ -126,7 +126,8 @@ public class SSTableIndexWriter implements PerIndexWriter
                 while (valueIterator.hasNext())
                 {
                     ByteBuffer value = valueIterator.next();
-                    addedRow = addTerm(TypeUtil.asIndexBytes(value.duplicate(), indexContext.getValidator()), key, sstableRowId, indexContext.getValidator());
+                    addedRow = addTerm(indexContext.asIndexTerm(value.duplicate()), key, sstableRowId,
+                                       indexContext.getValidator());
                 }
             }
         }
@@ -135,7 +136,8 @@ public class SSTableIndexWriter implements PerIndexWriter
             ByteBuffer value = indexContext.getValueOf(key.partitionKey(), row, nowInSec);
             if (value != null)
             {
-                addedRow = addTerm(TypeUtil.asIndexBytes(value.duplicate(), indexContext.getValidator()), key, sstableRowId, indexContext.getValidator());
+                addedRow = addTerm(indexContext.asIndexTerm(value.duplicate()), key, sstableRowId,
+                                   indexContext.getValidator());
             }
         }
         if (addedRow)

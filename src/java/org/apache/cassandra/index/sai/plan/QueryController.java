@@ -89,6 +89,7 @@ import org.apache.cassandra.index.sai.disk.vector.VectorCompression;
 import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
 import org.apache.cassandra.index.sai.iterators.KeyRangeTermIterator;
+import org.apache.cassandra.index.sai.iterators.KeyRangeUnionIterator;
 import org.apache.cassandra.index.sai.memory.MemtableIndex;
 import org.apache.cassandra.index.sai.utils.AbortedOperationException;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
@@ -545,7 +546,28 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     private KeyRangeIterator buildIterator(Expression predicate)
     {
         QueryView view = getQueryView(predicate.context);
-        return KeyRangeTermIterator.build(predicate, view, mergeRange, queryContext, false);
+        KeyRangeIterator iterator = KeyRangeTermIterator.build(predicate, view, mergeRange, queryContext, false);
+
+        // The indexes written before map entries, frozen values and varints were indexed in canonical form hold them as
+        // they were written, so they are also searched for the predicate's values as written (see
+        // Expression#withUncanonicalizedBounds).
+        Expression uncanonicalized = predicate.withUncanonicalizedBounds();
+        if (uncanonicalized == null)
+            return iterator;
+
+        try
+        {
+            // (withUncanonicalizedBounds returns null for every negation, i.e. != and NOT CONTAINS KEY/VALUE (see
+            // Expression.Op#isNonEquality), so this build never subtracts matches)
+            KeyRangeIterator uncanonicalizedIterator =
+                KeyRangeTermIterator.build(uncanonicalized, view, mergeRange, queryContext, false);
+            return KeyRangeUnionIterator.build(List.of(iterator, uncanonicalizedIterator));
+        }
+        catch (Throwable t)
+        {
+            FileUtils.closeQuietly(iterator);
+            throw t;
+        }
     }
 
     /**

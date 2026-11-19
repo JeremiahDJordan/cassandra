@@ -21,10 +21,14 @@ package org.apache.cassandra.index.sai.utils;
 import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
@@ -89,6 +93,8 @@ public class TypeUtil
 
     /** The largest map entry key: 0xFFFF starting a first CompositeType component is read as the static marker. */
     public static final int MAX_MAP_ENTRY_KEY_SIZE = FBUtilities.MAX_UNSIGNED_SHORT - 1;
+
+    private static final Map<AbstractType<?>, Boolean> NON_UNIQUE_SERIALIZATION = new ConcurrentHashMap<>();
 
     private TypeUtil() {}
 
@@ -281,7 +287,171 @@ public class TypeUtil
             return encodeBigInteger(value);
         else if (type instanceof DecimalType)
             return encodeDecimal(value);
+        else if (type instanceof CompositeType)
+            return canonicalizeComponents(value, (CompositeType) type);
+        else if (isFrozen(type) && !type.isVector() && hasNonUniqueSerialization(type))
+            return canonicalize(value, type);
         return value;
+    }
+
+    /**
+     * Whether equal values of the given type can have different serializations, so that the index must hold them in
+     * a canonical form (see {@link #canonicalize(ByteBuffer, AbstractType)}): decimals (2.5 and 2.50 differ by their
+     * scale), varints (0x0001 and 0x01), and the types that contain them (tuples, UDTs, frozen collections, map
+     * entries).
+     */
+    public static boolean hasNonUniqueSerialization(AbstractType<?> type)
+    {
+        // Every write and every query of a frozen or map entries index asks, so the answer is kept per type (there are
+        // few types, and an ALTER TYPE only adds one).
+        Boolean cached = NON_UNIQUE_SERIALIZATION.get(type);
+        if (cached == null)
+        {
+            cached = computeHasNonUniqueSerialization(type);
+            NON_UNIQUE_SERIALIZATION.put(type, cached);
+        }
+        return cached;
+    }
+
+    private static boolean computeHasNonUniqueSerialization(AbstractType<?> type)
+    {
+        type = baseType(type);
+        if (type instanceof DecimalType || type instanceof IntegerType)
+            return true;
+        for (AbstractType<?> subType : type.subTypes())
+        {
+            if (computeHasNonUniqueSerialization(subType))
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * Returns the canonical serialization of the given non-empty value of the given type: the one that its
+     * byte-comparable form decodes to, which is the same for all the values equal to it (e.g. 2.5, 2.50 and 2.500 give
+     * 2.50, and a tuple (2.5, 1) gives (2.50, 1)). It's also the form the storage engine gives map keys and set
+     * elements, which the trie memtable stores as byte-comparables.
+     */
+    public static ByteBuffer canonicalize(ByteBuffer value, AbstractType<?> type)
+    {
+        if (value == null || !value.hasRemaining())
+            return value;
+        type = baseType(type);
+        try
+        {
+            ByteSource bytes = type.asComparableBytes(ByteBufferAccessor.instance, value, BYTE_COMPARABLE_VERSION);
+            if (bytes == null)
+                return value;
+            ByteBuffer canonical = type.fromComparableBytes(ByteBufferAccessor.instance,
+                                                            ByteSource.peekable(bytes),
+                                                            BYTE_COMPARABLE_VERSION);
+            if (canonical.equals(value))
+                return value;
+            // The byte-comparable form of an empty element (e.g. blobAsDecimal(0x)) is that of a null, which a
+            // collection can't hold: the decoded collection is then invalid, and comparing it fails later (index view
+            // after a flush, compaction). Validation rejects it, and the value is indexed as written (below).
+            type.validate(canonical);
+            return canonical;
+        }
+        catch (RuntimeException e)
+        {
+            // The value doesn't parse with this type, or has no valid canonical form. The first happens to valid
+            // values: an index keeps the type its column had when it was created (IndexContext#validator), so after
+            // ALTER TYPE ... ADD the values of a UDT have more fields than the type the index knows. Index and search
+            // such a value as written, as was done before the canonical form: a write, a flush, a compaction or a read
+            // must not fail here.
+            return value;
+        }
+    }
+
+    /**
+     * Returns the composite value (a map entry, or a bound of a range over map entries: a key alone, possibly with an
+     * end-of-component byte of 1) with its components of a type with several serializations per value (see
+     * {@link #hasNonUniqueSerialization(AbstractType)}) replaced by their canonical serialization, the one they decode
+     * to from their byte-comparable form (see {@link #canonicalize(ByteBuffer, AbstractType)}), or the value itself if
+     * none changes. From {@link Version#DB}, entries are stored as byte-comparables, so their terms don't change.
+     */
+    public static ByteBuffer canonicalizeComponents(ByteBuffer value, CompositeType type)
+    {
+        if (value == null || !hasNonUniqueSerialization(type))
+            return value;
+
+        List<AbstractType<?>> types = type.subTypes();
+        ByteBuffer input = value.duplicate();
+        if (CompositeType.isStaticName(input, ByteBufferAccessor.instance))
+            return value;
+
+        List<ByteBuffer> components = new ArrayList<>(types.size());
+        List<Byte> endOfComponents = new ArrayList<>(types.size());
+        boolean changed = false;
+        while (input.hasRemaining())
+        {
+            // A value that doesn't parse as a composite is left alone: its validation will reject it.
+            if (input.remaining() < 2)
+                return value;
+            int length = ByteBufferUtil.readShortLength(input);
+            if (length < 0 || input.remaining() < length + 1)
+                return value;
+            ByteBuffer component = ByteBufferUtil.readBytes(input, length);
+            byte endOfComponent = input.get();
+
+            int i = components.size();
+            if (i < types.size() && hasNonUniqueSerialization(types.get(i)))
+            {
+                ByteBuffer canonical = canonicalize(component, types.get(i));
+                // The canonical form can be larger than the written one (2.5 is 5 bytes, 2.50 is 6): a component that
+                // no longer fits in a composite is left as written, rather than failing in writeShortLength below.
+                int maxSize = i == 0 ? MAX_MAP_ENTRY_KEY_SIZE : MAX_MAP_ENTRY_VALUE_SIZE;
+                if (canonical != component && canonical.remaining() <= maxSize)
+                {
+                    component = canonical;
+                    changed = true;
+                }
+            }
+            components.add(component);
+            endOfComponents.add(endOfComponent);
+        }
+
+        if (!changed)
+            return value;
+
+        int size = 0;
+        for (ByteBuffer component : components)
+            size += 2 + component.remaining() + 1;
+        ByteBuffer result = ByteBuffer.allocate(size);
+        for (int i = 0; i < components.size(); i++)
+        {
+            ByteBufferUtil.writeShortLength(result, components.get(i).remaining());
+            result.put(components.get(i).duplicate());
+            result.put(endOfComponents.get(i));
+        }
+        result.flip();
+        return result;
+    }
+
+    /**
+     * Whether the index term of a value of the type can differ from its term as written (see
+     * {@link #asIndexBytesAsWritten}): map entries, frozen values and varints.
+     */
+    public static boolean hasCanonicalIndexTerms(AbstractType<?> type)
+    {
+        return isComposite(type) || (isFrozen(type) && !type.isVector()) || isBigInteger(type);
+    }
+
+    /**
+     * The term of the value as written, as indexes written by Apache Cassandra 5.0 or without canonical terms hold it:
+     * the serialized bytes of a map entry or a frozen value as written, and a varint with its redundant sign bytes. For
+     * the other types, the same as {@link #asIndexBytes}.
+     */
+    public static ByteBuffer asIndexBytesAsWritten(ByteBuffer value, AbstractType<?> type)
+    {
+        if (value == null || value.remaining() == 0)
+            return value;
+        if (isBigInteger(type))
+            return encodeBigIntegerAsWritten(value);
+        if (isComposite(type) || (isFrozen(type) && !type.isVector()))
+            return value;
+        return asIndexBytes(value, type);
     }
 
     /**
@@ -341,7 +511,7 @@ public class TypeUtil
      * Returns the values of the live cells of the given collection, as indexed by an index of the given type.
      * <p>
      * The map entries that an {@link IndexTarget.Type#KEYS_AND_VALUES} index can't represent (see
-     * {@link #isIndexableMapEntry(Cell)}) are left out, and given to {@code onUnindexableMapEntry} if it isn't null.
+     * {@link #fitsMapEntryTerm(Cell)}) are left out, and given to {@code onUnindexableMapEntry} if it isn't null.
      */
     public static Iterator<ByteBuffer> collectionIterator(AbstractType<?> validator,
                                                           ComplexColumnData cellData,
@@ -358,7 +528,7 @@ public class TypeUtil
         if (indexType == IndexTarget.Type.KEYS_AND_VALUES)
         {
             cells = cells.filter(cell -> {
-                if (isIndexableMapEntry(cell))
+                if (fitsMapEntryTerm(cell))
                     return true;
                 if (onUnindexableMapEntry != null)
                     onUnindexableMapEntry.accept(cell);
@@ -405,12 +575,58 @@ public class TypeUtil
     }
 
     /**
-     * Whether the given map cell can be indexed by an {@link IndexTarget.Type#KEYS_AND_VALUES} index, i.e. whether its
-     * key is at most {@link #MAX_MAP_ENTRY_KEY_SIZE} bytes and its value at most {@link #MAX_MAP_ENTRY_VALUE_SIZE}.
+     * Whether an entry term can be built for the map cell as written: its key at most
+     * {@link #MAX_MAP_ENTRY_KEY_SIZE} bytes and its value at most {@link #MAX_MAP_ENTRY_VALUE_SIZE}. Indexing and
+     * post-filtering use this: a component whose canonical form doesn't fit is held as written (see
+     * {@link #canonicalizeComponents}). Client writes are checked on the canonical sizes (see
+     * {@link #isIndexableMapEntry}).
      */
-    public static boolean isIndexableMapEntry(Cell<?> cell)
+    public static boolean fitsMapEntryTerm(Cell<?> cell)
     {
         return cell.path().get(0).remaining() <= MAX_MAP_ENTRY_KEY_SIZE && cell.valueSize() <= MAX_MAP_ENTRY_VALUE_SIZE;
+    }
+
+    /**
+     * Whether a client write of the given map cell is accepted by an {@link IndexTarget.Type#KEYS_AND_VALUES} index of
+     * the given validator (the {@link CompositeType} of the map's key and value types), i.e. whether its key is at most
+     * {@link #MAX_MAP_ENTRY_KEY_SIZE} bytes and its value at most {@link #MAX_MAP_ENTRY_VALUE_SIZE} in canonical form
+     * (see {@link #mapEntryKeySize} and {@link #mapEntryValueSize}), so that the index holds them in that form. An
+     * entry that only fits as written, which reaches the index without this check, is indexed as written (see
+     * {@link #fitsMapEntryTerm}).
+     */
+    public static boolean isIndexableMapEntry(Cell<?> cell, AbstractType<?> validator)
+    {
+        return mapEntryKeySize(cell, validator) <= MAX_MAP_ENTRY_KEY_SIZE
+               && mapEntryValueSize(cell, validator) <= MAX_MAP_ENTRY_VALUE_SIZE;
+    }
+
+    /**
+     * The size of the key of the given map cell in the canonical form an entries index of the given validator holds it
+     * in when it fits (see {@link #canonicalizeComponents}), which can be larger than the written form (2.5 is 5
+     * bytes, 2.50 is 6).
+     */
+    public static int mapEntryKeySize(Cell<?> cell, AbstractType<?> validator)
+    {
+        return indexedComponentSize(cell.path().get(0), validator.subTypes().get(0), MAX_MAP_ENTRY_KEY_SIZE);
+    }
+
+    /**
+     * The size of the value of the given map cell as an entries index of the given validator holds it (see
+     * {@link #mapEntryKeySize}).
+     */
+    public static int mapEntryValueSize(Cell<?> cell, AbstractType<?> validator)
+    {
+        return indexedComponentSize(cell.buffer(), validator.subTypes().get(1), MAX_MAP_ENTRY_VALUE_SIZE);
+    }
+
+    private static int indexedComponentSize(ByteBuffer component, AbstractType<?> type, int maxSize)
+    {
+        int size = component.remaining();
+        // The canonical form can be much larger than the value as written, whatever its size: a tuple or UDT value
+        // written with fewer fields than its type is padded to all of them, 4 bytes per missing field.
+        if (size > maxSize || !hasNonUniqueSerialization(type))
+            return size;
+        return canonicalize(component, type).remaining();
     }
 
     private static ByteBuffer cellValue(ColumnMetadata columnMetadata, IndexTarget.Type indexType, Cell<?> cell)
@@ -498,6 +714,41 @@ public class TypeUtil
      *  16 bytes, the encoded value is sign extended.
      */
     public static ByteBuffer encodeBigInteger(ByteBuffer value)
+    {
+        return encodeBigIntegerAsWritten(withoutRedundantSignBytes(value));
+    }
+
+    /**
+     * Returns the given varint without its redundant leading sign bytes (0x0001 is 1, 0xFF80 is -128), which is the
+     * same for all the varints equal to it, so that they have the same index term. A varint written minimally, as
+     * clients and CQL literals do, is returned as it is.
+     */
+    private static ByteBuffer withoutRedundantSignBytes(ByteBuffer value)
+    {
+        int start = value.position();
+        int first = start;
+        while (value.limit() - first > 1)
+        {
+            byte b = value.get(first);
+            boolean nextIsNegative = (value.get(first + 1) & 0x80) != 0;
+            if ((b == 0 && !nextIsNegative) || (b == (byte) 0xFF && nextIsNegative))
+                first++;
+            else
+                break;
+        }
+        if (first == start)
+            return value;
+        ByteBuffer minimal = value.duplicate();
+        minimal.position(first);
+        return minimal;
+    }
+
+    /**
+     * The index term of the given varint as written, with its redundant sign bytes: the term an index written before
+     * {@link #encodeBigInteger} stripped them holds (see {@link #asIndexBytesAsWritten}), which is also the term of
+     * an index written by Apache Cassandra 5.0.
+     */
+    public static ByteBuffer encodeBigIntegerAsWritten(ByteBuffer value)
     {
         int size = value.remaining();
         int position = value.hasArray() ? value.arrayOffset() + value.position() : value.position();
