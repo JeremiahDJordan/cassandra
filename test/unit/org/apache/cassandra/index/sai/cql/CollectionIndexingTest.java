@@ -340,6 +340,12 @@ public class CollectionIndexingTest extends SAITester.Versioned
     }
 
     @Test
+    public void unindexedFrozenCollectionDescendingClusteringColumns() throws Throwable
+    {
+        testUnindexedFrozenCollections("PRIMARY KEY (k, x, m, s, l)) WITH CLUSTERING ORDER BY (x ASC, m DESC, s DESC, l DESC)", false, true);
+    }
+
+    @Test
     public void unindexedFrozenCollectionStaticColumns() throws Throwable
     {
         testUnindexedFrozenCollections("PRIMARY KEY (k, x))", true, false);
@@ -358,7 +364,7 @@ public class CollectionIndexingTest extends SAITester.Versioned
         execute("INSERT INTO %s (k, x, m, s, l, v) VALUES (3, 0, {2: 'b'}, {2}, [2], 2)");
 
         // collections without elements: empty ones, and missing ones where they aren't primary key columns
-        execute("INSERT INTO %s (k, x, m, s, l, v) VALUES (4, 0, {}, {}, [], 1)");
+        execute("INSERT INTO %s (k, x, m, s, l, v) VALUES (4, 0, ?, ?, ?, 1)", map(), set(), list());
         if (!clustering)
             execute("INSERT INTO %s (k, x, v) VALUES (5, 0, 1)");
         Object[][] withoutElements = clustering ? new Object[][]{ row(4) } : new Object[][]{ row(4), row(5) };
