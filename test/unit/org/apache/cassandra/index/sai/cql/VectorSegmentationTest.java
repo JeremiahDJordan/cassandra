@@ -20,6 +20,11 @@ package org.apache.cassandra.index.sai.cql;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Test;
 
@@ -27,8 +32,12 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
+import org.apache.cassandra.index.sai.disk.vector.GraphSearcherAccessManager;
+import org.apache.cassandra.inject.Injections;
 
+import static org.apache.cassandra.inject.InvokePointBuilder.newInvokePoint;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.awaitility.Awaitility.await;
 
 public class VectorSegmentationTest extends VectorTester
 {
@@ -148,5 +157,50 @@ public class VectorSegmentationTest extends VectorTester
         compact();
 
         assertThat(areAllTableIndexesQueryable()).isTrue();
+    }
+
+    @Test
+    public void testGraphSearchersClosedWhenSegmentIsReleased() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, val vector<float, " + dimension + ">, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+        disableCompaction();
+
+        for (int row = 0; row < 100; row++)
+            execute("INSERT INTO %s (pk, val) VALUES (?, ?)", row, vector(randomVector()));
+        flush();
+
+        Injections.Counter searcherCloses = Injections.newCounter("GraphSearcherCloses")
+                                                      .add(newInvokePoint().onClass(GraphSearcherAccessManager.class)
+                                                                           .onMethod("close"))
+                                                      .build();
+        Injections.inject(searcherCloses);
+
+        // each thread searches the graph of the flushed segment with its own searcher; executeInternal keeps the read
+        // on the calling thread
+        setMaxBruteForceRows(0);
+        int threads = 4;
+        ExecutorService executor = Executors.newFixedThreadPool(threads);
+        try
+        {
+            CyclicBarrier start = new CyclicBarrier(threads);
+            List<Future<?>> searches = new ArrayList<>();
+            for (int i = 0; i < threads; i++)
+            {
+                searches.add(executor.submit(() -> {
+                    start.await();
+                    return executeInternal("SELECT pk FROM %s ORDER BY val ANN OF ? LIMIT 5", vector(randomVector()));
+                }));
+            }
+            for (Future<?> search : searches)
+                search.get(30, TimeUnit.SECONDS);
+        }
+        finally
+        {
+            executor.shutdownNow();
+        }
+
+        compact();
+        await().atMost(10, TimeUnit.SECONDS).until(() -> searcherCloses.get() == threads);
     }
 }
