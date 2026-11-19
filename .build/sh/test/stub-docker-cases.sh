@@ -281,6 +281,34 @@ expect_out "docker/run-tests.sh names the executors in the memory check" "per je
 
 ################################
 #
+# Cases: docker/run-tests.sh, and the container's cpus
+#
+################################
+
+# the stub host has 8 cores, and is not a Jenkins agent
+reset_stub
+run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs with every core" 0
+expect_invocation "docker/run-tests.sh gives the container every core" "\-\-cpus=8.00 "
+
+reset_stub
+docker_cpus=3 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs with docker_cpus" 0
+expect_invocation "docker/run-tests.sh gives the container docker_cpus" "\-\-cpus=3 "
+
+reset_stub
+docker_cpus=0 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh rejects a docker_cpus of 0" 1
+expect_out "docker/run-tests.sh names the docker_cpus of 0" "docker_cpus must be a number above 0"
+
+reset_stub
+docker_cpus=all run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh rejects a docker_cpus that is not a number" 1
+expect_out "docker/run-tests.sh names the bad docker_cpus" "docker_cpus must be a number above 0"
+expect_no_invocation "docker/run-tests.sh starts no test container for a bad docker_cpus" "docker run \-\-name"
+
+################################
+#
 # Cases: docker/run-tests.sh, and the deprecated positional arguments
 #
 ################################

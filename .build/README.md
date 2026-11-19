@@ -112,6 +112,11 @@ Running unittests with a specific jdk with docker:
     .build/docker/run-tests.sh -a test -c 1/64 -j 11
 
 
+Limiting the cpus of the test container, which otherwise gets every core, with docker:
+
+    docker_cpus=4 .build/docker/run-tests.sh -a test -c 1/64
+
+
 On a Jenkins agent that has several executors, and whose Jenkins allows anonymous api reads,
 the test containers can share the agent's cores and memory: `docker_cpus_per_executor=yes`
 gives each an equal share of the cores, and `docker_memory_per_executor=yes` has the memory

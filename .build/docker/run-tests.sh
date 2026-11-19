@@ -264,7 +264,12 @@ case ${test_target/-repeat/} in
     ;;
 esac
 
-docker_cpus=$(echo "scale=2; ${cores} / ( ${cpu_executors} )" | bc)
+# docker_cpus, when set, is the container's cpus: for a host shared other than through jenkins executors
+if [ "x${docker_cpus}" == "x" ] ; then
+    docker_cpus=$(echo "scale=2; ${cores} / ( ${cpu_executors} )" | bc)
+elif [[ ! "${docker_cpus}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || (( ! $(echo "${docker_cpus} > 0" | bc) )) ; then
+    error 1 "docker_cpus must be a number above 0, it is set to ${docker_cpus}"
+fi
 docker_cpus_limit=$(docker info | grep CPUs | cut -d" " -f3)
 if (( $(echo "${docker_cpus} > ${docker_cpus_limit}" |bc -l) )) ; then
     echo "WARNING: requested more cpus (${docker_cpus}) than docker cpu limit (${docker_cpus_limit}), reducing cpus…"
