@@ -88,11 +88,11 @@ public class BtiTableReaderLoadingBuilder extends SortedTableReaderLoadingBuilde
                                                               .complete();
              FileHandle riFile = rowIndexFileBuilder(indexEncryptionMetadata).complete())
         {
-            return PartitionIterator.create(index,
-                                            tableMetadataRef.getLocal().partitioner,
-                                            riFile,
-                                            dFile,
-                                            descriptor.version);
+            return PartitionIterator.createForScan(index,
+                                                   tableMetadataRef.getLocal().partitioner,
+                                                   riFile,
+                                                   dFile,
+                                                   descriptor.version);
         }
     }
 

@@ -409,6 +409,12 @@ public class BtiTableReader extends SSTableReaderWithFilter
     }
 
     @Override
+    public PartitionIterator keyReaderForScan() throws IOException
+    {
+        return PartitionIterator.createForScan(partitionIndex, metadata().partitioner, rowIndexFile, dfile, descriptor.version);
+    }
+
+    @Override
     public Iterable<DecoratedKey> getKeySamples(final Range<Token> range)
     {
         // BTI does not support key sampling as it would involve walking the index or data file.

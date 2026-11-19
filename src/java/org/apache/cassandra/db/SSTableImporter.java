@@ -428,7 +428,7 @@ public class SSTableImporter
     @VisibleForTesting
     void invalidateCachesForSSTable(SSTableReader reader)
     {
-        try (KeyIterator iter = reader.keyIterator())
+        try (KeyIterator iter = reader.keyIteratorForScan())
         {
             while (iter.hasNext())
             {

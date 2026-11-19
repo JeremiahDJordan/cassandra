@@ -196,7 +196,7 @@ public class BigSSTableReaderLoadingBuilder extends SortedTableReaderLoadingBuil
         checkNotNull(serializationHeader);
 
         RowIndexEntry.IndexSerializer serializer = new RowIndexEntry.Serializer(descriptor.version, serializationHeader, tableMetrics);
-        return BigTableKeyReader.create(indexFile, serializer);
+        return BigTableKeyReader.createForScan(indexFile, serializer);
     }
 
     /**
@@ -293,7 +293,7 @@ public class BigSSTableReaderLoadingBuilder extends SortedTableReaderLoadingBuil
     {
         checkNotNull(indexFile);
 
-        try (RandomAccessReader indexReader = indexFile.createReader())
+        try (RandomAccessReader indexReader = indexFile.createReaderForScan())
         {
             // collect sizes for the first 10000 keys, or first 10 mebibytes of data
             final int samplesCap = 10000;
