@@ -95,6 +95,12 @@ public class ShardManagerDiskAware extends ShardManagerNoDisks
         return new BoundaryTrackerDiskAware(shardCount);
     }
 
+    @Override
+    public ShardTracker singleShardBoundaries()
+    {
+        return new BoundaryTracker(1);
+    }
+
     public class BoundaryTrackerDiskAware implements ShardTracker
     {
         private final int countPerDisk;

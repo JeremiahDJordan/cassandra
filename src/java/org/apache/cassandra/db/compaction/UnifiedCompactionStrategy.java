@@ -732,7 +732,7 @@ public class UnifiedCompactionStrategy extends AbstractCompactionStrategy
                                       lifecycleNewTracker,
                                       supportsL0Shards(sstableLevel, indexGroups)
                                       ? getFlushShardBoundaries()
-                                      : getShardManager().boundaries(1));
+                                      : getShardManager().singleShardBoundaries());
     }
 
     /// Whether the sstables written at the given level can be split into shards. A vector index can't be split across
