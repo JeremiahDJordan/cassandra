@@ -20,9 +20,17 @@ package org.apache.cassandra.index.sai.disk;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.Sets;
@@ -35,13 +43,16 @@ import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
+import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.OnDiskFormat;
 import org.apache.cassandra.index.sai.memory.RowMapping;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
+import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.Clock;
@@ -53,6 +64,9 @@ import org.apache.cassandra.utils.Throwables;
 public class StorageAttachedIndexWriter implements SSTableFlushObserver
 {
     private static final Logger logger = LoggerFactory.getLogger(MethodHandles.lookup().lookupClass());
+
+    // The indexes whose components each new SSTable's writer writes, by name, until it is added to its table or aborted
+    private static final ConcurrentMap<Descriptor, Map<String, StorageAttachedIndex>> indexesOfNewSSTables = new ConcurrentHashMap<>();
 
     private final IndexDescriptor indexDescriptor;
     private final PrimaryKey.Factory primaryKeyFactory;
@@ -67,6 +81,7 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
     private DecoratedKey currentKey;
     private boolean tokenOffsetWriterCompleted = false;
     private boolean aborted = false;
+    private boolean trackedAsNewSSTable = false;
 
     private long sstableRowId = 0;
     private long totalTimeSpent = 0;
@@ -113,6 +128,48 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                 ? PerSSTableWriter.NONE
                                 : onDiskFormat.newPerSSTableWriter(indexDescriptor);
         this.tableMetrics = tableMetrics;
+    }
+
+    /**
+     * Records the index instances this writer writes components for, until its SSTable is added to its table or the
+     * write is aborted (instances: an index dropped and created again with the same name is another one).
+     */
+    public void trackNewSSTable()
+    {
+        Set<IndexContext> written = Collections.newSetFromMap(new IdentityHashMap<>());
+        for (PerIndexWriter writer : perIndexWriters)
+            written.add(writer.indexContext());
+        Map<String, StorageAttachedIndex> writtenFor = new HashMap<>();
+        for (StorageAttachedIndex index : indices)
+            if (written.contains(index.getIndexContext()))
+                writtenFor.put(index.getIndexContext().getIndexName(), index);
+        indexesOfNewSSTables.put(indexDescriptor.descriptor, writtenFor);
+        trackedAsNewSSTable = true;
+    }
+
+    /** Removes and returns the indexes, by name, that the writer of the new SSTable wrote components for, or null. */
+    public static @Nullable Map<String, StorageAttachedIndex> takeIndexesWrittenFor(Descriptor descriptor)
+    {
+        return indexesOfNewSSTables.remove(descriptor);
+    }
+
+    /** Forgets the indexes written for the given new SSTables, which won't be added to their table. */
+    public static void forgetNewSSTables(Collection<SSTableReader> sstables)
+    {
+        for (SSTableReader sstable : sstables)
+            indexesOfNewSSTables.remove(sstable.descriptor);
+    }
+
+    /** Forgets the index of that name for the SSTable, if tracked: its components on the SSTable were dealt with. */
+    public static void forgetIndexWrittenFor(Descriptor descriptor, String indexName)
+    {
+        indexesOfNewSSTables.computeIfPresent(descriptor, (d, indexes) -> {
+            if (!indexes.containsKey(indexName))
+                return indexes;
+            Map<String, StorageAttachedIndex> others = new HashMap<>(indexes);
+            others.remove(indexName);
+            return others.isEmpty() ? null : others;
+        });
     }
 
     @Override
@@ -317,6 +374,8 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
 
         // Mark the write aborted, so we can short-circuit any further operations on the component writers.
         aborted = true;
+        if (trackedAsNewSSTable)
+            indexesOfNewSSTables.remove(indexDescriptor.descriptor);
 
         // For non-compaction and non-flush, make any indexes involved in this transaction non-queryable,
         // as they will likely not match the backing table.

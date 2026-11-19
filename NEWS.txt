@@ -107,6 +107,16 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - A storage-attached index (SAI) created on an existing table (CREATE INDEX) always builds from the table's data,
+      also when it re-creates a dropped index of the same name: it deletes the index files of its name already on the
+      table's sstables (left by a dropped index, or imported or streamed in), which may have been written for another
+      column or other options. An entire-sstable stream that is sending those sstables at that time fails, and a
+      compaction or stream that completes between DROP INDEX and CREATE INDEX makes the new index non-queryable on
+      that node until it is rebuilt. The new index can still use the files of the dropped one on a node that receives
+      both changes as one schema change (e.g. it was down), on sstables streamed whole or imported once it exists, and
+      after a restart that follows a CREATE INDEX that couldn't list the sstable files (an error is logged): don't
+      re-use the name of a dropped index for another definition while these can happen, or run nodetool rebuild_index
+      on the nodes concerned.
 
 5.0.7
 ======

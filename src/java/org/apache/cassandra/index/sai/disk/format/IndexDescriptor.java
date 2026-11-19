@@ -116,6 +116,19 @@ public class IndexDescriptor
         return empty(descriptor, new ClusteringComparator());
     }
 
+    /**
+     * The per-index components of the build of the index that exist on disk, among the types, whether or not this
+     * descriptor uses them (e.g. to delete them through
+     * {@link org.apache.cassandra.io.sstable.SSTableWatcher#onIndexDropped}).
+     */
+    public IndexComponents.ForWrite perIndexComponentsOfBuild(IndexContext context, ComponentsBuildId buildId, Set<IndexComponentType> types)
+    {
+        IndexComponentsImpl components = new IndexComponentsImpl(context, buildId);
+        types.forEach(components::addIfExists);
+        components.sealed = true;
+        return components;
+    }
+
     public static IndexDescriptor empty(Descriptor descriptor, ClusteringComparator comparator)
     {
         IndexDescriptor created = new IndexDescriptor(descriptor, comparator);

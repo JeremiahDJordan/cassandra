@@ -46,6 +46,7 @@ import org.apache.cassandra.db.view.View;
 import org.apache.cassandra.dht.Bounds;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
@@ -178,6 +179,7 @@ public class CassandraStreamReceiver implements StreamReceiver
     @Override
     public synchronized void abort()
     {
+        StorageAttachedIndexWriter.forgetNewSSTables(sstables);
         sstables.clear();
         txn.abort();
     }

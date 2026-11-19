@@ -21,6 +21,7 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -272,7 +273,10 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         IndexDescriptor indexDescriptor = IndexDescriptor.empty(descriptor, tableMetadata.comparator);
         try
         {
-            return new StorageAttachedIndexWriter(indexDescriptor, tableMetadata, indices, tracker, keyCount, baseCfs.metric);
+            StorageAttachedIndexWriter writer = new StorageAttachedIndexWriter(indexDescriptor, tableMetadata, indices,
+                                                                               tracker, keyCount, baseCfs.metric);
+            writer.trackNewSSTable();
+            return writer;
         }
         catch (Throwable t)
         {
@@ -340,6 +344,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             // are already validated in SSTableImporter.
             boolean validate = notice.fromStreaming() || 
                               (!notice.memtable().isPresent() && notice.operationType != OperationType.UNKNOWN);
+            discardComponentsOfDroppedIndexes(notice.added, Collections.emptySet(), notice.memtable().isPresent());
             onSSTableChanged(Collections.emptySet(), Lists.newArrayList(notice.added), indices, validate);
         }
         else if (notification instanceof SSTableListChangedNotification)
@@ -347,6 +352,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             SSTableListChangedNotification notice = (SSTableListChangedNotification) notification;
 
             // Avoid validation for index files just written during compaction.
+            discardComponentsOfDroppedIndexes(notice.added, notice.removed, false);
             onSSTableChanged(notice.removed, notice.added, indices, false);
         }
         else if (notification instanceof MemtableRenewedNotification)
@@ -356,6 +362,43 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         else if (notification instanceof MemtableDiscardedNotification)
         {
             indices.forEach(index -> index.getIndexContext().discardMemtable(((MemtableDiscardedNotification) notification).memtable));
+        }
+    }
+
+    /**
+     * The writer of a new SSTable may have written components for an index that was dropped, and created again with the
+     * same name, before the SSTable is added (e.g. a flush in flight across DROP INDEX and CREATE INDEX). The new index
+     * must not take these components for its own, and its {@link StorageAttachedIndex#onAddedToExistingTable} didn't see
+     * the SSTable, so they are discarded here, before the indexes load the SSTable.
+     *
+     * @param removed the SSTables removed by the same change: those that are also added are not new, but restored
+     *                (e.g. by an aborted compaction) or opened again
+     * @param flushed whether the SSTables come from a memtable flush
+     */
+    private void discardComponentsOfDroppedIndexes(Iterable<SSTableReader> added, Collection<SSTableReader> removed, boolean flushed)
+    {
+        Set<Descriptor> notNew = new HashSet<>();
+        for (SSTableReader sstable : removed)
+            notNew.add(sstable.descriptor);
+
+        for (SSTableReader sstable : added)
+        {
+            // An early-opened SSTable is added again when its write is over.
+            if (sstable.openReason != SSTableReader.OpenReason.NORMAL)
+                continue;
+
+            Map<String, StorageAttachedIndex> writtenFor = StorageAttachedIndexWriter.takeIndexesWrittenFor(sstable.descriptor);
+            if (writtenFor == null || notNew.contains(sstable.descriptor))
+                continue;
+
+            for (StorageAttachedIndex index : indices)
+            {
+                // Only for a dropped index: another instance of an index that wasn't dropped (e.g. the table was
+                // unloaded and loaded again) has the same definition, and its components are this index's
+                StorageAttachedIndex writer = writtenFor.get(index.getIndexContext().getIndexName());
+                if (writer != null && writer != index && writer.isDropped().getAsBoolean())
+                    index.discardComponentsOfDroppedIndex(sstable, flushed);
+            }
         }
     }
 
