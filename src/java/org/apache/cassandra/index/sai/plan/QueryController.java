@@ -528,13 +528,24 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * If the column type is truncatable, e.g., BigInteger or BigDecimal,
      * then it returns a full index scan, since the ranges might result
      * in false negatives when a truncated value is equivalent to
-     * the value to exclude.
+     * the value to exclude. A map entry inequality is planned as an index scan of
+     * all the keys, like NOT CONTAINS.
      * @param predicate Inequality expression with indexContext
      * @return A plan on the index, which can also result false positives.
      */
     private Plan.KeysIteration buildInequalityPlan(Expression predicate)
     {
         assert predicate.getOp()== Expression.Op.NOT_EQ : "Only inequality predicate is expected";
+
+        // A map entry inequality, m[k] != v, is satisfied by the rows whose map doesn't have the entry, including the
+        // rows whose map has no entry at all, which no range of entries can find. So, like NOT CONTAINS, it is
+        // served by all the keys of the index, which post-filtering then checks (see IndexContext#getNonEqIterator
+        // and IndexContext#canSubtractMatches).
+        if (predicate.context.isNonFrozenCollection())
+        {
+            long matchingRowCount = Math.min(estimateMatchingRowCount(predicate), planFactory.tableMetrics.rows);
+            return planFactory.indexScan(predicate, matchingRowCount);
+        }
 
         if (TypeUtil.supportsRounding(predicate.validator))
             return planFactory.fullIndexScan(predicate.context);
