@@ -26,7 +26,9 @@ import com.codahale.metrics.Histogram;
 import com.codahale.metrics.Snapshot;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.marshal.Redaction;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.metrics.DecayingEstimatedHistogramReservoir;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.context.OperationContext;
@@ -123,6 +125,21 @@ public class ReadExecutionController implements AutoCloseable
     void updateMinOldestUnrepairedTombstone(long candidate)
     {
         oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, candidate);
+    }
+
+    /**
+     * Lowers the oldest unrepaired tombstone to the min local deletion time of the memtables and unrepaired sstables
+     * of the view, for reads that build their purge before they read these sources.
+     */
+    void updateMinOldestUnrepairedTombstone(ColumnFamilyStore.ViewFragment view)
+    {
+        for (Memtable memtable : view.memtables)
+            updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+        for (SSTableReader sstable : view.sstables)
+        {
+            if (!sstable.isRepaired())
+                updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
+        }
     }
 
     boolean validForReadOn(ColumnFamilyStore cfs)
