@@ -154,7 +154,7 @@ public abstract class Sets
 
             // We've parsed empty maps as a set literal to break the ambiguity so
             // handle that case now
-            if (receiver.type instanceof MapType && elements.isEmpty())
+            if (receiver.type.unwrap() instanceof MapType && elements.isEmpty())
                 return new Maps.Value(Collections.emptySortedMap());
 
             ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);
