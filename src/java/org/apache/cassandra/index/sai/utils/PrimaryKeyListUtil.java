@@ -18,11 +18,33 @@
 
 package org.apache.cassandra.index.sai.utils;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 public class PrimaryKeyListUtil
 {
+    /**
+     * Converts sorted primary keys to the keys of the static rows of their partitions, without duplicates. An index on
+     * a static column only has the static rows, so this is what it can look up for the keys selected by other indexes.
+     *
+     * @param keys primary keys, in primary key order
+     * @return the static row keys of the partitions of {@code keys}, in primary key order
+     */
+    public static List<PrimaryKey> toStaticRowKeys(List<PrimaryKey> keys)
+    {
+        List<PrimaryKey> staticKeys = new ArrayList<>(keys.size());
+        PrimaryKey last = null;
+        for (PrimaryKey key : keys)
+        {
+            // the keys of a partition are consecutive
+            if (last != null && last.partitionKey().equals(key.partitionKey()))
+                continue;
+            last = key.forStaticRow();
+            staticKeys.add(last);
+        }
+        return staticKeys;
+    }
 
     /** Create a sublist of the keys within the provided bounds (inclusive) */
     public static List<PrimaryKey> getKeysInRange(List<PrimaryKey> keys, PrimaryKey minKey, PrimaryKey maxKey)
