@@ -108,6 +108,7 @@ public class IndexSearchResultIterator extends KeyRangeIterator
                 if (!(e instanceof QueryCancelledException))
                     logger.debug(sstableIndex.getIndexIdentifier().logMessage(String.format("Failed search an index %s, aborting query.", sstableIndex.getSSTable())), e);
 
+                FileUtils.closeQuietly(subIterators);
                 throw Throwables.cleaned(e);
             }
         }
