@@ -44,7 +44,7 @@ public class ArgsStringLoader implements ResourceLoader
     @Override
     public <T> Class<? extends T> findClass(String cname, Class<T> expectedType) {
         try {
-            return Class.forName(cname).asSubclass(expectedType);
+            return Class.forName(cname, false, ArgsStringLoader.class.getClassLoader()).asSubclass(expectedType);
         } catch (Exception e) {
             throw new RuntimeException("Cannot load class: " + cname, e);
         }
