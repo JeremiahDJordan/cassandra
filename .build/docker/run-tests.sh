@@ -341,7 +341,8 @@ logfile="${build_dir}/test/logs/docker_attach_${container_name}.log"
 # Docker commands:
 #  set java to java_version
 #  execute the run_script
-[ -n "${test_name_regexp}" ] && test_name_regexp_arg="-t ${test_name_regexp}" || split_chunk_arg="-c ${split_chunk}"
+# the regexp is quoted for the shell in the container, which runs docker_command
+[ -n "${test_name_regexp}" ] && test_name_regexp_arg="-t $(printf '%q' "${test_name_regexp}")" || split_chunk_arg="-c ${split_chunk}"
 
 docker_command="source \${CASSANDRA_DIR}/.build/docker/_set_java.sh ${java_version} ; \
             \${CASSANDRA_DIR}/.build/docker/_docker_init_tests.sh -a ${target} ${split_chunk_arg} ${test_name_regexp_arg} ${summary_arg} ${env_vars} ${extra_args} ; exit \$?"

@@ -173,6 +173,12 @@ expect_invocation "docker/run-tests.sh passes the target on" "_docker_init_tests
 expect_invocation "docker/run-tests.sh passes the test name and -s on" "\-t StorageServiceServerTest \-s"
 expect_invocation "docker/run-tests.sh sets java from -j" "_set_java.sh 17"
 
+# docker_command runs in a shell in the container, so a regexp with | must not become a pipe there
+reset_stub
+run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -t 'StorageServiceServerTest|Compaction.*Test$' -j 17
+expect_rc "docker/run-tests.sh runs with a regexp of several tests" 0
+expect_invocation "docker/run-tests.sh quotes the regexp for the container's shell" "\-t StorageServiceServerTest\\\\|Compaction\\.\\\\\\*Test\\\\\\$"
+
 # the long flags must reach the container as the same short flags
 reset_stub
 run_case "${cassandra_dir}/.build/docker/run-tests.sh" --target test --test StorageServiceServerTest --java 17 --summary
