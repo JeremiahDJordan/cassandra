@@ -950,6 +950,15 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
     public abstract KeyReader keyReader() throws IOException;
 
     /**
+     * Returns a {@link KeyReader} over all keys in the sstable for a pass over the whole sstable: it reads the primary
+     * index (BIG) or the row index (BTI) through scan readers, which bypass the chunk cache.
+     */
+    public KeyReader keyReaderForScan() throws IOException
+    {
+        return keyReader();
+    }
+
+    /**
      * Returns a {@link KeyIterator} over all keys in the sstable.
      */
     public KeyIterator keyIterator() throws IOException

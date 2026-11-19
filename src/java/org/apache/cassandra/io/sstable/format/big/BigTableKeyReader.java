@@ -66,8 +66,22 @@ public class BigTableKeyReader implements KeyReader
         }
     }
 
-    @SuppressWarnings({ "resource", "RedundantSuppression" }) // iFile and reader are closed in the BigTableKeyReader#close method
     public static BigTableKeyReader create(FileHandle indexFile, IndexSerializer serializer) throws IOException
+    {
+        return create(indexFile, serializer, false);
+    }
+
+    /**
+     * Creates a key reader for a pass over the whole file: it reads the index through a scan reader, which bypasses the
+     * chunk cache.
+     */
+    public static BigTableKeyReader createForScan(FileHandle indexFile, IndexSerializer serializer) throws IOException
+    {
+        return create(indexFile, serializer, true);
+    }
+
+    @SuppressWarnings({ "resource", "RedundantSuppression" }) // iFile and reader are closed in the BigTableKeyReader#close method
+    private static BigTableKeyReader create(FileHandle indexFile, IndexSerializer serializer, boolean forScan) throws IOException
     {
         FileHandle iFile = null;
         RandomAccessReader reader = null;
@@ -75,7 +89,7 @@ public class BigTableKeyReader implements KeyReader
         try
         {
             iFile = indexFile.sharedCopy();
-            reader = iFile.createReader();
+            reader = forScan ? iFile.createReaderForScan() : iFile.createReader();
             iterator = new BigTableKeyReader(iFile, reader, serializer);
             iterator.advance();
             return iterator;
