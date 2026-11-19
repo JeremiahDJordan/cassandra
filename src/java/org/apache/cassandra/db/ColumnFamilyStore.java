@@ -3494,6 +3494,10 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
     @Override
     public boolean onlyPurgeRepairedTombstones()
     {
+        // index sstables are never repaired
+        if (isIndex())
+            return false;
+
         // Here we need to ask the CSM for the parameters in case they were changed over JMX without changing the schema,
         // for now the CSM has the up-to-date copy of the params
         CompactionParams params = strategyContainer.getCompactionParams();
