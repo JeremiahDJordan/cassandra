@@ -41,6 +41,25 @@ import static java.lang.String.format;
 public class PartitionRangeReadCommandCQLTest extends ReadCommandCQLTester<PartitionRangeReadCommand>
 {
     @Test
+    public void testToCQLStringWithContainsOnDescendingFrozenMap()
+    {
+        createTable("CREATE TABLE %s (k int, m frozen<map<int, text>>, PRIMARY KEY (k, m)) WITH CLUSTERING ORDER BY (m DESC)");
+
+        assertToCQLString("SELECT * FROM %s WHERE m CONTAINS KEY 1 ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m CONTAINS KEY 1 ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m CONTAINS KEY ? ALLOW FILTERING");
+        assertToCQLString("SELECT * FROM %s WHERE m CONTAINS 'a' ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m CONTAINS 'a' ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m CONTAINS ? ALLOW FILTERING");
+        assertToCQLString("SELECT * FROM %s WHERE m NOT CONTAINS KEY 1 ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m NOT CONTAINS KEY 1 ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m NOT CONTAINS KEY ? ALLOW FILTERING");
+        assertToCQLString("SELECT * FROM %s WHERE m NOT CONTAINS 'a' ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m NOT CONTAINS 'a' ALLOW FILTERING",
+                          "SELECT * FROM %s WHERE m NOT CONTAINS ? ALLOW FILTERING");
+    }
+
+    @Test
     public void testToCQLString()
     {
         createTable("CREATE TABLE %s (k int, c int, v int, PRIMARY KEY (k, c))");
