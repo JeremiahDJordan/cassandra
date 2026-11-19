@@ -42,6 +42,7 @@ import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.io.FSDiskFullWriteError;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableMultiWriter;
@@ -71,10 +72,24 @@ public class Flushing
                                  cfs.keyspace.getName(),
                                  cfs.name);
 
+        // an index group that can't split a flush, such as one with a vector index, gets a single SSTable
+        if (!supportsSplitFlush(cfs))
+            return flushRunnables(cfs, memtable, null, null, txn);
+
         DiskBoundaries diskBoundaries = cfs.getDiskBoundaries();
         List<Token> boundaries = diskBoundaries.getPositions();
         List<Directories.DataDirectory> locations = diskBoundaries.directories;
         return flushRunnables(cfs, memtable, boundaries, locations, txn);
+    }
+
+    private static boolean supportsSplitFlush(ColumnFamilyStore cfs)
+    {
+        for (Index.Group group : cfs.indexManager.listIndexGroups())
+        {
+            if (!group.supportsL0Shards())
+                return false;
+        }
+        return true;
     }
 
     @VisibleForTesting
