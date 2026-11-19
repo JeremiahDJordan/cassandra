@@ -118,6 +118,16 @@ public final class ClientMetrics
     }
 
     /**
+     * Record time between Message creation and execution on NTR.
+     * @param value time elapsed
+     * @param unit time unit
+     */
+    public void recordQueueTime(long value, TimeUnit unit)
+    {
+        queueTime(value, unit);
+    }
+
+    /**
      * Record time between Message creation and execution on an async stage, if present.
      * Note that this includes the queue time previously recorded before execution on the NTR stage,
      * so for a given request, asyncQueueTime >= queueTime.
@@ -254,11 +264,6 @@ public final class ClientMetrics
         return Metrics.timer(factory.createMetricName(name));
     }
 
-    /**
-     * Record time between Message creation and execution on NTR.
-     * @param value time elapsed
-     * @param unit time unit
-     */
     public void queueTime(long value, TimeUnit unit)
     {
         queueTime.update(value, unit);
