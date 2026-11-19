@@ -76,6 +76,8 @@ public class QueryContext
 
     /** Number of live rows fetched from the storage engine, before post-filtering. */
     private long rowsFetched = 0;
+    // the row count estimates that failed, for which the query planner assumed that all the rows of the index match
+    private long estimatesFailed = 0;
 
     /** Number of live rows returned to the coordinator, after post-filtering. */
     private long rowsReturned = 0;
@@ -183,6 +185,12 @@ public class QueryContext
     {
         checkThreadOwnership();
         rowsFetched += val;
+    }
+
+    public void addEstimateFailure()
+    {
+        checkThreadOwnership();
+        estimatesFailed++;
     }
 
     public void addRowsReturned(long val)
@@ -358,6 +366,7 @@ public class QueryContext
         public final long partitionsReturned;
         public final long partitionTombstonesFetched;
         public final long rowsFetched;
+        public final long estimatesFailed;
         public final long rowsReturned;
         public final long rowTombstonesFetched;
         public final long cellsFetched;
@@ -392,6 +401,7 @@ public class QueryContext
             partitionsReturned = context.partitionsReturned;
             partitionTombstonesFetched = context.partitionTombstonesFetched;
             rowsFetched = context.rowsFetched;
+            estimatesFailed = context.estimatesFailed;
             rowsReturned = context.rowsReturned;
             rowTombstonesFetched = context.rowTombstonesFetched;
             cellsFetched = context.cellsFetched;
@@ -425,6 +435,7 @@ public class QueryContext
             appendMetric(sb, indent, "partitionsReturned", partitionsReturned);
             appendMetric(sb, indent, "partitionTombstonesFetched", partitionTombstonesFetched);
             appendMetric(sb, indent, "rowsFetched", rowsFetched);
+            appendMetric(sb, indent, "estimatesFailed", estimatesFailed);
             appendMetric(sb, indent, "rowsReturned", rowsReturned);
             appendMetric(sb, indent, "rowTombstonesFetched", rowTombstonesFetched);
             appendMetric(sb, indent, "cellsFetched", cellsFetched);
