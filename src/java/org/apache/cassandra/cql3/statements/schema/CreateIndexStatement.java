@@ -48,6 +48,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.KeyspaceMetadata;
@@ -258,6 +259,11 @@ public final class CreateIndexStatement extends AlterSchemaStatement
 
             throw ire(INDEX_DUPLICATE_OF_EXISTING, index.name, equalIndex.name);
         }
+
+        // SAI ANN indexes are only created on vectors of floats. That's checked before the table is validated, which
+        // would reject a single-dimension vector with cosine similarity first.
+        if (guardRails == IndexGuardrails.SAI)
+            StorageAttachedIndex.validateVectorElementType(table, index);
 
         TableMetadata newTable = table.withSwapped(table.indexes.with(index));
         newTable.validate();
