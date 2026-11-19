@@ -116,6 +116,39 @@ public class SkipIndexOnFullPrimaryKeysTest extends SkipIndexOnFullPrimaryKeysTe
     }
 
     @Test
+    public void testQueryOfStopWordsOnly() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, t text)");
+        createIndex("CREATE CUSTOM INDEX t_idx ON %s(t) USING 'StorageAttachedIndex' WITH OPTIONS = { 'index_analyzer': '{" +
+                    "\"tokenizer\":{\"name\":\"standard\"}, \"filters\":[{\"name\":\"lowercase\"}, {\"name\":\"stop\"}]}' }");
+        execute("INSERT INTO %s(k, t) VALUES (0, 'the quick fox')");
+
+        // a query of stop words only has no terms, which no row holds
+        beforeAndAfterFlush(() -> {
+            assertHasQueryPlan("SELECT k FROM %s WHERE t : 'the'");
+            assertHasQueryPlan("SELECT k FROM %s WHERE t : 'quick the'", row(0));
+            assertHasNoQueryPlan("SELECT k FROM %s WHERE k = 0 AND t : 'the'");
+            assertHasNoQueryPlan("SELECT k FROM %s WHERE k = 0 AND t : 'quick the'", row(0));
+        });
+    }
+
+    @Test
+    public void testContainsStopWordsOnly() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, l list<text>)");
+        createIndex("CREATE CUSTOM INDEX l_idx ON %s(l) USING 'StorageAttachedIndex' WITH OPTIONS = { 'index_analyzer': '{" +
+                    "\"tokenizer\":{\"name\":\"standard\"}, \"filters\":[{\"name\":\"lowercase\"}, {\"name\":\"stop\"}]}' }");
+        execute("INSERT INTO %s(k, l) VALUES (0, ['the quick fox'])");
+
+        // no element holds a query of stop words only
+        beforeAndAfterFlush(() -> {
+            assertHasQueryPlan("SELECT k FROM %s WHERE l CONTAINS 'the'");
+            assertHasNoQueryPlan("SELECT k FROM %s WHERE k = 0 AND l CONTAINS 'the'");
+            assertHasNoQueryPlan("SELECT k FROM %s WHERE k = 0 AND l NOT CONTAINS 'the'", row(0));
+        });
+    }
+
+    @Test
     public void testSkipsIndexWide()
     {
         createTable("CREATE TABLE %s (k int, c int, n int, t text, v vector<float, 2>, PRIMARY KEY(k, c))");
