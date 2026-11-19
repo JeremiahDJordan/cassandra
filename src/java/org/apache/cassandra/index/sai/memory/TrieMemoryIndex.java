@@ -417,7 +417,8 @@ public class TrieMemoryIndex extends MemoryIndex
             case NOT_EQ:
             case NOT_CONTAINS_KEY:
             case NOT_CONTAINS_VALUE:
-                if (TypeUtil.supportsRounding(expression.validator))
+                // The search returns all the rows when it can't subtract the matches of the negated expression
+                if (TypeUtil.supportsRounding(expression.validator) || !IndexContext.canSubtractMatches(expression))
                     return Memtable.estimateRowCount(memtable);
                 else
                     // need to clamp at 0, because row count is imprecise
