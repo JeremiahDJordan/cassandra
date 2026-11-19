@@ -39,7 +39,6 @@ import org.apache.cassandra.sensors.SensorsFactory;
 import org.apache.cassandra.sensors.Type;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.Clock;
-import org.apache.cassandra.utils.MonotonicClock;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.cassandra.db.commitlog.CommitLogSegment.ENTRY_OVERHEAD_SIZE;
@@ -75,12 +74,6 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
         }
 
         message.payload.validateSize(MessagingService.current_version, ENTRY_OVERHEAD_SIZE);
-        if (MonotonicClock.Global.approxTime.now() > message.expiresAtNanos())
-        {
-            Tracing.trace("Discarding mutation from {} (timed out)", message.from());
-            MessagingService.instance().metrics.recordDroppedMessage(message, message.elapsedSinceCreated(NANOSECONDS), NANOSECONDS);
-            return;
-        }
 
         // Record where the write came from before anything else touches the payload: an inbound mutation is
         // applied with the same WriteOptions as a locally coordinated one, so this is the only point at which
