@@ -285,7 +285,7 @@ public class SAICodecUtils
      * @throws CorruptIndexException if CRC is formatted incorrectly (wrong bits set)
      * @throws IOException if an i/o error occurs
      */
-    static long readChecksum(IndexInput input) throws IOException {
+    public static long readChecksum(IndexInput input) throws IOException {
         long value = readBELong(input);
         if ((value & 0xFFFFFFFF00000000L) != 0) {
             throw new CorruptIndexException("Illegal checksum: " + value, input);
