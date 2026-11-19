@@ -426,4 +426,31 @@ fi
 #
 ################################
 
+################################
+#
+# Cases: ci/generate-ci-summary.sh
+#
+################################
+
+# A checkout of its own, so that the git queries have known answers, with stubs in place of ci_parser.py and
+# cell_balance.py, which need python modules.  DIST_DIR is outside it, as /dist is in the container.
+summary_dir="${STUB_DIR}/summary-checkout"
+summary_dist="${STUB_DIR}/summary-dist"
+mkdir -p "${summary_dir}/.build/ci" "${summary_dist}"
+cp "${CASSANDRA_DIR}/build.xml" "${summary_dir}/"
+cp "${CASSANDRA_DIR}/.build/ci/generate-ci-summary.sh" "${summary_dir}/.build/ci/"
+printf '#!/bin/sh\nexit 0\n' > "${summary_dir}/.build/ci/ci_parser.py"
+printf '#!/bin/sh\nexit 0\n' > "${summary_dir}/.build/ci/cell_balance.py"
+chmod +x "${summary_dir}/.build/ci/"*
+git -C "${summary_dir}" init -q
+git -C "${summary_dir}" add .
+git -C "${summary_dir}" -c user.name=stub -c user.email=stub@example.com commit -q -m summary
+summary_sha="$(git -C "${summary_dir}" rev-parse HEAD)"
+
+reset_stub
+run_case env CASSANDRA_DIR="${summary_dir}" DIST_DIR="${summary_dist}" sh "${summary_dir}/.build/ci/generate-ci-summary.sh"
+expect_rc "generate-ci-summary.sh writes the summary" 0
+run_case cat "${summary_dist}/ci_summary.html"
+expect_out "generate-ci-summary.sh names the commit" "<li>sha:  ${summary_sha}</li>"
+
 report stub-ant
