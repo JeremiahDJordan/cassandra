@@ -150,7 +150,7 @@ public class V7OnDiskFormatIntegrationTest extends SAITester
     }
 
     @Test
-    public void testSkipChecksumValidationForTermsData() throws IOException
+    public void testValidateComponentDetectsTermsDataCorruption() throws IOException
     {
         execute("INSERT INTO %s (pk, value) VALUES (1, [1.0, 2.0, 3.0])");
         execute("INSERT INTO %s (pk, value) VALUES (2, [4.0, 5.0, 6.0])");
@@ -183,9 +183,15 @@ public class V7OnDiskFormatIntegrationTest extends SAITester
             }
         }
 
-        // For TERMS_DATA, checksum validation is skipped due to known issue
-        // So this should not throw even though file is corrupted
-        V7OnDiskFormat.instance.validateIndexComponent(component, true);
+        try
+        {
+            V7OnDiskFormat.instance.validateIndexComponent(component, true);
+            fail("Expected validation to fail due to corruption");
+        }
+        catch (UncheckedIOException e)
+        {
+            // Expected - the checksum of the graph doesn't match
+        }
     }
 
     @Test
