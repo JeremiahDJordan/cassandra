@@ -30,8 +30,10 @@ import org.junit.rules.ExpectedException;
 import com.datastax.driver.core.ResultSet;
 import net.openhft.chronicle.core.util.BooleanConsumer;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.cql3.Ordering;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.plan.QueryController;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 
@@ -657,14 +659,16 @@ public class QueryMetricsTest extends AbstractMetricsTest
         waitForEqualsIfExists(perTable, objectName(name, TABLE_MP_HYBRID_QUERY_METRIC_TYPE), 2 * numRows);
 
         // Verify counters for total cells returned.
+        // The rows of top-k and hybrid queries also have the synthetic score cell, if the index version uses it.
         name = "TotalCellsReturned";
-        waitForEquals(objectName(name, TABLE_QUERY_METRIC_TYPE), 2 * (numRowsPerPartition + numRows + numRowsPerPartition + numRows + numRowsPerPartition + numRows));
+        int annCells = Ordering.Ann.useSyntheticScore(Version.current(KEYSPACE)) ? 3 : 2;
+        waitForEquals(objectName(name, TABLE_QUERY_METRIC_TYPE), 2 * (numRowsPerPartition + numRows) + 2 * annCells * (numRowsPerPartition + numRows));
         waitForEqualsIfExists(perTable, objectName(name, TABLE_SP_FILTER_QUERY_METRIC_TYPE), 2 * numRowsPerPartition);
         waitForEqualsIfExists(perTable, objectName(name, TABLE_MP_FILTER_QUERY_METRIC_TYPE), 2 * numRows);
-        waitForEqualsIfExists(perTable, objectName(name, TABLE_SP_TOPK_QUERY_METRIC_TYPE), 2 * numRowsPerPartition);
-        waitForEqualsIfExists(perTable, objectName(name, TABLE_MP_TOPK_QUERY_METRIC_TYPE), 2 * numRows);
-        waitForEqualsIfExists(perTable, objectName(name, TABLE_SP_HYBRID_QUERY_METRIC_TYPE), 2 * numRowsPerPartition);
-        waitForEqualsIfExists(perTable, objectName(name, TABLE_MP_HYBRID_QUERY_METRIC_TYPE), 2 * numRows);
+        waitForEqualsIfExists(perTable, objectName(name, TABLE_SP_TOPK_QUERY_METRIC_TYPE), annCells * numRowsPerPartition);
+        waitForEqualsIfExists(perTable, objectName(name, TABLE_MP_TOPK_QUERY_METRIC_TYPE), annCells * numRows);
+        waitForEqualsIfExists(perTable, objectName(name, TABLE_SP_HYBRID_QUERY_METRIC_TYPE), annCells * numRowsPerPartition);
+        waitForEqualsIfExists(perTable, objectName(name, TABLE_MP_HYBRID_QUERY_METRIC_TYPE), annCells * numRows);
 
         // Verify counters for timeouts.
         name = "TotalQueryTimeouts";
