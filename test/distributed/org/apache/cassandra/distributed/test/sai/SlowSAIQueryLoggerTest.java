@@ -414,8 +414,8 @@ public class SlowSAIQueryLoggerTest extends TestBaseImpl
         coordinator.execute(numericQuery, ConsistencyLevel.ONE);
         assertLogsContain(mark, node,
                           "SAI slowest query metrics:",
-                          "sstablesHit: 3",
-                          "segmentsHit: 3",
+                          "sstablesHit: 2",
+                          "segmentsHit: 2",
                           "partitionsFetched: 3",
                           "rowsFetched: 6",
                           "cellsFetched: 15");

@@ -110,6 +110,13 @@ public interface ShardManager
     /// If a list of the ranges for each shard is required instead, use [#getShardRanges].
     ShardTracker boundaries(int shardCount);
 
+    /// Construct a boundary/shard iterator with a single shard that covers all the local ranges, also when they are
+    /// split between several disks.
+    default ShardTracker singleShardBoundaries()
+    {
+        return boundaries(1);
+    }
+
     static Range<Token> coveringRange(CompactionSSTable sstable)
     {
         return coveringRange(sstable.getFirst(), sstable.getLast());
