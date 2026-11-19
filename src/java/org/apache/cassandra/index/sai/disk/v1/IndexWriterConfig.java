@@ -18,6 +18,7 @@
 package org.apache.cassandra.index.sai.disk.v1;
 
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Map;
 import java.util.stream.Collectors;
 
@@ -295,7 +296,7 @@ public class IndexWriterConfig
             }
             if (options.containsKey(SOURCE_MODEL))
             {
-                String option = options.get(SOURCE_MODEL).toUpperCase().replace("-", "_");
+                String option = options.get(SOURCE_MODEL).toUpperCase(Locale.US).replace("-", "_");
                 try
                 {
                     sourceModel = VectorSourceModel.valueOf(option);
@@ -311,7 +312,7 @@ public class IndexWriterConfig
             }
             if (options.containsKey(SIMILARITY_FUNCTION))
             {
-                String option = options.get(SIMILARITY_FUNCTION).toUpperCase();
+                String option = options.get(SIMILARITY_FUNCTION).toUpperCase(Locale.US);
                 try
                 {
                     similarityFunction = VectorSimilarityFunction.valueOf(option);
@@ -361,7 +362,7 @@ public class IndexWriterConfig
 
             if (options.containsKey(ENABLE_HIERARCHY))
             {
-                String value = options.get(ENABLE_HIERARCHY).toLowerCase();
+                String value = options.get(ENABLE_HIERARCHY).toLowerCase(Locale.US);
                 if (!value.equals("true") && !value.equals("false"))
                     throw new InvalidRequestException(String.format("Enable hierarchy must be 'true' or 'false' for index %s, was '%s'",
                                                                   indexName, value));
