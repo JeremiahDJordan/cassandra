@@ -94,9 +94,48 @@ New features
       deployments that authenticate over mutual TLS. PasswordDefaultRoleInitializer
       remains the default and produces the historical behaviour. See CASSANDRA-21546
       for more information.
+    - Java UDFs can be sandboxed without the JDK Security Manager, which Java 24 removed. The JVM property
+      cassandra.udf.security_mechanism defaults to 'auto', which selects 'securitymanager' up to Java 23 and
+      'bytecode', which checks the compiled UDF against an allowlist, from Java 24. Set it to 'securitymanager' or
+      'bytecode' to select a mechanism explicitly. The launch scripts leave out -Djava.security.manager=allow on
+      Java 24 and later. See the "UDF sandbox" section of the functions documentation. (CASSANDRA-21670)
 
 Upgrading
 ---------
+    - A function rejected by the bytecode UDF sandbox remains in the schema and cannot run on that node, which logs
+      such functions at startup. With the Security Manager mechanism, CREATE FUNCTION warns about functions the
+      bytecode sandbox would reject, and startup logs them, so they can be found before moving to Java 24. Among the
+      uses the bytecode sandbox rejects:
+      * constructing org.apache.cassandra.exceptions classes other than InvalidRequestException, SyntaxException,
+        ConfigurationException, UnauthorizedException and AuthenticationException, or any Error other than
+        AssertionError;
+      * java.util.Properties and ResourceBundle;
+      * Class methods other than getName, getSimpleName, getTypeName, isInstance, cast, isArray, isEnum,
+        isPrimitive, isInterface, getEnumConstants, equals, hashCode and toString (isInstance and cast only compile
+        when the argument's static type is Object);
+      * Throwable.initCause, addSuppressed and printStackTrace;
+      * java.lang.System methods other than currentTimeMillis, nanoTime, arraycopy, identityHashCode and
+        lineSeparator. Without UDF threads (user_defined_functions_threads_enabled: false), java.lang.System cannot
+        be used at all unless allow_extra_insecure_udfs is true, with either mechanism.
+      (CASSANDRA-21670)
+    - Java UDFs, with either mechanism (CASSANDRA-21670):
+      * a UDF cannot call Class.newInstance, ClassLoader.getParent or Module.getClassLoader, use the java.lang.foreign
+        package, declare an instance initializer, or use 'new' to construct a VirtualMachineError or
+        UnrecoverableIllegalStateException. A UDF can still stop the node by exhausting the heap;
+      * anonymous and local classes are always rejected, with "additional class declared";
+      * the inet codec's parse, available to UDFs, accepts the IP address literals InetAddress.getByName accepts,
+        except IPv6 zones that name an interface, and does not resolve host names.
+    - CREATE FUNCTION is validated on the coordinator and on the CMS member that commits it. A node running this
+      version that cannot compile a committed function, for example because user-defined functions are disabled on
+      it or it uses a different UDF sandbox, keeps applying cluster metadata changes, and the function cannot be used
+      on that node. A node running an earlier version still stops applying metadata changes at such a function, so
+      during a rolling upgrade use the same UDF settings on all nodes before creating functions. A state or final
+      function used by an aggregate cannot be dropped while the aggregate exists. After CREATE OR REPLACE FUNCTION
+      fixes such a function, the aggregate stays unusable until it is re-created with CREATE OR REPLACE AGGREGATE or
+      the node restarts. (CASSANDRA-21670)
+    - With JMX authorization on Java 24 and later, subscribing to the notifications of an MBean requires DESCRIBE on
+      that MBean. For example, nodetool repair run by a role that is not a superuser needs DESCRIBE on
+      org.apache.cassandra.db:type=StorageService. (CASSANDRA-21670)
     - Do not set the UnifiedCompactionStrategy table option max_sstables_per_shard_factor until every node runs
       6.0-alpha3 or later, or 5.0.10 or later. Earlier versions, including 6.0-alpha1 and 6.0-alpha2, do not
       recognize the option. When one of them coordinates a schema change that validates the whole table definition,

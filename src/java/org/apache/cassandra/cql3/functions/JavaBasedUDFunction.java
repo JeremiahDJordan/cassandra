@@ -33,18 +33,19 @@ import java.net.URLStreamHandler;
 import java.nio.ByteBuffer;
 import java.security.CodeSource;
 import java.security.PermissionCollection;
+import java.security.Permissions;
 import java.security.ProtectionDomain;
 import java.security.SecureClassLoader;
 import java.security.cert.Certificate;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.StringTokenizer;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
@@ -73,15 +74,17 @@ import org.eclipse.jdt.internal.compiler.impl.CompilerOptions;
 import org.eclipse.jdt.internal.compiler.lookup.LookupEnvironment;
 import org.eclipse.jdt.internal.compiler.lookup.ModuleBinding;
 import org.eclipse.jdt.internal.compiler.problem.DefaultProblemFactory;
+import org.objectweb.asm.Type;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.NamedThreadFactory;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.security.SecurityThreadGroup;
-import org.apache.cassandra.security.ThreadAwareSecurityManager;
+import org.apache.cassandra.security.UDFSecurityMechanism;
 import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -106,6 +109,8 @@ public final class JavaBasedUDFunction extends UDFunction
 
     private static final UDFByteCodeVerifier udfByteCodeVerifier = new UDFByteCodeVerifier();
 
+    private static final PermissionCollection noPermissions = new Permissions();
+
     private static final ProtectionDomain protectionDomain;
 
     private static final IErrorHandlingPolicy errorHandlingPolicy = DefaultErrorHandlingPolicies.proceedWithAllProblems();
@@ -125,7 +130,10 @@ public final class JavaBasedUDFunction extends UDFunction
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/Class", "getClassLoader");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/Class", "getResource");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/Class", "getResourceAsStream");
+        // could construct a Throwable that JVMStabilityInspector treats as fatal
+        udfByteCodeVerifier.addDisallowedMethodCall("java/lang/Class", "newInstance");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "clearAssertionStatus");
+        udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "getParent");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "getResource");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "getResourceAsStream");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "getResources");
@@ -137,6 +145,7 @@ public final class JavaBasedUDFunction extends UDFunction
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "setClassAssertionStatus");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "setDefaultAssertionStatus");
         udfByteCodeVerifier.addDisallowedMethodCall("java/lang/ClassLoader", "setPackageAssertionStatus");
+        udfByteCodeVerifier.addDisallowedMethodCall("java/lang/Module", "getClassLoader");
         udfByteCodeVerifier.addDisallowedMethodCall("java/nio/ByteBuffer", "allocateDirect");
         for (String ia : new String[]{"java/net/InetAddress", "java/net/Inet4Address", "java/net/Inet6Address"})
         {
@@ -165,6 +174,8 @@ public final class JavaBasedUDFunction extends UDFunction
                      CompilerOptions.VERSION_11);
         settings.put(CompilerOptions.OPTION_TargetPlatform,
                      CompilerOptions.VERSION_11);
+        // OPTION_Compliance stays at 1.4, so string concatenation compiles to StringBuilder calls rather than to
+        // invokedynamic, which the bytecode sandbox rejects
 
         compilerOptions = new CompilerOptions(settings);
         compilerOptions.parseLiteralExpressionsAsConstants = true;
@@ -201,10 +212,12 @@ public final class JavaBasedUDFunction extends UDFunction
             throw new RuntimeException(e);
         }
 
-        protectionDomain = new ProtectionDomain(codeSource, ThreadAwareSecurityManager.noPermissions, targetClassLoader, null);
+        noPermissions.setReadOnly();
+        protectionDomain = new ProtectionDomain(codeSource, noPermissions, targetClassLoader, null);
     }
 
     private final JavaUDF javaUDF;
+    private final Set<String> bytecodeSandboxErrors;
 
     private static final Pattern patternJavaDriver = Pattern.compile("com\\.datastax\\.driver\\.core\\.");
 
@@ -316,18 +329,25 @@ public final class JavaBasedUDFunction extends UDFunction
                     throw new InvalidRequestException("Java source compilation failed:\n" + problems);
             }
 
-            // Verify the UDF bytecode against use of probably dangerous code
-            Set<String> errors = udfByteCodeVerifier.verify(targetClassName, targetClassLoader.classData(targetClassName));
-            String validDeclare = "not allowed method declared: " + executeInternalName + '(';
-            for (Iterator<String> i = errors.iterator(); i.hasNext();)
+            byte[] classData = targetClassLoader.classData(targetClassName);
+            if (!compilationUnit.additionalClasses.isEmpty() || classData == null)
             {
-                String error = i.next();
-                // we generate a random name of the private, internal execute method, which is detected by the byte-code verifier
-                if (error.startsWith(validDeclare))
-                    i.remove();
+                Set<String> errors = new TreeSet<>();
+                for (String additional : compilationUnit.additionalClasses)
+                    errors.add("additional class declared: " + additional);
+                if (classData == null)
+                    errors.add("class " + targetClassName + " not generated");
+                throw new InvalidRequestException("Java UDF validation failed: " + errors);
             }
+
+            // Verify the UDF bytecode against use of probably dangerous code
+            String executeInternalDesc = implementationMethodDescriptor(argumentTypes, resultType);
+            Set<String> errors = verifier().verify(targetClassName, classData, executeInternalName, executeInternalDesc);
             if (!errors.isEmpty())
                 throw new InvalidRequestException("Java UDF validation failed: " + errors);
+            bytecodeSandboxErrors = UDFSecurityMechanism.current() == UDFSecurityMechanism.SECURITY_MANAGER
+                                    ? checkBytecodeSandbox(name, targetClassName, classData, executeInternalName, executeInternalDesc)
+                                    : Collections.emptySet();
 
             // Load the class and create a new instance of it
             Thread thread = Thread.currentThread();
@@ -376,12 +396,65 @@ public final class JavaBasedUDFunction extends UDFunction
             logger.error(String.format("Could not compile function '%s' from Java source:%n%s", name, javaSource), e);
             throw new InvalidRequestException(String.format("Could not compile function '%s' from Java source: %s", name, e));
         }
+        finally
+        {
+            targetClassLoader.discardClass(targetClassName);
+        }
     }
 
     @Override
     protected ExecutorService executor()
     {
         return executor;
+    }
+
+    private static final class PolicyVerifiers
+    {
+        static final UDFByteCodeVerifier standard = new UDFByteCodeVerifier(UDFSandboxPolicy.STANDARD);
+        static final UDFByteCodeVerifier extraInsecure = new UDFByteCodeVerifier(UDFSandboxPolicy.EXTRA_INSECURE);
+    }
+
+    private static UDFByteCodeVerifier verifier()
+    {
+        return UDFSecurityMechanism.current() == UDFSecurityMechanism.SECURITY_MANAGER
+               ? udfByteCodeVerifier
+               : policyVerifier();
+    }
+
+    private static UDFByteCodeVerifier policyVerifier()
+    {
+        // Same scope as with the Security Manager: allow_extra_insecure_udfs only matters without UDF threads
+        return !DatabaseDescriptor.enableUserDefinedFunctionsThreads() && DatabaseDescriptor.allowExtraInsecureUDFs()
+               ? PolicyVerifiers.extraInsecure
+               : PolicyVerifiers.standard;
+    }
+
+    // For information only: never fails the function
+    private static Set<String> checkBytecodeSandbox(FunctionName name, String className, byte[] classData, String implName, String implDesc)
+    {
+        try
+        {
+            return policyVerifier().verify(className, classData, implName, implDesc);
+        }
+        catch (RuntimeException | LinkageError e)
+        {
+            logger.warn("Unable to check function {} against the bytecode UDF sandbox", name, e);
+            return Collections.emptySet();
+        }
+    }
+
+    @Override
+    public Set<String> bytecodeSandboxErrors()
+    {
+        return bytecodeSandboxErrors;
+    }
+
+    private static String implementationMethodDescriptor(List<UDFDataType> argTypes, UDFDataType resultType)
+    {
+        Type[] args = new Type[argTypes.size()];
+        for (int i = 0; i < args.length; i++)
+            args[i] = Type.getType(argTypes.get(i).toJavaRawType());
+        return Type.getMethodDescriptor(Type.getType(resultType.toJavaRawType()), args);
     }
 
     @Override
@@ -517,6 +590,7 @@ public final class JavaBasedUDFunction extends UDFunction
     static final class EcjCompilationUnit implements ICompilationUnit, ICompilerRequestor, INameEnvironment
     {
         List<IProblem> problemList;
+        final List<String> additionalClasses = new ArrayList<>();
         private final String className;
         private final char[] sourceCode;
 
@@ -603,7 +677,13 @@ public final class JavaBasedUDFunction extends UDFunction
             {
                 ClassFile[] classFiles = result.getClassFiles();
                 for (ClassFile classFile : classFiles)
-                    targetClassLoader.addClass(className, classFile.getBytes());
+                {
+                    String name = new String(classFile.fileName()).replace('/', '.');
+                    if (name.equals(className))
+                        targetClassLoader.addClass(className, classFile.getBytes());
+                    else
+                        additionalClasses.add(name);
+                }
             }
         }
 
@@ -734,6 +814,11 @@ public final class JavaBasedUDFunction extends UDFunction
             return classes.get(className);
         }
 
+        void discardClass(String className)
+        {
+            classes.remove(className);
+        }
+
         protected Class<?> findClass(String name) throws ClassNotFoundException
         {
             // remove the class binary - it's only used once - so it's wasting heap
@@ -747,7 +832,7 @@ public final class JavaBasedUDFunction extends UDFunction
 
         protected PermissionCollection getPermissions(CodeSource codesource)
         {
-            return ThreadAwareSecurityManager.noPermissions;
+            return noPermissions;
         }
     }
 
