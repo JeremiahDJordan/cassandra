@@ -30,6 +30,9 @@ RUN echo "Building with arguments:" \
     && echo " - BUILD_HOME=${BUILD_HOME}" \
     && echo " - CASSANDRA_DIR=${CASSANDRA_DIR}"
 
+# bullseye's security updates have moved from deb.debian.org to archive.debian.org
+RUN sed -i -e 's,http://deb.debian.org/debian-security,http://archive.debian.org/debian-security,' /etc/apt/sources.list
+
 # configure apt to retry downloads
 RUN echo 'APT::Acquire::Retries "99";' > /etc/apt/apt.conf.d/80-retries
 RUN echo 'Acquire::http::Timeout "60";' > /etc/apt/apt.conf.d/80proxy.conf
