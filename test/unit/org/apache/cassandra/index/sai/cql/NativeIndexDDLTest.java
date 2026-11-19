@@ -29,6 +29,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -61,6 +62,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ReversedType;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.SecondaryIndexManager;
@@ -1132,6 +1134,48 @@ public class NativeIndexDDLTest extends SAITester
             logger.setLevel(originalLevel);
             logger.detachAppender(appender);
         }
+    }
+
+    @Test
+    public void testTruncateWithoutFlushDuringWrite() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v vector<float, 2>)");
+        IndexContext indexContext = getIndexContext(createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'"));
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Memtable truncated = cfs.getTracker().getView().getCurrentMemtable();
+
+        // hold a write that has picked the memtable until truncation has switched it out
+        Injections.Barrier writeBarrier = Injections.newBarrier("writeDuringTruncate", 2, false)
+                                                    .add(InvokePointBuilder.newInvokePoint()
+                                                                           .onClass(IndexContext.class)
+                                                                           .onMethod("index")
+                                                                           .atEntry())
+                                                    .build();
+        Injections.Counter memtableRenewals = Injections.newCounter("memtableRenewalsDuringTruncate")
+                                                       .add(InvokePointBuilder.newInvokePoint()
+                                                                              .onClass(IndexContext.class)
+                                                                              .onMethod("renewMemtable")
+                                                                              .atExit())
+                                                       .build();
+        Injections.inject(writeBarrier, memtableRenewals);
+
+        CompletableFuture<Void> write = CompletableFuture.runAsync(() -> execute("INSERT INTO %s (pk, v) VALUES (0, [1.0, 2.0])"));
+        CompletableFuture<Void> truncate = CompletableFuture.completedFuture(null);
+        try
+        {
+            waitForAssert(() -> assertEquals(1, writeBarrier.getCount()), 10, TimeUnit.SECONDS);
+            truncate = CompletableFuture.runAsync(() -> truncate(false));
+            waitForAssert(() -> assertEquals(1, memtableRenewals.get()), 10, TimeUnit.SECONDS);
+        }
+        finally
+        {
+            writeBarrier.countDown();
+            CompletableFuture.allOf(write, truncate).get(30, TimeUnit.SECONDS);
+        }
+
+        assertEmpty(execute("SELECT pk FROM %s"));
+        assertEmpty(execute("SELECT pk FROM %s ORDER BY v ANN OF [1.0, 2.0] LIMIT 10"));
+        assertThat(indexContext.getLiveMemtables()).doesNotContainKey(truncated);
     }
 
     /**
