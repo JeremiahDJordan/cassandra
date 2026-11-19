@@ -34,7 +34,6 @@ import java.util.concurrent.TimeUnit;
 
 import org.apache.cassandra.db.marshal.InetAddressType;
 import org.apache.cassandra.index.sai.SAITester;
-import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TimeSerializer;
 import org.apache.cassandra.utils.TimeUUID;
@@ -678,9 +677,7 @@ public abstract class DataSet<T> extends SAITester
                 while (list.contains(value));
                 values[index] = value;
             }
-            IndexTermType indexTermType = createIndexTermType(InetAddressType.instance);
-            Arrays.sort(values, (o1, o2) -> indexTermType.compare(indexTermType.asIndexBytes(ByteBuffer.wrap(o1.getAddress())),
-                                                                  indexTermType.asIndexBytes(ByteBuffer.wrap(o2.getAddress()))));
+            Arrays.sort(values, (o1, o2) -> InetAddressType.instance.compare(ByteBuffer.wrap(o1.getAddress()), ByteBuffer.wrap(o2.getAddress())));
         }
 
         @Override

@@ -493,17 +493,14 @@ public class IndexTermType
     /**
      * This is used for value comparison in post-filtering - {@link Expression#isSatisfiedBy(ByteBuffer)}.
      * <p>
-     * This allows types to decide whether they should be compared based on their encoded value or their
-     * raw value. At present only {@link InetAddressType} values are compared by their encoded values to
-     * allow for ipv4 -> ipv6 equivalency in searches.
+     * Values are compared as the column type compares them, so an IPv4 address and its IPv4-mapped IPv6 address,
+     * which have the same index term, are different values (see {@link Expression#searchedRanges()}).
      */
     public int comparePostFilter(Expression.Value requestedValue, Expression.Value columnValue)
     {
-        if (isInetAddress())
-            return compareInet(requestedValue.encoded, columnValue.encoded);
-        // bigint, decimal, and varint are not indexed in reversed byte-comparable form or treated as reversed types by
-        // Expression, so it is correct to compare with the base/unwrapped type
-        else if (isLong() || isBigDecimal() || isBigInteger())
+        // inet, bigint, decimal, and varint are not indexed in reversed byte-comparable form or treated as reversed
+        // types by Expression, so it is correct to compare with the base/unwrapped type
+        if (isInetAddress() || isLong() || isBigDecimal() || isBigInteger())
             return indexType.unwrap().compare(requestedValue.raw, columnValue.raw);
         // Override comparisons for frozen collections and composite types (map entries)
         else if (isComposite() || isFrozen())
@@ -789,7 +786,7 @@ public class IndexTermType
     /**
      * Returns <code>true</code> if given {@link AbstractType} is {@link InetAddressType}
      */
-    private boolean isInetAddress()
+    public boolean isInetAddress()
     {
         return capabilities.contains(Capability.INET_ADDRESS);
     }
