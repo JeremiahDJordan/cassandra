@@ -108,7 +108,11 @@ if ! ( [[ "$(docker images -q ${image_name} 2>/dev/null)" != "" ]] ) ; then
   if ! ( docker pull -q ${image_name} >/dev/null 2>/dev/null ) ; then
     # Create build images containing the build tool-chain, Java and an Apache Cassandra git working directory, with retry
     echo "Building docker image..."
-    until docker build -t ${image_name} -f docker/${dockerfile} --load .  ; do
+    # --load is a buildx flag, which the classic builder and podman do not have
+    build_load=""
+    build_help="$(docker build --help 2>&1)"
+    [[ "${build_help}" =~ (^|[[:space:]])--load([[:space:]]|$) ]] && build_load="--load"
+    until docker build -t ${image_name} -f docker/${dockerfile} ${build_load} .  ; do
         echo "docker build failed… trying again in 10s… "
         sleep 10
     done

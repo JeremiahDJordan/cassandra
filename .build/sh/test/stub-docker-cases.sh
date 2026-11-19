@@ -61,7 +61,18 @@ case "$1" in
       podman:*)               echo "  cpus: 6" ;;
     esac
     ;;
-  images)    echo "stub-image-id" ;;
+  # STUB_NO_IMAGE=1 has no image to find or pull, so the scripts build it
+  images)    [ -n "${STUB_NO_IMAGE:-}" ] || echo "stub-image-id" ;;
+  pull)      [ -z "${STUB_NO_IMAGE:-}" ] || exit 1 ;;
+  # STUB_NO_BUILDX=1 is a builder without --load, as the classic builder and podman are
+  build)
+    case "$*" in
+      *--help*)
+        if [ -n "${STUB_BUILD_HELP:-}" ]; then echo "${STUB_BUILD_HELP}"
+        elif [ -z "${STUB_NO_BUILDX:-}" ]; then echo "      --load    Shorthand for \"--output=type=docker\""
+        fi ;;
+    esac
+    ;;
   run)
     # `docker run --rm alpine … nproc --all` and `… free -b` ask the host, not the image
     for _a in "$@"; do
@@ -285,6 +296,40 @@ JENKINS_URL=http://jenkins.example NODE_NAME=agent-1 STUB_CURL='  "numExecutors"
   docker_memory_per_executor=yes run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
 expect_rc "docker/run-tests.sh checks the memory of every executor when asked to" 1
 expect_out "docker/run-tests.sh names the executors in the memory check" "per jenkins executor (2)"
+
+################################
+#
+# Cases: building the image, with and without buildx
+#
+################################
+
+reset_stub
+STUB_NO_IMAGE=1 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh builds a missing image" 0
+expect_invocation "docker/run-tests.sh builds with --load under buildx" "docker build \-t apache/cassandra-ubuntu-test:.* \-\-load \.$"
+
+reset_stub
+STUB_NO_IMAGE=1 STUB_NO_BUILDX=1 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh builds a missing image without buildx" 0
+expect_invocation "docker/run-tests.sh builds the image without buildx" "docker build \-t apache/cassandra-ubuntu-test:"
+expect_no_invocation "docker/run-tests.sh passes no --load without buildx" "docker build .*\-\-load"
+
+# an option that only starts with --load is not --load
+reset_stub
+STUB_NO_IMAGE=1 STUB_BUILD_HELP="      --load-balancer   not an option docker has" run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh builds with a builder whose options only start with --load" 0
+expect_no_invocation "docker/run-tests.sh passes no --load for an option that only starts with it" "docker build .*\-\-load"
+
+reset_stub
+STUB_NO_IMAGE=1 run_case "${cassandra_dir}/.build/docker/_docker_run.sh" debian-build.docker build-jars.sh
+expect_rc "_docker_run.sh builds a missing image" 0
+expect_invocation "_docker_run.sh builds with --load under buildx" "docker build \-t apache/cassandra-debian-build:.* \-\-load \.$"
+
+reset_stub
+STUB_NO_IMAGE=1 STUB_NO_BUILDX=1 run_case "${cassandra_dir}/.build/docker/_docker_run.sh" debian-build.docker build-jars.sh
+expect_rc "_docker_run.sh builds a missing image without buildx" 0
+expect_invocation "_docker_run.sh builds the image without buildx" "docker build \-t apache/cassandra-debian-build:"
+expect_no_invocation "_docker_run.sh passes no --load without buildx" "docker build .*\-\-load"
 
 ################################
 #
