@@ -53,6 +53,7 @@ import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.StubIndex;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -121,6 +122,31 @@ public class RepairedDataTombstonesTest extends CQLTester
         assertEquals(1, Iterables.size(getCurrentColumnFamilyStore().getSSTables(SSTableSet.LIVE)));
         assertFalse(getCurrentColumnFamilyStore().getSSTables(SSTableSet.LIVE).iterator().next().isRepaired());
 
+    }
+
+    @Test
+    public void compactionIndexTableTest() throws Throwable
+    {
+        // index sstables are never repaired, so the index table purges its tombstones whatever the base table's option
+        createTable("create table %s (id int primary key, t int) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true}");
+        String index = createIndex("create index on %s (t) using 'legacy_local_table'");
+        ColumnFamilyStore indexCfs = getCurrentColumnFamilyStore().indexManager.getIndexByName(index).getBackingTable().get();
+        execute("insert into %s (id, t) values (1, 1)");
+        // deletes the index entry of t=1
+        execute("update %s set t=2 where id=1");
+        flush();
+        Thread.sleep(1000);
+        indexCfs.forceMajorCompaction();
+        SSTableReader sstable = Iterables.getOnlyElement(indexCfs.getSSTables(SSTableSet.LIVE));
+        try (ISSTableScanner scanner = sstable.getScanner())
+        {
+            assertTrue(scanner.hasNext());
+            try (UnfilteredRowIterator partition = scanner.next())
+            {
+                assertEquals(2, ByteBufferUtil.toInt(partition.partitionKey().getKey()));
+            }
+            assertFalse(scanner.hasNext());
+        }
     }
 
     @Test
