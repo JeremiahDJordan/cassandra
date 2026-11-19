@@ -25,8 +25,11 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Set;
+import java.util.function.Consumer;
 import java.util.stream.Stream;
 import java.util.stream.StreamSupport;
+
+import javax.annotation.Nullable;
 
 import com.googlecode.concurrenttrees.radix.ConcurrentRadixTree;
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -52,6 +55,7 @@ import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.FastByteOperations;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
@@ -79,6 +83,12 @@ public class TypeUtil
      * the early AA on-disk format.
      */
     public static final ByteComparable.Version BYTE_COMPARABLE_VERSION = ByteComparable.Version.OSS41;
+
+    /** The largest map entry value of an entries index: a CompositeType component has an unsigned short length. */
+    public static final int MAX_MAP_ENTRY_VALUE_SIZE = FBUtilities.MAX_UNSIGNED_SHORT;
+
+    /** The largest map entry key: 0xFFFF starting a first CompositeType component is read as the static marker. */
+    public static final int MAX_MAP_ENTRY_KEY_SIZE = FBUtilities.MAX_UNSIGNED_SHORT - 1;
 
     private TypeUtil() {}
 
@@ -327,17 +337,35 @@ public class TypeUtil
         return type.compare(requestedValue.raw, columnValue.raw);
     }
 
+    /**
+     * Returns the values of the live cells of the given collection, as indexed by an index of the given type.
+     * <p>
+     * The map entries that an {@link IndexTarget.Type#KEYS_AND_VALUES} index can't represent (see
+     * {@link #isIndexableMapEntry(Cell)}) are left out, and given to {@code onUnindexableMapEntry} if it isn't null.
+     */
     public static Iterator<ByteBuffer> collectionIterator(AbstractType<?> validator,
                                                           ComplexColumnData cellData,
                                                           ColumnMetadata columnMetadata,
                                                           IndexTarget.Type indexType,
-                                                          long nowInSecs)
+                                                          long nowInSecs,
+                                                          @Nullable Consumer<Cell<?>> onUnindexableMapEntry)
     {
         if (cellData == null)
             return null;
 
-        Stream<ByteBuffer> stream = StreamSupport.stream(cellData.spliterator(), false).filter(cell -> cell != null && cell.isLive(nowInSecs))
-                                                 .map(cell -> cellValue(columnMetadata, indexType, cell));
+        Stream<Cell<?>> cells = StreamSupport.stream(cellData.spliterator(), false)
+                                             .filter(cell -> cell != null && cell.isLive(nowInSecs));
+        if (indexType == IndexTarget.Type.KEYS_AND_VALUES)
+        {
+            cells = cells.filter(cell -> {
+                if (isIndexableMapEntry(cell))
+                    return true;
+                if (onUnindexableMapEntry != null)
+                    onUnindexableMapEntry.accept(cell);
+                return false;
+            });
+        }
+        Stream<ByteBuffer> stream = cells.map(cell -> cellValue(columnMetadata, indexType, cell));
 
         if (isInetAddress(validator))
             stream = stream.sorted((c1, c2) -> compareInet(encodeInetAddress(c1), encodeInetAddress(c2)));
@@ -374,6 +402,15 @@ public class TypeUtil
     public static float[] decomposeVector(IndexContext indexContext, ByteBuffer byteBuffer)
     {
         return decomposeVector(indexContext.getValidator(), byteBuffer);
+    }
+
+    /**
+     * Whether the given map cell can be indexed by an {@link IndexTarget.Type#KEYS_AND_VALUES} index, i.e. whether its
+     * key is at most {@link #MAX_MAP_ENTRY_KEY_SIZE} bytes and its value at most {@link #MAX_MAP_ENTRY_VALUE_SIZE}.
+     */
+    public static boolean isIndexableMapEntry(Cell<?> cell)
+    {
+        return cell.path().get(0).remaining() <= MAX_MAP_ENTRY_KEY_SIZE && cell.valueSize() <= MAX_MAP_ENTRY_VALUE_SIZE;
     }
 
     private static ByteBuffer cellValue(ColumnMetadata columnMetadata, IndexTarget.Type indexType, Cell<?> cell)
