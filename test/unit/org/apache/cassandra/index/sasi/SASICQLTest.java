@@ -34,7 +34,9 @@ import org.junit.Assert;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.sasi.conf.ColumnIndex;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.transport.ProtocolVersion;
 
@@ -363,5 +365,18 @@ public class SASICQLTest extends CQLTester
                                   StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                                   InvalidQueryException.class,
                                   "SELECT * FROM %s WHERE v IN (200, 250, 300)");
+    }
+
+    @Test
+    public void testSwitchOfCleanMemtableKeepsNoPendingIndexMemtable() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int primary key, v int);");
+        String indexName = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'org.apache.cassandra.index.sasi.SASIIndex';");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        ColumnIndex index = ((SASIIndex) cfs.indexManager.getIndexByName(indexName)).getIndex();
+
+        cfs.switchMemtableIfCurrent(cfs.getTracker().getView().getCurrentMemtable(), ColumnFamilyStore.FlushReason.UNIT_TESTS).get();
+
+        Assert.assertTrue(index.getPendingMemtables().isEmpty());
     }
 }
