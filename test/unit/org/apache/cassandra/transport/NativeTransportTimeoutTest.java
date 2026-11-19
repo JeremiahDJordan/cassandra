@@ -79,7 +79,7 @@ public class NativeTransportTimeoutTest extends CQLTester
                        targetClass = "org.apache.cassandra.transport.Message$Request",
                        targetMethod = "elapsedTimeSinceCreation",
                        targetLocation = "AT ENTRY",
-                       condition = "$this.getCustomPayload() != null && !callerEquals(\"Message$Request.execute\", true)",
+                       condition = "$this.getCustomPayload() != null",
                        action = "org.apache.cassandra.transport.NativeTransportTimeoutTest.WAIT_BARRIER.release(); " +
                                 "org.apache.cassandra.transport.NativeTransportTimeoutTest.EXECUTE_BARRIER.acquire(); " +
                                 "flag(Thread.currentThread());"),
@@ -113,6 +113,25 @@ public class NativeTransportTimeoutTest extends CQLTester
         {
             CassandraRelevantProperties.NATIVE_TRANSPORT_ASYNC_READ_WRITE_ENABLED.setBoolean(false);
         }
+    }
+
+    @Test
+    public void testQueueTimeRecordedOncePerRequest() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v text)");
+        Session session = sessionNet();
+        int requests = 20;
+
+        long initialQueued = ClientMetrics.instance.queueTime.getCount();
+        long initialTotalQueueTime = ClientMetrics.instance.totalQueueTime.getCount();
+
+        for (int i = 0; i < requests; i++)
+            session.execute("SELECT * FROM " + KEYSPACE + '.' + currentTable());
+
+        // the driver may send a few requests of its own, but each request is recorded once
+        long queued = ClientMetrics.instance.queueTime.getCount() - initialQueued;
+        Assertions.assertThat(queued).isBetween((long) requests, 2L * requests - 1);
+        Assertions.assertThat(ClientMetrics.instance.totalQueueTime.getCount()).isGreaterThan(initialTotalQueueTime);
     }
 
     private void doTestLoadShedding(boolean useAsyncStages, Statement statement) throws InterruptedException

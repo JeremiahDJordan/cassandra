@@ -124,8 +124,7 @@ public final class ClientMetrics
      */
     public void recordQueueTime(long value, TimeUnit unit)
     {
-        queueTime.update(value, unit);
-        totalQueueTime.inc(TimeUnit.NANOSECONDS.convert(value, unit));
+        queueTime(value, unit);
     }
 
     /**
@@ -179,7 +178,6 @@ public final class ClientMetrics
         authFailure = registerMeter("AuthFailure");
 
         pausedConnections = new AtomicInteger();
-        connectionPaused = registerMeter("ConnectionPaused");
         pausedConnectionsGauge = registerGauge("PausedConnections", pausedConnections::get);
         connectionPaused = registerMeter("ConnectionPaused");
         requestDiscarded = registerMeter("RequestDiscarded");
@@ -269,6 +267,7 @@ public final class ClientMetrics
     public void queueTime(long value, TimeUnit unit)
     {
         queueTime.update(value, unit);
+        totalQueueTime.inc(TimeUnit.NANOSECONDS.convert(value, unit));
     }
 
     private Counter registerCounter(String name)
