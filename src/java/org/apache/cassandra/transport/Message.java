@@ -31,14 +31,10 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.*;
 
 import org.apache.cassandra.utils.Closeable;
-import org.apache.cassandra.utils.concurrent.ImmediateFuture;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.ExecutorLocals;
-import org.apache.cassandra.config.DatabaseDescriptor;
-import org.apache.cassandra.exceptions.OverloadedException;
-import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.messages.*;
@@ -252,15 +248,6 @@ public abstract class Message
 
         public final Future<Response> execute(QueryState queryState, Dispatcher.RequestTime requestTime)
         {
-            // at the time of the check, this is approximately the time spent in the NTR stage's queue
-            long elapsedTimeSinceCreation = elapsedTimeSinceCreation(TimeUnit.NANOSECONDS);
-            ClientMetrics.instance.recordQueueTime(elapsedTimeSinceCreation, TimeUnit.NANOSECONDS);
-            if (elapsedTimeSinceCreation > DatabaseDescriptor.getNativeTransportTimeout(TimeUnit.NANOSECONDS))
-            {
-                ClientMetrics.instance.markTimedOutBeforeProcessing();
-                return ImmediateFuture.success(ErrorMessage.fromTransportException(new OverloadedException("Query timed out before it could start")));
-            }
-
             boolean shouldTrace = false;
             TimeUUID tracingSessionId = null;
 

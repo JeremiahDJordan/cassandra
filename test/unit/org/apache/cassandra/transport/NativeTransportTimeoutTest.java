@@ -52,19 +52,19 @@ public class NativeTransportTimeoutTest extends CQLTester
     static Semaphore WAIT_BARRIER;
 
     @Test
-    @BMRules(rules = { @BMRule(name = "Delay Message execution on NTR stage",
-                       targetClass = "org.apache.cassandra.transport.Message$Request",
-                       targetMethod = "execute",
+    @BMRules(rules = { @BMRule(name = "Delay request processing on NTR stage",
+                       targetClass = "org.apache.cassandra.transport.Dispatcher$RequestProcessor",
+                       targetMethod = "run",
                        targetLocation = "AT ENTRY",
-                       condition = "$this.getCustomPayload() != null",
+                       condition = "$0.request.getCustomPayload() != null",
                        action = "org.apache.cassandra.transport.NativeTransportTimeoutTest.WAIT_BARRIER.release(); " +
                                 "org.apache.cassandra.transport.NativeTransportTimeoutTest.EXECUTE_BARRIER.acquire(); " +
                                 "flag(Thread.currentThread());"),
-                       @BMRule(name = "Mock NTR timeout from Request.execute",
+                       @BMRule(name = "Mock NTR timeout from Dispatcher.processRequest",
                        targetClass = "org.apache.cassandra.config.DatabaseDescriptor",
                        targetMethod = "getNativeTransportTimeout",
                        targetLocation = "AT ENTRY",
-                       condition = "flagged(Thread.currentThread()) && callerEquals(\"Message$Request.execute\", true)",
+                       condition = "flagged(Thread.currentThread()) && callerEquals(\"Dispatcher.processRequest\", true)",
                        action = "clear(Thread.currentThread()); " +
                                 "return 10000000;") })
     public void testNativeTransportLoadShedding() throws Throwable
@@ -79,7 +79,7 @@ public class NativeTransportTimeoutTest extends CQLTester
                        targetClass = "org.apache.cassandra.transport.Message$Request",
                        targetMethod = "elapsedTimeSinceCreation",
                        targetLocation = "AT ENTRY",
-                       condition = "$this.getCustomPayload() != null && !callerEquals(\"Message$Request.execute\", true)",
+                       condition = "$this.getCustomPayload() != null",
                        action = "org.apache.cassandra.transport.NativeTransportTimeoutTest.WAIT_BARRIER.release(); " +
                                 "org.apache.cassandra.transport.NativeTransportTimeoutTest.EXECUTE_BARRIER.acquire(); " +
                                 "flag(Thread.currentThread());"),
@@ -113,6 +113,25 @@ public class NativeTransportTimeoutTest extends CQLTester
         {
             CassandraRelevantProperties.NATIVE_TRANSPORT_ASYNC_READ_WRITE_ENABLED.setBoolean(false);
         }
+    }
+
+    @Test
+    public void testQueueTimeRecordedOncePerRequest() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v text)");
+        Session session = sessionNet();
+        int requests = 20;
+
+        long initialQueued = ClientMetrics.instance.queueTime.getCount();
+        long initialTotalQueueTime = ClientMetrics.instance.totalQueueTime.getCount();
+
+        for (int i = 0; i < requests; i++)
+            session.execute("SELECT * FROM " + KEYSPACE + '.' + currentTable());
+
+        // the driver may send a few requests of its own, but each request is recorded once
+        long queued = ClientMetrics.instance.queueTime.getCount() - initialQueued;
+        Assertions.assertThat(queued).isBetween((long) requests, 2L * requests - 1);
+        Assertions.assertThat(ClientMetrics.instance.totalQueueTime.getCount()).isGreaterThan(initialTotalQueueTime);
     }
 
     private void doTestLoadShedding(boolean useAsyncStages, Statement statement) throws InterruptedException
