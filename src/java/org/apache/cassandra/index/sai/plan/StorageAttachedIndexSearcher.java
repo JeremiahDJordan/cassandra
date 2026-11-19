@@ -548,7 +548,10 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             queryContext.addPostFilteringReadLatency(Clock.Global.nanoTime() - startTimeNanos);
 
             queryContext.addKeysFetched(keys.size());
-            return applyIndexFilter(counted, filterTree);
+            // If there is an unresolved static expression during RFP, completion reads to silent replicas will
+            // fetch entire partitions. If we don't return range tombstones in this initial read, there may not be
+            // enough information at the coordinator for RFP to shadow logically deleted rows from those replicas.
+            return applyIndexFilter(counted, filterTree, command.rowFilter().hasStaticExpression());
         }
 
         @Override
@@ -761,7 +764,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                 queryContext.addKeysFetched(sourceKeys.size());
 
                 UnfilteredRowIterator counted = fetchedRowsCounter.apply(partition);
-                UnfilteredRowIterator clusters = applyIndexFilter(counted, filterTree);
+                // Scored queries do not involve RFP, and therefore can ignore range tombstones.
+                UnfilteredRowIterator clusters = applyIndexFilter(counted, filterTree, false);
 
                 if (clusters == null)
                     return null;
@@ -888,9 +892,9 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         }
     }
 
-    private static UnfilteredRowIterator applyIndexFilter(UnfilteredRowIterator partition, FilterTree tree)
+    private static UnfilteredRowIterator applyIndexFilter(UnfilteredRowIterator partition, FilterTree tree, boolean matchTombstones)
     {
-        FilteringPartitionIterator filtered = new FilteringPartitionIterator(partition, tree);
+        FilteringPartitionIterator filtered = new FilteringPartitionIterator(partition, tree, matchTombstones);
         if (!filtered.hasNext() && !filtered.matchesStaticRow())
         {
             filtered.close();
@@ -901,16 +905,25 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
     /**
      * Filters the rows in the partition so that only non-static rows that match given filter are returned.
+     * <p>
+     * If {@code matchTombstones} is true, range tombstone markers are also returned, but only if at least one row
+     * (or the static row) matches the filter: range tombstones do not constitute matches on their own, so they are
+     * buffered until the first match and discarded if there is none (CASSANDRA-21332).
      */
     private static class FilteringPartitionIterator extends AbstractUnfilteredRowIterator
     {
         private final FilterTree filter;
         private final UnfilteredRowIterator rows;
+        private final boolean matchTombstones;
 
         private final DecoratedKey key;
         private final Row staticRow;
 
-        public FilteringPartitionIterator(UnfilteredRowIterator partition, FilterTree filter)
+        // range tombstone markers (and the first matching row following them) not yet returned
+        private final Queue<Unfiltered> pending = new ArrayDeque<>();
+        private boolean matchedRow = false;
+
+        public FilteringPartitionIterator(UnfilteredRowIterator partition, FilterTree filter, boolean matchTombstones)
         {
             super(partition.metadata(),
                   partition.partitionKey(),
@@ -922,6 +935,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
             this.rows = partition;
             this.filter = filter;
+            this.matchTombstones = matchTombstones;
             this.key = partition.partitionKey();
             this.staticRow = partition.staticRow();
         }
@@ -934,16 +948,40 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         @Override
         protected Unfiltered computeNext()
         {
+            if (!pending.isEmpty())
+                return pending.poll();
+
             while (rows.hasNext())
             {
                 Unfiltered row = rows.next();
+
+                if (matchTombstones && row.isRangeTombstoneMarker())
+                {
+                    // Once something matched, the markers can be returned directly; until then, hold them back.
+                    if (matchedRow)
+                        return row;
+                    pending.add(row);
+                    continue;
+                }
 
                 if (!row.isRow() || ((Row)row).isStatic())
                     continue;
 
                 if (filter.isSatisfiedBy(key, row, staticRow))
-                    return row;
+                {
+                    matchedRow = true;
+                    if (pending.isEmpty())
+                        return row;
+                    pending.add(row);
+                    return pending.poll();
+                }
             }
+
+            // No more rows. Buffered markers are only returned if the partition matched through its static row.
+            if (!pending.isEmpty() && matchesStaticRow())
+                return pending.poll();
+
+            pending.clear();
             return endOfData();
         }
 
