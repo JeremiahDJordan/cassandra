@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.common.collect.Sets;
@@ -59,6 +60,7 @@ public class SecondaryIndexManagerTest extends CQLTester
     public void after()
     {
         TestingIndex.clear();
+        HeldInitializationIndex.releaseAll();
     }
 
     @Test
@@ -120,6 +122,51 @@ public class SecondaryIndexManagerTest extends CQLTester
         // create the index again and verify that it's added to the built indexes table
         createIndex(String.format("CREATE INDEX %s ON %%s(c)", indexName));
         assertMarkedAsBuilt(indexName);
+    }
+
+    @Test
+    public void recreatedIndexIsNotMarkedBuiltByTheBuildOfTheDroppedIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+        HeldInitializationIndex.resetLatches();
+        createIndexAsync(heldIndex("old", false));
+        assertTrue(HeldInitializationIndex.oldStarted.await(30, TimeUnit.SECONDS));
+        dropIndex("DROP INDEX %s.v_idx");
+        createIndexAsync(heldIndex("new", false));
+
+        // the initial build of the dropped index succeeds while the one of the recreated index is still running
+        HeldInitializationIndex.oldRelease.countDown();
+        for (int i = 0; i < 40; i++)
+        {
+            assertFalse(SystemKeyspace.isIndexBuilt(KEYSPACE, "v_idx"));
+            Thread.sleep(50);
+        }
+
+        HeldInitializationIndex.newRelease.countDown();
+        Util.spinAssertEquals(true, () -> SystemKeyspace.isIndexBuilt(KEYSPACE, "v_idx"), 30);
+    }
+
+    @Test
+    public void recreatedIndexIsNotFailedByTheBuildOfTheDroppedIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+        HeldInitializationIndex.resetLatches();
+        createIndexAsync(heldIndex("old", true));
+        assertTrue(HeldInitializationIndex.oldStarted.await(30, TimeUnit.SECONDS));
+        dropIndex("DROP INDEX %s.v_idx");
+        createIndexAsync(heldIndex("new", false));
+
+        // the initial build of the dropped index fails while the one of the recreated index is still running
+        HeldInitializationIndex.oldRelease.countDown();
+        HeldInitializationIndex.newRelease.countDown();
+        Util.spinAssertEquals(true, () -> SystemKeyspace.isIndexBuilt(KEYSPACE, "v_idx"), 30);
+        assertTrue(getCurrentColumnFamilyStore().indexManager.isIndexQueryable(getCurrentColumnFamilyStore().indexManager.getIndexByName("v_idx")));
+    }
+
+    private static String heldIndex(String build, boolean fail)
+    {
+        return String.format("CREATE CUSTOM INDEX v_idx ON %%s (v) USING '%s' WITH OPTIONS = {'build': '%s', 'fail': '%s'}",
+                             HeldInitializationIndex.class.getName(), build, fail);
     }
 
     @Test
@@ -858,6 +905,59 @@ public class SecondaryIndexManagerTest extends CQLTester
         public LoadType getSupportedLoadTypeOnFailure(boolean isInitialBuild)
         {
             return LoadType.WRITE;
+        }
+    }
+
+    /**
+     * A <code>StubIndex</code> whose initial build waits to be released: the one of the index with the option
+     * {@code build = old} also fails if its option {@code fail} is {@code true}.
+     */
+    public static class HeldInitializationIndex extends StubIndex
+    {
+        static volatile CountDownLatch oldStarted;
+        static volatile CountDownLatch oldRelease;
+        static volatile CountDownLatch newRelease;
+
+        public HeldInitializationIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        static void resetLatches()
+        {
+            oldStarted = new CountDownLatch(1);
+            oldRelease = new CountDownLatch(1);
+            newRelease = new CountDownLatch(1);
+        }
+
+        static void releaseAll()
+        {
+            if (oldRelease != null)
+            {
+                oldRelease.countDown();
+                newRelease.countDown();
+            }
+        }
+
+        @Override
+        public Callable<?> getInitializationTask()
+        {
+            boolean old = "old".equals(getIndexMetadata().options.get("build"));
+            boolean fail = Boolean.parseBoolean(getIndexMetadata().options.get("fail"));
+            return () -> {
+                if (old)
+                {
+                    oldStarted.countDown();
+                    oldRelease.await();
+                    if (fail)
+                        throw new RuntimeException("Initial build of the dropped index failed");
+                }
+                else
+                {
+                    newRelease.await();
+                }
+                return null;
+            };
         }
     }
 }
