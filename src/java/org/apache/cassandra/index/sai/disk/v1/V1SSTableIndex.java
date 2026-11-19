@@ -164,12 +164,20 @@ public class V1SSTableIndex extends SSTableIndex
     {
         List<KeyRangeIterator> segmentIterators = new ArrayList<>();
 
-        for (Segment segment : segments)
+        try
         {
-            if (segment.intersects(keyRange))
+            for (Segment segment : segments)
             {
-                segmentIterators.add(segment.search(expression, keyRange, context));
+                if (segment.intersects(keyRange))
+                {
+                    segmentIterators.add(segment.search(expression, keyRange, context));
+                }
             }
+        }
+        catch (Throwable t)
+        {
+            FileUtils.closeQuietly(segmentIterators);
+            throw t;
         }
 
         return segmentIterators;
@@ -179,9 +187,17 @@ public class V1SSTableIndex extends SSTableIndex
     {
         // Return a list to allow the caller to merge the results from multiple sstables into a single iterator.
         List<CloseableIterator<PrimaryKeyWithScore>> iterators = new ArrayList<>(segments.size());
-        for (Segment segment : segments)
-            if (segment.intersects(keyRange))
-                iterators.add(segment.orderBy(orderer, keyRange, context));
+        try
+        {
+            for (Segment segment : segments)
+                if (segment.intersects(keyRange))
+                    iterators.add(segment.orderBy(orderer, keyRange, context));
+        }
+        catch (Throwable t)
+        {
+            FileUtils.closeQuietly(iterators);
+            throw t;
+        }
 
         return iterators;
     }
@@ -190,8 +206,16 @@ public class V1SSTableIndex extends SSTableIndex
     {
         // Return a list to allow the caller to merge the results from multiple sstables into a single iterator.
         List<CloseableIterator<PrimaryKeyWithScore>> iterators = new ArrayList<>(segments.size());
-        for (Segment segment : segments)
-            iterators.add(segment.orderResultsBy(context, results, orderer));
+        try
+        {
+            for (Segment segment : segments)
+                iterators.add(segment.orderResultsBy(context, results, orderer));
+        }
+        catch (Throwable t)
+        {
+            FileUtils.closeQuietly(iterators);
+            throw t;
+        }
 
         return iterators;
     }

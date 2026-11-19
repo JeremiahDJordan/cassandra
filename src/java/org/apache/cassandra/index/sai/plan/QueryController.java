@@ -255,6 +255,7 @@ public class QueryController
                                            ? KeyRangeIntersectionIterator.builder(expressions.size(), queryView::close)
                                            : KeyRangeUnionIterator.builder(expressions.size(), queryView::close);
 
+        KeyRangeIterator.Builder repairedBuilder = null;
         try
         {
             maybeTriggerGuardrails(queryView);
@@ -269,7 +270,7 @@ public class QueryController
             }
             else
             {
-                KeyRangeIterator.Builder repairedBuilder = KeyRangeIntersectionIterator.builder(expressions.size(), () -> {});
+                repairedBuilder = KeyRangeIntersectionIterator.builder(expressions.size(), () -> {});
 
                 for (QueryViewBuilder.QueryExpressionView queryExpressionView : queryView.view)
                 {
@@ -309,12 +310,15 @@ public class QueryController
 
                 if (repairedBuilder.rangeCount() > 0)
                     builder.add(repairedBuilder.build());
+                repairedBuilder = null;
             }
         }
         catch (Throwable t)
         {
             // all sstable indexes in view have been referenced, need to clean up when exception is thrown
             builder.cleanup();
+            if (repairedBuilder != null)
+                repairedBuilder.cleanup();
             throw t;
         }
         return builder;
