@@ -756,9 +756,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * {@code false} for all other cases (i.e. newly added index)
      */
     @VisibleForTesting
-    public synchronized void markIndexesBuilding(Set<Index> indexes, boolean isFullRebuild, boolean isNewCF)
+    public synchronized void markIndexesBuilding(Set<Index> allIndexes, boolean isFullRebuild, boolean isNewCF)
     {
         String keyspaceName = baseCfs.getKeyspaceName();
+        // markIndexBuilt and markIndexFailed ignore an index that has been replaced by another one with the same name,
+        // so it mustn't be counted as building under that name either: its replacement would look as building forever.
+        Set<Index> indexes = allIndexes.stream().filter(index -> !isReplaced(index)).collect(Collectors.toSet());
 
         // First step is to validate against concurrent rebuilds; it would be more optimized to do everything on a single
         // step, but we're not really expecting a very high number of indexes, and this isn't on any hot path, so
@@ -799,6 +802,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private synchronized void markIndexBuilt(Index index, boolean isFullRebuild)
     {
         String indexName = index.getIndexMetadata().name;
+        if (isReplaced(index))
+            return;
+
         if (isFullRebuild)
             makeIndexQueryable(index, Index.Status.BUILD_SUCCEEDED);
         
@@ -825,6 +831,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private synchronized void markIndexFailed(Index index, boolean isInitialBuild)
     {
         String indexName = index.getIndexMetadata().name;
+        if (isReplaced(index))
+            return;
 
         AtomicInteger counter = inProgressBuilds.get(indexName);
         if (counter != null)
@@ -844,6 +852,16 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             if (!index.getSupportedLoadTypeOnFailure(isInitialBuild).supportsReads() && queryableIndexes.remove(indexName))
                 logger.info("Index [{}] became not-queryable because of failed build.", indexName);
         }
+    }
+
+    /**
+     * Whether the index was dropped and replaced by one of the same name, whose build state (kept by index name) its
+     * builds must not change. An index that isn't registered at all still releases its build state.
+     */
+    private boolean isReplaced(Index index)
+    {
+        Index registered = indexes.get(index.getIndexMetadata().name);
+        return registered != null && registered != index;
     }
 
     private void logAndMarkIndexesFailed(Set<Index> indexes, Throwable indexBuildFailure, boolean isInitialBuild)
