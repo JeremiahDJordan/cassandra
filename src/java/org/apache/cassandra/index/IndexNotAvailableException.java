@@ -20,6 +20,7 @@ package org.apache.cassandra.index;
 
 import org.apache.cassandra.exceptions.InternalRequestExecutionException;
 import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.schema.TableMetadata;
 
 /**
  * Thrown if a secondary index is not currently available.
@@ -33,6 +34,16 @@ public final class IndexNotAvailableException extends RuntimeException implement
     public IndexNotAvailableException(Index index)
     {
         super(String.format("The secondary index '%s' is not yet available", index.getIndexMetadata().name));
+    }
+
+    /**
+     * Creates a new <code>IndexNotAvailableException</code> for a read of the specified table that needs an index
+     * that this node doesn't know yet.
+     * @param table the table
+     */
+    public IndexNotAvailableException(TableMetadata table)
+    {
+        super(String.format("The secondary index needed by the query on %s.%s is not yet available", table.keyspace, table.name));
     }
 
     @Override
