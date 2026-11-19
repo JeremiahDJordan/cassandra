@@ -65,6 +65,7 @@ import io.github.jbellis.jvector.quantization.VectorCompressor;
 import io.github.jbellis.jvector.util.Accountable;
 import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.util.DenseIntMap;
+import io.github.jbellis.jvector.util.ExplicitThreadLocal;
 import io.github.jbellis.jvector.util.RamUsageEstimator;
 import io.github.jbellis.jvector.vector.ArrayVectorFloat;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
@@ -142,8 +143,9 @@ public class CassandraOnHeapGraph<T> implements Accountable
     private volatile boolean hasDeletions;
     private volatile boolean allVectorsAreUnitLength;
 
-    // we don't need to explicitly close these since only on-heap resources are involved
-    private final ThreadLocal<GraphSearcherAccessManager> searchers;
+    // A searcher's last filter can reference the memtable index, so caching searchers on a thread can pin memtables.
+    // The on-heap graph views have no resources to close.
+    private final ExplicitThreadLocal<GraphSearcherAccessManager> searchers;
 
     private final boolean writeNvq;
 
@@ -196,7 +198,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
                                         indexConfig.getNeighborhoodOverflow(1.0f), // no overflow means add will be a bit slower but flush will be faster
                                         indexConfig.getAlpha(dimension > 3 ? 1.2f : 2.0f),
                                         indexConfig.isHierarchyEnabled() && jvectorVersion >= 4);
-        searchers = ThreadLocal.withInitial(() -> new GraphSearcherAccessManager(new GraphSearcher(builder.getGraph())));
+        searchers = ExplicitThreadLocal.withInitial(() -> new GraphSearcherAccessManager(new GraphSearcher(builder.getGraph())));
     }
 
     public int size()
