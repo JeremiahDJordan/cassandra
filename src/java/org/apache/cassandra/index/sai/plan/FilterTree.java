@@ -19,17 +19,17 @@ package org.apache.cassandra.index.sai.plan;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.ListIterator;
-import java.util.Set;
 
 import com.google.common.collect.ListMultimap;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
+import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -135,20 +135,35 @@ public class FilterTree
     }
 
     /**
-     * @return the number of unique SSTable indexes that are referenced by the expressions in this filter tree.
+     * Returns the highest number of SSTable indexes that a single indexed expression of this filter tree searches: those
+     * whose key range overlaps the given key range, which {@link QueryView.Builder} puts in the query view of the column
+     * and {@link org.apache.cassandra.index.sai.iterators.KeyRangeTermIterator} searches. This includes the expressions
+     * that order the results (ANN, BM25, ORDER BY), which search every index in the key range.
+     * <p>
+     * This is what the {@code sai_sstable_indexes_per_query} guardrail limits: how many SSTable indexes a single
+     * column search touches, not how many indexed columns the query has.
+     *
+     * @param keyRange the key range of the query
+     * @return the highest number of SSTable indexes searched for an expression of this tree, or 0 if there are none
      */
-    public int numSSTableIndexes()
+    public int maxSSTableIndexesPerExpression(AbstractBounds<PartitionPosition> keyRange)
     {
-        Set<SSTableIndex> referencedIndexes = new HashSet<>();
-        sstableIndexes(referencedIndexes);
-        return referencedIndexes.size();
-    }
-
-    private void sstableIndexes(Set<SSTableIndex> indexes)
-    {
+        int max = 0;
         for (Expression expression : expressions.values())
-            indexes.addAll(expression.context.getView().getIndexes());
+        {
+            if (!expression.context.isIndexed())
+                continue;
+
+            int count = 0;
+            for (SSTableIndex index : expression.context.getView().getIndexes())
+            {
+                if (QueryView.Builder.indexInRange(index, keyRange))
+                    count++;
+            }
+            max = Math.max(max, count);
+        }
         for (FilterTree child : children)
-            child.sstableIndexes(indexes);
+            max = Math.max(max, child.maxSSTableIndexesPerExpression(keyRange));
+        return max;
     }
 }
