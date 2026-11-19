@@ -1,0 +1,111 @@
+#!/bin/bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# `docker` for the .build/docker/*.sh scripts on a podman host.  job.sh puts it first on the PATH of a cell
+# when the host runs podman.
+#
+#   run    rootless: adds --userns=keep-id --passwd=false, so the container user that _create_user.sh creates
+#          with the host uid is the host user, and the bind mounted build directory stays the host user's.
+#          With $CI_LOCAL_CPUS, --cpus=<n> becomes --cpus=$CI_LOCAL_CPUS, for trees whose run-tests.sh does
+#          not read $docker_cpus.  With $CI_LOCAL_CONTAINERS, the id of a detached container is appended to it.
+#   build  drops --load, which podman build does not have.  Builds of one tag are serialised per host, and a
+#          build is skipped when another cell built the image meanwhile.  Rootless: a Dockerfile uid outside
+#          the user's subordinate uid range is mapped into it.
+#   info   adds the " CPUs: <n>" line docker prints, for trees whose run-tests.sh greps for it.
+#   *      passed to podman.
+#
+podman="${CI_LOCAL_PODMAN:-podman}"
+rootless="${CI_LOCAL_PODMAN_ROOTLESS:-no}"
+home="${CI_LOCAL_HOME:-${HOME}/.run-ci-local}"
+
+case "$1" in
+  run)
+    shift
+    args=()
+    for a in "$@"; do
+      if [[ "${a}" == --cpus=* ]] && [ -n "${CI_LOCAL_CPUS:-}" ]; then
+        args+=("--cpus=${CI_LOCAL_CPUS}")
+      else
+        args+=("${a}")
+      fi
+    done
+    [ "${rootless}" == "yes" ] && args=(--userns=keep-id --passwd=false "${args[@]}")
+    detached=""
+    for a in "${args[@]}"; do [ "${a}" == "-d" ] || [ "${a}" == "--detach" ] && detached=1; done
+    if [ -z "${detached}" ] || [ -z "${CI_LOCAL_CONTAINERS:-}" ]; then
+      exec "${podman}" run "${args[@]}"
+    fi
+    # the id of a detached container, for job.sh to stop it when the cell ends
+    id="$("${podman}" run "${args[@]}")"
+    rc=$?
+    [ -n "${id}" ] && echo "${id}" && echo "${id##*$'\n'}" >> "${CI_LOCAL_CONTAINERS}"
+    exit ${rc}
+    ;;
+  build)
+    shift
+    args=()
+    tag=""
+    previous=""
+    for a in "$@"; do
+      [ "${a}" == "--load" ] && continue
+      [ "${previous}" == "-t" ] && tag="${a}"
+      args+=("${a}")
+      previous="${a}"
+    done
+    mkdir -p "${home}/locks"
+    exec {lock}>"${home}/locks/build-$(echo "${tag:-none}" | tr '/:' '__').lock"
+    flock "${lock}"
+    if [ -n "${tag}" ] && "${podman}" image exists "${tag}" {lock}>&- 2>/dev/null ; then
+      echo "image ${tag} was built by another cell"
+      exit 0
+    fi
+    # ubuntu-test.docker creates a build user with a uid above the usual 65536 subordinate uids
+    dockerfile_copy=""
+    for ((i = 0; i < ${#args[@]}; i++)); do
+      if [ "${rootless}" == "yes" ] && [ "${args[$i]}" == "-f" ] && [ -f "${args[$((i + 1))]}" ]; then
+        dockerfile="${args[$((i + 1))]}"
+        uids=$(grep -oE -- '--(last)?uid [0-9]{6,}' "${dockerfile}" | awk '{ print $2 }' | sort -u)
+        [ -n "${uids}" ] || continue
+        dockerfile_copy="$(mktemp "${TMPDIR:-/tmp}/run-ci-local-dockerfile.XXXXXX")"
+        cp "${dockerfile}" "${dockerfile_copy}"
+        for uid in ${uids}; do
+          sed -i -E "s/\\b${uid}\\b/$((60000 + uid % 5000))/g" "${dockerfile_copy}"
+        done
+        args[$((i + 1))]="${dockerfile_copy}"
+      fi
+    done
+    # podman build leaves helper processes behind that would inherit, and keep, the lock
+    "${podman}" build "${args[@]}" {lock}>&- &
+    build_pid=$!
+    trap 'kill -TERM ${build_pid} 2>/dev/null' TERM INT HUP
+    wait ${build_pid}; rc=$?
+    while kill -0 ${build_pid} 2>/dev/null; do wait ${build_pid}; rc=$?; done
+    [ -n "${dockerfile_copy}" ] && rm -f "${dockerfile_copy}"
+    exit ${rc}
+    ;;
+  info)
+    shift
+    "${podman}" info "$@"
+    rc=$?
+    [ $# -eq 0 ] && echo " CPUs: $("${podman}" info --format '{{.Host.CPUs}}')"
+    exit ${rc}
+    ;;
+  *)
+    exec "${podman}" "$@"
+    ;;
+esac

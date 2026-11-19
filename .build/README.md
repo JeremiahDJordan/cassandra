@@ -182,6 +182,20 @@ Debugging test scripts:
     DEBUG=true .build/docker/run-tests.sh -a test
 
 
+Running the CI pipeline on your own hosts
+-----------------------------------------
+
+`.build/run-ci-local` runs the cells of a `.jenkins/Jenkinsfile` profile with the
+scripts above, in docker or podman, on hosts reached over ssh.  It needs no Jenkins.
+List the hosts in `~/.config/cassandra/run-ci-local-hosts`, as in
+`.build/run-ci-local.d/hosts.example`, then:
+
+    .build/run-ci-local run --label my-change --dry-run
+    .build/run-ci-local run --label my-change --profile pre-commit --jdk 11
+
+See `.build/run-ci-local.d/README.md`.
+
+
 Testing the helper scripts
 --------------------------
 

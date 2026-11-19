@@ -1,0 +1,45 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# Settings for .build/run-ci-local, read from --config, else $RUN_CI_LOCAL_CONFIG, else
+# ~/.config/cassandra/run-ci-local.conf.  The command line overrides them, and they override the defaults,
+# which for the Jenkins job's parameters are the Jenkinsfile's.  A resumed label keeps the parameters it
+# first ran with.  Every key is optional; the values shown are the defaults.
+#
+
+[run-ci-local]
+# The parameters of the Jenkins job.  Without repository and branch the checkout's commit is tested.
+#repository = https://github.com/apache/cassandra
+#branch = trunk
+#profile = skinny
+#profile_custom_regexp =
+#architecture = amd64
+#jdk =
+#dtest_repository = https://github.com/apache/cassandra-dtest
+#dtest_branch = trunk
+
+# What failFast does in the Jenkinsfile: a cell that fails its last attempt stops the run.
+#fail_fast = yes
+
+# The tool's own settings.
+#hosts = ~/.config/cassandra/run-ci-local-hosts
+#remote_home = .run-ci-local
+#results_dir = build/ci-local
+#maven_mirror = https://maven-mirror.example.org/maven2
+#timeout_factor = 1
+#report = yes
+#dtest_dir =

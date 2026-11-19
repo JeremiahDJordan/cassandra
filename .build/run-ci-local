@@ -1,0 +1,2586 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""
+Local CI Pipeline Script
+
+Runs the .jenkins/Jenkinsfile pipeline of a local git checkout on hosts reached over ssh, without Jenkins.
+Each cell runs the .build/docker/ script Jenkins runs for it, with the same arguments, in docker or podman.
+Only the committed HEAD is tested.  Python standard library only.
+See .build/run-ci-local.d/README.md
+
+test with:
+ `python3 .build/run-ci-local.d/run-ci-local-test.py`
+"""
+
+import argparse
+import configparser
+import datetime
+import fcntl
+import hashlib
+import io
+import json
+import lzma
+import os
+import re
+import shlex
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import uuid
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+CASSANDRA_DIR = Path(__file__).resolve().parent.parent
+REMOTE_DIR = CASSANDRA_DIR / ".build" / "run-ci-local.d" / "remote"
+DEFAULT_REMOTE_HOME = ".run-ci-local"
+# Jenkins retries a failed cell once, on another agent
+MAX_ATTEMPTS = 2
+# a cell that waited this long reserves capacity on a host, see `job.sh start`
+RESERVE_AFTER_SECONDS = 300
+# every run removes the stashes this tool left on its hosts for labels idle this long
+SWEEP_IDLE_HOURS = 24
+# in <results>/<label>/: a label this tool made, the stash of which clean may remove
+LABEL_MARKER = ".run-ci-local"
+# what a report is made of, to attach to a JIRA ticket
+REPORT_ARTIFACTS = ("ci_summary.html", "results_details.tar.xz")
+# the cassandra-report agent of .jenkins/Jenkinsfile
+REPORT_UNITS = 2
+REPORT_TIMEOUT_HOURS = 2
+# the exit codes of job.sh for a full host, a label another driver owns, and a cell an earlier attempt of which runs
+HOST_FULL = 75
+NOT_OWNER = 76
+RUNNER_ALIVE = 77
+# job.sh start: an attempt that was stopped or replaced, or of another session
+FENCED = 78
+# job.sh: runs/<label> on the host is a link, or leads out of runs/
+LABEL_DIR_UNUSABLE = 79
+# ssh: the host could not be reached, or the connection broke
+SSH_FAILED = 255
+# the keys of a cell's entry that are not of its result
+NOT_A_RESULT = ("name", "kind", "done_attempts", "last_done")
+# labels, cell ids and the other names used in paths on the hosts
+NAME_PATTERN = r"[A-Za-z0-9_][A-Za-z0-9_.-]*"
+SSH_TIMEOUT = 300
+# copying a stash or a result
+TRANSFER_TIMEOUT = 3600
+# a cell not done this long after its own timeout is lost; ssh failing this many times in a row loses it too
+DEADLINE_MARGIN_SECONDS = 1800
+SSH_FAILURES_LOST = 15
+# a cell that hosts fail to start this many times in a row fails, as does one no host of its architecture answers
+# for this long
+START_FAILURE_LIMIT = 10
+HOSTS_UNREACHABLE_SECONDS = 3600
+# a host that does not answer is tried again after this long, then after twice as long each time, up to the maximum
+HOST_RETRY_SECONDS = 20
+HOST_RETRY_MAX_SECONDS = 300
+EXIT_CODES = {"SUCCESS": 0, "UNSTABLE": 3, "FAILURE": 4}
+# the parameters of the Jenkins job, in the order its init stage prints them
+JENKINS_PARAMETERS = ("repository", "branch", "profile", "profile_custom_regexp", "architecture", "jdk",
+                      "dtest_repository", "dtest_branch")
+PARAMETER_TITLES = {"repository": "Repository", "branch": "Branch", "profile": "Profile",
+                    "profile_custom_regexp": "Custom Profile Regexp", "architecture": "Architecture", "jdk": "JDK",
+                    "dtest_repository": "DTest Repository", "dtest_branch": "DTest Branch", "fail_fast": "Fail Fast"}
+# refuses absolute paths and links out of the destination, where tarfile has it (3.12, and 3.8.17 on)
+TAR_FILTER = {"filter": "data"} if hasattr(tarfile, "data_filter") else {}
+
+log_lock = threading.Lock()
+
+
+def log(message):
+    with log_lock:
+        print(f"[{datetime.datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
+
+
+def default_hosts_file():
+    if os.environ.get("RUN_CI_LOCAL_HOSTS"):
+        return Path(os.environ["RUN_CI_LOCAL_HOSTS"])
+    directory = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return directory / "cassandra" / "run-ci-local-hosts"
+
+
+#########################################
+#### .jenkins/Jenkinsfile, read here ####
+#########################################
+
+class JenkinsfileError(Exception):
+    pass
+
+
+_GROOVY_TOKEN = re.compile(r"""
+    (?P<space>\s+|//[^\n]*|/\*.*?\*/)
+  | (?P<string>'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*")
+  | (?P<number>-?\d+)
+  | (?P<word>[A-Za-z_]\w*)
+  | (?P<punct>[\[\]:,])
+""", re.S | re.X)
+
+
+class _GroovyTokens:
+    def __init__(self, text, pos):
+        self.text = text
+        self.pos = pos
+        self.pushed = []
+
+    def where(self):
+        return f"line {self.text.count(chr(10), 0, self.pos) + 1}"
+
+    def next(self):
+        if self.pushed:
+            return self.pushed.pop()
+        while True:
+            match = _GROOVY_TOKEN.match(self.text, self.pos)
+            if not match:
+                raise JenkinsfileError(f"not a Groovy literal at {self.where()}: {self.text[self.pos:self.pos + 40]!r}")
+            self.pos = match.end()
+            if match.lastgroup != "space":
+                return match.lastgroup, match.group()
+
+    def push(self, token):
+        self.pushed.append(token)
+
+
+def _groovy_scalar(tokens, token):
+    kind, text = token
+    if kind == "string":
+        if text[0] == '"' and "$" in text:
+            raise JenkinsfileError(f"GString {text} at {tokens.where()} is not a literal")
+        return re.sub(r"\\(.)", r"\1", text[1:-1])
+    if kind == "number":
+        return int(text)
+    if kind == "word" and text in ("true", "false", "null"):
+        return {"true": True, "false": False, "null": None}[text]
+    raise JenkinsfileError(f"{text!r} at {tokens.where()} is not a literal")
+
+
+def _groovy_value(tokens):
+    token = tokens.next()
+    if token != ("punct", "["):
+        return _groovy_scalar(tokens, token)
+    first = tokens.next()
+    if first == ("punct", "]"):
+        return []
+    if first == ("punct", ":"):
+        if tokens.next() != ("punct", "]"):
+            raise JenkinsfileError(f"expected ] at {tokens.where()}")
+        return {}
+    second = tokens.next()
+    if second == ("punct", ":"):
+        result = {}
+        key_token = first
+        while True:
+            if key_token[0] not in ("string", "number", "word"):
+                raise JenkinsfileError(f"bad map key {key_token[1]!r} at {tokens.where()}")
+            key = key_token[1] if key_token[0] == "word" else _groovy_scalar(tokens, key_token)
+            result[key] = _groovy_value(tokens)
+            separator = tokens.next()
+            if separator == ("punct", "]"):
+                return result
+            if separator != ("punct", ","):
+                raise JenkinsfileError(f"expected , or ] at {tokens.where()}")
+            key_token = tokens.next()
+            if key_token == ("punct", "]"):
+                return result
+            if tokens.next() != ("punct", ":"):
+                raise JenkinsfileError(f"expected : at {tokens.where()}")
+    tokens.push(second)
+    tokens.push(first)
+    result = []
+    while True:
+        result.append(_groovy_value(tokens))
+        separator = tokens.next()
+        if separator == ("punct", "]"):
+            return result
+        if separator != ("punct", ","):
+            raise JenkinsfileError(f"expected , or ] at {tokens.where()}")
+        following = tokens.next()
+        if following == ("punct", "]"):
+            return result
+        tokens.push(following)
+
+
+def parse_groovy_literal(text, pos=0):
+    """The Groovy list, map, string, integer or boolean literal at text[pos:], as Python values."""
+    return _groovy_value(_GroovyTokens(text, pos))
+
+
+def _jenkinsfile_literal(text, anchor, what):
+    match = re.search(anchor, text)
+    if not match:
+        raise JenkinsfileError(f"{what} not found in .jenkins/Jenkinsfile")
+    return parse_groovy_literal(text, match.end())
+
+
+def read_pipeline(text):
+    """
+    The profiles, steps and axes of a .jenkins/Jenkinsfile.  The literals are parsed, the defaults that tasks()
+    adds are applied here; JENKINSFILE_MIRRORED lists the Jenkinsfile code this relies on.
+    """
+    profiles = _jenkinsfile_literal(text, r"\bdef\s+pipelineProfiles\s*\(\s*\)\s*\{\s*return\s+", "pipelineProfiles()")
+    build_steps = _jenkinsfile_literal(text, r"\bdef\s+buildSteps\s*=\s*", "buildSteps")
+    test_steps = _jenkinsfile_literal(text, r"\bdef\s+testSteps\s*=\s*", "testSteps")
+    pythons = _jenkinsfile_literal(text, r"@Field\s+List<String>\s+pythonsSupported\s*=\s*", "pythonsSupported")
+    archs = _jenkinsfile_literal(text, r"@Field\s+List<String>\s+archsSupported\s*=\s*", "archsSupported")
+    python_default = _jenkinsfile_literal(text, r"@Field\s+String\s+pythonDefault\s*=\s*", "pythonDefault")
+    # the agent sizes, from the header: "//  - cassandra-small + cassandra-${arch}-small  : 1 cpu, 1GB ram"
+    sizes = {m.group(1): int(m.group(2))
+             for m in re.finditer(r"^//\s*-\s*cassandra-(\w+)\s*\+[^:\n]*:\s*(\d+)\s*cpu", text, re.M)}
+    if not (isinstance(profiles, dict) and all(isinstance(v, list) for v in profiles.values())):
+        raise JenkinsfileError("pipelineProfiles() is not a map of lists")
+    for steps in (build_steps, test_steps):
+        if not (isinstance(steps, dict) and all(isinstance(v, dict) for v in steps.values())):
+            raise JenkinsfileError("buildSteps and testSteps must be maps of maps")
+    steps = {}
+    for name, command in build_steps.items():
+        steps[name] = dict(command, type="build", splits=1, timeout_hours=1)
+        steps[name].setdefault("size", "small")
+    for name, command in test_steps.items():
+        steps[name] = dict(command, type="test")
+        steps[name].setdefault("size", "medium")
+        steps[name]["timeout_hours"] = command.get("timeout_hours") or 1
+        if name.startswith("dtest"):
+            steps[name]["python-dtest"] = True
+    missing = {c["size"] for c in steps.values()} - set(sizes)
+    if missing:
+        raise JenkinsfileError(f"agent sizes {sorted(missing)} have no cpu count in the .jenkins/Jenkinsfile header")
+    return {"profiles": profiles, "steps": steps, "pythons": pythons, "python_default": python_default,
+            "sizes": sizes, "archs": archs, "defaults": jenkins_parameter_defaults(text, archs)}
+
+
+def jenkins_parameter_defaults(text, archs):
+    """
+    The defaults of the job's parameters in the Jenkinsfile's parameters block, but for repository and branch,
+    which default to the job's own scm there, and to the local checkout here.
+    """
+    names = re.findall(r"^\s*(?:string|choice)\(name:\s*'(\w+)'", groovy_block(text, "parameters"), re.M)
+    if sorted(names) != sorted(JENKINS_PARAMETERS):
+        raise JenkinsfileError(f"the Jenkinsfile's parameters are {names}, "
+                               f"run-ci-local knows {list(JENKINS_PARAMETERS)}")
+    defaults = {"repository": "", "branch": "", "architecture": archs[0]}
+    for name in ("profile_custom_regexp", "jdk", "dtest_repository", "dtest_branch"):
+        match = re.search(rf"string\(name:\s*'{name}',\s*defaultValue:\s*params\.{name}\s*\?:\s*'([^']*)'", text)
+        if not match:
+            raise JenkinsfileError(f"no default for the {name} parameter in the Jenkinsfile")
+        defaults[name] = match.group(1)
+    match = re.search(r"names\.contains\(putFirst\)\s*\?\s*putFirst\s*:\s*'([^']+)'", text)
+    if not match:
+        raise JenkinsfileError("no default profile in pipelineProfileNames() of the Jenkinsfile")
+    defaults["profile"] = match.group(1)
+    return defaults
+
+
+# The Jenkinsfile functions read_pipeline(), plan_cells(), Run and job.sh reproduce whole, by a digest of their code
+# with comments and the whitespace outside strings dropped.  A change to one needs the same change here, then the
+# new digest, which run-ci-local-test.py prints.
+JENKINSFILE_DIGESTS = {
+    "pipelineProfileNames": "91b97751ca63333b",
+    "tasks": "1097731548713e0b",
+    "getStepName": "c067ff32f6e37a50",
+    "isStageEnabled": "d04d5e5715860500",
+    "isArchEnabled": "6c0477a8e3670c46",
+    "isJdkEnabled": "43e6d56b29c37cb8",
+    "testScriptVars": "61d89fca887686d5",
+    "fetchDTestsSource": "807eb1ca41098d05",
+    "buildJVMDTestJars": "25dc4c13a9847b33",
+    "organiseTestResultFiles": "259644356c1356b7",
+    "processJmhReports": "1518af8cc8f7c3fc",
+}
+
+# The lines run-ci-local and job.sh reproduce from the larger functions, most of whose code (agents, archiving,
+# nightlies) has no counterpart here: comments dropped and whitespace collapsed, by the function holding them.
+JENKINSFILE_MIRRORED = (
+    ("test", """if (cause.getClass().getName().contains('CauseOfInterruption$UserInterruption')
+                || cause.getClass().getName().contains('ParallelStep$FailFastCause')) {"""),
+    ("build", "def maxAttempts = 2"),
+    ("build", "withEnv(cell.collect { k, v -> \"${k}=${v}\" }) {"),
+    ("build", "def build_script = \".build/docker/${command.script}\""),
+    ("build", "script_vars = \"${script_vars} m2_dir=\\'${WORKSPACE}/build/m2\\'\""),
+    ("build", "timeout(time: 1, unit: 'HOURS') {"),
+    ("build", """filterConsoleOutput("${script_vars} ${build_script} ${cell.jdk} 2>&1
+                 | tee >( xz -c > build/${logfile} )")"""),
+    ("test", "def maxAttempts = 2"),
+    ("test", "withEnv(cell.collect { k, v -> \"${k}=${v}\" }) {"),
+    ("test", 'def cell_suffix = "_jdk${cell.jdk}_python_${cell.python}_${cell.cython}_${cell.arch}_${cell.split}'
+             '_${splits}"'),
+    ("test", "timeout(time: command.timeout_hours, unit: 'HOURS') {"),
+    ("test", "script_vars = \"${script_vars} docker_timeout_hours=\\\"${command.timeout_hours}\\\"\""),
+    ("test", """filterConsoleOutput("${script_vars} .build/docker/run-tests.sh -a ${cell.step}
+                -c '${cell.split}/${splits}' -j ${cell.jdk} 2>&1 | tee >( xz -c > build/${logfile} )")"""),
+    ("generateTestReports", 'CASSANDRA_DOCKER_ANT_OPTS="-Xmx2g -Dbuild.test.output.dir=build/test/output/\\${target} '
+                            '-Dbuild.test.report.dir=build/test/reports/\\${target}"'),
+    ("generateTestReports", ".build/docker/_docker_run.sh debian-build.docker ci/generate-test-report.sh"),
+    ("generateTestReports", ".build/docker/_docker_run.sh debian-build.docker ci/generate-ci-summary.sh"),
+    ("generateTestReports", "tar -cf build/results_details.tar -C build/test/ reports"),
+)
+
+
+def _normalise_groovy(text):
+    return " ".join(re.sub(r"//[^\n]*", "", text).split())
+
+
+def _normalise_code(text):
+    """Groovy code without its comments, and without the whitespace outside string literals but for one space"""
+    out, i, n, space = [], 0, len(text), False
+    while i < n:
+        if text.startswith("//", i) or text.startswith("/*", i):
+            end = text.find("\n" if text[i + 1] == "/" else "*/", i + 2)
+            i = n if end < 0 else end + (0 if text[i + 1] == "/" else 2)
+            space = True
+            continue
+        quote = next((q for q in ("'''", '"""', "'", '"') if text.startswith(q, i)), None)
+        if quote is None and text[i].isspace():
+            space, i = True, i + 1
+            continue
+        if space and out:
+            out.append(" ")
+        space = False
+        if quote is None:
+            out.append(text[i])
+            i += 1
+            continue
+        end = i + len(quote)
+        while end < n and not text.startswith(quote, end):
+            end += 2 if text[end] == "\\" else 1
+        out.append(text[i:end + len(quote)])
+        i = end + len(quote)
+    return "".join(out)
+
+
+# literals the tool parses, not reproduces: a function's digest leaves them out, so that new splits are no drift
+PARSED_LITERALS = (r"\bdef\s+buildSteps\s*=\s*", r"\bdef\s+testSteps\s*=\s*")
+
+
+def function_digest(text, name):
+    body = groovy_function(text, name)
+    for anchor in PARSED_LITERALS:
+        match = re.search(anchor, body)
+        if match:
+            tokens = _GroovyTokens(body, match.end())
+            _groovy_value(tokens)
+            body = body[:match.end()] + "[]" + body[tokens.pos:]
+    return hashlib.sha1(_normalise_code(body).encode()).hexdigest()[:16]
+
+
+def groovy_function(text, name):
+    """The source of a top level function of the Jenkinsfile, up to the next top level definition, or ''"""
+    match = re.search(rf"^def\s+(?:\w+\s+)?{re.escape(name)}\s*\(", text, re.M)
+    if not match:
+        return ""
+    end = re.compile(r"^(?:def\s|@|/{6,})", re.M).search(text, match.end())
+    return text[match.start():end.start() if end else len(text)]
+
+
+def groovy_block(text, name):
+    """The body of the first `<name> {` block of the Jenkinsfile, braces matched, or ''"""
+    match = re.search(rf"^\s*{re.escape(name)}\s*\{{", text, re.M)
+    if not match:
+        return ""
+    depth, pos = 1, match.end()
+    while depth and pos < len(text):
+        depth += {"{": 1, "}": -1}.get(text[pos], 0)
+        pos += 1
+    return text[match.end():pos - 1]
+
+
+def jenkinsfile_drift(text):
+    """
+    What run-ci-local reproduces that the given Jenkinsfile has changed: (function, None) for a function whose
+    digest differs, and (function, code) for a line of JENKINSFILE_MIRRORED it no longer has
+    """
+    changed = [(function, None) for function, digest in JENKINSFILE_DIGESTS.items()
+               if function_digest(text, function) != digest]
+    return changed + [(function, snippet) for function, snippet in JENKINSFILE_MIRRORED
+                      if _normalise_groovy(snippet) not in _normalise_groovy(groovy_function(text, function))]
+
+
+def python_regex(pattern, what):
+    """The pattern for Python's re, with Java's named groups (?<name>...) as (?P<name>...)"""
+    translated = re.sub(r"\(\?<(?=[A-Za-z_])", "(?P<", pattern)
+    try:
+        re.compile(translated)
+    except re.error as e:
+        raise SystemExit(f"{what} {pattern!r}: {e}.  It is a Python regex (the re module), where Java's "
+                         f"(?<name>...) groups also work") from e
+    return translated
+
+
+def build_xml_property(build_xml, name):
+    match = re.search(rf'property\s*name="{re.escape(name)}"\s*value="([^"]*)"', build_xml)
+    if not match:
+        raise JenkinsfileError(f"{name} not found in build.xml")
+    return match.group(1)
+
+
+###############
+#### cells ####
+###############
+
+class Cell:
+    """One parallel task of the Jenkinsfile's tasks(): a step, on one jdk, python, cython and split."""
+
+    def __init__(self, step, command, units, jdk, python, cython, split=1, test_regexp="", arch="amd64"):
+        self.step, self.command, self.units = step, command, units
+        self.jdk, self.python, self.cython, self.split = jdk, python, cython, split
+        self.arch = arch
+        self.test_regexp = test_regexp
+        self.kind = "jar" if step == "jar" else command["type"]
+        self.splits = command["splits"]
+        self.timeout_hours = command["timeout_hours"]
+
+    @property
+    def name(self):
+        """getStepName() of the Jenkinsfile"""
+        arch = "" if self.arch == "amd64" else f" {self.arch}"
+        python = f" python{self.python}" if self.step == "cqlsh-test" else ""
+        cython = " cython" if self.cython != "no" else ""
+        split = f" {self.split}/{self.splits}" if self.splits > 1 and not self.test_regexp else ""
+        test = f" -t {self.test_regexp}" if self.test_regexp else ""
+        return f"{self.step}{arch} jdk{self.jdk}{python}{cython}{split}{test}"
+
+    @property
+    def suffix(self):
+        """cell_suffix of the Jenkinsfile's build() and test()"""
+        if self.kind == "test":
+            return f"_jdk{self.jdk}_python_{self.python}_{self.cython}_{self.arch}_{self.split}_{self.splits}"
+        return f"_jdk{self.jdk}_{self.arch}"
+
+    @property
+    def cell_id(self):
+        test = "_t" + hashlib.sha1(self.test_regexp.encode()).hexdigest()[:8] if self.test_regexp else ""
+        return re.sub(r"[^\w.-]", "_", f"{self.step}{self.suffix}{test}")
+
+    @property
+    def base(self):
+        """The stash of the jar stage the cell starts from, the Jenkinsfile's stash <arch>_<jdk>"""
+        return f"base-{self.arch}-jdk{self.jdk}.tar"
+
+    def env(self, timeout_factor, runtime, extra=None):
+        values = dict(KIND=self.kind, STEP=self.step, SCRIPT=self.command.get("script", ""), JDK=self.jdk,
+                      ARCH=self.arch, SPLIT=self.split, SPLITS=self.splits, PYTHON=self.python, CYTHON=self.cython,
+                      TEST_REGEXP=self.test_regexp, TIMEOUT_HOURS=self.timeout_hours * timeout_factor,
+                      PYTHON_DTEST="yes" if self.command.get("python-dtest") else "no", CELL_SUFFIX=self.suffix,
+                      RUNTIME=runtime or "", BASE=self.base)
+        values.update(extra or {})
+        return "".join(f"{k}={shlex.quote(str(v))}\n" for k, v in values.items())
+
+
+class ReportCell(Cell):
+    def __init__(self):
+        super().__init__("report", {"type": "report", "splits": 1, "timeout_hours": REPORT_TIMEOUT_HOURS},
+                         REPORT_UNITS, "", "", "no")
+
+    @property
+    def name(self):
+        return "report"
+
+    @property
+    def cell_id(self):
+        return "report"
+
+
+def plan_cells(pipeline, java_default, java_supported, profile, profile_custom_regexp="", jdk="", test_regexp="",
+               architecture="amd64"):
+    """
+    The cells tasks() of the Jenkinsfile creates for these parameters, jar cells first.  With test_regexp every
+    test step runs once per jdk, with run-tests.sh -t, in place of its splits.
+    """
+    profiles, steps = pipeline["profiles"], pipeline["steps"]
+    if profile not in profiles:
+        raise ValueError(f"no profile {profile!r} in .jenkins/Jenkinsfile; profiles: {', '.join(profiles)}")
+    if profile == "custom" and not profile_custom_regexp:
+        raise ValueError("the custom profile needs a regexp of steps")
+    archs = [a for a in pipeline["archs"] if architecture in (a, "all")]
+    if not archs:
+        raise ValueError(f"architecture {architecture!r} is not one of {', '.join(pipeline['archs'] + ['all'])}")
+    jdk = (jdk or "").strip()
+    if jdk and jdk not in java_supported:
+        raise ValueError(f"jdk {jdk} is not in build.xml's java.supported {','.join(java_supported)}")
+    java_python_dtests = jdk or java_default
+
+    def stage_enabled(step):
+        return ("jar" == step or step in profiles[profile]
+                or (profile == "custom" and re.fullmatch(profile_custom_regexp, step) is not None))
+
+    cells = []
+    for arch in archs:
+        for java in java_supported:
+            if jdk and jdk != java:
+                continue
+            for python in pipeline["pythons"]:
+                for cython in ("yes", "no"):
+                    for step, command in steps.items():
+                        if not stage_enabled(step):
+                            continue
+                        if python != pipeline["python_default"] and step != "cqlsh-test":
+                            continue
+                        if cython != "no" and step != "cqlsh-test":
+                            continue
+                        if cython == "yes" and python in ("3.12", "3.13"):
+                            continue
+                        if java != java_default and (step in ("cqlsh-test", "simulator-dtest")
+                                                     or "dtest-upgrade" in step):
+                            continue
+                        if java != java_python_dtests and command.get("python-dtest"):
+                            continue
+                        if arch != "amd64" and command["type"] != "build":
+                            continue
+                        units = pipeline["sizes"][command["size"]]
+                        if test_regexp and command["type"] == "test":
+                            cells.append(Cell(step, command, units, java, python, cython, test_regexp=test_regexp,
+                                              arch=arch))
+                            continue
+                        for split in range(1, command["splits"] + 1):
+                            cells.append(Cell(step, command, units, java, python, cython, split, arch=arch))
+    cells.sort(key=lambda c: c.kind != "jar")
+    return cells
+
+
+###############
+#### hosts ####
+###############
+
+class HostError(Exception):
+    pass
+
+
+class PreflightError(HostError):
+    """A host that answers but cannot run cells"""
+
+
+class ClaimError(HostError):
+    """A host where the label is another driver's, or a directory run-ci-local did not make"""
+
+
+class PrestartError(HostError):
+    """A host that failed before a cell's start went out"""
+
+
+class Host:
+    def __init__(self, name, capacity=None, runtime=None, arch=None, home=None):
+        if not name or name.startswith("-"):
+            raise ValueError(f"invalid host name {name!r}")
+        self.name = name
+        self.capacity = capacity
+        self.runtime = runtime
+        self.arch = arch
+        self.home = home
+        self.local = name == "localhost"
+        self.remote = None
+
+    def command(self, remote_command):
+        # bash runs the command whatever the login shell on the host is
+        if self.local:
+            return ["bash", "-c", remote_command]
+        control = ssh_control_directory() / "%C"
+        return ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=30",
+                "-o", "ControlMaster=auto",
+                "-o", f"ControlPath={control}", "-o", "ControlPersist=10m", "--", self.name,
+                "exec bash -c " + shlex.quote(remote_command)]
+
+    def run(self, remote_command, check=True, input_bytes=None, timeout=SSH_TIMEOUT, stdout=subprocess.PIPE,
+            stdin=None):
+        """Runs a command on the host.  Raises HostError when check and it fails, and on a timeout."""
+        if self.runtime:
+            remote_command = f"export CI_LOCAL_RUNTIME={self.runtime}; {remote_command}"
+        try:
+            result = subprocess.run(self.command(remote_command), input=input_bytes, stdin=stdin, stdout=stdout,
+                                    stderr=subprocess.PIPE, timeout=timeout, check=False)
+        except subprocess.TimeoutExpired as e:
+            raise HostError(f"{self.name}: `{remote_command}` timed out after {timeout}s") from e
+        if check and result.returncode != 0:
+            raise HostError(f"{self.name}: `{remote_command}` failed with {result.returncode}: "
+                            f"{result.stderr.decode(errors='replace')[-2000:]}")
+        return result
+
+    def __repr__(self):
+        return self.name
+
+
+def ssh_control_directory():
+    """
+    A directory of this user's alone for the ssh control sockets, in /tmp whatever TMPDIR is: a socket path has
+    to fit in 104 bytes on macOS
+    """
+    directory = Path("/tmp") / f"run-ci-local-{os.getuid()}"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    info = directory.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise SystemExit(f"{directory} must be a directory of this user's with mode 0700")
+    return directory
+
+
+def load_hosts(path, remote_home):
+    """
+    Lines of `<host> [<capacity>] [runtime=docker|podman] [arch=amd64|arm64] [home=<directory>]`, # starts a
+    comment.  home overrides remote_home for the host.
+    """
+    hosts = []
+    for number, line in enumerate(Path(path).expanduser().read_text().splitlines(), 1):
+        fields = line.split("#", 1)[0].split()
+        if not fields:
+            continue
+        try:
+            host = Host(fields[0])
+        except ValueError as e:
+            raise ValueError(f"{path}:{number}: {e}") from e
+        for field in fields[1:]:
+            if field.isdigit():
+                host.capacity = int(field)
+            elif field in ("runtime=docker", "runtime=podman"):
+                host.runtime = field.split("=", 1)[1]
+            elif re.fullmatch(r"arch=\w+", field):
+                host.arch = field.split("=", 1)[1]
+            elif field.startswith("home=") and len(field) > len("home="):
+                host.home = field.split("=", 1)[1]
+            else:
+                raise ValueError(f"{path}:{number}: unknown field {field!r}")
+        host.remote = Remote(host.home or remote_home)
+        hosts.append(host)
+    if not hosts:
+        raise ValueError(f"{path} lists no hosts")
+    return hosts
+
+
+def remote_version():
+    """A digest of the remote scripts: each version installs into its own bin/<version>/"""
+    digest = hashlib.sha1()
+    for path in sorted(p for p in REMOTE_DIR.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(REMOTE_DIR)).encode() + b"\0" + path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def check_name(name, what="label"):
+    if not re.fullmatch(NAME_PATTERN, name or ""):
+        raise SystemExit(f"{what} {name!r}: use letters, digits, '.', '_' and '-', not starting with '.' or '-'")
+    return name
+
+
+class Remote:
+    """
+    The paths and job.sh calls on the hosts.  home is relative to the remote $HOME, or absolute; it is quoted
+    once, and every name appended to it is a checked single path component.
+    """
+
+    def __init__(self, home, version=None):
+        if re.search(r"\s", home):
+            raise SystemExit(f"remote home {home!r}: a directory without whitespace, which the .build/docker scripts "
+                             f"do not quote")
+        self.given_home = home
+        self.home = shlex.quote(home) if home.startswith("/") else '"$HOME"/' + shlex.quote(home)
+        # the scripts an attempt started with, which a later driver keeps using for that attempt
+        self.version = version or remote_version()
+
+    def path(self, *names):
+        for name in names:
+            check_name(name, "path component")
+        return "/".join((self.home,) + names)
+
+    def job(self, *args):
+        return self.path("bin", self.version, "job.sh") + " " + " ".join(shlex.quote(str(a)) for a in args)
+
+    def run_dir(self, label, *names):
+        return self.path("runs", label, *names)
+
+    def install(self, host, preflight=True):
+        """Installs job.sh and the podman wrapper, sets the capacity, and checks the host can run cells"""
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as tar:
+            tar.add(str(REMOTE_DIR), arcname=".")
+        # extracted aside and renamed into place: drivers can install at once, and running cells keep their copy
+        version_dir = self.path("bin", self.version)
+        host.run(f'test -x {version_dir}/job.sh || {{ mkdir -p {self.home}/bin && '
+                 f'd=$(mktemp -d {self.home}/bin/.install.XXXXXX) && tar -C "$d" -xf - && '
+                 f'chmod +x "$d/job.sh" "$d/podman/docker" && '
+                 f'{{ mv -T "$d" {version_dir} 2>/dev/null || rm -rf "$d"; }}; }}',
+                 input_bytes=buffer.getvalue())
+        host.run(self.job("init", host.capacity or ""))
+        if not preflight:
+            return
+        result = host.run(self.job("preflight"), check=False)
+        if result.returncode == 1 and result.stdout.strip():
+            raise PreflightError(f"{host} cannot run cells: {result.stdout.decode(errors='replace').strip()}")
+        if result.returncode == 3:
+            raise HostError(f"{host} cannot run cells for now: {result.stdout.decode(errors='replace').strip()}")
+        if result.returncode != 0:
+            raise HostError(f"{host}: preflight failed with {result.returncode}: "
+                            f"{result.stderr.decode(errors='replace').strip()}")
+
+
+##################
+#### the run ####
+##################
+
+def git(src, *args):
+    return subprocess.run(["git", "-C", str(src), *args], stdout=subprocess.PIPE, check=True, text=True).stdout.strip()
+
+
+def git_show(src, sha, path):
+    return subprocess.run(["git", "-C", str(src), "show", f"{sha}:{path}"], stdout=subprocess.PIPE, check=True,
+                          text=True).stdout
+
+
+def junit_files(directory):
+    return [p for p in Path(directory).rglob("*") if p.name.endswith((".xml", ".xml.xz")) and p.is_file()]
+
+
+def open_result(path):
+    return lzma.open(path, "rb") if str(path).endswith(".xz") else open(path, "rb")
+
+
+def compress(directory):
+    """xz the JUnit XML, which holds the output of every test, and the stage log, as Jenkins archives them"""
+    files = [p for p in junit_files(directory)
+             if p.name.endswith(".xml")] + [p for p in Path(directory).rglob("stage.log") if p.is_file()]
+    for start in range(0, len(files), 64):
+        subprocess.run(["xz", "-f"] + [str(p) for p in files[start:start + 64]], check=False)
+
+
+def extract_member(tar, member, destination):
+    """
+    Extracts a tar member of a cell's result into destination: only files and directories, with no absolute path and
+    no .., and with tarfile's data filter too where it has one
+    """
+    name = member.name
+    if os.path.isabs(name) or ".." in Path(name).parts:
+        raise tarfile.TarError(f"{name}: outside the destination")
+    if not (member.isfile() or member.isdir()):
+        raise tarfile.TarError(f"{name}: not a file or a directory")
+    tar.extract(member, destination, **TAR_FILTER)
+
+
+def file_digest(path):
+    digest = hashlib.sha1()
+    with open(path, "rb") as handle:
+        for block in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()[:16]
+
+
+def testcases(path):
+    """
+    (classname, name, seconds, outcome) of every testcase of a JUnit file; outcome is pass, failure, error or
+    skipped
+    """
+    try:
+        with open_result(path) as handle:
+            root = ET.parse(handle).getroot()
+    except (ET.ParseError, lzma.LZMAError, EOFError, OSError):
+        yield ("<unreadable>", str(path), 0.0, "error")
+        return
+    for case in root.iter("testcase"):
+        outcome = "pass"
+        for child in case:
+            if child.tag in ("failure", "error"):
+                outcome = child.tag
+                break
+            if child.tag == "skipped":
+                outcome = "skipped"
+        try:
+            seconds = float(case.get("time") or 0)
+        except ValueError:
+            seconds = 0.0
+        yield (case.get("classname") or "", case.get("name") or "", seconds, outcome)
+
+
+def cell_times(cell, duration_ms, outcome, output_dir):
+    """The .tsv and .suites files recordCellTime() of the Jenkinsfile writes, for .build/ci/cell_balance.py"""
+    per_class = {}
+    for path in junit_files(output_dir):
+        for classname, _, seconds, _ in testcases(path):
+            per_class[classname] = per_class.get(classname, 0.0) + seconds
+    total = sum(per_class.values())
+    tsv = "\t".join(str(v) for v in (cell.step, cell.arch, cell.jdk, cell.split, cell.splits, cell.timeout_hours,
+                                     duration_ms, f"{total:.3f}", outcome)) + "\n"
+    longest = sorted(per_class.items(), key=lambda kv: -kv[1])[:12]
+    suites = "".join(f"{seconds:.3f}\t{classname}\n" for classname, seconds in longest)
+    return tsv, suites
+
+
+def build_properties(src, maven_mirror=""):
+    """The checkout's untracked build.properties, with maven_mirror set over it, or None"""
+    properties = b""
+    if (Path(src) / "build.properties").exists():
+        properties = (Path(src) / "build.properties").read_bytes() + b"\n"
+    if maven_mirror:
+        mirror = maven_mirror.rstrip("/")
+        properties += (f"artifact.remoteRepository.central={mirror}\n"
+                       f"artifact.remoteRepository.apache={mirror}\n"
+                       f"resolver-ant-tasks.url={mirror}/org/apache/maven/resolver/maven-resolver-ant-tasks\n").encode()
+    return properties or None
+
+
+def inputs_version(sha, properties):
+    """What a stash is built from: the commit and the build.properties shipped with it"""
+    return hashlib.sha1(sha.encode() + b"\0" + (properties or b"")).hexdigest()[:16]
+
+
+def submodules(src, sha):
+    """(path, name, url, commit) of the commit's submodules"""
+    names, urls = {}, {}
+    if subprocess.run(["git", "-C", str(src), "cat-file", "-e", f"{sha}:.gitmodules"], stderr=subprocess.DEVNULL,
+                      check=False).returncode == 0:
+        listing = git(src, "config", "--blob", f"{sha}:.gitmodules", "--get-regexp", r"^submodule\..*\.(path|url)$")
+        for line in listing.splitlines():
+            key, value = line.split(" ", 1)
+            name, field = key[len("submodule."):].rsplit(".", 1)
+            (names if field == "path" else urls)[name] = value
+    paths = {path: name for name, path in names.items()}
+    result = []
+    for line in git(src, "ls-tree", "-r", "-z", sha).split("\0"):
+        if not line:
+            continue
+        meta, path = line.split("\t", 1)
+        _, kind, commit = meta.split()
+        if kind == "commit":
+            name = paths.get(path, path)
+            result.append((path, name, urls.get(name, ""), commit))
+    return result
+
+
+def _add_bytes(tar, name, data):
+    info = tarfile.TarInfo(name)
+    info.size = len(data)
+    info.mtime = int(time.time())
+    tar.addfile(info, io.BytesIO(data))
+
+
+def write_source_tarball(src, sha, tar_path, properties, branch=None, repository=None, remote_branch=None):
+    """
+    git archive of the commit with its submodules, a depth-1 .git, and the build.properties given.  The
+    submodules are registered and checked out in that .git, so that the build's `git submodule update --init`
+    finds nothing to do.  The .git has the commit on the given branch, by default the checkout's, and with a
+    repository, as that branch, or remote_branch, of its origin remote, as a Jenkins checkout has it.
+    """
+    src, tar_path = Path(src), Path(tar_path)
+    temporary = tar_path.with_suffix(".tmp")
+    subprocess.run(["git", "-C", str(src), "archive", "--format=tar", "-o", str(temporary), sha], check=True)
+    with tarfile.open(temporary, "a") as tar, tempfile.TemporaryDirectory(dir=tar_path.parent) as clone:
+        # Jenkins builds a shallow clone, and the build and the summary read the sha, branch and origin from git
+        branch = branch or git(src, "rev-parse", "--abbrev-ref", "HEAD")
+        git(clone, "init", "-q")
+        git(clone, "fetch", "-q", "--depth=1", f"file://{src}", sha)
+        if branch != "HEAD":
+            git(clone, "update-ref", f"refs/heads/{branch}", sha)
+            git(clone, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+        else:
+            git(clone, "update-ref", "--no-deref", "HEAD", sha)
+        if repository:
+            git(clone, "remote", "add", "origin", repository)
+            if (remote_branch or branch) != "HEAD":
+                git(clone, "update-ref", f"refs/remotes/origin/{remote_branch or branch}", sha)
+        git(clone, "read-tree", "HEAD")
+        for path, name, url, commit in submodules(src, sha):
+            if subprocess.run(["git", "-C", str(src / path), "cat-file", "-e", f"{commit}^{{commit}}"],
+                              stderr=subprocess.DEVNULL, check=False).returncode != 0:
+                raise SystemExit(f"submodule {path} at {commit} is not checked out; "
+                                 f"run `git submodule update --init {path}`")
+            module_archive = Path(clone) / "module.tar"
+            subprocess.run(["git", "-C", str(src / path), "archive", "--format=tar", f"--prefix={path}/",
+                            "-o", str(module_archive), commit], check=True)
+            with tarfile.open(module_archive) as module_tar:
+                for member in module_tar:
+                    tar.addfile(member, module_tar.extractfile(member) if member.isfile() else None)
+            module_archive.unlink()
+            # the layout `git submodule update --init` leaves: .git/modules/<name>, and a .git file in the submodule
+            module_git = Path(clone) / ".git" / "modules" / name
+            git(clone, "init", "-q", "--bare", str(module_git))
+            git(module_git, "fetch", "-q", "--depth=1", f"file://{src / path}", commit)
+            git(module_git, "update-ref", "--no-deref", "HEAD", commit)
+            git(module_git, "read-tree", "HEAD")
+            git(module_git, "config", "core.bare", "false")
+            git(module_git, "config", "core.worktree", os.path.relpath(Path(clone) / path, module_git))
+            git(clone, "config", f"submodule.{name}.url", url)
+            git(clone, "config", f"submodule.{name}.active", "true")
+            _add_bytes(tar, f"{path}/.git", f"gitdir: {os.path.relpath(module_git, Path(clone) / path)}\n".encode())
+        if properties is not None:
+            _add_bytes(tar, "build.properties", properties)
+        tar.add(str(Path(clone) / ".git"), arcname=".git")
+    temporary.replace(tar_path)
+
+
+def owner_id(results_dir):
+    """Who runs a label: this machine and this results directory"""
+    return hashlib.sha1(f"{socket.gethostname()}:{Path(results_dir).resolve()}".encode()).hexdigest()[:16]
+
+
+def label_lock_file(out):
+    """<results>/.locks/<label>.lock: outside the label's directory, which may be removed, and never removed itself"""
+    return out.parent / ".locks" / f"{out.name}.lock"
+
+
+def lock_label(out):
+    """An exclusive lock on the label of <results>/<label>, or None when a driver on this machine holds it"""
+    label_lock_file(out).parent.mkdir(parents=True, exist_ok=True)
+    handle = open(label_lock_file(out), "a")
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def label_active(out):
+    """True while a driver on this machine runs the label"""
+    if not label_lock_file(out).exists():
+        return False
+    handle = lock_label(out)
+    if handle is None:
+        return True
+    handle.close()
+    return False
+
+
+################
+#### config ####
+################
+
+CONFIG_SECTION = "run-ci-local"
+# the keys of the config file: the Jenkins parameters, fail_fast, and the tool's own settings
+CONFIG_KEYS = {name: str for name in JENKINS_PARAMETERS}
+CONFIG_KEYS.update(fail_fast=bool, hosts=str, remote_home=str, results_dir=str, maven_mirror=str, timeout_factor=int,
+                   report=bool, dtest_dir=str)
+# the tool's own settings, when neither the command line nor the config file sets them
+SETTING_DEFAULTS = {"remote_home": DEFAULT_REMOTE_HOME, "results_dir": str(CASSANDRA_DIR / "build" / "ci-local"),
+                    "maven_mirror": "", "timeout_factor": 1, "report": True, "dtest_dir": "", "fail_fast": True}
+
+
+def default_config_file():
+    if os.environ.get("RUN_CI_LOCAL_CONFIG"):
+        return Path(os.environ["RUN_CI_LOCAL_CONFIG"])
+    directory = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return directory / "cassandra" / "run-ci-local.conf"
+
+
+def load_config(path, required):
+    """The [run-ci-local] settings of an INI file, typed; {} when the file is absent and not required"""
+    path = Path(path).expanduser()
+    if not path.exists():
+        if required:
+            raise SystemExit(f"config file {path} does not exist")
+        return {}
+    parser = configparser.ConfigParser(interpolation=None)
+    try:
+        parser.read(path)
+    except configparser.Error as e:
+        raise SystemExit(f"{path}: {e}") from e
+    if set(parser.sections()) - {CONFIG_SECTION}:
+        raise SystemExit(f"{path}: only a [{CONFIG_SECTION}] section is read, not {parser.sections()}")
+    values = {}
+    if not parser.has_section(CONFIG_SECTION):
+        return values
+    for key in parser[CONFIG_SECTION]:
+        kind = CONFIG_KEYS.get(key)
+        try:
+            if kind is None:
+                raise ValueError(f"unknown key; the keys are {', '.join(sorted(CONFIG_KEYS))}")
+            if kind is bool:
+                values[key] = parser.getboolean(CONFIG_SECTION, key)
+            elif kind is int:
+                values[key] = parser.getint(CONFIG_SECTION, key)
+            else:
+                values[key] = parser.get(CONFIG_SECTION, key)
+        except ValueError as e:
+            raise SystemExit(f"{path}: {key}: {e}") from e
+    return values
+
+
+def apply_settings(args, config):
+    """The tool's own settings: the command line, else the config file, else the defaults"""
+    for name in ("hosts", "remote_home", "results_dir", "maven_mirror", "timeout_factor", "report", "dtest_dir"):
+        if getattr(args, name, None) is None:
+            default = str(default_hosts_file()) if name == "hosts" else SETTING_DEFAULTS[name]
+            setattr(args, name, config.get(name, default))
+
+
+def git_upstream(src):
+    """(url, branch) of the checkout's upstream, or (None, None)"""
+    upstream = subprocess.run(["git", "-C", str(src), "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False).stdout.strip()
+    if "/" not in upstream:
+        return None, None
+    remote, branch = upstream.split("/", 1)
+    url = subprocess.run(["git", "-C", str(src), "remote", "get-url", remote], stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, check=False).stdout.strip()
+    return (url, branch) if url else (None, None)
+
+
+###############
+#### run ####
+###############
+
+class OwnerError(HostError):
+    pass
+
+
+class Run:
+    """
+    One label: its parameters, resolved as the command line, else the parameters a resumed label ran with, else
+    the config file, else the Jenkinsfile's defaults; and its cells, stashes and results.
+    """
+
+    def __init__(self, args, config):
+        self.args = args
+        self.config = config
+        self.label = check_name(args.label)
+        self.results_dir = Path(args.results_dir).expanduser().resolve()
+        self.out = self.results_dir / self.label
+        self.stash = self.out / "stash"
+        self.hosts = load_hosts(args.hosts, args.remote_home)
+        self.owner = owner_id(self.results_dir)
+        # the label's lock is held from before the state and the stash are read until the run has cleaned up
+        self.lock = None
+        if not args.dry_run:
+            self.lock = lock_label(self.out)
+            if self.lock is None:
+                raise SystemExit(f"another run-ci-local driver on this machine runs label {self.label}")
+            self.out.mkdir(parents=True, exist_ok=True)
+        self.dry_run_directory = tempfile.TemporaryDirectory() if args.dry_run else None
+        self.state_file = self.out / "state.json"
+        self.state = json.loads(self.state_file.read_text()) if self.state_file.exists() else {}
+        self.state.setdefault("cells", {})
+        self.state.setdefault("stashes", {})
+        known = {h.name for h in self.hosts + recorded_hosts(self.hosts, self.state, args.remote_home)}
+        for name in set(args.forget_host) - known:
+            raise SystemExit(f"--forget-host {name}: not a host of the hosts file, nor one label {self.label} ran on")
+        self.state_lock = threading.Lock()
+        self.uploaded = {}  # (host, file) -> version
+        self.base_ready = {}  # (arch, jdk) -> True once its jar cell built, False when it failed for good
+        self.dtest_tar = None
+        self.aborting = None  # the cell whose failure stops the run, with fail fast
+        self.checked = set()  # hosts checked for the run
+        self.ready = set()  # hosts set up for the run, the label claimed there
+        # cell -> the attempt whose stop its host has not confirmed, which keeps the cell from starting anywhere
+        self.unconfirmed = {}
+        self.found_dtest_commit = None
+        self.staged = {}  # name -> version of the inputs prepare_inputs made
+        self.excluded = {}  # host -> why it cannot run cells
+        self.unready = {}  # host -> (when it is tried again, the delay before that, why it is not set up yet)
+        self.started = False
+        self.foreign = set()  # hosts where the label is not this driver's
+        # host -> the hosts, one per remote home, given up on as the label resumed, which stop the label's cells
+        # before the host runs one
+        self.forgotten = {}
+        # this run of the driver: on the hosts, only its starts run cells of the label
+        self.session = uuid.uuid4().hex[:16]
+        self.parameters = {}
+        self.resolve("repository")
+        self.resolve("branch")
+        self.src = self.checkout()
+        self.sha = git(self.src, "rev-parse", "HEAD")
+        self.properties = build_properties(self.src, args.maven_mirror)
+        self.inputs = inputs_version(self.sha, self.properties)
+        self.pipeline = read_pipeline(git_show(self.src, self.sha, ".jenkins/Jenkinsfile"))
+        for name in JENKINS_PARAMETERS[2:] + ("fail_fast",):
+            self.resolve(name)
+
+    def resolve(self, name):
+        """A parameter: the command line, else what the label ran with, else the config file, else the default"""
+        given = getattr(self.args, name, None)
+        stored = self.state.get("parameters", {})
+        # fail fast only decides what happens after a failure, so a resumed label may change it; --force allows
+        # the other parameters given to change too, and keeps those not given
+        if given is not None and name in stored and given != stored[name] and not self.args.force \
+                and name != "fail_fast":
+            raise SystemExit(f"label {self.label} ran with {name} {stored[name]!r}; use --force to run it with "
+                             f"{given!r}, or a new label")
+        if given is not None:
+            value = given
+        elif name in stored:
+            value = stored[name]
+        elif name in self.config:
+            value = self.config[name]
+        elif name in ("repository", "branch"):
+            value = None
+        elif name == "fail_fast":
+            value = SETTING_DEFAULTS["fail_fast"]
+        else:
+            value = self.pipeline["defaults"][name]
+        self.parameters[name] = value
+
+    def checkout(self):
+        """
+        The checkout to test: this one, or, as Jenkins does, the branch of a repository, fetched into the stash with
+        its submodules, or for a dry run into a temporary directory.  Only --branch: of this checkout's upstream
+        repository.  Only --repository: this checkout's branch.
+        """
+        local = Path(self.args.src).resolve()
+        repository, branch = self.parameters["repository"], self.parameters["branch"]
+        if repository is None and branch is None:
+            return local
+        if repository is None:
+            repository = git_upstream(local)[0] or subprocess.run(
+                ["git", "-C", str(local), "remote", "get-url", "origin"], stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, check=False).stdout.strip()
+            if not repository:
+                raise SystemExit(f"{local} has no upstream or origin remote; give --repository")
+        if branch is None:
+            branch = git(local, "rev-parse", "--abbrev-ref", "HEAD")
+            if branch == "HEAD":
+                raise SystemExit(f"{local} is on no branch; give --branch")
+        self.parameters.update(repository=repository, branch=branch)
+        source = Path(self.dry_run_directory.name) / "source" if self.args.dry_run else self.stash / "source"
+        if not (source / ".git").exists():
+            source.mkdir(parents=True, exist_ok=True)
+            git(source, "init", "-q")
+        log(f"fetching {branch} of {repository}")
+        git(source, "fetch", "-q", "--depth=1", "--", repository, branch)
+        git(source, "checkout", "-q", "--force", "--detach", "FETCH_HEAD")
+        git(source, "submodule", "update", "-q", "--init", "--recursive", "--depth=1")
+        return source
+
+    def summary_parameters(self):
+        """BUILD_TAG and the build parameters, for ci_summary.html: those Jenkins would have had for this run"""
+        repository, branch = self.parameters["repository"], self.parameters["branch"]
+        if repository is None:
+            repository, branch = git_upstream(self.src)
+            repository, branch = repository or "", branch or self.sha
+        values = {"BUILD_TAG": f"run-ci-local-{self.label}", "repository": repository, "branch": branch}
+        values.update((name, self.parameters[name]) for name in JENKINS_PARAMETERS[2:])
+        return {f"SUMMARY_{name}": value for name, value in values.items()}
+
+    def print_parameters(self):
+        """As the Jenkinsfile's init stage does"""
+        log("Printing parameters used for this build")
+        for name in JENKINS_PARAMETERS + ("fail_fast",):
+            value = self.parameters[name]
+            if name == "repository" and value is None:
+                value = f"(this checkout) {self.src}"
+            elif name == "branch" and value is None:
+                value = f"{git(self.src, 'rev-parse', '--abbrev-ref', 'HEAD')} at {self.sha}"
+            log(f"{PARAMETER_TITLES[name]}: {value}")
+
+    def save(self):
+        with self.state_lock:
+            temporary = self.state_file.with_suffix(".tmp")
+            temporary.write_text(json.dumps(self.state, indent=1, sort_keys=True))
+            temporary.replace(self.state_file)
+
+    def update(self, cell, **values):
+        with self.state_lock:
+            self.state["cells"].setdefault(cell.cell_id, {"name": cell.name}).update(values)
+        self.save()
+
+    def plan(self):
+        """The cells, from the Jenkinsfile and build.xml of the commit that is tested"""
+        text = git_show(self.src, self.sha, ".jenkins/Jenkinsfile")
+        for function, snippet in jenkinsfile_drift(text):
+            log(f"WARNING: .jenkins/Jenkinsfile has changed in code run-ci-local reproduces; its cells may differ "
+                f"from Jenkins'. Changed: {function}()" + (f":\n{snippet}" if snippet else ""))
+        build_xml = git_show(self.src, self.sha, "build.xml")
+        p = self.parameters
+        try:
+            cells = plan_cells(self.pipeline, build_xml_property(build_xml, "java.default"),
+                               build_xml_property(build_xml, "java.supported").split(","), p["profile"],
+                               python_regex(p["profile_custom_regexp"], "--profile-custom-regexp"), p["jdk"],
+                               self.args.test, p["architecture"])
+        except ValueError as e:
+            raise SystemExit(str(e)) from e
+        if self.args.cells:
+            cells_regex = python_regex(self.args.cells, "--cells")
+            selected = [c for c in cells if c.kind != "jar" and re.search(cells_regex, c.name)]
+            needed = {(c.arch, c.jdk) for c in selected}
+            cells = [c for c in cells if c.kind == "jar" and (c.arch, c.jdk) in needed] + selected
+        if not cells:
+            raise SystemExit("no cells to run")
+        return cells
+
+    def load_state(self, cells):
+        """
+        Starts or resumes the label.  A label that ran before has its cells stopped on every host first; it keeps
+        the results it downloaded, and every other cell runs again, or every cell with --force.  A label belongs to
+        the commit and build.properties it first ran; after a change, with --allow-sha-change, the earlier results
+        move to previous/<version>/ and every cell runs again.
+        """
+        # check_resume has let it go ahead
+        self.stop_earlier_runs(self.state)
+        # A change of inputs or --force is recorded before any result is moved or removed, and finished by this
+        # run, or by the next one when this one is killed meanwhile
+        if self.state.get("transition"):
+            self.finish_transition(self.state["transition"])
+        previous = self.state.get("inputs")
+        if previous and previous != self.inputs:
+            # one directory per change, numbered: a label can go back to inputs it ran before
+            earlier = [int(p.name.split("-", 1)[0]) for p in (self.out / "previous").glob("*-*")
+                       if p.name.split("-", 1)[0].isdigit()] if (self.out / "previous").is_dir() else []
+            self.state["transition"] = {"archive": f"{max(earlier, default=0) + 1}-{previous}", "inputs": self.inputs}
+        elif self.args.force:
+            self.state["transition"] = {"reset": True}
+        if self.state.get("transition"):
+            self.save()
+            self.finish_transition(self.state["transition"])
+        for cell_id, entry in self.state["cells"].items():
+            # an attempt that was not downloaded is discarded, and does not count
+            kept = (entry.get("last_done") or {}).get("attempt")
+            if entry.get("status") != "done" and entry.get("attempt") and entry.get("attempt") != kept:
+                shutil.rmtree(self.out / "cells" / cell_id / f"attempt{entry['attempt']}", ignore_errors=True)
+            if entry.get("status") != "done":
+                restore_last_done(entry)
+        # the report of an earlier run is not this one's
+        for name in REPORT_ARTIFACTS + ("generateTestReports.log.xz", "test/output/combined-result.json"):
+            (self.out / name).unlink(missing_ok=True)
+        self.state["cells"].pop(ReportCell().cell_id, None)
+        # the summary, the report and the exit code are of this run's cells; a report is made of test results
+        report = bool(self.args.report) and any(c.kind == "test" for c in cells)
+        plan = {c.cell_id: {"name": c.name, "kind": c.kind} for c in cells}
+        if report:
+            plan[ReportCell().cell_id] = {"name": "report", "kind": "report"}
+        self.state.update(sha=self.sha, inputs=self.inputs, src=str(self.src), parameters=self.parameters, plan=plan,
+                          report=report)
+        self.save()
+        (self.out / LABEL_MARKER).touch()
+
+    def finish_transition(self, transition):
+        """
+        Moves the earlier results to previous/<n>-<inputs>/ for a change of inputs, or removes them for --force;
+        each step can be done again
+        """
+        if "archive" in transition:
+            archive = self.out / "previous" / transition["archive"]
+            archive.mkdir(parents=True, exist_ok=True)
+            if not (archive / "state.json").exists():
+                earlier = {k: v for k, v in self.state.items() if k != "transition"}
+                (archive / "state.json.tmp").write_text(json.dumps(earlier, indent=1, sort_keys=True))
+                os.replace(archive / "state.json.tmp", archive / "state.json")
+            for name in ("cells", "summary.txt", "ci_summary.html", "results_details.tar.xz",
+                         "generateTestReports.log.xz", "test"):
+                if (self.out / name).exists():
+                    os.replace(self.out / name, archive / name)
+            for name in os.listdir(self.stash) if self.stash.is_dir() else []:
+                # the fetched checkout, and this run's inputs
+                if name not in ("source", "next"):
+                    path = self.stash / name
+                    shutil.rmtree(path) if path.is_dir() else path.unlink()
+            log(f"{self.label}: inputs changed; the results of {self.state.get('sha')} are in {archive}")
+            self.state = {"cells": {}, "stashes": {}, "hosts": self.state.get("hosts", {})}
+        else:
+            shutil.rmtree(self.out / "cells", ignore_errors=True)
+            self.state["cells"] = {}
+        self.save()
+
+    # ---- inputs
+
+    def prepare_inputs(self, cells):
+        """
+        This run's src.tar, and dtest.tar for python dtests, made and checked in stash/next/ before anything of an
+        earlier run of the label is stopped or changed; install_inputs puts them in place
+        """
+        if self.src == Path(self.args.src).resolve() and git(self.src, "status", "--porcelain", "--untracked-files=no"):
+            log("WARNING: the checkout has uncommitted changes; only the committed HEAD is tested")
+        staged = self.stash / "next"
+        shutil.rmtree(staged, ignore_errors=True)
+        staged.mkdir(parents=True)
+        self.staged = {}
+        keep = not self.replaces_results()
+        if not (keep and (self.stash / "src.tar").exists() and self.state["stashes"].get("src.tar") == self.inputs):
+            log(f"creating the source tarball of {self.src} at {self.sha[:10]}")
+            if self.parameters["repository"] is not None:
+                branch, repository, remote_branch = self.parameters["branch"], self.parameters["repository"], None
+            else:
+                branch = None
+                repository, remote_branch = git_upstream(self.src)
+            write_source_tarball(self.src, self.sha, staged / "src.tar", self.properties, branch, repository,
+                                 remote_branch)
+            self.staged["src.tar"] = self.inputs
+        if not any(c.command.get("python-dtest") for c in cells):
+            return
+        commit = self.dtest_commit()
+        self.dtest_tar = self.stash / "dtest.tar"
+        if keep and self.dtest_tar.exists() and self.state["stashes"].get("dtest.tar") == commit:
+            return
+        if self.args.dtest_dir:
+            checkout = Path(self.args.dtest_dir).resolve()
+            self.check_dtest_dir(commit)
+        else:
+            checkout = staged / "cassandra-dtest"
+            checkout.mkdir()
+            log(f"fetching {commit} of {self.parameters['dtest_repository']}")
+            git(checkout, "init", "-q")
+            git(checkout, "fetch", "-q", "--depth=1", "--", self.parameters["dtest_repository"], commit)
+            git(checkout, "checkout", "-q", "--detach", "FETCH_HEAD")
+            if not (checkout / "requirements.txt").exists():
+                raise SystemExit(f"{commit} of {self.parameters['dtest_repository']} is not a cassandra-dtest "
+                                 f"checkout")
+        subprocess.run(["git", "-C", str(checkout), "archive", "--format=tar", "-o", str(staged / "dtest.tar"),
+                        commit], check=True)
+        if not self.args.dtest_dir:
+            shutil.rmtree(checkout, ignore_errors=True)
+        self.staged["dtest.tar"] = commit
+
+    def install_inputs(self):
+        """Puts the inputs prepare_inputs made in the stash, as the label's"""
+        for name, version in self.staged.items():
+            os.replace(self.stash / "next" / name, self.stash / name)
+            self.state["stashes"][name] = version
+            if name == "dtest.tar":
+                self.state.update(dtest_commit=version,
+                                  dtest_source=str(self.args.dtest_dir or self.parameters["dtest_repository"]))
+        shutil.rmtree(self.stash / "next", ignore_errors=True)
+        self.save()
+
+    def dtest_commit(self):
+        """
+        The commit of the python dtests: the one the label ran, else the head of --dtest-dir, else that of the
+        dtest branch, which a resumed label keeps unless given --force or --allow-sha-change with other inputs
+        """
+        if self.found_dtest_commit:
+            return self.found_dtest_commit
+        self.found_dtest_commit = self.find_dtest_commit()
+        return self.found_dtest_commit
+
+    def find_dtest_commit(self):
+        if self.state.get("dtest_commit") and not self.args.force and not self.replaces_results():
+            return self.state["dtest_commit"]
+        if self.args.dtest_dir:
+            return git(Path(self.args.dtest_dir).resolve(), "rev-parse", "HEAD")
+        repository, branch = self.parameters["dtest_repository"], self.parameters["dtest_branch"]
+        listing = subprocess.run(["git", "ls-remote", "--", repository, f"refs/heads/{branch}", f"refs/tags/{branch}"],
+                                 stdout=subprocess.PIPE, text=True, check=True).stdout.split()
+        if listing:
+            return listing[0]
+        if re.fullmatch(r"[0-9a-f]{40}", branch):
+            return branch
+        raise SystemExit(f"no branch {branch} in {repository}")
+
+    def check_dtest_dir(self, commit):
+        checkout = Path(self.args.dtest_dir).resolve()
+        if not (checkout / "requirements.txt").exists():
+            raise SystemExit(f"{checkout} is not a cassandra-dtest checkout")
+        if git(checkout, "rev-parse", "HEAD") != commit:
+            raise SystemExit(f"label {self.label} ran the dtests at {commit}, {checkout} is at another commit; "
+                             f"use --force to run it with that one")
+
+    def check_host(self, host):
+        """
+        Installs and checks a host, and whether the label there may be this driver's, without touching it; True
+        when it can run cells.  A host that does not answer is tried again later; one that answers but cannot run
+        cells is left out.
+        """
+        if host.name in self.checked:
+            return True
+        if host.name in self.excluded or time.time() < self.unready.get(host.name, (0, 0, ""))[0]:
+            return False
+        try:
+            host.remote.install(host)
+            host.arch = host.arch or host.run(host.remote.job("arch")).stdout.decode().strip()
+            # the runtime its cells use, which their attempts record
+            host.runtime = host.runtime or (host.run(host.remote.job("runtime")).stdout.decode().split() or [None])[0]
+            result = host.run(host.remote.job("owner", self.label, self.owner), check=False)
+            self.claim_refused(host, result)
+        except HostError as e:
+            return self.not_set_up(host, e)
+        self.checked.add(host.name)
+        return True
+
+    def setup_host(self, host):
+        """A checked host where the label has been claimed for this run; True when it can run cells"""
+        if host.name in self.ready:
+            return True
+        if not self.check_host(host):
+            return False
+        try:
+            # given up on as the label resumed: what it still runs of the label, under any remote home, is stopped
+            # before it runs more
+            for skipped in list(self.forgotten.get(host.name, [])):
+                self.stop_label_on(skipped)
+                self.forgotten[host.name].remove(skipped)
+            self.claim(host)
+        except HostError as e:
+            self.checked.discard(host.name)
+            return self.not_set_up(host, e)
+        self.ready.add(host.name)
+        return True
+
+    def not_set_up(self, host, error):
+        """False, for a host that cannot run cells now: left out, or tried again later"""
+        if isinstance(error, ClaimError):
+            if not self.started:
+                raise SystemExit(f"{error}; use another label") from error
+            self.foreign.add(host.name)
+        if isinstance(error, (ClaimError, PreflightError)):
+            log(f"WARNING: {error}; it is left out")
+            self.excluded[host.name] = str(error)
+        else:
+            self.back_off(host, error)
+        return False
+
+    @staticmethod
+    def claim_refused(host, result):
+        """ClaimError or PreflightError for a label directory that is not this driver's to have"""
+        if result.returncode == NOT_OWNER:
+            raise ClaimError(f"{host}: {result.stderr.decode(errors='replace').strip()}")
+        if result.returncode == LABEL_DIR_UNUSABLE:
+            raise PreflightError(f"{host}: {result.stderr.decode(errors='replace').strip()}")
+        if result.returncode != 0:
+            raise HostError(f"{host}: {result.stderr.decode(errors='replace').strip()}")
+
+    def back_off(self, host, error):
+        """A host that does not answer is tried again after a delay that doubles each time, up to a maximum"""
+        delay = self.unready.get(host.name, (0, 0, ""))[1]
+        delay = min(delay * 2, HOST_RETRY_MAX_SECONDS) if delay else HOST_RETRY_SECONDS
+        self.unready[host.name] = (time.time() + delay, delay, str(error))
+        log(f"WARNING: {host} cannot be set up yet, and is tried again in {delay}s: {error}")
+
+    def claim(self, host):
+        """
+        Makes the label's directory on the host this driver's, and records the host as one the label runs on;
+        ClaimError when it is not this driver's to have
+        """
+        result = host.run(host.remote.job("claim", self.label, self.owner, self.session), check=False)
+        if result.returncode == FENCED:
+            # this driver's label of a run whose state is gone: taken over as a resume does
+            self.stop_label_on(host)
+            result = host.run(host.remote.job("claim", self.label, self.owner, self.session), check=False)
+        self.claim_refused(host, result)
+        with self.state_lock:
+            self.state.setdefault("hosts", {})[f"{host.name} {host.remote.given_home}"] = {
+                "host": host.name, "home": host.remote.given_home, "runtime": host.runtime,
+                "version": host.remote.version}
+        self.save()
+
+    def stop_label_on(self, host):
+        """
+        Stops every cell of the label on the host, waits until none runs, and discards what they left; only this
+        run starts cells of the label there after.  HostError while the host does not answer.
+        """
+        host.remote.install(host, preflight=False)
+        result = host.run(host.remote.job("kill", self.label, self.owner, self.session), check=False, timeout=600)
+        if result.returncode == LABEL_DIR_UNUSABLE:
+            # holds nothing of this driver's
+            log(f"WARNING: {host}: {result.stderr.decode(errors='replace').strip()}")
+            return
+        if result.returncode not in (0, NOT_OWNER):
+            raise HostError(f"{host}: stopping the cells of {self.label} failed: "
+                            f"{result.stderr.decode(errors='replace').strip()}")
+        stopped = result.stdout.decode().strip()
+        if result.returncode == 0 and stopped not in ("", "0"):
+            log(f"{host}: stopped {stopped} running cells of {self.label}, which run again")
+
+    def stop_earlier_runs(self, state):
+        """
+        A label that ran before: its cells are stopped on the hosts of the hosts file and on those it ran on before
+        anything starts, waiting for a host that does not answer unless --forget-host gives it up
+        """
+        if not state.get("cells") and not state.get("hosts"):
+            return
+        waiting = {(h.name, h.remote.given_home): h
+                   for h in self.hosts + recorded_hosts(self.hosts, state, self.args.remote_home)}
+        delay = 0
+        while True:
+            errors = {}
+            for key, host in list(waiting.items()):
+                if host.name in self.args.forget_host:
+                    log(f"WARNING: {host} is not asked to stop the cells of {self.label} under {key[1]} "
+                        f"(--forget-host); it stops them before it runs one")
+                    self.forgotten.setdefault(host.name, []).append(host)
+                    del waiting[key]
+                    continue
+                try:
+                    self.stop_label_on(host)
+                    del waiting[key]
+                except HostError as e:
+                    errors[key] = e
+            if not waiting:
+                return
+            delay = min(delay * 2, HOST_RETRY_MAX_SECONDS) if delay else HOST_RETRY_SECONDS
+            log(f"WARNING: no cell of {self.label} starts while one may still run on "
+                f"{', '.join(sorted(h.name for h in waiting.values()))}; asking again in {delay}s, or give up on a "
+                f"host with --forget-host <host>: {'; '.join(str(e) for e in errors.values())}")
+            time.sleep(delay)
+
+    def upload(self, host, path, name, version):
+        """Copies a stash to the host's run directory, unless the host has this version of it"""
+        if self.uploaded.get((host.name, name)) == version:
+            return
+        target = host.remote.run_dir(self.label, name)
+        if host.run(f"cat {target}.version 2>/dev/null", check=False).stdout.decode().strip() != version:
+            log(f"uploading {name} to {host}")
+            with open(path, "rb") as handle:
+                self.put(host, name, os.fstat(handle.fileno()).st_size, version, stdin=handle,
+                         timeout=TRANSFER_TIMEOUT)
+        self.uploaded[(host.name, name)] = version
+
+    def put(self, host, name, size, version=None, **run_args):
+        """
+        Writes a file of the label's directory on the host through job.sh, which takes it only from this run of the
+        driver, and only whole
+        """
+        result = host.run(host.remote.job("put", self.label, self.session, name, size, *([version] if version else [])),
+                          check=False, **run_args)
+        if result.returncode == FENCED:
+            raise OwnerError(f"{host}: {result.stderr.decode(errors='replace').strip()}; stopping")
+        if result.returncode != 0:
+            raise HostError(f"{host}: writing {name} failed: {result.stderr.decode(errors='replace').strip()}")
+
+    def inputs_for(self, cell):
+        """The stashes a cell needs: (local path, remote name, version), or None while one is not ready yet"""
+        if cell.kind in ("jar", "report"):
+            needed = [(self.stash / "src.tar", "src.tar", self.inputs)]
+        else:
+            version = self.state["stashes"].get(cell.base, "")
+            if not self.base_ready.get((cell.arch, cell.jdk)) or not version.startswith(self.inputs + "-"):
+                return None
+            needed = [(self.stash / cell.base, cell.base, version)]
+        if cell.command.get("python-dtest"):
+            needed.append((self.dtest_tar, "dtest.tar", self.state["stashes"]["dtest.tar"]))
+        if cell.kind == "report":
+            needed.append((self.stash / "report-input.tar", "report-input.tar", self.state["report_input"]))
+        return needed
+
+    # ---- cells
+
+    def try_start(self, cell, host, attempt_id, reserve=False):
+        """
+        Starts an attempt of the cell; False when the host is full, or an earlier attempt of the cell still runs
+        there.  PrestartError when the host fails before the start, HostError when the start may have gone out
+        without an answer, and OwnerError when another driver, or another run of this one, has taken the label.
+        """
+        inputs = self.inputs_for(cell)
+        if inputs is None:
+            return False
+        extra = self.summary_parameters() if cell.kind == "report" else None
+        try:
+            for path, name, version in inputs:
+                self.upload(host, path, name, version)
+            # fail fast may have stopped the run while the stashes went up
+            if self.aborting is not None and cell.kind != "report":
+                return False
+            env = cell.env(self.args.timeout_factor, host.runtime, extra).encode()
+            self.put(host, f"jobs/{cell.cell_id}.env", len(env), input_bytes=env)
+        except OwnerError:
+            raise
+        except HostError as e:
+            raise PrestartError(str(e)) from e
+        result = host.run(host.remote.job("start", self.label, cell.cell_id, cell.units, self.owner, attempt_id,
+                                          self.session, *(["reserve"] if reserve else [])), check=False)
+        if result.returncode in (HOST_FULL, RUNNER_ALIVE):
+            return False
+        if result.returncode in (NOT_OWNER, FENCED):
+            raise OwnerError(f"{host}: {result.stderr.decode(errors='replace').strip()}; stopping")
+        if result.returncode == SSH_FAILED:
+            raise HostError(f"starting {cell.name} on {host}: {result.stderr.decode(errors='replace')}")
+        if result.returncode != 0:
+            raise PrestartError(f"starting {cell.name} on {host} failed: {result.stderr.decode(errors='replace')}")
+        return True
+
+    def stop(self, cell, host, attempt_id):
+        """
+        Stops the attempt, and keeps it from starting later: "stopped" when it ran, "finished" when it had ended,
+        "not running", or None when the host does not answer
+        """
+        try:
+            result = host.run(host.remote.job("stop", self.label, cell.cell_id, attempt_id), timeout=600)
+            return result.stdout.decode().strip()
+        except HostError as e:
+            log(str(e))
+            return None
+
+    def wait(self, cell, host, attempt_id, deadline):
+        """The exit code of a started cell, or None when it is lost, past its deadline, or the host is unreachable"""
+        lost = failures = 0
+        while True:
+            try:
+                status = host.run(host.remote.job("status", self.label, cell.cell_id, attempt_id))
+                status = status.stdout.decode().split()
+                failures = 0
+            except HostError as e:
+                failures += 1
+                log(f"status of {cell.name} on {host} ({failures}): {e}")
+                if failures >= SSH_FAILURES_LOST:
+                    return None
+                time.sleep(20)
+                continue
+            # a finished attempt is read whatever the time; the deadline is for one still running
+            if status and status[0] == "done":
+                return int(status[1])
+            if time.time() > deadline:
+                log(f"{cell.name} on {host} is past its deadline; stopping it")
+                self.stop(cell, host, attempt_id)
+                return None
+            lost = lost + 1 if status and status[0] in ("lost", "unknown") else 0
+            if lost >= 3:
+                return None
+            time.sleep(20)
+
+    def fetch(self, cell, host, attempt, attempt_id):
+        """The cell's result, into cells/<cell>/attempt<N>/; False when it is missing or unreadable"""
+        destination = self.out / "cells" / cell.cell_id / f"attempt{attempt}"
+        shutil.rmtree(destination, ignore_errors=True)
+        destination.mkdir(parents=True)
+        result_tar = destination.parent / f"attempt{attempt}.result.tar"
+        try:
+            with open(result_tar, "wb") as handle:
+                copied = host.run(f"cat {host.remote.run_dir(self.label, 'jobs', cell.cell_id + '.result.tar')}",
+                                  check=False, stdout=handle, timeout=TRANSFER_TIMEOUT)
+            if copied.returncode != 0:
+                return False
+            with tarfile.open(result_tar) as tar:
+                for member in tar:
+                    if member.name.startswith("out/"):
+                        member.name = member.name[len("out/"):]
+                        extract_member(tar, member, destination)
+        except (tarfile.TarError, OSError, EOFError) as e:
+            log(f"the result of {cell.name} from {host} is unreadable: {e}")
+            return False
+        finally:
+            result_tar.unlink(missing_ok=True)
+        rc = (destination / "rc").read_text().strip() if (destination / "rc").exists() else ""
+        if not rc:
+            return False
+        if cell.kind == "jar" and rc == "0":
+            base = self.stash / cell.base
+            with open(str(base) + ".tmp", "wb") as handle:
+                copied = host.run(f"cat {host.remote.run_dir(self.label, cell.base)}", check=False, stdout=handle,
+                                  timeout=TRANSFER_TIMEOUT)
+            if copied.returncode != 0 or not tarfile.is_tarfile(str(base) + ".tmp"):
+                return False
+            os.replace(str(base) + ".tmp", base)
+            # the base of this attempt: the cells that start from it ask for this version
+            version = f"{self.inputs}-{attempt_id}"
+            marked = host.run(host.remote.job("mark", self.label, self.session, cell.base, version), check=False)
+            if marked.returncode != 0:
+                log(f"{host}: {marked.stderr.decode(errors='replace').strip()}")
+                return False
+            self.uploaded[(host.name, cell.base)] = version
+            with self.state_lock:
+                self.state["stashes"][cell.base] = version
+            self.save()
+        compress(destination)
+        if cell.kind == "report":
+            # as the Jenkinsfile archives it, next to ci_summary.html
+            shutil.copy2(destination / "stage.log.xz", self.out / "generateTestReports.log.xz")
+            # the report of a successful attempt, both files of it, or none
+            if rc == "0" and report_made(destination):
+                for name in REPORT_ARTIFACTS:
+                    shutil.copy2(destination / name, self.out / (name + ".tmp"))
+                for name in REPORT_ARTIFACTS:
+                    os.replace(self.out / (name + ".tmp"), self.out / name)
+        if cell.kind == "test":
+            duration = int((destination / "duration_s").read_text().strip() or 0) * 1000 \
+                if (destination / "duration_s").exists() else 0
+            outcome = "ok" if rc == "0" else "timeout" if rc in ("124", "137") else "failed"
+            tsv, suites = cell_times(cell, duration, outcome, destination / "output")
+            (destination / "cell-time.tsv").write_text(tsv)
+            (destination / "cell-time.suites").write_text(suites)
+        return True
+
+    def run_cell(self, cell, host, attempt, attempt_id, deadline):
+        """Waits for a started cell and fetches it.  True when it succeeded and needs no retry."""
+        started = time.time()
+        rc = self.wait(cell, host, attempt_id, deadline)
+        fetched = rc is not None and self.fetch(cell, host, attempt, attempt_id)
+        if rc is None and self.stop(cell, host, attempt_id) is None:
+            # a lost attempt may still run: the cell is not tried again, anywhere, until it has stopped
+            self.unconfirmed[cell.cell_id] = unconfirmed_stop(host, attempt_id)
+        junit = len(junit_files(self.out / "cells" / cell.cell_id / f"attempt{attempt}" / "output")) if fetched else 0
+        duration = int(time.time() - started)
+        status = "done" if fetched else "lost"
+        with self.state_lock:
+            entry = self.state["cells"].setdefault(cell.cell_id, {"name": cell.name})
+            entry.update(host=host.name, rc=rc, status=status, attempt=attempt, duration_s=duration, junit=junit,
+                         finished=datetime.datetime.now().isoformat(timespec="seconds"),
+                         **({"artifacts": report_made(self.out)} if cell.kind == "report" else {}))
+            if fetched:
+                # what a resumed label keeps of the cell
+                entry["done_attempts"] = entry.get("done_attempts", 0) + 1
+                entry["last_done"] = {k: v for k, v in entry.items() if k not in NOT_A_RESULT}
+        self.save()
+        if fetched:
+            # the result is kept here and in state.json before the host forgets it; a failure to clean up after
+            # that leaves files behind, and the result as it is
+            try:
+                result = host.run(host.remote.job("clean", self.label, cell.cell_id, attempt_id, self.session),
+                                  check=False)
+                if result.returncode != 0:
+                    log(f"cleaning up {cell.name} on {host} failed with {result.returncode}: "
+                        f"{result.stderr.decode(errors='replace').strip()}")
+            except HostError as e:
+                log(f"cleaning up {cell.name} on {host}: {e}")
+        note = " no test results" if fetched and cell.kind == "test" and not junit else ""
+        if cell.kind == "report" and not report_made(self.out):
+            note = " no report"
+        log(f"FINISHED {cell.name} on {host}: rc={rc} {status}{note} in {duration // 60}m{duration % 60:02d}s")
+        return cell_succeeded(self.state["cells"][cell.cell_id], cell.kind)
+
+    def host_free(self):
+        """{host: (free units, capacity)}, (0, 0) for a host that does not answer"""
+        free = {}
+        for host in self.hosts:
+            if not self.setup_host(host):
+                free[host.name] = (0, 0)
+                continue
+            try:
+                units, capacity = host.run(host.remote.job("capacity"), timeout=60).stdout.decode().split()
+                free[host.name] = (int(units), int(capacity))
+                # answering in full: the next time it does not, it is tried again after the first delay
+                self.unready.pop(host.name, None)
+            except (HostError, ValueError) as e:
+                # set up again once it answers
+                self.ready.discard(host.name)
+                self.back_off(host, e)
+                free[host.name] = (0, 0)
+        return free
+
+    def finished(self, cell):
+        """A cell that succeeded, or that failed on its last attempt; --force resets"""
+        entry = self.state["cells"].get(cell.cell_id, {})
+        if self.args.force:
+            return False
+        return (cell_succeeded(entry, cell.kind)
+                or (entry.get("status") == "done" and entry.get("done_attempts", 0) >= MAX_ATTEMPTS))
+
+    def schedule(self, cells):
+        """
+        Runs the cells on the hosts of their architecture with free capacity, retrying a failed or lost cell once,
+        on another host when one has room.  With fail fast, as in the Jenkinsfile, the other cells wait for the jar
+        cells, and a cell that fails its last attempt stops the run.  A start that went out without an answer is
+        stopped on its host before the cell starts anywhere else.
+        """
+        pending = [c for c in cells if not self.finished(c)]
+        for cell in cells:
+            if cell.kind == "jar" and self.finished(cell):
+                if (cell_succeeded(self.state["cells"][cell.cell_id], "jar") and (self.stash / cell.base).exists()
+                        and self.state["stashes"].get(cell.base, "").startswith(self.inputs + "-")):
+                    self.base_ready[(cell.arch, cell.jdk)] = True
+                elif cell_succeeded(self.state["cells"][cell.cell_id], "jar"):
+                    if any((c.arch, c.jdk) == (cell.arch, cell.jdk) and c.kind in ("build", "test") for c in pending):
+                        # the stashes of a finished run are gone: build again
+                        self.update(cell, status="not run", rc=None, done_attempts=0, last_done=None)
+                        pending.append(cell)
+                else:
+                    self.base_ready[(cell.arch, cell.jdk)] = False
+                    if self.parameters["fail_fast"] and self.aborting is None:
+                        # as the run it resumes did, a jar cell that failed stops this one
+                        self.aborting = cell.name
+        # jar cells first, the largest cells next, python dtests last
+        pending.sort(key=lambda c: (c.kind != "jar", bool(c.command.get("python-dtest")), -c.units, c.step, c.split))
+        attempts, lost, last_host, waiting_since, reserved_on, running = {}, {}, {}, {}, {}, {}
+        start_failures, unreachable_since, failed_on = {}, {}, {}
+        unconfirmed = self.unconfirmed
+        stopped = set()  # the attempts fail fast interrupted
+        pending_lock = threading.Lock()
+        warned = set()
+        stopping = False
+
+        def counted(cell):
+            """The attempts that count towards the cell's two: those downloaded, and those lost in this run"""
+            return self.state["cells"].get(cell.cell_id, {}).get("done_attempts", 0) + lost.get(cell.cell_id, 0)
+
+        def failed_for_good(cell):
+            if cell.kind == "jar":
+                self.base_ready[(cell.arch, cell.jdk)] = False
+            if self.parameters["fail_fast"] and cell.kind != "report" and self.aborting is None:
+                self.aborting = cell.name
+
+        def stop_unconfirmed(cell):
+            """
+            True once the attempt whose stop is not confirmed, a start that went out without an answer or a lost
+            attempt, has stopped on its host, or there is none, or its host is given to --forget-host.  The host is
+            asked again after a delay that doubles each time.
+            """
+            waiting = unconfirmed.get(cell.cell_id)
+            if waiting is None:
+                return True
+            host, attempt_id = waiting["host"], waiting["attempt_id"]
+            if host.name in self.args.forget_host:
+                log(f"WARNING: {cell.name}: attempt {attempt_id} on {host} is not waited for (--forget-host)")
+                del unconfirmed[cell.cell_id]
+                return True
+            if time.time() < waiting["retry_at"]:
+                return False
+            if self.stop(cell, host, attempt_id) is None:
+                delay = min(waiting["delay"] * 2, HOST_RETRY_MAX_SECONDS) if waiting["delay"] else HOST_RETRY_SECONDS
+                waiting.update(retry_at=time.time() + delay, delay=delay)
+                log(f"{cell.name} waits for {host} to confirm that attempt {attempt_id} has stopped; asking again "
+                    f"in {delay}s, or give up on the host with --forget-host {host}")
+                return False
+            del unconfirmed[cell.cell_id]
+            return True
+
+        def keep_result(cell, status):
+            """The cell's entry, once its attempts are over: its last downloaded result, else the status"""
+            with self.state_lock:
+                entry = self.state["cells"].setdefault(cell.cell_id, {"name": cell.name})
+                entry["kind"] = cell.kind
+                if entry.get("status") != "done":
+                    if entry.get("last_done"):
+                        restore_last_done(entry)
+                    else:
+                        entry.update(status=status, rc=None)
+            self.save()
+
+        def not_run(cell):
+            """A cell taken out of pending that will not run; an earlier result it has stands"""
+            if cell.cell_id in unconfirmed:
+                waiting = unconfirmed.pop(cell.cell_id)
+                self.stop(cell, waiting["host"], waiting["attempt_id"])
+            keep_result(cell, "not run")
+
+        def launch(cell, host, attempt, attempt_id):
+            attempts[cell.cell_id] = attempt
+            last_host[cell.cell_id] = host.name
+            deadline = time.time() + cell.timeout_hours * self.args.timeout_factor * 3600 + DEADLINE_MARGIN_SECONDS
+            self.update(cell, status="running", kind=cell.kind, **attempt_record(host, attempt, attempt_id))
+            log(f"STARTED {cell.name} on {host} (attempt {attempt})")
+            if self.aborting is not None and cell.kind != "report":
+                # started as fail fast stopped the run
+                stop_for_fail_fast(cell, host, attempt_id)
+
+            def follow():
+                try:
+                    ok = self.run_cell(cell, host, attempt, attempt_id, deadline)
+                except Exception as e:  # pylint: disable=broad-except
+                    log(f"{cell.name} on {host}: {type(e).__name__}: {e}")
+                    self.update(cell, status="lost", rc=None, host=host.name, attempt=attempt)
+                    ok = False
+                if attempt_id in stopped:
+                    # interrupted by fail fast, which Jenkins does not retry either: the attempt does not count, and
+                    # an earlier result of the cell stands
+                    keep_result(cell, "aborted")
+                    return
+                if self.state["cells"][cell.cell_id].get("status") == "lost":
+                    lost[cell.cell_id] = lost.get(cell.cell_id, 0) + 1
+                    # a result downloaded earlier stands for the cell until another is
+                    keep_result(cell, "lost")
+                if ok:
+                    if cell.kind == "jar":
+                        self.base_ready[(cell.arch, cell.jdk)] = True
+                elif self.aborting is not None:
+                    # no retry once fail fast has stopped the run; the cell keeps its failure
+                    pass
+                elif counted(cell) < MAX_ATTEMPTS:
+                    log(f"RETRY {cell.name}")
+                    with pending_lock:
+                        pending.insert(0, cell)
+                else:
+                    failed_for_good(cell)
+            thread = threading.Thread(target=follow, daemon=True)
+            thread.start()
+            running[cell.cell_id] = (thread, cell, host, attempt_id)
+
+        def stop_for_fail_fast(cell, host, attempt_id):
+            # an attempt that had ended keeps its own result
+            if self.stop(cell, host, attempt_id) == "stopped":
+                stopped.add(attempt_id)
+
+        def next_attempt(cell):
+            """The next attempt's number, above those of the attempts kept"""
+            if cell.cell_id in attempts:
+                return attempts[cell.cell_id] + 1
+            directory = self.out / "cells" / cell.cell_id
+            numbers = [int(p.name[len("attempt"):]) for p in directory.glob("attempt*")
+                       if p.is_dir() and p.name[len("attempt"):].isdigit()] if directory.is_dir() else []
+            return max(numbers, default=0) + 1
+
+        def give_up(cell, why, status):
+            log(f"{status.upper()} {cell.name}: {why}")
+            with pending_lock:
+                pending.remove(cell)
+            not_run(cell)
+            keep_result(cell, status)
+            failed_for_good(cell)
+
+        def start_attempt(cell, host, reserve):
+            attempt = next_attempt(cell)
+            attempt_id = f"{attempt}-{uuid.uuid4().hex[:12]}"
+            try:
+                started = self.try_start(cell, host, attempt_id, reserve)
+            except PrestartError:
+                raise
+            except HostError:
+                unconfirmed[cell.cell_id] = unconfirmed_stop(host, attempt_id)
+                raise
+            if started:
+                launch(cell, host, attempt, attempt_id)
+            return started
+
+        while True:
+            for cell_id in [i for i, (t, _, _, _) in running.items() if not t.is_alive()]:
+                del running[cell_id]
+            if self.aborting is not None:
+                # as failFast in the Jenkinsfile: the other cells are interrupted, and none starts
+                with pending_lock:
+                    dropped = list(pending)
+                    pending.clear()
+                for cell in dropped:
+                    not_run(cell)
+                if not stopping:
+                    stopping = True
+                    log(f"FAIL FAST: {self.aborting} failed; stopping the other cells (--no-fail-fast runs them all)")
+                    for _, cell, host, attempt_id in list(running.values()):
+                        stop_for_fail_fast(cell, host, attempt_id)
+            with pending_lock:
+                # cells whose jar cell failed for good
+                dropped = [c for c in pending if c.kind not in ("jar", "report")
+                           and self.base_ready.get((c.arch, c.jdk)) is False]
+                for cell in dropped:
+                    pending.remove(cell)
+                waiting = list(pending)
+            for cell in dropped:
+                not_run(cell)
+                log(f"NOT RUN {cell.name}: the jar cell of {cell.arch} jdk{cell.jdk} failed")
+            if not waiting and not running:
+                return
+            # with fail fast, as the jar stage of the Jenkinsfile, every jar cell finishes before any other starts
+            jars_running = (any(c.kind == "jar" for c in waiting)
+                            or any(c.kind == "jar" for _, c, _, _ in running.values()))
+            free = self.host_free() if waiting else {}
+            started = False
+            for cell in waiting:
+                if self.aborting is not None:
+                    break
+                if self.inputs_for(cell) is None or (self.parameters["fail_fast"] and jars_running
+                                                     and cell.kind != "jar"):
+                    continue
+                if not stop_unconfirmed(cell):
+                    entry = unconfirmed[cell.cell_id]
+                    if time.time() - entry["since"] >= HOSTS_UNREACHABLE_SECONDS:
+                        give_up(cell, f"{entry['host']} has not confirmed for an hour that attempt "
+                                      f"{entry['attempt_id']} has stopped", "unstartable")
+                    continue
+                waiting_since.setdefault(cell.cell_id, time.time())
+                hosts = [h for h in self.hosts if cell.kind == "report" or h.arch == cell.arch]
+                answering = [h for h in hosts if free[h.name][1]]
+                if not answering:
+                    # a host that does not answer may come back: the cell waits, but not for ever
+                    waited = time.time() - unreachable_since.setdefault(cell.cell_id, time.time())
+                    if waited >= HOSTS_UNREACHABLE_SECONDS:
+                        give_up(cell, "no host of its architecture has answered for an hour", "unstartable")
+                    continue
+                unreachable_since.pop(cell.cell_id, None)
+                # a host smaller than the cell only when no host is large enough
+                eligible = [h for h in answering if free[h.name][1] >= cell.units]
+                if not eligible:
+                    eligible = answering
+                    if cell.cell_id not in warned:
+                        warned.add(cell.cell_id)
+                        log(f"WARNING: no host has the {cell.units} units {cell.name} takes; it runs on a smaller one")
+                # Jenkins retries on another agent; a host that failed to start the cell comes last
+                candidates = sorted((h for h in eligible if free[h.name][0] >= min(cell.units, free[h.name][1])),
+                                    key=lambda h: (h.name in failed_on.get(cell.cell_id, ()),
+                                                   h.name == last_host.get(cell.cell_id),
+                                                   -free[h.name][0] / free[h.name][1]))
+                reserve = not candidates and time.time() - waiting_since[cell.cell_id] > RESERVE_AFTER_SECONDS
+                if reserve:
+                    candidates = [max(eligible, key=lambda h: free[h.name])]
+                failed = False
+                for host in candidates:
+                    try:
+                        if not start_attempt(cell, host, reserve):
+                            if reserve:
+                                reserved_on[cell.cell_id] = host
+                            continue
+                    except OwnerError as e:
+                        raise SystemExit(str(e)) from e
+                    except HostError as e:
+                        log(f"{cell.name} cannot start on {host}: {e}")
+                        failed = True
+                        failed_on.setdefault(cell.cell_id, set()).add(host.name)
+                        start_failures[cell.cell_id] = start_failures.get(cell.cell_id, 0) + 1
+                        if start_failures[cell.cell_id] >= START_FAILURE_LIMIT:
+                            give_up(cell, f"hosts failed to start it {START_FAILURE_LIMIT} times in a row",
+                                    "unstartable")
+                            break
+                        if cell.cell_id in unconfirmed:
+                            # the start may have gone out: it is stopped there before the cell starts elsewhere
+                            break
+                        continue
+                    free[host.name] = (free[host.name][0] - cell.units, free[host.name][1])
+                    with pending_lock:
+                        pending.remove(cell)
+                    waiting_since.pop(cell.cell_id, None)
+                    start_failures.pop(cell.cell_id, None)
+                    failed_on.pop(cell.cell_id, None)
+                    reserved = reserved_on.pop(cell.cell_id, None)
+                    if reserved is not None and reserved is not host:
+                        try:
+                            reserved.run(reserved.remote.job("unreserve", self.label, cell.cell_id))
+                        except HostError as e:
+                            log(str(e))
+                    started = True
+                    break
+                else:
+                    if candidates and not failed:
+                        start_failures.pop(cell.cell_id, None)
+            time.sleep(5 if started else 20)
+
+    def combine_jmh_results(self):
+        """test/output/combined-result.json from the cells' jmh-result.json, as processJmhReports() writes it"""
+        results = []
+        for cell_id in sorted(self.state.get("plan", [])):
+            attempt = recorded_attempt(self.out, cell_id, self.state["cells"].get(cell_id))
+            for path in sorted((attempt / "output").rglob("jmh-result.json")) if attempt else []:
+                data = json.loads(path.read_text())
+                results.extend(data if isinstance(data, list) else [data])
+        if results:
+            combined = self.out / "test" / "output" / "combined-result.json"
+            combined.parent.mkdir(parents=True, exist_ok=True)
+            combined.write_text(json.dumps(results))
+            log(f"combined {len(results)} jmh results into {combined}")
+
+    def report(self):
+        """ci_summary.html and results_details.tar.xz, made on a host as the Jenkinsfile's generateTestReports() does"""
+        report_input = self.stash / "report-input.tar"
+        added = 0
+        report_cell = ReportCell()
+        with tarfile.open(str(report_input) + ".tmp", "w") as tar:
+            for cell_id in sorted(c for c in self.state.get("plan", []) if c != report_cell.cell_id):
+                attempt = recorded_attempt(self.out, cell_id, self.state["cells"].get(cell_id))
+                if attempt is None:
+                    continue
+                if (attempt / "output").is_dir():
+                    for path in sorted((attempt / "output").rglob("*")):
+                        if path.is_file():
+                            tar.add(str(path), arcname=f"test/output/{path.relative_to(attempt / 'output')}")
+                            added += 1
+                for extension in ("tsv", "suites"):
+                    if (attempt / f"cell-time.{extension}").exists():
+                        tar.add(str(attempt / f"cell-time.{extension}"),
+                                arcname=f"test/cell-times/{cell_id}.{extension}")
+        if not added:
+            os.unlink(str(report_input) + ".tmp")
+            log("no test results; no report")
+            return
+        os.replace(str(report_input) + ".tmp", report_input)
+        self.state["report_input"] = file_digest(report_input)
+        # made again by every run
+        self.state["cells"].pop(report_cell.cell_id, None)
+        self.save()
+        self.schedule([report_cell])
+
+    def execute(self):
+        """Runs the label; returns the exit code of its result"""
+        self.print_parameters()
+        cells = self.plan()
+        log(f"label {self.label}: {len(cells)} cells from {self.src} at {self.sha[:10]}")
+        for cell in cells:
+            log(f"  {cell.name}  ({cell.units} units, {cell.timeout_hours * self.args.timeout_factor}h)")
+        if self.args.dry_run:
+            self.dry_run_directory.cleanup()
+            return 0
+        try:
+            # everything that can refuse the run, before anything of an earlier run is stopped or moved
+            self.check_resume(cells)
+            self.prepare_inputs(cells)
+            for host in self.hosts:
+                self.check_host(host)
+            self.check_hosts(cells, self.checked)
+            self.load_state(cells)
+            self.install_inputs()
+            for host in self.hosts:
+                self.setup_host(host)
+            self.check_hosts(cells, self.ready)
+            self.started = True
+            try:
+                sweep([h for h in self.hosts if h.name in self.ready], self.owner, idle_hours=SWEEP_IDLE_HOURS,
+                      results_dir=self.results_dir, keep={self.label})
+            except HostError as e:
+                log(f"sweep of idle labels failed: {e}")
+            self.schedule(cells)
+            self.combine_jmh_results()
+            if self.aborting is not None:
+                # Jenkins skips its Summary stage after a failed stage
+                log("no ci_summary.html: the run stopped early (fail fast)")
+            elif self.state["report"]:
+                self.report()
+            text, result = summarise(self.out)
+            print(text)
+            if not self.args.keep_stashes:
+                self.clean_stashes()
+            return EXIT_CODES[result]
+        finally:
+            self.lock.close()
+
+    def check_resume(self, cells):
+        """Refuses a run of the label with other inputs"""
+        previous = self.earlier_inputs()
+        if previous and previous != self.inputs and not self.args.allow_sha_change:
+            what = "commit" if self.state.get("sha") != self.sha else "build.properties or --maven-mirror"
+            raise SystemExit(f"label {self.label} ran {self.state.get('sha')} with other inputs; the {what} "
+                             f"changed.  Use a new label, or --allow-sha-change to run every cell again")
+
+    def earlier_inputs(self):
+        """The inputs of the label's results: those a change that was not finished goes to, else the state's"""
+        return (self.state.get("transition") or {}).get("inputs", self.state.get("inputs"))
+
+    def replaces_results(self):
+        """True when this run moves the label's earlier results aside, as its inputs changed"""
+        previous = self.earlier_inputs()
+        return bool(previous and previous != self.inputs) or "archive" in (self.state.get("transition") or {})
+
+    def check_hosts(self, cells, usable):
+        """Stops a run no host can run, or where no host has the architecture of some cells"""
+        if not usable:
+            why = list(self.excluded.values()) + [f"{name}: {e}" for name, (_, _, e) in self.unready.items()]
+            raise SystemExit("no host can run cells: " + "; ".join(why))
+        # a host not set up yet may yet answer, and run the cells of its architecture when it does
+        maybe = [h for h in self.hosts if h.name not in usable and h.name not in self.excluded]
+        if not any(h.arch is None for h in maybe):
+            missing = sorted({c.arch for c in cells} - {h.arch for h in self.hosts if h.name not in self.excluded})
+            if missing:
+                raise SystemExit(f"no host for the {', '.join(missing)} cells; hosts: "
+                                 f"{', '.join(f'{h} ({h.arch})' for h in self.hosts)}")
+
+    def clean_stashes(self):
+        """
+        Every cell has finished: removes the label's run directory on its hosts, under the remote homes it ran with,
+        and then the local stashes.  A host where the label is not this driver's holds none of them.
+        """
+        removed, failed = [], []
+        for host in self.hosts + recorded_hosts(self.hosts, self.state, self.args.remote_home):
+            if host.name in self.foreign:
+                continue
+            try:
+                if host not in self.hosts:
+                    host.remote.install(host, preflight=False)
+                result = host.run(host.remote.job("rmlabel", self.label, self.owner), check=False, timeout=600)
+                if result.returncode not in (0, NOT_OWNER, LABEL_DIR_UNUSABLE):
+                    raise HostError(result.stderr.decode(errors="replace").strip())
+                removed.append(host.name)
+            except HostError as e:
+                log(f"could not remove {self.label} on {host}: {e}; use `clean --label {self.label}`")
+                failed.append(host.name)
+        if failed:
+            log(f"removed {self.label} on {', '.join(removed) or 'no host'}; the local stash is kept, as "
+                f"{', '.join(failed)} still has the label")
+            return
+        shutil.rmtree(self.stash, ignore_errors=True)
+        log(f"removed the stashes of {self.label} on {', '.join(removed)} and locally")
+
+
+def attempt_host(hosts, record, remote_home):
+    """The host of a stored attempt, with the remote home, runtime and scripts the attempt started with"""
+    known = {h.name: h for h in hosts}.get(record["host"])
+    home = record.get("home") or (known.remote.given_home if known else remote_home)
+    version = record.get("version")
+    if known is not None and known.remote.given_home == home and (version is None or known.remote.version == version):
+        return known
+    host = Host(record["host"], runtime=record.get("runtime", known.runtime if known else None))
+    host.remote = Remote(home, version)
+    return host
+
+
+def recorded_hosts(hosts, state, remote_home):
+    """The hosts a label ran on under a remote home the hosts file does not give them, with their runtime"""
+    have = {(h.name, h.remote.given_home) for h in hosts}
+    extra = {}
+    for record in list(state.get("hosts", {}).values()) + list(state.get("cells", {}).values()):
+        if record.get("host"):
+            key = (record["host"], record.get("home") or remote_home)
+            if key not in have and key not in extra:
+                extra[key] = Host(key[0], runtime=record.get("runtime"))
+                extra[key].remote = Remote(key[1])
+    return [extra[key] for key in sorted(extra)]
+
+
+def unconfirmed_stop(host, attempt_id):
+    """An attempt that may still run on its host, until the host confirms it has stopped"""
+    return {"host": host, "attempt_id": attempt_id, "since": time.time(), "retry_at": 0, "delay": 0}
+
+
+def restore_last_done(entry):
+    """Makes a cell's entry that of its last downloaded result, or of a cell that has not run"""
+    for key in [k for k in entry if k not in ("name", "kind", "done_attempts", "last_done")]:
+        del entry[key]
+    entry.update(entry.get("last_done") or {"status": "not run", "rc": None})
+
+
+def attempt_record(host, attempt, attempt_id):
+    """Where an attempt runs: its host, and the remote home, runtime and scripts it started with"""
+    return {"attempt": attempt, "attempt_id": attempt_id, "host": host.name, "home": host.remote.given_home,
+            "runtime": host.runtime, "version": host.remote.version}
+
+
+def recorded_attempt(out, cell_id, entry):
+    """The directory of the attempt a cell's entry records as done, or None: a cell not done adds nothing"""
+    if not entry or entry.get("status") != "done" or not entry.get("attempt"):
+        return None
+    path = Path(out) / "cells" / cell_id / f"attempt{entry['attempt']}"
+    return path if path.is_dir() else None
+
+
+def cell_succeeded(entry, kind):
+    """
+    A cell succeeded when it finished, its script exited 0, a test cell left test results, and the report cell
+    made the report
+    """
+    return (entry.get("status") == "done" and entry.get("rc") == 0
+            and (kind != "test" or entry.get("junit", 0) > 0) and (kind != "report" or entry.get("artifacts", False)))
+
+
+def report_made(out):
+    return all((out / name).is_file() and (out / name).stat().st_size > 0 for name in REPORT_ARTIFACTS)
+
+
+#################
+#### summary ####
+#################
+
+def summarise(out):
+    """
+    A plain text summary of a label's cells and failing tests, also written to summary.txt, and the result:
+    SUCCESS, UNSTABLE (failing tests) or FAILURE (a cell that failed, was lost or stopped, did not run, or left no
+    test results)
+    """
+    state = json.loads((out / "state.json").read_text()) if (out / "state.json").exists() else {"cells": {}}
+    lines = [f"run-ci-local {out.name}: {state.get('src')} at {state.get('sha')}", ""]
+    failing, failed_cells, totals = [], [], {"pass": 0, "failure": 0, "error": 0, "skipped": 0}
+    # the cells the last run planned, which a cell it did not get to is one of; without a plan, every cell recorded
+    plan = state.get("plan") or list(state["cells"])
+    if isinstance(plan, list):
+        plan = {cell_id: {} for cell_id in plan}
+    for cell_id, planned in sorted(plan.items()):
+        entry = state["cells"].get(cell_id) or dict(planned, status="not run", rc=None)
+        attempt = recorded_attempt(out, cell_id, entry)
+        counts = {"pass": 0, "failure": 0, "error": 0, "skipped": 0}
+        for path in junit_files(attempt / "output") if attempt else []:
+            for classname, name, _, outcome in testcases(path):
+                counts[outcome] += 1
+                if outcome in ("failure", "error"):
+                    failing.append(f"{entry.get('name')}: {classname} {name} {outcome}")
+        for key, value in counts.items():
+            totals[key] += value
+        if not cell_succeeded(entry, entry.get("kind")):
+            failed_cells.append(entry.get("name"))
+        lines.append(f"{entry.get('name')}: {entry.get('status')} rc={entry.get('rc')} host={entry.get('host')} "
+                     f"attempts={entry.get('attempt')} {(entry.get('duration_s') or 0) // 60}m "
+                     f"tests={sum(counts.values())} failing={counts['failure'] + counts['error']}")
+    result = "FAILURE" if failed_cells else "UNSTABLE" if failing else "SUCCESS"
+    lines += ["", f"result: {result}",
+              f"tests: passed {totals['pass']} | failed {totals['failure'] + totals['error']} | "
+              f"skipped {totals['skipped']}", f"failed cells: {len(failed_cells)}"]
+    lines += [f"  {name}" for name in failed_cells]
+    lines += [f"failing tests: {len(failing)}"] + [f"  {f}" for f in failing]
+    if report_made(out):
+        lines.append(f"for a JIRA ticket: {out / 'ci_summary.html'} and {out / 'results_details.tar.xz'}")
+    text = "\n".join(lines) + "\n"
+    (out / "summary.txt").write_text(text)
+    return text, result
+
+
+##################
+#### cleaning ####
+##################
+
+def sweep(hosts, owner, labels=None, idle_hours=None, results_dir=None, force=False, dry_run=False, keep=(), held=(),
+          unreachable=False):
+    """
+    Removes the run directories of this driver's labels on the hosts, and their local stashes: the given labels,
+    or else the labels idle for idle_hours.  Never a label whose driver runs on this machine or whose cell runs on
+    a host, nor, without force, a label another driver owns.  A given label is removed from no host at all while
+    a host cannot be asked, or one of its cells runs on any host; a local stash goes only once every host has
+    removed its label.
+    """
+    now = time.time()
+    locks = {}
+    listings, unreachable = list_labels(hosts, unreachable)
+    try:
+        if labels is None and results_dir:
+            # an idle label is removed under its lock, so that no driver here takes it meanwhile, and its idleness
+            # is checked again once the lock is held
+            idle = {label for _, entries in listings for label, live, newest, _, label_owner in entries
+                    if label_owner == owner and not live and now - newest >= idle_hours * 3600 and label not in keep}
+            for label in sorted(idle):
+                lock = lock_label(Path(results_dir) / label)
+                if lock is not None:
+                    locks[label] = lock
+            if not locks:
+                return
+            listings, unreachable = list_labels(hosts, unreachable)
+            listings = [(host, [e for e in entries if e[0] in locks]) for host, entries in listings]
+            held = set(held) | set(locks)
+        sweep_listed(listings, owner, labels, idle_hours, results_dir, force, dry_run, keep, held, unreachable, now)
+    finally:
+        for lock in locks.values():
+            lock.close()
+
+
+def list_labels(hosts, unreachable):
+    """[(host, [(label, running cells, newest mtime, stash bytes, owner)])], and whether a host did not answer"""
+    listings = []
+    for host in hosts:
+        try:
+            listing = host.run(host.remote.job("labels"), timeout=300).stdout.decode().splitlines()
+        except HostError as e:
+            log(f"clean: {host}: {e}")
+            unreachable = True
+            continue
+        entries = []
+        for line in listing:
+            fields = line.split()
+            if len(fields) == 5:
+                entries.append((fields[0], int(fields[1]), int(fields[2] or 0), int(fields[3]), fields[4]))
+        listings.append((host, entries))
+    return listings, unreachable
+
+
+def sweep_listed(listings, owner, labels, idle_hours, results_dir, force, dry_run, keep, held, unreachable, now):
+    removed, kept = set(), set()
+    if labels is not None:
+        # all or nothing, across the hosts where the label is this driver's
+        if unreachable:
+            log(f"clean: a host could not be asked; nothing of {', '.join(sorted(labels))} is removed, on any host")
+            kept.update(labels)
+        for host, entries in listings:
+            for label, live, _, _, label_owner in entries:
+                if label in labels and live and (label_owner == owner or force):
+                    log(f"clean: {host}: {label} still runs a cell; nothing of it is removed, on any host")
+                    kept.add(label)
+    for host, entries in listings:
+        listed = {entry[0] for entry in entries}
+        for label in sorted(set(labels or ()) - listed - kept):
+            # what an interrupted claim left
+            if not dry_run:
+                result = host.run(host.remote.job("rmlabel", label, owner), check=False, timeout=600)
+                if result.returncode not in (0, NOT_OWNER, LABEL_DIR_UNUSABLE):
+                    log(f"clean: {host}: {label}: {result.stderr.decode(errors='replace').strip()}")
+                    kept.add(label)
+        for label, live, newest, size, label_owner in entries:
+            if label in keep or (labels is not None and (label not in labels or label in kept)):
+                continue
+            if label_owner != owner and not (force and labels is not None):
+                if labels is not None:
+                    # it holds nothing of this driver's
+                    log(f"clean: {host}: {label} belongs to another driver; left alone (--force removes it)")
+                continue
+            if live or (label not in held and results_dir and label_active(Path(results_dir) / label)):
+                if labels is not None:
+                    log(f"clean: {host}: {label} is still running; kept")
+                    kept.add(label)
+                continue
+            if labels is None and now - newest < idle_hours * 3600:
+                continue
+            log(f"clean: {host}: {'would remove' if dry_run else 'removing'} {label} ({size / 1e9:.1f} GB of stashes)")
+            removed.add(label)
+            if not dry_run:
+                result = host.run(host.remote.job("rmlabel", label, owner, *(["force"] if force else [])),
+                                  check=False, timeout=600)
+                if result.returncode != 0:
+                    log(f"clean: {host}: {label} not removed: {result.stderr.decode(errors='replace').strip()}")
+                    kept.add(label)
+    for label in sorted((labels if labels is not None else removed) - kept):
+        out = Path(results_dir) / label if results_dir else None
+        # the stash of a label this tool made here only
+        if (out and (out / "stash").is_dir() and (out / LABEL_MARKER).is_file()
+                and (label in held or not label_active(out))):
+            log(f"clean: {'would remove' if dry_run else 'removing'} {out / 'stash'}")
+            if not dry_run:
+                shutil.rmtree(out / "stash", ignore_errors=True)
+    for label in sorted(kept & (labels or set())):
+        log(f"clean: the local stash of {label} is kept, as a host still has the label")
+
+
+def status(args):
+    hosts = load_hosts(args.hosts, args.remote_home)
+    for host in hosts:
+        try:
+            host.remote.install(host, preflight=False)
+            free = host.run(host.remote.job("capacity"), timeout=60).stdout.decode().split()
+            runtime = host.run(host.remote.job("runtime"), timeout=60).stdout.decode().strip()
+            arch = host.arch or host.run(host.remote.job("arch"), timeout=60).stdout.decode().strip()
+            print(f"{host}: {free[0]} of {free[1]} units free, {arch}, {runtime}")
+        except (HostError, IndexError) as e:
+            print(f"{host}: {e}")
+    if args.label:
+        state = json.loads((Path(args.results_dir).expanduser() / check_name(args.label) / "state.json").read_text())
+        counts = {}
+        for entry in state["cells"].values():
+            counts[entry.get("status")] = counts.get(entry.get("status"), 0) + 1
+        print(f"{args.label}: {counts}")
+        for cell_id, entry in sorted(state["cells"].items(), key=lambda item: item[1].get("name")):
+            if entry.get("status") == "running" and entry.get("host") and entry.get("attempt_id"):
+                # asked where the attempt started, also when its host has left the hosts file
+                host = attempt_host(hosts, entry, args.remote_home)
+                try:
+                    now = host.run(host.remote.job("status", args.label, cell_id, entry["attempt_id"]), check=False,
+                                   timeout=60).stdout.decode().strip()
+                except HostError as e:
+                    now = str(e)
+                print(f"  running: {entry.get('name')} on {host}: {now}")
+
+
+def argument_parser():
+    parser = argparse.ArgumentParser(description="Run the Jenkins CI pipeline on hosts reached over ssh, without "
+                                                 "Jenkins.",
+                                     epilog="Exit codes: 0 SUCCESS, 1 the run could not start or go on (hosts, "
+                                            "checkout, label), 2 usage, 3 UNSTABLE (failing tests), 4 FAILURE (a "
+                                            "failed, lost or result-less cell).  See .build/run-ci-local.d/README.md")
+    parser.add_argument("--config", help="Config file, see .build/run-ci-local.d/run-ci-local.conf.example (default: "
+                                         "$RUN_CI_LOCAL_CONFIG, else $XDG_CONFIG_HOME/cassandra/run-ci-local.conf or "
+                                         "~/.config/cassandra/run-ci-local.conf).")
+    parser.add_argument("--hosts", help="Hosts file, see .build/run-ci-local.d/hosts.example (default: "
+                                        "$RUN_CI_LOCAL_HOSTS, "
+                                        "else $XDG_CONFIG_HOME/cassandra/run-ci-local-hosts or "
+                                        "~/.config/cassandra/run-ci-local-hosts).")
+    parser.add_argument("--remote-home", help=f"Directory on the hosts for scripts, slots and runs, relative to the "
+                                              f"remote home (default: {DEFAULT_REMOTE_HOME}).")
+    parser.add_argument("--results-dir", help="Results go to <results-dir>/<label>/ (default: build/ci-local).")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    run = commands.add_parser("run", help="Run a pipeline profile, or part of one.  Rerunning a label resumes it.")
+    run.add_argument("-l", "--label", required=True, help="Name of the run, and of its results directory.")
+    run.add_argument("--src", default=str(CASSANDRA_DIR), help="The git checkout to test (default: this one).")
+    run.add_argument("-r", "--repository", help="Repository URL to fetch and test, as Jenkins does.  Defaults to "
+                                                "testing the checkout; with only --branch, its upstream repository.")
+    run.add_argument("-b", "--branch", help="Branch of the repository to fetch and test.  Defaults to testing the "
+                                            "checkout; with only --repository, its branch.")
+    run.add_argument("-p", "--profile", help="CI pipeline profile.  Defaults to the Jenkinsfile's, skinny.")
+    run.add_argument("-e", "--profile-custom-regexp",
+                     help="Regexp of steps for the custom profile.  Example: 'stress.*|jvm-dtest'")
+    run.add_argument("--architecture", help="amd64, arm64 or all, as the Jenkins parameter.  Defaults to amd64.")
+    run.add_argument("-j", "--jdk", help="Specify JDK version. Defaults to all JDKs the checkout supports.")
+    run.add_argument("-d", "--dtest-repository", help="DTest repository URL.")
+    run.add_argument("-k", "--dtest-branch", help="DTest repository branch.")
+    run.add_argument("--dtest-dir", help="A local cassandra-dtest checkout to use, in place of a clone.")
+    run.add_argument("--fail-fast", dest="fail_fast", action="store_const", const=True,
+                     help="Stop the run when a cell fails its last attempt, as Jenkins does (the default).")
+    run.add_argument("--no-fail-fast", dest="fail_fast", action="store_const", const=False,
+                     help="Run every cell whatever fails, and make the report.")
+    run.add_argument("--cells", default="",
+                     help="Regexp (search) of the cell names to run, e.g. 'test jdk11 (3|5)/20'.")
+    run.add_argument("-t", "--test", default="",
+                     help="Run each test step once, with run-tests.sh -t <regexp>, in place of its splits.")
+    run.add_argument("--maven-mirror", help="Maven repository URL every cell resolves dependencies from, in place of "
+                                            "Maven Central.")
+    run.add_argument("--timeout-factor", type=int, help="Multiplier of the Jenkinsfile's timeouts (default: 1).")
+    run.add_argument("--report", dest="report", action="store_const", const=True,
+                     help="Make ci_summary.html and results_details.tar.xz (the default).")
+    run.add_argument("--no-report", dest="report", action="store_const", const=False,
+                     help="Skip ci_summary.html and results_details.tar.xz.")
+    run.add_argument("--force", action="store_true",
+                     help="Rerun the cells that already finished, and let the options given change the label's "
+                          "parameters.")
+    run.add_argument("--allow-sha-change", action="store_true",
+                     help="Run a label again after new commits or another build.properties: every cell runs again.")
+    run.add_argument("--forget-host", action="append", default=[], metavar="HOST",
+                     help="As a label resumes, do not wait for this host to stop the label's earlier cells; it stops "
+                          "them before it runs one.  Repeatable.")
+    run.add_argument("--keep-stashes", action="store_true",
+                     help="Keep the source and build tarballs after the run, for a --force rerun.  Remove them "
+                          "with clean.")
+    run.add_argument("-n", "--dry-run", action="store_true", help="Print the parameters and cells and exit.")
+
+    summary = commands.add_parser("summary", help="Print a label's summary again.")
+    summary.add_argument("-l", "--label", required=True)
+
+    clean = commands.add_parser("clean", help="Remove the stashes of finished labels on the hosts and locally.")
+    clean.add_argument("-l", "--label", action="append", default=[], help="A label to clean, repeatable.")
+    clean.add_argument("--stop", action="store_true", help="Stop the label's running cells first.")
+    clean.add_argument("--force", action="store_true", help="Also remove a label another driver owns.")
+    clean.add_argument("--idle-hours", type=float,
+                       help="Without --label, clean every label of this driver idle this long.")
+    clean.add_argument("-n", "--dry-run", action="store_true")
+
+    commands.add_parser("set-capacity", help="Set the capacity of the hosts the hosts file gives one, replacing what "
+                                              "they have.  Otherwise a host keeps its capacity.")
+
+    host_status = commands.add_parser("status", help="Free capacity, architecture and container runtime of each host.")
+    host_status.add_argument("-l", "--label", default="", help="Also list the label's running cells.")
+    return parser
+
+
+def main(argv=None):
+    args = argument_parser().parse_args(argv)
+    config_file = args.config or default_config_file()
+    config = load_config(config_file, required=bool(args.config or os.environ.get("RUN_CI_LOCAL_CONFIG")))
+    apply_settings(args, config)
+    try:
+        if args.command == "run":
+            return Run(args, config).execute()
+        if args.command == "summary":
+            text, result = summarise(Path(args.results_dir).expanduser().resolve() / check_name(args.label))
+            print(text)
+            return EXIT_CODES[result]
+        if args.command == "clean":
+            if not args.label and args.idle_hours is None:
+                raise SystemExit("clean: pass --label <label> or --idle-hours <hours>")
+            for label in args.label:
+                check_name(label)
+            results_dir = Path(args.results_dir).expanduser().resolve()
+            hosts, owner = load_hosts(args.hosts, args.remote_home), owner_id(results_dir)
+            # The locks of the labels, held from before anything is asked of a host to the end of the clean, as a
+            # run holds them
+            locks, running = {}, set()
+            for label in args.label:
+                lock = lock_label(results_dir / label)
+                if lock is None:
+                    log(f"clean: {label} is running on this machine; kept")
+                    running.add(label)
+                else:
+                    locks[label] = lock
+            labels = set(args.label) - running
+            if args.label and not labels:
+                return 0
+            # and the hosts, under the remote homes, where the labels' attempts ran
+            for label in sorted(locks):
+                if (results_dir / label / "state.json").is_file():
+                    state = json.loads((results_dir / label / "state.json").read_text())
+                    hosts += recorded_hosts(hosts, state, args.remote_home)
+            reachable = []
+            for host in hosts:
+                try:
+                    host.remote.install(host, preflight=False)
+                    reachable.append(host)
+                except HostError as e:
+                    log(f"clean: {host} could not be reached, and keeps its labels: {e}")
+            unstopped = set()
+            if args.stop and not args.dry_run:
+                for host in reachable:
+                    for label in sorted(labels):
+                        result = host.run(host.remote.job("kill", label, owner), check=False, timeout=600)
+                        if result.returncode in (NOT_OWNER, LABEL_DIR_UNUSABLE):
+                            log(f"clean: {host}: {label}: {result.stderr.decode(errors='replace').strip()}; "
+                                f"nothing of this driver's to stop")
+                        elif result.returncode != 0:
+                            log(f"clean: {host}: stopping the cells of {label} failed, so nothing of {label} is "
+                                f"removed, on any host: {result.stderr.decode(errors='replace').strip()}")
+                            unstopped.add(label)
+                labels -= unstopped
+            try:
+                if labels or not args.label:
+                    sweep(reachable, owner, labels=labels or None, idle_hours=args.idle_hours,
+                          results_dir=results_dir, force=args.force, dry_run=args.dry_run, held=set(locks),
+                          unreachable=len(reachable) < len(hosts))
+            finally:
+                for lock in locks.values():
+                    lock.close()
+            if unstopped:
+                raise SystemExit(f"clean: the cells of {', '.join(sorted(unstopped))} could not all be stopped; "
+                                 f"nothing of them was removed")
+            return 0
+        if args.command == "set-capacity":
+            for host in load_hosts(args.hosts, args.remote_home):
+                if host.capacity:
+                    host.remote.install(host)
+                    host.run(host.remote.job("set-capacity", host.capacity))
+                    log(f"{host}: capacity {host.capacity}")
+            return 0
+        status(args)
+        return 0
+    except HostError as e:
+        raise SystemExit(str(e)) from e
+
+
+if __name__ == "__main__":
+    sys.exit(main())
