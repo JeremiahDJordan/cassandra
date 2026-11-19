@@ -270,12 +270,27 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
     /**
      * Determines the {@link IndexTarget.Type} for the expression. In this case we are only interested in map types and
-     * the operator being used in the expression.
+     * the operator being used in the expression, and in the operators on the elements of frozen collections.
      */
     public static IndexTarget.Type determineIndexTargetType(RowFilter.Expression expression)
     {
         AbstractType<?> type  = expression.column().type;
         IndexTarget.Type indexTargetType = IndexTarget.Type.SIMPLE;
+        if (TypeUtil.isFrozenCollection(type))
+        {
+            // evaluated on the keys or values of the frozen value, as on those of a non-frozen collection
+            switch (expression.operator())
+            {
+                case CONTAINS:
+                case NOT_CONTAINS:
+                    return IndexTarget.Type.VALUES;
+                case CONTAINS_KEY:
+                case NOT_CONTAINS_KEY:
+                    return IndexTarget.Type.KEYS;
+                default:
+                    return indexTargetType;
+            }
+        }
         if (type.isCollection() && type.isMultiCell())
         {
             CollectionType<?> collection = ((CollectionType<?>) type);
