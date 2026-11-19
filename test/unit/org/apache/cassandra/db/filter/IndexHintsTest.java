@@ -1429,6 +1429,36 @@ public class IndexHintsTest extends CQLTester
         }
     }
 
+    /**
+     * Tests that the index hints serialization accepts as many indexes as the validation accepts.
+     */
+    @Test
+    public void testMaxHintsOnSerializationAtTheLimit() throws IOException
+    {
+        // prepare a set of indexes that reaches the limit without exceeding it
+        Set<IndexMetadata> indexes = new HashSet<>();
+        for (int i = 0; i < Short.MAX_VALUE; i++)
+            indexes.add(IndexMetadata.fromSchemaMetadata("idx" + i, IndexMetadata.Kind.CUSTOM, Collections.emptyMap()));
+
+        // test the limit of included indexes
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            IndexHints hints = IndexHints.create(indexes, null);
+            IndexHints.serializer.serialize(hints, out, MessagingService.VERSION_DS_12);
+            Assertions.assertThat((long) out.getLength())
+                      .isEqualTo(IndexHints.serializer.serializedSize(hints, MessagingService.VERSION_DS_12));
+        }
+
+        // test the limit of excluded indexes
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            IndexHints hints = IndexHints.create(null, indexes);
+            IndexHints.serializer.serialize(hints, out, MessagingService.VERSION_DS_12);
+            Assertions.assertThat((long) out.getLength())
+                      .isEqualTo(IndexHints.serializer.serializedSize(hints, MessagingService.VERSION_DS_12));
+        }
+    }
+
     private void assertNonIncludableIndexesError(String query)
     {
         Assertions.assertThatThrownBy(() -> execute(query))
