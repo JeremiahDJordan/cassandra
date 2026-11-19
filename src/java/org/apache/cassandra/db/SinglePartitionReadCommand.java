@@ -54,7 +54,6 @@ import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Cell;
-import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -495,6 +494,12 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         return new SingletonUnfilteredPartitionIterator(partition);
     }
 
+    @Override
+    protected void updateMinOldestUnrepairedTombstone(ColumnFamilyStore cfs, ReadExecutionController controller)
+    {
+        controller.updateMinOldestUnrepairedTombstone(cfs.select(View.select(SSTableSet.LIVE, partitionKey())));
+    }
+
     /**
      * Fetch the rows requested if in cache; if not, read it from disk and cache it.
      * <p>
@@ -510,6 +515,11 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         assert cfs.isRowCacheEnabled() : String.format("Row cache is not enabled on table [%s]", cfs.name);
 
         RowCacheKey key = new RowCacheKey(metadata(), partitionKey());
+
+        // A cached partition doesn't record which of its tombstones are repaired, so take the bound from the sources
+        // before the lookup, and again on a hit for a partition cached in between
+        if (cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones())
+            updateMinOldestUnrepairedTombstone(cfs, executionController);
 
         // Attempt a sentinel-read-cache sequence.  if a write invalidates our sentinel, we'll return our
         // (now potentially obsolete) data, but won't cache it. see CASSANDRA-3862
@@ -530,6 +540,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             {
                 cfs.metric.rowCacheHit.inc();
                 Tracing.trace("Row cache hit");
+                if (cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones())
+                    updateMinOldestUnrepairedTombstone(cfs, executionController);
                 UnfilteredRowIterator unfilteredRowIterator = clusteringIndexFilter().getUnfilteredRowIterator(columnFilter(), cachedPartition);
                 cfs.metric.updateSSTableIterated(0);
                 return unfilteredRowIterator;
@@ -969,9 +981,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                                                                        : iter;
                 result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false),
                              result,
-                             filter,
-                             false,
-                             controller);
+                             filter);
             }
         }
 
@@ -1018,20 +1028,18 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                                                                            iter.partitionLevelDeletion(),
                                                                            filter.isReversed()),
                                      result,
-                                     filter,
-                                     sstable.isRepaired(),
-                                     controller);
+                                     filter);
                     }
                     else
                     {
                         UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(sstable.getId()))
                                                                                : iter;
 
+                        if (!sstable.isRepaired())
+                            controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
                         result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false),
                                      result,
-                                     filter,
-                                     sstable.isRepaired(),
-                                     controller);
+                                     filter);
                     }
                 }
 
@@ -1044,11 +1052,11 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     continue;
                 UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(sstable.getId()))
                                                                        : iter;
+                if (!sstable.isRepaired())
+                    controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
                 result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false),
                              result,
-                             filter,
-                             sstable.isRepaired(),
-                             controller);
+                             filter);
             }
         }
 
@@ -1065,12 +1073,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         return result.unfilteredIterator(columnFilter(), Slices.ALL, clusteringIndexFilter().isReversed());
     }
 
-    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, boolean isRepaired, ReadExecutionController controller)
+    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter)
     {
-        // EncodingStats uses a synthetic epoch for no local deletion time
-        if (!isRepaired && iter.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
-            controller.updateMinOldestUnrepairedTombstone(iter.stats().minLocalDeletionTime);
-
         int maxRows = Math.max(filter.requestedRows().size(), 1);
         if (result == null)
             return ImmutableBTreePartition.create(iter, maxRows);

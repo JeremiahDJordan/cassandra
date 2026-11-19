@@ -216,7 +216,7 @@ public class StubIndex implements Index
     {
         private final ReadCommand command;
 
-        Searcher(ReadCommand command)
+        protected Searcher(ReadCommand command)
         {
             this.command = command;
         }

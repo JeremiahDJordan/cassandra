@@ -18,7 +18,10 @@
 
 package org.apache.cassandra.distributed.test;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
@@ -34,6 +37,7 @@ import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.MethodDelegation;
 import net.bytebuddy.implementation.bind.annotation.SuperCall;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -45,11 +49,14 @@ import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
 import org.apache.cassandra.distributed.api.ICoordinator;
 import org.apache.cassandra.distributed.api.IInstanceConfig;
+import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.TokenSupplier;
 import org.apache.cassandra.distributed.shared.NetworkTopology;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.locator.ReplicaPlan;
+import org.apache.cassandra.metrics.ReadRepairMetrics;
 import org.apache.cassandra.service.PendingRangeCalculatorService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.reads.repair.BlockingReadRepair;
@@ -475,6 +482,81 @@ public class ReadRepairTest extends TestBaseImpl
             assertRows(cluster.coordinator(1).execute("SELECT * FROM distributed_test_keyspace.tbl0 WHERE pk=? AND ck>=? AND ck<?;",
                                                       ConsistencyLevel.ALL, pk, 1L, 3L));
         }
+    }
+
+    @Test
+    public void testUnrepairedTombstoneOnRowCacheHit() throws Throwable
+    {
+        try (Cluster cluster = init(Cluster.build(2).withConfig(c -> c.set("row_cache_size", "1MiB")).start()))
+        {
+            for (String table : new String[]{ "t", "t2" })
+                cluster.schemaChange(withKeyspace("CREATE TABLE %s." + table + " (k int, c int, v text, PRIMARY KEY (k, c)) WITH gc_grace_seconds = 0 " +
+                                                  "AND caching = {'keys': 'ALL', 'rows_per_partition': 'ALL'} " +
+                                                  "AND compaction = {'class': 'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones': true}"));
+            for (int i = 1; i <= 2; i++)
+                cluster.get(i).runOnInstance(() -> open(KEYSPACE).getColumnFamilyStore("t2").disableAutoCompaction());
+            // t: a row deleted on node 1 only; t2: a row deleted on both nodes
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.t (k, c, v) VALUES (1, 1, 'live') USING TIMESTAMP 1"), ALL);
+            cluster.get(1).executeInternal(withKeyspace("DELETE FROM %s.t USING TIMESTAMP 2 WHERE k = 1 AND c = 1"));
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.t2 (k, c, v) VALUES (1, 1, 'live') USING TIMESTAMP 1"), ALL);
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.t2 (k, c, v) VALUES (1, 2, 'live') USING TIMESTAMP 1"), ALL);
+            cluster.coordinator(1).execute(withKeyspace("DELETE FROM %s.t2 USING TIMESTAMP 2 WHERE k = 1 AND c = 1"), ALL);
+            cluster.get(1).flush(KEYSPACE);
+            cluster.get(2).flush(KEYSPACE);
+            Thread.sleep(2000);
+
+            // node 1 caches the partition, and the unrepaired row deletion shadows the row of node 2
+            assertRows(cluster.get(1).executeInternal(withKeyspace("SELECT * FROM %s.t WHERE k = 1")));
+            long hits = rowCacheHits(cluster.get(1), "t");
+            assertRows(cluster.coordinator(1).execute(withKeyspace("SELECT * FROM %s.t WHERE k = 1"), ALL));
+            Assert.assertTrue(rowCacheHits(cluster.get(1), "t") > hits);
+            assertRows(cluster.get(2).executeInternal(withKeyspace("SELECT * FROM %s.t WHERE k = 1")));
+
+            // node 1 caches the partition while its row deletion is unrepaired, then both replicas repair the deletion
+            // and compaction purges it
+            assertRows(cluster.get(1).executeInternal(withKeyspace("SELECT k, c FROM %s.t2 WHERE k = 1")), row(1, 2));
+            for (int i = 1; i <= 2; i++)
+                markRepairedAndCompact(cluster.get(i), "t2");
+            long blockingReadRepairs = blockingReadRepairs(cluster.get(1));
+            hits = rowCacheHits(cluster.get(1), "t2");
+            assertRows(cluster.coordinator(1).execute(withKeyspace("SELECT k, c FROM %s.t2 WHERE k = 1"), ALL), row(1, 2));
+            Assert.assertTrue(rowCacheHits(cluster.get(1), "t2") > hits);
+            // node 1 answers from its cached partition as the replica without the deletion does
+            Assert.assertEquals(blockingReadRepairs, blockingReadRepairs(cluster.get(1)));
+        }
+    }
+
+    private static void markRepairedAndCompact(IInvokableInstance instance, String table)
+    {
+        instance.runOnInstance(() -> {
+            ColumnFamilyStore cfs = open(KEYSPACE).getColumnFamilyStore(table);
+            for (SSTableReader sstable : cfs.getLiveSSTables())
+            {
+                if (sstable.isRepaired())
+                    continue;
+                try
+                {
+                    sstable.descriptor.getMetadataSerializer().mutateRepairMetadata(sstable.descriptor, currentTimeMillis(), null, false);
+                    sstable.reloadSSTableMetadata();
+                }
+                catch (IOException e)
+                {
+                    throw new UncheckedIOException(e);
+                }
+                cfs.getTracker().notifySSTableRepairedStatusChanged(Collections.singleton(sstable));
+            }
+            cfs.forceMajorCompaction();
+        });
+    }
+
+    private static long blockingReadRepairs(IInvokableInstance instance)
+    {
+        return instance.callOnInstance(() -> ReadRepairMetrics.repairedBlocking.getCount());
+    }
+
+    private static long rowCacheHits(IInvokableInstance instance, String table)
+    {
+        return instance.callOnInstance(() -> open(KEYSPACE).getColumnFamilyStore(table).metric.rowCacheHit.getCount());
     }
 
     public static class RRHelper
