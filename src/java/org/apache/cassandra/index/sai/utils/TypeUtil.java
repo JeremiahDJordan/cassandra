@@ -314,17 +314,14 @@ public class TypeUtil
     /**
      * This is used for value comparison in post-filtering - {@link Expression#isSatisfiedBy(ByteBuffer)}.
      *
-     * This allows types to decide whether they should be compared based on their encoded value or their
-     * raw value. At present only {@link InetAddressType} values are compared by their encoded values to
-     * allow for ipv4 -> ipv6 equivalency in searches.
+     * Values are compared as the column type compares them, so an IPv4 address and its IPv4-mapped IPv6 address,
+     * which have the same index term, are different values (see {@link Expression#searchedRanges()}).
      */
     public static int comparePostFilter(Expression.Value requestedValue, Expression.Value columnValue, AbstractType<?> type)
     {
-        if (isInetAddress(type))
-            return compareInet(requestedValue.encoded, columnValue.encoded);
-        // varint and decimal values are indexed in their non-reversed form, and Expression doesn't swap their bounds
-        // on DESC clustering columns (see #isIndexedUnreversed), so they must be compared with the base type
-        else if (isBigInteger(type) || isBigDecimal(type))
+        // inet, varint and decimal values are indexed in their non-reversed form, and Expression doesn't swap their
+        // bounds on DESC clustering columns (see #isIndexedUnreversed), so they must be compared with the base type
+        if (isIndexedUnreversed(type))
             return baseType(type).compare(requestedValue.raw, columnValue.raw);
         // Override comparisons for frozen collections
         else if (isFrozen(type))
@@ -627,7 +624,7 @@ public class TypeUtil
     /**
      * Returns <code>true</code> if given {@link AbstractType} is {@link InetAddressType}
      */
-    private static boolean isInetAddress(AbstractType<?> type)
+    public static boolean isInetAddress(AbstractType<?> type)
     {
         type = baseType(type);
         return type instanceof InetAddressType;
