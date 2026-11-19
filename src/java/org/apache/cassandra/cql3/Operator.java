@@ -613,4 +613,14 @@ public enum Operator
     {
         return this == IN;
     }
+
+    /**
+     * Checks if only an index can evaluate this operator: ANN, BM25, ORDER BY and the analyzer match operator, whose
+     * {@link #isSatisfiedBy} throws.
+     * @return {@code true} if a filter with this operator can't be applied without an index, {@code false} otherwise.
+     */
+    public boolean requiresIndex()
+    {
+        return this == ANN || this == BM25 || this == ORDER_BY_ASC || this == ORDER_BY_DESC || this == ANALYZER_MATCHES;
+    }
 }
