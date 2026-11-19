@@ -476,8 +476,8 @@ public class IndexContext
     }
 
     // Returns an iterator for NEQ, NOT_CONTAINS_KEY, NOT_CONTAINS_VALUE, which
-    // 1. Either includes everything if the column type values can be truncated and
-    // thus the keys cannot be matched precisely,
+    // 1. Either includes everything if the column type values can be truncated, or are inet addresses (an IPv4
+    // address and its IPv4-mapped IPv6 address have the same index term), and thus the keys cannot be matched precisely,
     // 2. or includes everything minus the keys matching the expression
     // if the column type values cannot be truncated, i.e., matching the keys is always precise.
     // (not matching precisely will lead to false negatives)
@@ -494,6 +494,7 @@ public class IndexContext
     {
         KeyRangeIterator allKeys = scanMemtable(keyRange, memtables);
         if (TypeUtil.supportsRounding(expression.validator)
+            || TypeUtil.isInetAddress(expression.validator)
             || !version.onDiskFormat().indexFeatureSet().isRowAware()
             || expression.hasUnindexedEmptyValue())
         {

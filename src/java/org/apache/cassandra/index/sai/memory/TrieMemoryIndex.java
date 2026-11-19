@@ -816,7 +816,7 @@ public class TrieMemoryIndex extends MemoryIndex
             case NOT_EQ:
             case NOT_CONTAINS_KEY:
             case NOT_CONTAINS_VALUE:
-                if (TypeUtil.supportsRounding(expression.validator))
+                if (TypeUtil.supportsRounding(expression.validator) || TypeUtil.isInetAddress(expression.validator))
                     return Memtable.estimateRowCount(memtable);
                 else
                     // need to clamp at 0, because row count is imprecise

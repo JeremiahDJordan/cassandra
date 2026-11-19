@@ -634,7 +634,8 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * If the column type is truncatable, e.g., BigInteger or BigDecimal,
      * then it returns a full index scan, since the ranges might result
      * in false negatives when a truncated value is equivalent to
-     * the value to exclude.
+     * the value to exclude. So is an inet inequality, whose two ranges overlap in the order of the index
+     * terms (see {@link Expression#searchedRanges()}).
      * @param predicate Inequality expression with indexContext
      * @return A plan on the index, which can also result false positives.
      */
@@ -642,7 +643,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     {
         assert predicate.getOp()== Expression.Op.NOT_EQ : "Only inequality predicate is expected";
 
-        if (TypeUtil.supportsRounding(predicate.validator))
+        if (TypeUtil.supportsRounding(predicate.validator) || TypeUtil.isInetAddress(predicate.validator))
             return planFactory.fullIndexScan(predicate.context);
         else
         {
@@ -1129,11 +1130,14 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         var queryView = getQueryView(predicate.context);
 
         long rowCount = 0;
-        for (MemtableIndex index : queryView.memtableIndexes)
-            rowCount += index.estimateMatchingRowsCount(predicate);
+        for (Expression range : predicate.searchedRanges())
+        {
+            for (MemtableIndex index : queryView.memtableIndexes)
+                rowCount += index.estimateMatchingRowsCount(range);
 
-        for (SSTableIndex index : queryView.sstableIndexes)
-            rowCount += index.estimateMatchingRowsCount(predicate);
+            for (SSTableIndex index : queryView.sstableIndexes)
+                rowCount += index.estimateMatchingRowsCount(range);
+        }
 
         return rowCount;
     }
