@@ -1535,9 +1535,9 @@ public class RowFilter
 
         private boolean contains(TableMetadata metadata, DecoratedKey partitionKey, Row row, long nowInSec)
         {
-            assert column.type.isCollection();
+            assert column.type.unwrap().isCollection();
 
-            CollectionType<?> type = (CollectionType<?>) column.type;
+            CollectionType<?> type = (CollectionType<?>) column.type.unwrap();
 
             if (column.isComplex())
             {
@@ -1574,8 +1574,8 @@ public class RowFilter
 
         private boolean containsKey(TableMetadata metadata, DecoratedKey partitionKey, Row row, long nowInSec)
         {
-            assert column.type.isCollection() && column.type instanceof MapType;
-            MapType<?, ?> mapType = (MapType<?, ?>) column.type;
+            assert column.type.unwrap() instanceof MapType;
+            MapType<?, ?> mapType = (MapType<?, ?>) column.type.unwrap();
             if (column.isComplex())
             {
                 if (analyzer != null)
@@ -1609,14 +1609,14 @@ public class RowFilter
             {
                 case CONTAINS:
                 case NOT_CONTAINS:
-                    assert type instanceof CollectionType;
-                    CollectionType<?> ct = (CollectionType<?>)type;
+                    assert type.unwrap() instanceof CollectionType;
+                    CollectionType<?> ct = (CollectionType<?>)type.unwrap();
                     type = ct.kind == CollectionType.Kind.SET ? ct.nameComparator() : ct.valueComparator();
                     break;
                 case CONTAINS_KEY:
                 case NOT_CONTAINS_KEY:
-                    assert type instanceof MapType;
-                    type = ((MapType<?, ?>)type).nameComparator();
+                    assert type.unwrap() instanceof MapType;
+                    type = ((MapType<?, ?>)type.unwrap()).nameComparator();
                     break;
                 case IN:
                 case NOT_IN:
