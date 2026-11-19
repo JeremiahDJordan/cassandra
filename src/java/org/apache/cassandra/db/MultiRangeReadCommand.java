@@ -32,6 +32,7 @@ import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.marshal.Redaction;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
@@ -319,6 +320,13 @@ public class MultiRangeReadCommand extends ReadCommand implements MultiPartition
                                                              .map(this::toPartitionRangeReadCommand)
                                                              .map(command -> command.queryStorage(cfs, executionController))
                                                              .collect(Collectors.toList()));
+    }
+
+    @Override
+    protected void updateMinOldestUnrepairedTombstone(ColumnFamilyStore cfs, ReadExecutionController controller)
+    {
+        for (DataRange dataRange : dataRanges)
+            controller.updateMinOldestUnrepairedTombstone(cfs.select(View.selectLive(dataRange.keyRange())));
     }
 
     @Override
