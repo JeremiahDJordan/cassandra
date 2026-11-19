@@ -61,5 +61,28 @@ class TestSummaryTotals(unittest.TestCase):
                 self.assertEqual([table.find('th').get_text(strip=True) for table in tables], ['suite-0', 'Suites'])
 
 
+class TestSummaryText(unittest.TestCase):
+    def test_the_input_text_stays_escaped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            suite = ET.Element('testsuite', name='suite')
+            test = ET.SubElement(suite, 'testcase', classname='ExampleTest', name='failed', time='1')
+            ET.SubElement(test, 'failure', message='expected:<1> but was:<2>')
+            ET.ElementTree(suite).write(directory / 'suite.xml')
+            output = directory / 'ci_summary.html'
+            output.write_text('<html><head></head><body><h1>CI Summary</h1>'
+                              '<ul><li>profile_custom_regexp: (?&lt;step&gt;stress-test)|a&amp;b</li></ul></body></html>')
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name('ci_parser.py').resolve()),
+                                     '--input', str(directory), '--output', str(output), '--mute'],
+                                    cwd=directory, capture_output=True, text=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            text = output.read_text()
+            self.assertIn('profile_custom_regexp: (?&lt;step&gt;stress-test)|a&amp;b', text)
+            report = BeautifulSoup(text, 'html.parser')
+            self.assertIn('(?<step>stress-test)|a&b', report.get_text())
+            # what ci_parser.py adds is markup, written as it was
+            self.assertEqual(['suite', 'Suites'], [t.find('th').get_text(strip=True) for t in report.find_all('table')[1:]])
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -35,6 +35,8 @@ from logging_helper import build_logger, mute_logging, CustomLogger
 
 try:
     from bs4 import BeautifulSoup
+    from bs4.dammit import EntitySubstitution
+    from bs4.formatter import HTMLFormatter
 except ImportError:
     print('bs4 not installed; make sure you have bs4 in your active python env.')
     exit(1)
@@ -201,6 +203,19 @@ def process_test_cases(suite: JUnitTestSuite, file_name: str, root) -> int:
     return test_count
 
 
+class EscapeInputText(HTMLFormatter):
+    """
+    Writes the text the input file had escaped, as it was read, and every other string as it is: the strings
+    create_summary_file() adds hold markup.
+    """
+    def __init__(self, input_text):
+        super().__init__(entity_substitution=None)
+        self.input_text = input_text
+
+    def substitute(self, ns):
+        return EntitySubstitution.substitute_xml(ns) if id(ns) in self.input_text else ns
+
+
 def create_summary_file(test_suites: Dict[str, JUnitTestSuite], xml_files, output: str) -> None:
     """
     Will create a table with all failed tests in it organized by sorted suite name.
@@ -215,6 +230,7 @@ def create_summary_file(test_suites: Dict[str, JUnitTestSuite], xml_files, outpu
 
     with open(output, 'r') as file:
         soup = BeautifulSoup(file, 'html.parser')
+    input_text = {id(text) for text in soup.find_all(string=True)}
 
     failures_list_tag = soup.new_tag("div")
     failures_list_tag.string = '<br/><br/>[Test Failures]<br/><br/>'
@@ -276,10 +292,11 @@ def create_summary_file(test_suites: Dict[str, JUnitTestSuite], xml_files, outpu
     # Only backup the output file if we've gotten this far
     shutil.copyfile(output, output + '.bak')
 
-    # We write w/formatter set to None as invalid char above our insertion in the input file we're modifying (from other
-    # tests, test output, etc) can cause the parser to get very confused and do Bad Things.
+    # We write w/o entity substitution as invalid char above our insertion in the input file we're modifying (from other
+    # tests, test output, etc) can cause the parser to get very confused and do Bad Things.  The input file's own text
+    # was parsed from escaped html, so it is escaped again.
     with open(output, 'w') as file:
-        file.write(soup.prettify(formatter=None))
+        file.write(soup.prettify(formatter=EscapeInputText(input_text)))
     logger.progress(f'Test failure details appended to file: {output}')
 
 

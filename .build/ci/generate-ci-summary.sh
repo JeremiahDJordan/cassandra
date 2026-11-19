@@ -37,6 +37,11 @@ command -v ant >/dev/null 2>&1 || { echo >&2 "ant needs to be installed"; exit 1
 [ -f "${CASSANDRA_DIR}/build.xml" ] || { echo >&2 "${CASSANDRA_DIR}/build.xml must exist"; exit 1; }
 [ -d "${DIST_DIR}" ] || { mkdir -p "${DIST_DIR}" ; }
 
+# a value as html text
+html() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+}
+
 # generate CI summary file
 cd ${DIST_DIR}/
 
@@ -60,7 +65,7 @@ cat >${DIST_DIR}/ci_summary.html <<EOL
   <li>profile_custom_regexp: ${PROFILE_CUSTOM_REGEXP}</li>
   <li>architecture: ${ARCHITECTURE}</li>
   <li>jdk: ${JDK}</li>
-  <li>dtest_repository: {DTEST_REPOSITORY}</li>
+  <li>dtest_repository: $(html "${DTEST_REPOSITORY}")</li>
   <li>dtest_branch: ${DTEST_BRANCH}</li>
 </ul>
 </body>

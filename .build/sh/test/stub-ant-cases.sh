@@ -453,4 +453,42 @@ expect_rc "generate-ci-summary.sh writes the summary" 0
 run_case cat "${summary_dist}/ci_summary.html"
 expect_out "generate-ci-summary.sh names the commit" "<li>sha:  ${summary_sha}</li>"
 
+reset_stub
+run_case env CASSANDRA_DIR="${summary_dir}" DIST_DIR="${summary_dist}" DTEST_REPOSITORY=https://dtest.example/repo \
+  sh "${summary_dir}/.build/ci/generate-ci-summary.sh"
+expect_rc "generate-ci-summary.sh writes the summary with a dtest repository" 0
+run_case cat "${summary_dist}/ci_summary.html"
+expect_out "generate-ci-summary.sh names the dtest repository" "<li>dtest_repository: https://dtest.example/repo</li>"
+
+# the published summary shows the value as given: escaped once, whether or not ci_parser.py, which rewrites the
+# file, ran.  Here the stub ci_parser.py leaves the file as generate-ci-summary.sh wrote it
+summary_odd_value='https://dtest.example/?a=1&b=<2>'
+summary_odd_html='https://dtest.example/?a=1&amp;b=&lt;2&gt;'
+reset_stub
+run_case env CASSANDRA_DIR="${summary_dir}" DIST_DIR="${summary_dist}" DTEST_REPOSITORY="${summary_odd_value}" \
+  sh "${summary_dir}/.build/ci/generate-ci-summary.sh"
+run_case cat "${summary_dist}/ci_summary.html"
+expect_out "generate-ci-summary.sh escapes the dtest repository" "<li>dtest_repository: ${summary_odd_html}</li>"
+
+if python3 -c 'import bs4, jinja2' 2>/dev/null ; then
+  # and through the real ci_parser.py
+  summary_parsed="${STUB_DIR}/summary-parsed"
+  cp -r "${summary_dir}" "${summary_parsed}"
+  cp "${CASSANDRA_DIR}/.build/ci/ci_parser.py" "${CASSANDRA_DIR}/.build/ci/junit_helpers.py" \
+     "${CASSANDRA_DIR}/.build/ci/logging_helper.py" "${summary_parsed}/.build/ci/"
+  mkdir -p "${summary_dist}/test/output/test"
+  printf '<testsuite name="a.B"><testcase classname="a.B" name="c" time="1"/></testsuite>\n' \
+    > "${summary_dist}/test/output/test/TEST-a.B.xml"
+  reset_stub
+  run_case env CASSANDRA_DIR="${summary_parsed}" DIST_DIR="${summary_dist}" DTEST_REPOSITORY="${summary_odd_value}" \
+    sh "${summary_parsed}/.build/ci/generate-ci-summary.sh"
+  expect_rc "generate-ci-summary.sh writes the summary through ci_parser.py" 0
+  run_case cat "${summary_dist}/ci_summary.html"
+  expect_out "ci_parser.py keeps the dtest repository escaped" "dtest_repository: ${summary_odd_html}"
+  expect_out "ci_parser.py appends its totals" "[Totals]"
+  rm -rf "${summary_dist}/test"
+else
+  echo "skip  ci_summary.html through ci_parser.py: python3 has no bs4 and jinja2 (pip install -r .build/ci/requirements.txt)"
+fi
+
 report stub-ant
