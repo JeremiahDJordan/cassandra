@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -910,6 +911,21 @@ public class SAITester extends CQLTester
     protected void rebuildIndexes(String... indexes)
     {
         ColumnFamilyStore.rebuildSecondaryIndex(KEYSPACE, currentTable(), indexes);
+    }
+
+    protected static CompletableFuture<Throwable> rebuildAsync(ColumnFamilyStore cfs, String index)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(index));
+                return null;
+            }
+            catch (Throwable t)
+            {
+                return t;
+            }
+        });
     }
 
     protected void reloadSSTableIndex()
