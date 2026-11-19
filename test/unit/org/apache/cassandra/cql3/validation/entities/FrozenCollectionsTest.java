@@ -1345,6 +1345,27 @@ public class FrozenCollectionsTest extends CQLTester
         assertRows(execute("SELECT c FROM %s WHERE k=0 AND c={1:2, 3:4}"), row(map(1, 2, 3, 4)));
     }
 
+    /**
+     * Test parsing of the empty literal {} when the column type is a reversed map or set
+     */
+    @Test
+    public void testLiteralReversedEmptyMap() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<map<int, int>>, c frozen<set<int>>, PRIMARY KEY (a, b, c)) " +
+                    "WITH CLUSTERING ORDER BY (b DESC, c DESC)");
+
+        execute("INSERT INTO %s (a, b, c) VALUES (0, {}, {})");
+        execute("INSERT INTO %s (a, b, c) VALUES (0, {1: 10}, {1})");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT * FROM %s WHERE a = 0"), row(0, map(1, 10), set(1)), row(0, map(), set()));
+            assertRows(execute("SELECT * FROM %s WHERE a = 0 AND b = {}"), row(0, map(), set()));
+            assertRows(execute("SELECT * FROM %s WHERE a = 0 AND b = {} AND c = {}"), row(0, map(), set()));
+            assertRows(execute("SELECT * FROM %s WHERE a = 0 AND b IN ({}, {2: 20})"), row(0, map(), set()));
+            assertRows(execute("SELECT * FROM %s WHERE a = 0 AND b = {1: 10} AND c IN ({}, {1})"), row(0, map(1, 10), set(1)));
+        });
+    }
+
     private static String clean(String classname)
     {
         return StringUtils.remove(classname, "org.apache.cassandra.db.marshal.");
