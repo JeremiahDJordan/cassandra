@@ -509,6 +509,9 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
             acquireWriteLock();
             try
             {
+                // The stats give the minimum local deletion time, which goes down before the update is visible, for the
+                // reads that purge the tombstones older than it
+                stats = stats.mergeWith(update.stats());
                 try
                 {
                     indexer.start();
@@ -542,7 +545,6 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
                     updateCurrentOperations(update.operationCount());
 
                     columns = columns.mergeTo(update.columns());
-                    stats = stats.mergeWith(update.stats());
                 }
             }
             finally

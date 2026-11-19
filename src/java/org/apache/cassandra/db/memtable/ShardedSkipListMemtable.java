@@ -402,11 +402,12 @@ public class ShardedSkipListMemtable extends AbstractShardedMemtable
                 }
             }
 
-            BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
-            updateMin(minTimestamp, update.stats().minTimestamp);
-            // EncodingStats uses a synthetic epoch for no local deletion time
+            // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the update
+            // is visible, for the reads that purge the tombstones older than it
             if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
                 updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
+            BTreePartitionUpdater updater = previous.addAll(BTreePartitionUpdate.asBTreeUpdate(update), cloner, opGroup, indexer);
+            updateMin(minTimestamp, update.stats().minTimestamp);
             liveDataSize.addAndGet(initialSize + updater.dataSize);
             columnsCollector.update(update.columns());
             statsCollector.update(update.stats());

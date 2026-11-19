@@ -368,7 +368,7 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
             {
                 UnfilteredPartitionIterator iter = memtable.partitionIterator(columnFilter(), dataRange(), readCountUpdater);
                 if (useMinLocalDeletionTime)
-                    controller.updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+                    controller.updateMinOldestUnrepairedTombstone(memtable, true);
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
             }
 
