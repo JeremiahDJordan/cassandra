@@ -22,6 +22,7 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -74,6 +75,7 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
     // to select key range using Token.KeyBound. However put() ensures that we
     // actually only store DecoratedKey.
     private final ConcurrentNavigableMap<PartitionPosition, AtomicBTreePartition> partitions = new ConcurrentSkipListMap<>();
+    private final AtomicInteger minLocalDeletionTime = new AtomicInteger(Integer.MAX_VALUE);
 
     private final AtomicLong liveDataSize = new AtomicLong(0);
 
@@ -154,6 +156,12 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
         return partitions.isEmpty();
     }
 
+    @Override
+    public int getMinLocalDeletionTime()
+    {
+        return minLocalDeletionTime.get();
+    }
+
     /**
      * Should only be called by ColumnFamilyStore.apply via Keyspace.apply, which supplies the appropriate
      * OpOrdering.
@@ -193,6 +201,9 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
         {
             // addAll can fail after applying the update (in Indexer#finish), so record its columns and stats anyway
             updateMin(minTimestamp, previous.stats().minTimestamp);
+            // EncodingStats uses a synthetic epoch for no local deletion time
+            if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+                minLocalDeletionTime.accumulateAndGet(update.stats().minLocalDeletionTime, Math::min);
             columnsCollector.update(update.columns());
             statsCollector.update(update.stats());
             currentOperations.addAndGet(update.operationCount());

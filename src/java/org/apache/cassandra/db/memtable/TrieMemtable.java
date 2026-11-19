@@ -330,6 +330,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         return min != EncodingStats.NO_STATS.minTimestamp ? min : NO_MIN_TIMESTAMP;
     }
 
+    @Override
     public int getMinLocalDeletionTime()
     {
         int min = Integer.MAX_VALUE;
