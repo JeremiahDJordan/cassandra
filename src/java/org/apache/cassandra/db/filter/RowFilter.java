@@ -99,6 +99,25 @@ public class RowFilter
     }
 
     /**
+     * @return {@code true} if this filter has an expression that only an index can evaluate (see
+     * {@link Expression#requiresIndex()}), {@code false} otherwise.
+     */
+    public boolean requiresIndex()
+    {
+        return root.requiresIndex(false);
+    }
+
+    /**
+     * @return {@code true} if this filter has an expression with an operator that only an index can evaluate (see
+     * {@link Operator#requiresIndex()}), {@code false} otherwise. Unlike {@link #requiresIndex()}, this includes an
+     * analyzer match with an analyzer, which the filter could evaluate.
+     */
+    public boolean hasIndexOnlyOperator()
+    {
+        return root.requiresIndex(true);
+    }
+
+    /**
      * @return {@code true} if this filter contains any expression with an ANN operator, {@code false} otherwise.
      */
     public boolean hasANN()
@@ -624,6 +643,21 @@ public class RowFilter
             return expressions;
         }
 
+        private boolean requiresIndex(boolean ignoreAnalyzers)
+        {
+            for (Expression expression : expressions)
+            {
+                if (ignoreAnalyzers ? expression.hasIndexOnlyOperator() : expression.requiresIndex())
+                    return true;
+            }
+            for (FilterElement child : children)
+            {
+                if (child.requiresIndex(ignoreAnalyzers))
+                    return true;
+            }
+            return false;
+        }
+
         private List<Expression> traversedExpressions()
         {
             List<Expression> allExpressions = new ArrayList<>(expressions);
@@ -933,6 +967,25 @@ public class RowFilter
         public Index.Analyzer analyzer()
         {
             return null;
+        }
+
+        /**
+         * Whether only an index can evaluate this expression (see {@link Operator#requiresIndex()}). The analyzer match
+         * operator can be evaluated with the analyzer this expression was given, the one of this node's index on the
+         * column.
+         */
+        public boolean requiresIndex()
+        {
+            return operator.requiresIndex() && !(operator == Operator.ANALYZER_MATCHES && analyzer() != null);
+        }
+
+        /**
+         * Whether this expression has an operator that only an index can evaluate (see {@link Operator#requiresIndex()}),
+         * with or without an analyzer.
+         */
+        public boolean hasIndexOnlyOperator()
+        {
+            return operator.requiresIndex();
         }
 
         public boolean isOrderingExpression()
@@ -1911,6 +1964,19 @@ public class RowFilter
         protected UserExpression(ColumnMetadata column, Operator operator, ByteBuffer value)
         {
             super(column, operator, value);
+        }
+
+        // a user expression evaluates itself, whatever its operator
+        @Override
+        public boolean requiresIndex()
+        {
+            return false;
+        }
+
+        @Override
+        public boolean hasIndexOnlyOperator()
+        {
+            return false;
         }
 
         @Override

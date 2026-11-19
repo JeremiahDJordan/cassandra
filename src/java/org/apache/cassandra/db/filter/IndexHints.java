@@ -29,10 +29,13 @@ import javax.annotation.Nullable;
 
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Sets;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.QualifiedName;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.UnknownIndexException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -52,6 +55,8 @@ import static java.lang.String.format;
  */
 public class IndexHints
 {
+    private static final Logger logger = LoggerFactory.getLogger(IndexHints.class);
+
     public static final String CONFLICTING_INDEXES_ERROR = "Indexes cannot be both included and excluded: ";
     public static final String WRONG_KEYSPACE_ERROR = "Index %s is not in the same keyspace as the queried table.";
     public static final String MISSING_INDEX_ERROR = "Table %s doesn't have an index named %s";
@@ -117,10 +122,22 @@ public class IndexHints
      */
     public final Set<IndexMetadata> excluded;
 
+    /**
+     * Whether the included indexes, as this node decoded them from a read message (also one it sent to itself), had an
+     * index that this node doesn't know or hasn't registered.
+     */
+    public final boolean includesUnknownIndex;
+
     private IndexHints(Set<IndexMetadata> included, Set<IndexMetadata> excluded)
+    {
+        this(included, excluded, false);
+    }
+
+    private IndexHints(Set<IndexMetadata> included, Set<IndexMetadata> excluded, boolean includesUnknownIndex)
     {
         this.included = included;
         this.excluded = excluded;
+        this.includesUnknownIndex = includesUnknownIndex;
     }
 
     /**
@@ -572,10 +589,23 @@ public class IndexHints
                                       "new types of hint that are not supported by this node.");
 
             // read included and excluded indexes
-            Set<IndexMetadata> included = hasIncluded(flags) ? indexSetSerializer.deserialize(in, version, table) : Collections.emptySet();
-            Set<IndexMetadata> excluded = hasExcluded(flags) ? indexSetSerializer.deserialize(in, version, table) : Collections.emptySet();
+            Set<IndexMetadata> included = new HashSet<>();
+            Set<IndexMetadata> excluded = new HashSet<>();
+            boolean knowsIncluded = !hasIncluded(flags) || indexSetSerializer.deserialize(in, version, table, included);
+            if (!included.isEmpty())
+            {
+                // an index of the schema that isn't registered yet can't serve the read either
+                IndexRegistry registry = IndexRegistry.obtain(table);
+                for (IndexMetadata index : included)
+                {
+                    if (registry.getIndex(index) == null)
+                        knowsIncluded = false;
+                }
+            }
+            if (hasExcluded(flags))
+                indexSetSerializer.deserialize(in, version, table, excluded);
 
-            return IndexHints.create(included, excluded);
+            return knowsIncluded ? IndexHints.create(included, excluded) : new IndexHints(included, excluded, true);
         }
 
         public long serializedSize(IndexHints hints, int version)
@@ -640,16 +670,33 @@ public class IndexHints
                 IndexMetadata.serializer.serialize(index, out, version);
         }
 
-        private Set<IndexMetadata> deserialize(DataInputPlus in, int version, TableMetadata table) throws IOException
+        /**
+         * Adds the deserialized indexes that this node knows to the given set.
+         *
+         * @return {@code true} if this node knows all the deserialized indexes, {@code false} otherwise
+         */
+        private boolean deserialize(DataInputPlus in, int version, TableMetadata table, Set<IndexMetadata> indexes) throws IOException
         {
+            boolean knowsAll = true;
             int n = (int) in.readVInt();
-            Set<IndexMetadata> indexes = new HashSet<>(n);
             for (short i = 0; i < n; i++)
             {
-                IndexMetadata metadata = IndexMetadata.serializer.deserialize(in, version, table);
-                indexes.add(metadata);
+                try
+                {
+                    indexes.add(IndexMetadata.serializer.deserialize(in, version, table));
+                }
+                catch (UnknownIndexException e)
+                {
+                    knowsAll = false;
+                    logger.info("Couldn't find a defined index on {}.{} with the id {}. " +
+                                "If an index was just created, this is likely due to the schema not " +
+                                "being fully propagated. A read that includes this index will fail as index " +
+                                "not available, and a read that excludes it will ignore that hint. " +
+                                "Please wait for schema agreement after index creation.",
+                                table.keyspace, table.name, e.indexId);
+                }
             }
-            return indexes;
+            return knowsAll;
         }
 
         private long serializedSize(Set<IndexMetadata> indexes, int version)
