@@ -508,6 +508,7 @@ public class Tracker
             // sstable may be null if we flushed batchlog and nothing needed to be retained
             // if it's null, we don't care what state the cfstore is in, we just replace it and continue
             apply(View.replaceFlushed(memtable, null, maybeGetSSTableIntervalTreeLatencyMetrics()));
+            notifyDiscarded(memtable);
             return;
         }
 
