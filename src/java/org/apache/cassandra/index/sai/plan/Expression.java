@@ -59,6 +59,10 @@ public class Expression
 {
     private static final Logger logger = LoggerFactory.getLogger(Expression.class);
 
+    private static final int IPV4_ADDRESS_SIZE = 4;
+    private static final byte[] IPV4_MIN = new byte[]{ 0, 0, 0, 0 };
+    private static final byte[] IPV4_MAX = new byte[]{ -1, -1, -1, -1 };
+
     public enum Op
     {
         EQ, MATCH, PREFIX, NOT_EQ, RANGE,
@@ -877,6 +881,117 @@ public class Expression
         result.upperInclusive = upperInclusive;
         result.exclusions.addAll(exclusions);
         return result;
+    }
+
+    /**
+     * Returns the expressions to search the index with for this expression: this expression, except for a range on an
+     * inet column. The index orders the addresses in their 16-byte form, in which an IPv4 address is its IPv4-mapped
+     * IPv6 address, while the column type orders the 4-byte and the 16-byte values by their bytes. The 4-byte values
+     * and the 16-byte values of a range are each a range of index terms, which hold the values of the other form with
+     * the same term too, for post-filtering to reject.
+     *
+     * @return the ranges of index terms that hold the values this expression matches, none if it matches nothing
+     */
+    public List<Expression> searchedRanges()
+    {
+        if (operation != Op.RANGE || !TypeUtil.isInetAddress(validator))
+            return Collections.singletonList(this);
+
+        assert !reversed : "inet is indexed unreversed";
+        Expression ipv4 = inetRange(IPV4_ADDRESS_SIZE);
+        Expression ipv6 = inetRange(TypeUtil.INET_ADDRESS_SIZE);
+        if (ipv4 == null)
+            return ipv6 == null ? Collections.emptyList() : Collections.singletonList(ipv6);
+        if (ipv6 == null)
+            return Collections.singletonList(ipv4);
+
+        // the terms of the IPv4 addresses are contiguous, and often in the range of the 16-byte values
+        if (isBelow(ipv6.upper, ipv4.lower) || isBelow(ipv4.upper, ipv6.lower))
+            return List.of(ipv4, ipv6);
+        return Collections.singletonList(inetRange(lowest(ipv4.lower, ipv6.lower), highest(ipv4.upper, ipv6.upper)));
+    }
+
+    /**
+     * Returns the range of this inet range's values of the given size, or {@code null} if it has none.
+     */
+    private Expression inetRange(int size)
+    {
+        Bound lowerBound = inetBound(lower, size, true);
+        Bound upperBound = inetBound(upper, size, false);
+        if (lowerBound != null && upperBound != null)
+        {
+            int cmp = ByteBufferUtil.compareUnsigned(lowerBound.value.raw, upperBound.value.raw);
+            if (cmp > 0 || (cmp == 0 && !(lowerBound.inclusive && upperBound.inclusive)))
+                return null;
+        }
+
+        return inetRange(lowerBound, upperBound);
+    }
+
+    private Expression inetRange(Bound lowerBound, Bound upperBound)
+    {
+        Expression result = new Expression(context);
+        result.operation = Op.RANGE;
+        result.lower = lowerBound;
+        result.upper = upperBound;
+        result.lowerInclusive = lowerBound != null && lowerBound.inclusive;
+        result.upperInclusive = upperBound != null && upperBound.inclusive;
+        result.exclusions.addAll(exclusions);
+        return result;
+    }
+
+    /**
+     * Returns the bound of the values of the given size that is equivalent to the given bound in the column type's
+     * order, which sorts a value before the longer values that start with it.
+     */
+    private Bound inetBound(Bound bound, int size, boolean isLower)
+    {
+        // the 4-byte values are bounded by the smallest and greatest IPv4 addresses, so that their range of terms
+        // holds no other term
+        if (bound == null)
+            return size == IPV4_ADDRESS_SIZE ? new Bound(ByteBuffer.wrap(isLower ? IPV4_MIN : IPV4_MAX), validator, true) : null;
+
+        ByteBuffer value = bound.value.raw;
+        if (value.remaining() == size)
+            return bound;
+
+        ByteBuffer converted = ByteBuffer.allocate(size);
+        ByteBufferUtil.copyBytes(value, value.position(), converted, 0, IPV4_ADDRESS_SIZE);
+        // A 16-byte value sorts after the 4-byte values up to its first 4 bytes and before the greater ones, and a
+        // 4-byte value sorts before the 16-byte values that start with it and after the smaller ones.
+        return new Bound(converted, validator, size == IPV4_ADDRESS_SIZE ? !isLower : isLower);
+    }
+
+    /**
+     * Whether the terms up to the upper bound all sort before the terms from the lower bound.
+     */
+    private boolean isBelow(Bound upperBound, Bound lowerBound)
+    {
+        if (upperBound == null || lowerBound == null)
+            return false;
+        int cmp = compareTerms(upperBound, lowerBound);
+        return cmp < 0 || (cmp == 0 && !(upperBound.inclusive && lowerBound.inclusive));
+    }
+
+    private Bound lowest(Bound a, Bound b)
+    {
+        if (a == null || b == null)
+            return null;
+        int cmp = compareTerms(a, b);
+        return cmp < 0 || (cmp == 0 && a.inclusive) ? a : b;
+    }
+
+    private Bound highest(Bound a, Bound b)
+    {
+        if (a == null || b == null)
+            return null;
+        int cmp = compareTerms(a, b);
+        return cmp > 0 || (cmp == 0 && a.inclusive) ? a : b;
+    }
+
+    private int compareTerms(Bound a, Bound b)
+    {
+        return TypeUtil.compare(a.value.encoded, b.value.encoded, validator, context.version());
     }
 
     /**

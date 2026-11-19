@@ -19,29 +19,19 @@ package org.apache.cassandra.index.sai.cql;
 
 import java.net.InetAddress;
 import org.junit.Before;
-import org.junit.BeforeClass;
 import org.junit.Test;
 
-import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.cql.types.InetTest;
 
 /**
- * This is testing that we can query ipv4 addresses using ipv6 equivalent addresses.
+ * This is testing queries of ipv4 and ipv6 addresses, which are ordered by their bytes, as {@code InetAddressType} orders
+ * them. A CQL literal of an ipv4-mapped ipv6 address is the ipv4 address.
  * </p>
  * The remaining InetAddressType tests are now handled by {@link InetTest}
  */
 public class InetAddressTypeEquivalencyTest extends SAITester
 {
-    // TODO: Disables coordinator execution because we know SAI indexing for inet works differently than RowFilter,
-    //  which can wrongly discard rows in the coordinator. This is reported in CNDB-12978, and we should enable
-    //  distributed execution again once we have a fix.
-    @BeforeClass
-    public static void disableCoordinatorExecution()
-    {
-        CQLTester.disableCoordinatorExecution();
-    }
-
     @Before
     public void createTableAndIndex()
     {
@@ -96,43 +86,43 @@ public class InetAddressTypeEquivalencyTest extends SAITester
         // GT ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip > '127.0.0.1'"),
                 row(1, 3, InetAddress.getByName("127.0.0.2")),
-                row(1, 4, InetAddress.getByName("::ffff:7f00:3")),
-                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
+                row(1, 4, InetAddress.getByName("127.0.0.3")));
 
         // GT mapped-ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip > '::ffff:7f00:1'"),
                 row(1, 3, InetAddress.getByName("127.0.0.2")),
-                row(1, 4, InetAddress.getByName("::ffff:7f00:3")),
-                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
+                row(1, 4, InetAddress.getByName("127.0.0.3")));
 
         // GT ipv6 address
         assertRows(execute("SELECT * FROM %s WHERE ip > '2002:4559:1fe2::4559:1fe2'"),
+                row(1, 1, InetAddress.getByName("127.0.0.1")),
+                row(1, 2, InetAddress.getByName("127.0.0.1")),
+                row(1, 3, InetAddress.getByName("127.0.0.2")),
+                row(1, 4, InetAddress.getByName("127.0.0.3")),
                 row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
 
         // LT ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip < '127.0.0.3'"),
                 row(1, 1, InetAddress.getByName("127.0.0.1")),
                 row(1, 2, InetAddress.getByName("127.0.0.1")),
-                row(1, 3, InetAddress.getByName("127.0.0.2")));
+                row(1, 3, InetAddress.getByName("127.0.0.2")),
+                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
 
         // LT mapped-ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip < '::ffff:7f00:3'"),
                 row(1, 1, InetAddress.getByName("127.0.0.1")),
                 row(1, 2, InetAddress.getByName("127.0.0.1")),
-                row(1, 3, InetAddress.getByName("127.0.0.2")));
+                row(1, 3, InetAddress.getByName("127.0.0.2")),
+                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
 
         // LT ipv6 address
         assertRows(execute("SELECT * FROM %s WHERE ip < '2002:4559:1fe2::4559:1fe3'"),
-                row(1, 1, InetAddress.getByName("127.0.0.1")),
-                row(1, 2, InetAddress.getByName("127.0.0.1")),
-                row(1, 3, InetAddress.getByName("127.0.0.2")),
-                row(1, 4, InetAddress.getByName("::ffff:7f00:3")),
                 row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
                 row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
                 row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")));
@@ -140,43 +130,43 @@ public class InetAddressTypeEquivalencyTest extends SAITester
         // GE ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip >= '127.0.0.2'"),
                 row(1, 3, InetAddress.getByName("127.0.0.2")),
-                row(1, 4, InetAddress.getByName("::ffff:7f00:3")),
-                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
+                row(1, 4, InetAddress.getByName("127.0.0.3")));
 
         // GE mapped-ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip >= '::ffff:7f00:2'"),
                 row(1, 3, InetAddress.getByName("127.0.0.2")),
-                row(1, 4, InetAddress.getByName("::ffff:7f00:3")),
-                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
-                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
+                row(1, 4, InetAddress.getByName("127.0.0.3")));
 
         // GE ipv6 address
         assertRows(execute("SELECT * FROM %s WHERE ip >= '2002:4559:1fe2::4559:1fe3'"),
+                row(1, 1, InetAddress.getByName("127.0.0.1")),
+                row(1, 2, InetAddress.getByName("127.0.0.1")),
+                row(1, 3, InetAddress.getByName("127.0.0.2")),
+                row(1, 4, InetAddress.getByName("127.0.0.3")),
                 row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
 
         // LE ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip <= '127.0.0.2'"),
                 row(1, 1, InetAddress.getByName("127.0.0.1")),
                 row(1, 2, InetAddress.getByName("127.0.0.1")),
-                row(1, 3, InetAddress.getByName("127.0.0.2")));
+                row(1, 3, InetAddress.getByName("127.0.0.2")),
+                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
 
         // LE mapped-ipv4 address
         assertRows(execute("SELECT * FROM %s WHERE ip <= '::ffff:7f00:2'"),
                 row(1, 1, InetAddress.getByName("127.0.0.1")),
                 row(1, 2, InetAddress.getByName("127.0.0.1")),
-                row(1, 3, InetAddress.getByName("127.0.0.2")));
+                row(1, 3, InetAddress.getByName("127.0.0.2")),
+                row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
+                row(1, 8, InetAddress.getByName("2002:4559:1fe2::4559:1fe3")));
 
         // LE ipv6 address
         assertRows(execute("SELECT * FROM %s WHERE ip <= '2002:4559:1fe2::4559:1fe2'"),
-                row(1, 1, InetAddress.getByName("127.0.0.1")),
-                row(1, 2, InetAddress.getByName("127.0.0.1")),
-                row(1, 3, InetAddress.getByName("127.0.0.2")),
-                row(1, 4, InetAddress.getByName("::ffff:7f00:3")),
                 row(1, 5, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
                 row(1, 6, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")),
                 row(1, 7, InetAddress.getByName("2002:4559:1fe2::4559:1fe2")));

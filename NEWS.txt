@@ -454,6 +454,11 @@ Upgrading
       SAI files of Apache Cassandra 5.0, instead of failing with "skipTo skipped to an item smaller than the target"
       or, with assertions disabled, missing rows of "ga" SSTables or of Apache Cassandra 5.0's. ANN queries
       restricted to a token range return the rows of an SSTable that holds several keys of the last token of the range.
+    - Storage-attached index (SAI) queries on inet columns now match a 4-byte IPv4 address and its 16-byte
+      IPv4-mapped IPv6 form (::ffff:a.b.c.d) as different values, and order inet values as the column type does, by
+      their bytes, as filtering without an index does. Range restrictions on a column that holds both IPv4 and IPv6
+      addresses used to miss rows. The index files don't change and need no rebuild. Until every replica runs this
+      release, the replicas of an earlier release still select rows as before.
 
 5.0.9
 =====

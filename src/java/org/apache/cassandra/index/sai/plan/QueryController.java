@@ -755,7 +755,8 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * If the column type is truncatable, e.g., BigInteger or BigDecimal,
      * then it returns a full index scan, since the ranges might result
      * in false negatives when a truncated value is equivalent to
-     * the value to exclude. A map entry inequality is planned as an index scan of
+     * the value to exclude. So is an inet inequality, whose two ranges overlap in the order of the index
+     * terms (see {@link Expression#searchedRanges()}). A map entry inequality is planned as an index scan of
      * all the keys, like NOT CONTAINS. An inequality on a frozen value searched
      * in an index before {@link Version#DB} is planned as a full index scan too
      * (see {@link #searchesByteOrderedTermsBeforeDB}).
@@ -776,7 +777,9 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             return planFactory.indexScan(predicate, matchingRowCount, scope);
         }
 
-        if (TypeUtil.supportsRounding(predicate.validator) || searchesByteOrderedTermsBeforeDB(predicate))
+        if (TypeUtil.supportsRounding(predicate.validator)
+            || TypeUtil.isInetAddress(predicate.validator)
+            || searchesByteOrderedTermsBeforeDB(predicate))
             return planFactory.fullIndexScan(predicate.context, scope);
         else
         {
@@ -1653,11 +1656,14 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         var queryView = getQueryView(predicate.context).forScope(scope);
 
         long rowCount = 0;
-        for (MemtableIndex index : queryView.memtableIndexes)
-            rowCount += estimateOrAssumeAllRows(predicate, index, index::estimateMatchingRowsCount, index::getRowCount);
+        for (Expression range : predicate.searchedRanges())
+        {
+            for (MemtableIndex index : queryView.memtableIndexes)
+                rowCount += estimateOrAssumeAllRows(range, index, index::estimateMatchingRowsCount, index::getRowCount);
 
-        for (SSTableIndex index : queryView.sstableIndexes)
-            rowCount += estimateOrAssumeAllRows(predicate, index, index::estimateMatchingRowsCount, index::getRowCount);
+            for (SSTableIndex index : queryView.sstableIndexes)
+                rowCount += estimateOrAssumeAllRows(range, index, index::estimateMatchingRowsCount, index::getRowCount);
+        }
 
         return rowCount;
     }

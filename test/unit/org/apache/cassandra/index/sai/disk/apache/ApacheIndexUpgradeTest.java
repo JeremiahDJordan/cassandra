@@ -66,6 +66,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.service.snapshot.TableSnapshot;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FastByteOperations;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -271,11 +272,11 @@ public class ApacheIndexUpgradeTest extends ApacheIndexTester
         // The candidate rows the Apache indexes return for ranges, before any post-filtering. Varints and decimals are
         // truncated in the index, so their candidates can include more.
         InetAddress ci = InetAddress.getByName("10.1.10.0");
-        assertCandidates("descs_ci", Operator.GT, InetAddressType.instance.decompose(ci), rows, r -> compareInet(r.ci, ci) > 0, true);
-        assertCandidates("descs_ci", Operator.LTE, InetAddressType.instance.decompose(ci), rows, r -> compareInet(r.ci, ci) <= 0, true);
+        assertCandidates("descs_ci", Operator.GT, InetAddressType.instance.decompose(ci), rows, r -> compareIndexTerms(r.ci, ci) > 0, true);
+        assertCandidates("descs_ci", Operator.LTE, InetAddressType.instance.decompose(ci), rows, r -> compareIndexTerms(r.ci, ci) <= 0, true);
         InetAddress ci6 = InetAddress.getByName("2001::50b");
-        assertCandidates("descs_ci", Operator.GTE, InetAddressType.instance.decompose(ci6), rows, r -> compareInet(r.ci, ci6) >= 0, true);
-        assertCandidates("descs_ci", Operator.LT, InetAddressType.instance.decompose(ci6), rows, r -> compareInet(r.ci, ci6) < 0, true);
+        assertCandidates("descs_ci", Operator.GTE, InetAddressType.instance.decompose(ci6), rows, r -> compareIndexTerms(r.ci, ci6) >= 0, true);
+        assertCandidates("descs_ci", Operator.LT, InetAddressType.instance.decompose(ci6), rows, r -> compareIndexTerms(r.ci, ci6) < 0, true);
         for (BigInteger bound : new BigInteger[]{ BigInteger.valueOf(1000000), BigInteger.valueOf(-100), BigInteger.TEN.pow(20).negate() })
         {
             assertCandidates("descs_cv", Operator.GT, IntegerType.instance.decompose(bound), rows, r -> r.cv.compareTo(bound) > 0, false);
@@ -298,6 +299,10 @@ public class ApacheIndexUpgradeTest extends ApacheIndexTester
         ranges.put(select + "ci <= '10.1.10.0'", r -> compareInet(r.ci, ci) <= 0);
         ranges.put(select + "ci >= '2001::50b'", r -> compareInet(r.ci, ci6) >= 0);
         ranges.put(select + "ci >= '10.1.3.4' AND ci < '10.1.10.0'", r -> compareInet(r.ci, ip4) >= 0 && compareInet(r.ci, ci) < 0);
+        // the IPv6 addresses sort before 64.0.0.0, and their index terms after it
+        InetAddress ci64 = InetAddress.getByName("64.0.0.0");
+        ranges.put(select + "ci < '64.0.0.0'", r -> compareInet(r.ci, ci64) < 0);
+        ranges.put(select + "ci > '64.0.0.0'", r -> compareInet(r.ci, ci64) > 0);
         for (BigInteger bound : new BigInteger[]{ BigInteger.valueOf(1000000), BigInteger.valueOf(-100), BigInteger.TEN.pow(20).negate() })
         {
             ranges.put(select + "cv > " + bound, r -> r.cv.compareTo(bound) > 0);
@@ -360,7 +365,15 @@ public class ApacheIndexUpgradeTest extends ApacheIndexTester
 
     private static int compareInet(InetAddress a, InetAddress b)
     {
-        return ByteBuffer.wrap(ipv6(a)).compareTo(ByteBuffer.wrap(ipv6(b)));
+        return InetAddressType.instance.compare(InetAddressType.instance.decompose(a), InetAddressType.instance.decompose(b));
+    }
+
+    /**
+     * Compares the addresses in the order of their index terms, in which an IPv4 address is its IPv4-mapped IPv6 address.
+     */
+    private static int compareIndexTerms(InetAddress a, InetAddress b)
+    {
+        return FastByteOperations.compareUnsigned(ipv6(a), 0, 16, ipv6(b), 0, 16);
     }
 
     private static byte[] ipv6(InetAddress address)
