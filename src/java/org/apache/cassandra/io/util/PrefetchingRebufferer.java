@@ -131,22 +131,22 @@ public class PrefetchingRebufferer implements Rebufferer
         this.alignmentMask = -source.chunkSize();
     }
 
-    public static Rebufferer withPrefetching(RebuffererFactory factory)
+    public static Rebufferer withPrefetching(RebuffererFactory factory, boolean forScan)
     {
         if (!ENABLED)
-            return factory.instantiateRebufferer(false);
+            return factory.instantiateRebufferer(forScan);
 
         int chunkSize = factory.chunkSize();
         // No `chunkSize` typically means mmap, where prefetching doesn't make sense anyway (the OS already does it)
         if (chunkSize <= 0)
-            return factory.instantiateRebufferer(false);
+            return factory.instantiateRebufferer(forScan);
 
         if (Integer.bitCount(chunkSize) != 1)
         {
             NO_SPAM_LOGGER.debug("Prefecting is enabled for SEQUENTIAL reads on {} but the chunk size {} is not a " +
                                  "power of two (should only true for zero-copied files); will not prefetch.",
                                  factory.channel().filePath(), chunkSize);
-            return factory.instantiateRebufferer(false);
+            return factory.instantiateRebufferer(forScan);
         }
 
         return new PrefetchingRebufferer(factory);

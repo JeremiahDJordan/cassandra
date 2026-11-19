@@ -165,7 +165,12 @@ public class FileHandle extends SharedCloseableImpl
 
     public RandomAccessReader createReaderForScan()
     {
-        return createReader(null, true, sliceDescriptor.dataStart, ReadPattern.SEQUENTIAL);
+        return createReaderForScan(null);
+    }
+
+    public RandomAccessReader createReaderForScan(RateLimiter limiter)
+    {
+        return createReader(limiter, true, sliceDescriptor.dataStart, ReadPattern.SEQUENTIAL);
     }
 
     public RandomAccessReader createReader(ReadPattern accessPattern)
@@ -236,7 +241,7 @@ public class FileHandle extends SharedCloseableImpl
     public Rebufferer instantiateRebufferer(RateLimiter limiter, boolean forScan, ReadPattern accessPattern)
     {
         Rebufferer rebufferer = accessPattern == ReadPattern.SEQUENTIAL
-                                ? PrefetchingRebufferer.withPrefetching(rebuffererFactory)
+                                ? PrefetchingRebufferer.withPrefetching(rebuffererFactory, forScan)
                                 : rebuffererFactory.instantiateRebufferer(forScan);
 
         if (limiter != null && limiter.getRate() < Double.MAX_VALUE)

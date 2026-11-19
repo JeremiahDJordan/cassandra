@@ -1,0 +1,109 @@
+/*
+ * Copyright IBM Corp.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package org.apache.cassandra.io.sstable;
+
+import java.nio.ByteBuffer;
+
+import org.junit.Before;
+import org.junit.Test;
+
+import org.apache.cassandra.cache.ChunkCache;
+import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DataRange;
+import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.io.sstable.compaction.IteratorFromCursor;
+import org.apache.cassandra.io.sstable.compaction.SortedStringTableCursor;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.OutputHandler;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
+
+/**
+ * Compaction and verification read sstables with scan readers, which bypass the chunk cache; range reads use it.
+ */
+public class ScanReaderChunkCacheTest extends CQLTester
+{
+    private ColumnFamilyStore cfs;
+    private SSTableReader sstable;
+
+    @Before
+    public void createSSTable() throws Throwable
+    {
+        assertTrue(ChunkCache.instance.isEnabled());
+        createTable("CREATE TABLE %s (pk int, ck int, v blob, PRIMARY KEY (pk, ck)) " +
+                    "WITH compression = {'class': 'LZ4Compressor', 'chunk_length_in_kb': 16}");
+        cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+        for (int pk = 0; pk < 100; pk++)
+            for (int ck = 0; ck < 50; ck++)
+                execute("INSERT INTO %s (pk, ck, v) VALUES (?, ?, ?)", pk, ck, ByteBuffer.wrap(new byte[200]));
+        flush();
+        sstable = cfs.getLiveSSTables().iterator().next();
+        ChunkCache.instance.invalidateFileNow(sstable.getDataFile());
+    }
+
+    @Test
+    public void testCompactionCursorBypassesChunkCache()
+    {
+        readAll(new IteratorFromCursor(sstable.metadata(), new SortedStringTableCursor(sstable)));
+        assertEquals(0, ChunkCache.instance.sizeOfFile(sstable.getDataFile()));
+    }
+
+    @Test
+    public void testScannerBypassesChunkCache()
+    {
+        readAll(sstable.getScanner());
+        assertEquals(0, ChunkCache.instance.sizeOfFile(sstable.getDataFile()));
+    }
+
+    @Test
+    public void testVerifierBypassesChunkCache()
+    {
+        try (IVerifier verifier = sstable.getVerifier(cfs, new OutputHandler.LogOutput(), false,
+                                                      IVerifier.options().extendedVerification(true).build()))
+        {
+            verifier.verify();
+        }
+        assertEquals(0, ChunkCache.instance.sizeOfFile(sstable.getDataFile()));
+    }
+
+    @Test
+    public void testRangeReadUsesChunkCache()
+    {
+        readAll(sstable.partitionIterator(ColumnFilter.all(sstable.metadata()),
+                                          DataRange.allData(sstable.getPartitioner()),
+                                          SSTableReadsListener.NOOP_LISTENER));
+        assertTrue(ChunkCache.instance.sizeOfFile(sstable.getDataFile()) > 0);
+    }
+
+    private static void readAll(UnfilteredPartitionIterator partitions)
+    {
+        try (partitions)
+        {
+            while (partitions.hasNext())
+            {
+                try (UnfilteredRowIterator partition = partitions.next())
+                {
+                    partition.forEachRemaining(unfiltered -> {});
+                }
+            }
+        }
+    }
+}

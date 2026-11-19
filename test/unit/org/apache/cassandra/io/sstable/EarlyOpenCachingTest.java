@@ -36,8 +36,12 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.notifications.INotificationConsumer;
@@ -102,6 +106,7 @@ public class EarlyOpenCachingTest extends CQLTester
             SSTableAddingNotification n = (SSTableAddingNotification) notification;
             SSTableReader s = n.adding.iterator().next();
             EarlyOpenIterationTest.readAllAndVerifyKeySpan(s);
+            readThroughChunkCache(s);
             assertTrue("Chunk cache is not used",
                        ChunkCache.instance.sizeOfFile(s.getDataFile()) > 0);
             phaser.register();
@@ -131,5 +136,24 @@ public class EarlyOpenCachingTest extends CQLTester
                    ChunkCache.instance.sizeOfFile(finalReader.getDataFile()) > 0);
         assertEquals(Sets.newHashSet(finalReader), cfs.getLiveSSTables());
         EarlyOpenIterationTest.readAllAndVerifyKeySpan(finalReader);
+    }
+
+    /**
+     * Reads all of the sstable as a range read does. Scanners bypass the chunk cache, range reads don't.
+     */
+    private static void readThroughChunkCache(SSTableReader sstable)
+    {
+        try (UnfilteredPartitionIterator partitions = sstable.partitionIterator(ColumnFilter.all(sstable.metadata()),
+                                                                                  DataRange.allData(sstable.getPartitioner()),
+                                                                                  SSTableReadsListener.NOOP_LISTENER))
+        {
+            while (partitions.hasNext())
+            {
+                try (UnfilteredRowIterator partition = partitions.next())
+                {
+                    partition.forEachRemaining(unfiltered -> {});
+                }
+            }
+        }
     }
 }
