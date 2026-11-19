@@ -97,6 +97,14 @@ public final class UDFDataType
     }
 
     /**
+     * @return the raw Java class used for this type in generated UDF source, a primitive class if {@link #isPrimitive()}.
+     */
+    Class<?> toJavaRawType()
+    {
+        return javaType.getRawType();
+    }
+
+    /**
      * @return the name of the java type corresponding to this class.
      */
     public String getJavaTypeName()
