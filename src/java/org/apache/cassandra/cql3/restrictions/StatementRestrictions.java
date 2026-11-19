@@ -668,11 +668,19 @@ public class StatementRestrictions
                 usesSecondaryIndexing = true;
 
             // Because an ANN queries limit the result set based within the SAI, clustering column restrictions
-            // must be added to the filter restrictions.
-            if (orderings.stream().anyMatch(o -> o.expression.hasNonClusteredOrdering()))
+            // must be added to the filter restrictions, unless the clustering index filter of the query applies them:
+            // see clusteringRestrictionsAppliedBySlices (CASSANDRA-19544).
+            boolean hasNonClusteredOrdering = orderings.stream().anyMatch(o -> o.expression.hasNonClusteredOrdering());
+            if (hasNonClusteredOrdering)
                 usesSecondaryIndexing = true;
 
-            if (usesSecondaryIndexing || clusteringColumnsRestrictions.needFiltering())
+            boolean clusteringRestrictionsAppliedBySlices = hasNonClusteredOrdering
+                                                            && clusteringRestrictionsAppliedBySlices(partitionKeyRestrictions,
+                                                                                                     clusteringColumnsRestrictions,
+                                                                                                     isKeyRange,
+                                                                                                     indexRegistry);
+
+            if ((usesSecondaryIndexing && !clusteringRestrictionsAppliedBySlices) || clusteringColumnsRestrictions.needFiltering())
                 filterRestrictionsBuilder.add(clusteringColumnsRestrictions);
 
             // Even if usesSecondaryIndexing is false at this point, we'll still have to use one if
@@ -743,6 +751,32 @@ public class StatementRestrictions
                                              hasRegularColumnsRestrictions,
                                              filterRestrictionsBuilder.build(),
                                              children.build());
+        }
+
+        /**
+         * Whether the clustering column restrictions of a query ordered by an index (ANN, BM25 or generic ORDER BY) are
+         * left to the clustering index filter of the query rather than added to its row filter: in a single, fully
+         * specified partition, when they don't need filtering and some has no supporting index. The ordered index
+         * search skips the keys that the clustering index filter doesn't select before counting them (see
+         * {@code QueryController#selects}).
+         */
+        private boolean clusteringRestrictionsAppliedBySlices(PartitionKeyRestrictions partitionKeyRestrictions,
+                                                              ClusteringColumnRestrictions clusteringColumnsRestrictions,
+                                                              boolean isKeyRange,
+                                                              IndexRegistry indexRegistry)
+        {
+            if (isKeyRange
+                || clusteringColumnsRestrictions.isEmpty()
+                || clusteringColumnsRestrictions.needFiltering()
+                || partitionKeyRestrictions.hasUnrestrictedPartitionKeyComponents(table)
+                || partitionKeyRestrictions.needFiltering(table))
+                return false;
+
+            for (Restriction restriction : clusteringColumnsRestrictions.restrictions())
+                if (!restriction.hasSupportingIndex(indexRegistry, indexHints))
+                    return true;
+
+            return false;
         }
 
         /**
@@ -1293,13 +1327,18 @@ public class StatementRestrictions
     }
 
     /**
-     * Checks if the query has any cluster column restrictions that do not also have a supporting index.
+     * Checks if the query has any cluster column restrictions in its row filter that do not also have a supporting index.
+     * Clustering column restrictions that are applied by the clustering index filter of the query rather than its row
+     * filter (see {@code Builder#clusteringRestrictionsAppliedBySlices}) don't need an index.
      * @param table the table metadata
      * @return <code>true</code> if the query has any cluster column restrictions that do not also have a supporting index,
      * <code>false</code> otherwise.
      */
     public boolean hasClusterColumnRestrictionWithoutSupportingIndex(TableMetadata table)
     {
+        if (filterRestrictions.getRestrictions().stream().noneMatch(r -> r == clusteringColumnsRestrictions))
+            return false;
+
         IndexRegistry registry = IndexRegistry.obtain(table);
         for (Restriction restriction : clusteringColumnsRestrictions.restrictions())
             if (!restriction.hasSupportingIndex(registry, indexHints))
