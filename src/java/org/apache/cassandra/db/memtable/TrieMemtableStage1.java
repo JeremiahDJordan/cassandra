@@ -334,6 +334,15 @@ public class TrieMemtableStage1 extends AbstractAllocatorMemtable
     }
 
     @Override
+    public int getMinLocalDeletionTime()
+    {
+        int min = Integer.MAX_VALUE;
+        for (MemtableShard shard : shards)
+            min = EncodingStats.mergeMinLocalDeletionTime(min, shard.stats);
+        return min;
+    }
+
+    @Override
     public DecoratedKey minPartitionKey()
     {
         for (int i = 0; i < shards.length; i++)

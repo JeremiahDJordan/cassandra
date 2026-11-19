@@ -275,6 +275,13 @@ public class MultiRangeReadCommand extends ReadCommand implements MultiPartition
     }
 
     @Override
+    protected void updateMinOldestUnrepairedTombstone(ColumnFamilyStore cfs, ReadExecutionController controller)
+    {
+        for (DataRange dataRange : dataRanges)
+            toPartitionRangeReadCommand(dataRange).updateMinOldestUnrepairedTombstone(cfs, controller);
+    }
+
+    @Override
     public UnfilteredPartitionIterator searchStorage(Index.Searcher searcher, ReadExecutionController controller)
     {
         if (indexQueryPlan.supportsMultiRangeReadCommand())
