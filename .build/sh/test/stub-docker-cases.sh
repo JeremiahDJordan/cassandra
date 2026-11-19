@@ -60,7 +60,7 @@ case "$1" in
     for _a in "$@"; do
       case "${_a}" in
         nproc) echo 8 ; exit 0 ;;
-        free)  echo "Mem: 34359738368 0 0" ; exit 0 ;;
+        free)  echo "Mem: ${STUB_MEM:-34359738368} 0 0" ; exit 0 ;;
       esac
     done
     echo "stub-container-id"
@@ -69,6 +69,14 @@ esac
 exit 0
 STUB
 chmod +x "${STUB_DIR}/bin/docker"
+
+# the stub curl answers the Jenkins api query of run-tests.sh with ${STUB_CURL}
+cat > "${STUB_DIR}/bin/curl" <<'STUB'
+#!/bin/sh
+echo "curl $*" >> "${STUB_INVOCATIONS}"
+printf '%s\n' "${STUB_CURL:-}"
+STUB
+chmod +x "${STUB_DIR}/bin/curl"
 export PATH="${STUB_DIR}/bin:${PATH}"
 
 reset_stub() {
@@ -201,6 +209,52 @@ reset_stub
 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -t StorageServiceServerTest -b cassandra-11
 expect_rc "docker/run-tests.sh keeps an argument that merely contains a java version" 0
 expect_invocation "docker/run-tests.sh passes that argument downstream" "\-b cassandra-11"
+
+################################
+#
+# Cases: docker/run-tests.sh, and the executors of a Jenkins agent
+#
+################################
+
+# the stub host has 8 cores; Jenkins answers api/json?pretty=true with one '"numExecutors" : <n>,' line.  The count
+# is used only when asked to
+reset_stub
+JENKINS_URL=http://jenkins.example NODE_NAME=agent-1 STUB_CURL='  "numExecutors" : 2,' \
+  run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs on a Jenkins agent with two executors" 0
+expect_invocation "docker/run-tests.sh asks Jenkins for the agent's executors" "curl .*/computer/agent-1/api/json"
+expect_invocation "docker/run-tests.sh gives the container every core by default" "\-\-cpus=8.00 "
+
+reset_stub
+JENKINS_URL=http://jenkins.example NODE_NAME=agent-1 STUB_CURL='  "numExecutors" : 2,' docker_cpus_per_executor=yes \
+  run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs with the cores divided between executors" 0
+expect_invocation "docker/run-tests.sh gives each of two executors half the cores when asked to" "\-\-cpus=4.00 "
+
+# a Jenkins that refuses anonymous api reads answers with an html page
+reset_stub
+JENKINS_URL=http://jenkins.example NODE_NAME=agent-1 STUB_CURL='<html><body>Authentication required</body></html>' \
+  docker_cpus_per_executor=yes run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs when Jenkins refuses the api read" 0
+expect_invocation "docker/run-tests.sh counts one executor when Jenkins refuses the api read" "\-\-cpus=8.00 "
+
+reset_stub
+JENKINS_URL=http://jenkins.example NODE_NAME=agent-1 STUB_CURL='  "numExecutors" : 0,' docker_cpus_per_executor=yes \
+  run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs on an agent that reports no executors" 0
+expect_invocation "docker/run-tests.sh counts one executor for an agent that reports none" "\-\-cpus=8.00 "
+
+# an 8 GiB host passes a test target's 5 GiB minimum, unless the memory check counts two executors
+reset_stub
+JENKINS_URL=http://jenkins.example NODE_NAME=agent-1 STUB_CURL='  "numExecutors" : 2,' STUB_MEM=8589934592 \
+  run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh checks the memory of one container by default" 0
+
+reset_stub
+JENKINS_URL=http://jenkins.example NODE_NAME=agent-1 STUB_CURL='  "numExecutors" : 2,' STUB_MEM=8589934592 \
+  docker_memory_per_executor=yes run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh checks the memory of every executor when asked to" 1
+expect_out "docker/run-tests.sh names the executors in the memory check" "per jenkins executor (2)"
 
 ################################
 #

@@ -210,8 +210,14 @@ jenkins_executors=1
 if [[ ! -z ${JENKINS_URL+x} ]] && [[ ! -z ${NODE_NAME+x} ]] ; then
     fetched_jenkins_executors=$(curl -s --retry 9 --retry-connrefused --retry-delay 1 "${JENKINS_URL}/computer/${NODE_NAME}/api/json?pretty=true" | grep 'numExecutors' | awk -F' : ' '{print $2}' | cut -d',' -f1)
     # use it if we got a valid number (despite retry settings the curl above can still fail
-    [[ ${fetched_jenkins_executors} =~ '^[0-9]+$' ]] && jenkins_executors=${fetched_jenkins_executors}
+    [[ ${fetched_jenkins_executors} =~ ^[1-9][0-9]*$ ]] && jenkins_executors=${fetched_jenkins_executors}
 fi
+# The cores and the memory check are divided between the executors only when docker_cpus_per_executor and
+# docker_memory_per_executor are yes.
+cpu_executors=1
+[ "${docker_cpus_per_executor}" == "yes" ] && cpu_executors=${jenkins_executors}
+memory_executors=1
+[ "${docker_memory_per_executor}" == "yes" ] && memory_executors=${jenkins_executors}
 
 # find host's available cores and mem
 cores=$(docker run --rm alpine:3.19.1 nproc --all) || { error 1 "Unable to check available CPU cores"; }
@@ -233,32 +239,32 @@ case ${test_target/-repeat/} in
     "build_dtest_jars")
     ;;
     "stress-test" | "fqltool-test" | "sstableloader-test" )
-        [[ ${mem} -gt $((1 * 1024 * 1024 * 1024 * ${jenkins_executors})) ]] || { error 1 "${target} require minimum docker memory 1g (per jenkins executor (${jenkins_executors})), found ${mem}"; }
+        [[ ${mem} -gt $((1 * 1024 * 1024 * 1024 * ${memory_executors})) ]] || { error 1 "${target} require minimum docker memory 1g (per jenkins executor (${memory_executors})), found ${mem}"; }
     ;;
     # test-burn doesn't have enough tests in it to split beyond 8, and burn and long we want a bit more resources anyway
     "test-burn" | "long-test" | "cqlsh-test" )
-        [[ ${mem} -gt $((5 * 1024 * 1024 * 1024 * ${jenkins_executors})) ]] || { error 1 "${target} require minimum docker memory 6g (per jenkins executor (${jenkins_executors})), found ${mem}"; }
+        [[ ${mem} -gt $((5 * 1024 * 1024 * 1024 * ${memory_executors})) ]] || { error 1 "${target} require minimum docker memory 6g (per jenkins executor (${memory_executors})), found ${mem}"; }
     ;;
     "microbench" | "microbench-test" | "simulator-dtest")
-        [[ ${mem} -gt $((15 * 1024 * 1024 * 1024 * ${jenkins_executors})) ]] || { error 1 "${target} require minimum docker memory 16g (per jenkins executor (${jenkins_executors})), found ${mem}"; }
+        [[ ${mem} -gt $((15 * 1024 * 1024 * 1024 * ${memory_executors})) ]] || { error 1 "${target} require minimum docker memory 16g (per jenkins executor (${memory_executors})), found ${mem}"; }
         docker_flags="-m 15g --memory-swap 15g"
     ;;
     "dtest" | "dtest-novnode" | "dtest-latest" | "dtest-large" | "dtest-large-novnode" | "dtest-large-latest" | "dtest-upgrade" | "dtest-upgrade-novnode"| "dtest-upgrade-large" | "dtest-upgrade-large-novnode" | "dtest-large-novnode-latest")
         [ -f "${cassandra_dtest_dir}/dtest.py" ] || { error 1 "${cassandra_dtest_dir}/dtest.py not found. please specify 'cassandra_dtest_dir' to point to the local cassandra-dtest source"; }
         test_script="run-python-dtests.sh"
         docker_mounts="${docker_mounts} -v ${cassandra_dtest_dir}:/home/cassandra/cassandra-dtest"
-        [[ ${mem} -gt $((15 * 1024 * 1024 * 1024 * ${jenkins_executors})) ]] || { error 1 "${target} require minimum docker memory 16g (per jenkins executor (${jenkins_executors})), found ${mem}"; }
+        [[ ${mem} -gt $((15 * 1024 * 1024 * 1024 * ${memory_executors})) ]] || { error 1 "${target} require minimum docker memory 16g (per jenkins executor (${memory_executors})), found ${mem}"; }
         docker_flags="-m 15g --memory-swap 15g"
     ;;
     "test" | "test-cdc" | "test-compression" | "test-oa" | "test-system-keyspace-directory" | "test-latest" | "jvm-dtest" | "jvm-dtest-upgrade" | "jvm-dtest-novnode" | "jvm-dtest-upgrade-novnode")
-        [[ ${mem} -gt $((5 * 1024 * 1024 * 1024 * ${jenkins_executors})) ]] || { error 1 "${target} require minimum docker memory 6g (per jenkins executor (${jenkins_executors})), found ${mem}"; }
+        [[ ${mem} -gt $((5 * 1024 * 1024 * 1024 * ${memory_executors})) ]] || { error 1 "${target} require minimum docker memory 6g (per jenkins executor (${memory_executors})), found ${mem}"; }
     ;;
     *)
         error 1 "docker resource limits unconfigured for test type \"${target}\""
     ;;
 esac
 
-docker_cpus=$(echo "scale=2; ${cores} / ( ${jenkins_executors} )" | bc)
+docker_cpus=$(echo "scale=2; ${cores} / ( ${cpu_executors} )" | bc)
 docker_cpus_limit=$(docker info | grep CPUs | cut -d" " -f3)
 if (( $(echo "${docker_cpus} > ${docker_cpus_limit}" |bc -l) )) ; then
     echo "WARNING: requested more cpus (${docker_cpus}) than docker cpu limit (${docker_cpus_limit}), reducing cpus…"
