@@ -370,7 +370,7 @@ public class SegmentMetadata implements Comparable<SegmentMetadata>
             case NOT_CONTAINS_KEY:
             case NOT_CONTAINS_VALUE:
             {
-                if (TypeUtil.supportsRounding(predicate.validator))
+                if (TypeUtil.supportsRounding(predicate.validator) || TypeUtil.isInetAddress(predicate.validator))
                     return numRows;
                 else
                 {

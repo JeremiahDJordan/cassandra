@@ -60,6 +60,11 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - Storage-attached index (SAI) queries on inet columns now match a 4-byte IPv4 address and its 16-byte
+      IPv4-mapped IPv6 form (::ffff:a.b.c.d) as different values, and order inet values as the column type does, by
+      their bytes. Range restrictions on a column that holds both IPv4 and IPv6 addresses used to miss rows. Ranges
+      on a DESC inet clustering column are searched as before. The index files don't change and need no rebuild.
+      Until every replica runs this release, the replicas of an earlier release still select rows as before.
 
 Deprecation
 ---------
