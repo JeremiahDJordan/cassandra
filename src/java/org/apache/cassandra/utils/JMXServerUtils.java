@@ -42,8 +42,10 @@ import java.util.HashMap;
 import java.util.Map;
 import java.util.stream.Collectors;
 import javax.management.remote.*;
+import javax.management.remote.rmi.RMIConnectionImpl;
 import javax.management.remote.rmi.RMIConnectorServer;
 import javax.management.remote.rmi.RMIJRMPServerImpl;
+import javax.management.remote.rmi.RMIServerImpl;
 import javax.rmi.ssl.SslRMIClientSocketFactory;
 import javax.rmi.ssl.SslRMIServerSocketFactory;
 import javax.security.auth.Subject;
@@ -138,13 +140,32 @@ public class JMXServerUtils
                                                          (RMIClientSocketFactory) env.get(RMIConnectorServer.RMI_CLIENT_SOCKET_FACTORY_ATTRIBUTE),
                                                          (RMIServerSocketFactory) env.get(RMIConnectorServer.RMI_SERVER_SOCKET_FACTORY_ATTRIBUTE),
                                                          env);
-        JMXServiceURL serviceURL = new JMXServiceURL("rmi", hostname, rmiPort);
-        RMIConnectorServer jmxServer = new RMIConnectorServer(serviceURL, env, server, ManagementFactory.getPlatformMBeanServer());
+        createNotificationBuffer(server, env);
+        RMIConnectorServer jmxServer;
+        try
+        {
+            JMXServiceURL serviceURL = new JMXServiceURL("rmi", hostname, rmiPort);
+            jmxServer = new RMIConnectorServer(serviceURL, env, server, ManagementFactory.getPlatformMBeanServer());
 
-        // If a custom authz proxy was created, attach it to the server now.
-        if (authzProxy != null)
-            jmxServer.setMBeanServerForwarder(authzProxy);
-        jmxServer.start();
+            // If a custom authz proxy was created, attach it to the server now.
+            if (authzProxy != null)
+                jmxServer.setMBeanServerForwarder(authzProxy);
+            jmxServer.start();
+        }
+        catch (IOException | RuntimeException e)
+        {
+            // closing the server disposes of the notification buffer and its listeners
+            try
+            {
+                server.close();
+            }
+            catch (IOException | RuntimeException closeFailure)
+            {
+                e.addSuppressed(closeFailure);
+            }
+            ((JmxRegistry) registry).close();
+            throw e;
+        }
 
         ((JmxRegistry)registry).setRemoteServerStub(server.toStub());
         logJmxServiceUrl(serverAddress, port);
@@ -154,6 +175,26 @@ public class JMXServerUtils
     public static JMXConnectorServer createJMXServer(int port, boolean local) throws IOException
     {
         return createJMXServer(port, null, local);
+    }
+
+    /**
+     * Creates the notification buffer that all clients share, on the platform MBeanServer and without a Subject.
+     * Otherwise the first client to subscribe creates it through the authorization proxy, which on Java 24 and later
+     * sees that client's Subject.
+     */
+    private static void createNotificationBuffer(RMIServerImpl server, Map<String, Object> env)
+    {
+        Map<String, Object> bufferEnv = new HashMap<>(env);
+        bufferEnv.put("jmx.remote.x.server.connection.timeout", Long.MAX_VALUE); // no connection timeout thread
+        server.setMBeanServer(ManagementFactory.getPlatformMBeanServer());
+        try
+        {
+            new RMIConnectionImpl(server, "notification-buffer", null, null, bufferEnv).fetchNotifications(0, 0, 0);
+        }
+        catch (IOException | RuntimeException e)
+        {
+            logger.warn("Unable to create the JMX notification buffer before clients connect", e);
+        }
     }
 
     private static Map<String, Object> configureSecureCredentials()

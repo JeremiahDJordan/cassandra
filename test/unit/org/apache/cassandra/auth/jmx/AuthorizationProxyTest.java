@@ -18,14 +18,20 @@
 
 package org.apache.cassandra.auth.jmx;
 
+import java.lang.reflect.Proxy;
+import java.security.PrivilegedAction;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import javax.management.InstanceNotFoundException;
+import javax.management.MBeanServerFactory;
 import javax.management.MalformedObjectNameException;
+import javax.management.NotificationListener;
 import javax.management.ObjectName;
+import javax.management.remote.MBeanServerForwarder;
 import javax.security.auth.Subject;
 
 import com.google.common.collect.ImmutableMap;
@@ -36,6 +42,7 @@ import org.junit.Test;
 import org.apache.cassandra.auth.*;
 import org.apache.cassandra.config.DatabaseDescriptor;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -60,6 +67,50 @@ public class AuthorizationProxyTest
     Set<ObjectName> allBeans = objectNames(osBean, runtimeBean, threadingBean, hintsBean, batchlogBean, customBean);
 
     RoleResource role1 = RoleResource.role("r1");
+
+    @Test
+    public void invocationUsesAuthenticatedSubject() throws Exception
+    {
+        Subject allowed = subject(role1.getRoleName());
+        Subject denied = subject("denied");
+        Map<RoleResource, Set<PermissionDetails>> permissions =
+        ImmutableMap.of(role1, Collections.singleton(permission(role1, JMXResource.root(), Permission.DESCRIBE)),
+                        RoleResource.role("denied"), Collections.emptySet());
+        AuthorizationProxy proxy = new ProxyBuilder().isAuthzRequired(() -> true)
+                                                     .isSuperuser((role) -> false)
+                                                     .getPermissions(permissions::get)
+                                                     .build();
+        MBeanServerForwarder forwarder = forwarder(proxy);
+
+        ObjectName missing = new ObjectName("subject-test:type=Missing");
+        Subject.doAs(allowed, (PrivilegedAction<Void>) () -> {
+            assertEquals("subject-test", forwarder.getDefaultDomain());
+            assertThatThrownBy(() -> forwarder.getMBeanInfo(missing)).isInstanceOf(InstanceNotFoundException.class);
+            Subject.doAs(denied, (PrivilegedAction<Void>) () -> {
+                assertThatThrownBy(forwarder::getDefaultDomain).isInstanceOf(SecurityException.class);
+                return null;
+            });
+            return null;
+        });
+    }
+
+    @Test
+    public void invocationWithoutSubjectPreservesConnectorAuthorization() throws Exception
+    {
+        AuthorizationProxy proxy = new ProxyBuilder().isAuthzRequired(() -> true)
+                                                     .isSuperuser((role) -> {
+                                                         throw new AssertionError("A connector invocation must not check a role");
+                                                     })
+                                                     .build();
+        MBeanServerForwarder forwarder = forwarder(proxy);
+
+        Subject.doAs(null, (PrivilegedAction<Void>) () -> {
+            assertEquals("subject-test", forwarder.getDefaultDomain());
+            proxy.isAuthSetupComplete = () -> false;
+            assertThatThrownBy(forwarder::getDefaultDomain).isInstanceOf(SecurityException.class);
+            return null;
+        });
+    }
 
     @Test
     public void roleHasRequiredPermission() throws Throwable
@@ -344,6 +395,23 @@ public class AuthorizationProxyTest
     }
 
     @Test
+    public void authorizeConnectorNotificationListener() throws Throwable
+    {
+        AuthorizationProxy proxy = new ProxyBuilder().isAuthzRequired(() -> true)
+                                                     .isSuperuser((role) -> false)
+                                                     .getPermissions((role) -> Collections.emptySet())
+                                                     .build();
+        ObjectName target = ObjectName.getInstance(osBean.getObjectName());
+        NotificationListener listener = (notification, handback) -> {};
+
+        for (String method : new String[]{ "addNotificationListener", "removeNotificationListener" })
+        {
+            assertTrue(proxy.authorize(subject(role1.getRoleName()), method, new Object[]{ target, listener, null, null }));
+            assertFalse(proxy.authorize(subject(role1.getRoleName()), method, new Object[]{ target, target, null, null }));
+        }
+    }
+
+    @Test
     public void rejectInvocationOfRestrictedMethods() throws Throwable
     {
         String[] methods = { "createMBean",
@@ -463,6 +531,18 @@ public class AuthorizationProxyTest
     private static PermissionDetails permission(RoleResource grantee, IResource resource, Permission permission)
     {
         return new PermissionDetails(grantee.getRoleName(), resource, permission);
+    }
+
+    private static MBeanServerForwarder forwarder(AuthorizationProxy proxy)
+    {
+        MBeanServerForwarder forwarder = (MBeanServerForwarder) Proxy.newProxyInstance(MBeanServerForwarder.class.getClassLoader(),
+                                                                                    new Class<?>[]{ MBeanServerForwarder.class },
+                                                                                    proxy);
+        Subject.doAs(null, (PrivilegedAction<Void>) () -> {
+            forwarder.setMBeanServer(MBeanServerFactory.newMBeanServer("subject-test"));
+            return null;
+        });
+        return forwarder;
     }
 
     private static Subject subject(String roleName)

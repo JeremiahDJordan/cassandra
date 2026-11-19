@@ -33,6 +33,7 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.io.*;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.Throwables;
 
 public class DefaultFSErrorHandler implements FSErrorHandler
 {
@@ -104,7 +105,7 @@ public class DefaultFSErrorHandler implements FSErrorHandler
 
     private boolean shouldMaybeRemoveData(Throwable error)
     {
-        for (Throwable t = error; t != null; t = t.getCause())
+        for (Throwable t : Throwables.causeChain(error))
         {
             for (Class<?> c : exceptionsSkippingDataRemoval)
                 if (c.isAssignableFrom(t.getClass()))

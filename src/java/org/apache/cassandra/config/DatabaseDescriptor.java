@@ -108,6 +108,7 @@ import org.apache.cassandra.security.AbstractCryptoProvider;
 import org.apache.cassandra.security.EncryptionContext;
 import org.apache.cassandra.security.JREProvider;
 import org.apache.cassandra.security.SSLFactory;
+import org.apache.cassandra.security.UDFSecurityMechanism;
 import org.apache.cassandra.service.CacheService.CacheType;
 import org.apache.cassandra.service.paxos.Paxos;
 import org.apache.cassandra.utils.FBUtilities;
@@ -873,11 +874,7 @@ public class DatabaseDescriptor
         if (conf.user_defined_functions_fail_timeout.toMilliseconds() < conf.user_defined_functions_warn_timeout.toMilliseconds())
             throw new ConfigurationException("user_defined_functions_warn_timeout must less than user_defined_function_fail_timeout", false);
 
-        if (!conf.allow_insecure_udfs && !conf.user_defined_functions_threads_enabled)
-            throw new ConfigurationException("To be able to set enable_user_defined_functions_threads: false you need to set allow_insecure_udfs: true - this is an unsafe configuration and is not recommended.");
-
-        if (conf.allow_extra_insecure_udfs)
-            logger.warn("Allowing java.lang.System.* access in UDFs is dangerous and not recommended. Set allow_extra_insecure_udfs: false to disable.");
+        applyUdfSandboxValidations(conf);
 
         if(conf.scripted_user_defined_functions_enabled)
             throw new ConfigurationException("JavaScript user-defined functions were removed in CASSANDRA-18252. " +
@@ -1111,6 +1108,18 @@ public class DatabaseDescriptor
     {
         if (config.repair_command_pool_size < 1)
             config.repair_command_pool_size = config.concurrent_validations;
+    }
+
+    @VisibleForTesting
+    static void applyUdfSandboxValidations(Config conf)
+    {
+        if (!conf.allow_insecure_udfs && !conf.user_defined_functions_threads_enabled)
+            throw new ConfigurationException("To be able to set enable_user_defined_functions_threads: false you need to set allow_insecure_udfs: true - this is an unsafe configuration and is not recommended.");
+
+        if (conf.allow_extra_insecure_udfs)
+            logger.warn("Allowing java.lang.System.* access in UDFs is dangerous and not recommended. Set allow_extra_insecure_udfs: false to disable.");
+
+        UDFSecurityMechanism.current();
     }
 
     @VisibleForTesting

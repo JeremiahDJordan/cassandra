@@ -84,16 +84,19 @@ if [ -z $JAVA ] ; then
     exit 1;
 fi
 
-# Determine the sort of JVM we'll be running on.
+# Determine the sort of JVM we'll be running on, and its major version
 java_ver_output=`"${JAVA:-java}" -version 2>&1`
-jvmver=`echo "$java_ver_output" | grep '[openjdk|java] version' | awk -F'"' 'NR==1 {print $2}' | cut -d\- -f1`
-JVM_VERSION=${jvmver%_*}
-short=$(echo "${jvmver}" | cut -c1-2)
+JAVA_VERSION=$(echo "$java_ver_output" \
+               | grep -E '^(openjdk|java) version "' | head -n 1 \
+               | cut -d '"' -f2 | sed -e 's/^1\.//' -e 's/[^0-9].*$//')
+case "$JAVA_VERSION" in
+  ''|*[!0-9]*)
+    echo "Unable to determine the Java version of $JAVA" >&2
+    exit 1
+    ;;
+esac
 
-JAVA_VERSION=17
-if [ "$short" = "11" ] ; then
-     JAVA_VERSION=11
-elif [ "$JVM_VERSION" \< "17" ] ; then
+if [ "$JAVA_VERSION" -ne 11 ] && [ "$JAVA_VERSION" -lt 17 ] ; then
     echo "Cassandra 5.0 requires Java 11 or Java 17(or newer)."
 fi
 
@@ -126,6 +129,10 @@ fi
 
 for opt in `grep "^-" $JVM_OPTS_FILE` `grep "^-" $JVM_DEP_OPTS_FILE`
 do
+  # Java 24 and later refuse to start with this option
+  if [ "$opt" = "-Djava.security.manager=allow" ] && [ "$JAVA_VERSION" -ge 24 ]; then
+    continue
+  fi
   JVM_OPTS="$JVM_OPTS $opt"
 done
 

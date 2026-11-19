@@ -41,7 +41,7 @@ import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.locator.AbstractEndpointSnitch;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
-import org.apache.cassandra.security.ThreadAwareSecurityManager;
+import org.apache.cassandra.security.UDFSecurityMechanism;
 import org.apache.cassandra.service.EmbeddedCassandraService;
 
 /**
@@ -129,7 +129,7 @@ public final class ServerTestUtils
             }
         });
 
-        ThreadAwareSecurityManager.install();
+        UDFSecurityMechanism.install();
 
         Keyspace.setInitialized();
         SystemKeyspace.persistLocalMetadata();

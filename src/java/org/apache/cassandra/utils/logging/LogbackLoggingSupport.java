@@ -39,6 +39,7 @@ import ch.qos.logback.classic.turbo.TurboFilter;
 import ch.qos.logback.classic.util.ContextInitializer;
 import ch.qos.logback.core.Appender;
 import ch.qos.logback.core.hook.DefaultShutdownHook;
+import org.apache.cassandra.security.SecurityThreadGroup;
 import org.apache.cassandra.security.ThreadAwareSecurityManager;
 
 /**
@@ -200,7 +201,7 @@ public class LogbackLoggingSupport implements LoggingSupport
 
         protected boolean changeDetected(long now)
         {
-            if (ThreadAwareSecurityManager.isSecuredThread())
+            if (SecurityThreadGroup.isSecuredThread())
                 return false;
             return super.changeDetected(now);
         }

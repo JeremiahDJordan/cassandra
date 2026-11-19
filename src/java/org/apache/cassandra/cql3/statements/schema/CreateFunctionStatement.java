@@ -20,9 +20,13 @@ package org.apache.cassandra.cql3.statements.schema;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.stream.Stream;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Lists;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.audit.AuditLogContext;
 import org.apache.cassandra.audit.AuditLogEntryType;
@@ -36,6 +40,7 @@ import org.apache.cassandra.cql3.functions.UserFunction;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.schema.UserFunctions.FunctionsDiff;
 import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.KeyspaceMetadata.KeyspaceDiff;
 import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.schema.Schema;
@@ -48,6 +53,8 @@ import static java.util.stream.Collectors.toList;
 
 public final class CreateFunctionStatement extends AlterSchemaStatement
 {
+    private static final Logger logger = LoggerFactory.getLogger(CreateFunctionStatement.class);
+
     private final String functionName;
     private final List<ColumnIdentifier> argumentNames;
     private final List<CQL3Type.Raw> rawArgumentTypes;
@@ -168,6 +175,27 @@ public final class CreateFunctionStatement extends AlterSchemaStatement
                                 keyspaceName,
                                 functionName,
                                 rawArgumentTypes.stream().map(CQL3Type.Raw::toString).collect(toList()));
+    }
+
+    @Override
+    Set<String> clientWarnings(KeyspacesDiff diff)
+    {
+        Set<String> warnings = new HashSet<>();
+        for (KeyspaceDiff keyspaceDiff : diff.altered)
+        {
+            if (!keyspaceDiff.after.name.equals(keyspaceName))
+                continue;
+            FunctionsDiff<UDFunction> udfsDiff = keyspaceDiff.udfs;
+            Stream.concat(udfsDiff.created.udfs(), udfsDiff.altered.stream().map(altered -> altered.after))
+                  .filter(function -> function.name().name.equals(functionName) && !function.bytecodeSandboxErrors().isEmpty())
+                  .forEach(function -> {
+                      String warning = String.format("Function %s would be rejected by the bytecode UDF sandbox used on Java 24 and later: %s",
+                                                     function.signature(), function.bytecodeSandboxErrors());
+                      logger.warn(warning);
+                      warnings.add(warning);
+                  });
+        }
+        return warnings;
     }
 
     public void authorize(ClientState client)

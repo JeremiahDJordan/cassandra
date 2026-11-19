@@ -69,7 +69,7 @@ public final class JVMStabilityInspector
         try { StorageMetrics.uncaughtExceptions.inc(); } catch (Throwable ignore) { /* might not be initialised */ }
         logger.error("Exception in thread {}", thread, t);
         Tracing.trace("Exception in thread {}", thread, t);
-        for (Throwable t2 = t; t2 != null; t2 = t2.getCause())
+        for (Throwable t2 : Throwables.causeChain(t))
         {
             // make sure error gets logged exactly once.
             if (t2 != t && (t2 instanceof FSError || t2 instanceof CorruptSSTableException))
@@ -80,7 +80,7 @@ public final class JVMStabilityInspector
 
     /**
      * Certain Throwables and Exceptions represent "Die" conditions for the server.
-     * This recursively checks the input Throwable's cause hierarchy until null.
+     * This checks the input Throwable's cause hierarchy until null, or until a cause repeats.
      * @param t
      *      The Throwable to check for server-stop conditions
      */
@@ -104,6 +104,14 @@ public final class JVMStabilityInspector
 
     public static void inspectThrowable(Throwable t, Consumer<Throwable> fn, boolean isUncaughtException) throws OutOfMemoryError
     {
+        for (Throwable cause : Throwables.causeChain(t))
+            if (!inspectOne(cause, fn, isUncaughtException))
+                return;
+    }
+
+    // returns false if the causes of t must not be inspected
+    private static boolean inspectOne(Throwable t, Consumer<Throwable> fn, boolean isUncaughtException) throws OutOfMemoryError
+    {
         boolean isUnstable = false;
         if (t instanceof OutOfMemoryError)
         {
@@ -114,7 +122,7 @@ public final class JVMStabilityInspector
                 synchronized(lock)
                 {
                     if (printingHeapHistogram)
-                        return;
+                        return false;
                     printingHeapHistogram = true;
                 }
                 HeapUtils.logHeapHistogram();
@@ -177,8 +185,7 @@ public final class JVMStabilityInspector
             logger.warn("Unexpected error while handling unexpected error", e);
         }
 
-        if (t.getCause() != null)
-            inspectThrowable(t.getCause(), fn, isUncaughtException);
+        return true;
     }
 
     private static final Set<String> FORCE_HEAP_OOM_IGNORE_SET = ImmutableSet.of("Java heap space", "GC Overhead limit exceeded");

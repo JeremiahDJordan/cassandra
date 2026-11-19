@@ -19,8 +19,6 @@
 package org.apache.cassandra.auth.jmx;
 
 import java.lang.reflect.*;
-import java.security.AccessControlContext;
-import java.security.AccessController;
 import java.security.Principal;
 import java.util.Collections;
 import java.util.Set;
@@ -31,6 +29,7 @@ import java.util.stream.Collectors;
 import javax.management.InstanceNotFoundException;
 import javax.management.MBeanServer;
 import javax.management.MalformedObjectNameException;
+import javax.management.NotificationListener;
 import javax.management.ObjectName;
 import javax.security.auth.Subject;
 
@@ -153,9 +152,7 @@ public class AuthorizationProxy implements InvocationHandler
         if (methodName.equals("invoke") && args.length == 4)
             checkVulnerableMethods(args);
 
-        // Retrieve Subject from current AccessControlContext
-        AccessControlContext acc = AccessController.getContext();
-        Subject subject = Subject.getSubject(acc);
+        Subject subject = CurrentSubject.get();
 
         // Allow setMBeanServer iff performed on behalf of the connector server itself
         if (("setMBeanServer").equals(methodName))
@@ -209,6 +206,11 @@ public class AuthorizationProxy implements InvocationHandler
         if (subject == null)
             return true;
 
+        // Only the connector server can pass a NotificationListener instance. On Java 24 and later it registers its
+        // listeners as the client's Subject.
+        if (isConnectorListenerMethod(methodName, args))
+            return true;
+
         // Restrict access to certain methods by any remote user
         if (DENIED_METHODS.contains(methodName))
         {
@@ -236,6 +238,12 @@ public class AuthorizationProxy implements InvocationHandler
             return authorizeMBeanMethod(userResource, methodName, args);
         else
             return authorizeMBeanServerMethod(userResource, methodName);
+    }
+
+    private static boolean isConnectorListenerMethod(String methodName, Object[] args)
+    {
+        return ("addNotificationListener".equals(methodName) || "removeNotificationListener".equals(methodName))
+               && args != null && args.length >= 2 && args[1] instanceof NotificationListener;
     }
 
     /**

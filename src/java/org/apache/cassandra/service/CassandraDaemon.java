@@ -24,9 +24,11 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import javax.management.ObjectName;
 import javax.management.StandardMBean;
@@ -45,6 +47,7 @@ import org.apache.cassandra.auth.AuthCacheService;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SizeEstimatesRecorder;
@@ -66,7 +69,7 @@ import org.apache.cassandra.net.StartupClusterConnectivityChecker;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
-import org.apache.cassandra.security.ThreadAwareSecurityManager;
+import org.apache.cassandra.security.UDFSecurityMechanism;
 import org.apache.cassandra.service.paxos.PaxosState;
 import org.apache.cassandra.streaming.StreamManager;
 import org.apache.cassandra.utils.FBUtilities;
@@ -221,6 +224,24 @@ public class CassandraDaemon
         this.setupCompleted = false;
     }
 
+    private static void logUnusableFunctions()
+    {
+        List<String> broken = Schema.instance.distributedKeyspaces()
+                                             .stream()
+                                             .flatMap(ksm -> ksm.userFunctions.udfs())
+                                             .filter(UDFunction::isBroken)
+                                             .map(UDFunction::signature)
+                                             .collect(Collectors.toList());
+        if (!broken.isEmpty())
+            logger.warn("The following user-defined functions cannot be used on this node; see earlier log messages for the reasons: {}", broken);
+
+        List<String> rejected = UDFunction.rejectedByBytecodeSandbox(Schema.instance.distributedKeyspaces()
+                                                                                    .stream()
+                                                                                    .flatMap(ksm -> ksm.userFunctions.udfs()));
+        if (!rejected.isEmpty())
+            logger.warn("The bytecode UDF sandbox used on Java 24 and later would reject the following user-defined functions: {}", rejected);
+    }
+
     /**
      * This is a hook for concrete daemons to initialize themselves suitably.
      *
@@ -247,7 +268,7 @@ public class CassandraDaemon
 
         Mx4jTool.maybeLoad();
 
-        ThreadAwareSecurityManager.install();
+        UDFSecurityMechanism.install();
 
         logSystemInfo(logger);
 
@@ -387,6 +408,12 @@ public class CassandraDaemon
             System.err.println(e.getMessage() + "\nFatal configuration error; unable to start server.  See log for stacktrace.");
             exitOrFail(1, "Fatal configuration error", e);
         }
+
+        ScheduledExecutors.optionalTasks.execute(() -> {
+            // after the schema pull from other nodes, so that functions created while this node was down are included
+            Schema.instance.waitUntilReady(Duration.ofMillis(StorageService.SCHEMA_DELAY_MILLIS));
+            logUnusableFunctions();
+        });
 
         // Because we are writing to the system_distributed keyspace, this should happen after that is created, which
         // happens in StorageService.instance.initServer()
