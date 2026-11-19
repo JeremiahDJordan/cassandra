@@ -60,6 +60,14 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - Storage-attached indexes (SAI) on a clustering column ordered DESC now behave as on the same column ordered ASC,
+      as Apache Cassandra 5.0's do. An index on a DESC text, varchar, ascii or boolean clustering column, or on a DESC
+      frozen tuple or UDT clustering column, indexes the empty value, so c = '' or c IN ('', 'a') find the rows whose
+      clustering value is empty. Indexes built by earlier versions lack those entries until they are rebuilt
+      or their SSTables compacted: if you query such columns for the empty value, rebuild those indexes on each node
+      after upgrading it, with nodetool rebuild_index. The index on a DESC text, varchar, ascii, boolean or uuid
+      clustering column doesn't serve != and NOT IN, nor range restrictions on uuid, like the index on an ASC column:
+      such queries need ALLOW FILTERING or another index.
 
 Deprecation
 ---------
