@@ -50,6 +50,7 @@ import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.rows.Row;
@@ -649,7 +650,9 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
         assert indexGroup != null;
         Version minVersion = null;
-        for (SSTableReader sstable : baseCfs.getLiveSSTables())
+        // The canonical set: the sources of a running compaction, which have their components, rather than its
+        // results opened early, which may not have them yet.
+        for (SSTableReader sstable : baseCfs.getSSTables(SSTableSet.CANONICAL))
         {
             IndexDescriptor indexDescriptor = indexGroup.descriptorFor(sstable);
             assert indexDescriptor != null;
