@@ -34,8 +34,7 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
     private boolean ignoreGcGraceSeconds;
     private final long oldestUnrepairedTombstone;
     // Whether a range tombstone is open in the current partition, and whether it is purged. Its close bound is purged
-    // with it: reads lower the oldest unrepaired tombstone when they open sources, which the index searchers do between
-    // partitions or key batches, not between the bounds of a range tombstone, but a searcher that does keeps them paired
+    // with it, as the oldest unrepaired tombstone of a read can go down between the two
     private boolean rangeTombstoneOpen;
     private boolean openRangeTombstonePurged;
 

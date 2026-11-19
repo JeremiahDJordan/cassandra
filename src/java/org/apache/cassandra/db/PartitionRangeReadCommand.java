@@ -326,10 +326,11 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
         try
         {
             SSTableReadsListener readCountUpdater = newReadCountUpdater();
+            boolean onlyPurgeRepairedTombstones = cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones();
             for (Memtable memtable : view.memtables)
             {
                 UnfilteredPartitionIterator iter = memtable.partitionIterator(columnFilter(), dataRange(), readCountUpdater);
-                controller.updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+                controller.updateMinOldestUnrepairedTombstone(memtable, onlyPurgeRepairedTombstones);
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
             }
 
