@@ -53,7 +53,14 @@ cat > "${STUB_DIR}/bin/docker" <<'STUB'
 echo "docker $*" >> "${STUB_INVOCATIONS}"
 case "$1" in
   --version) echo "Docker version 0.0.0-stub, build stub" ;;
-  info)      echo " CPUs: 8" ;;
+  info)
+    # STUB_INFO=podman answers as podman does, STUB_INFO=none prints no cpu count
+    case "${STUB_INFO:-docker}:$*" in
+      docker:*)               echo " CPUs: 8" ;;
+      podman:*Host.CPUs*)     echo 6 ;;
+      podman:*)               echo "  cpus: 6" ;;
+    esac
+    ;;
   images)    echo "stub-image-id" ;;
   run)
     # `docker run --rm alpine … nproc --all` and `… free -b` ask the host, not the image
@@ -290,11 +297,25 @@ reset_stub
 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
 expect_rc "docker/run-tests.sh runs with every core" 0
 expect_invocation "docker/run-tests.sh gives the container every core" "\-\-cpus=8.00 "
+expect_no_invocation "docker/run-tests.sh reads docker's cpu count from the plain docker info" "docker info \-\-format"
 
 reset_stub
 docker_cpus=3 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
 expect_rc "docker/run-tests.sh runs with docker_cpus" 0
 expect_invocation "docker/run-tests.sh gives the container docker_cpus" "\-\-cpus=3 "
+
+# podman prints its cpu count in other words, and has it as .Host.CPUs
+reset_stub
+STUB_INFO=podman run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs with podman's info" 0
+expect_invocation "docker/run-tests.sh asks podman for its cpu count" "docker info \-\-format {{.Host.CPUs}}"
+expect_invocation "docker/run-tests.sh limits the container to podman's cpu count" "\-\-cpus=6 "
+
+# with no cpu count at all, the host's cores are the limit
+reset_stub
+STUB_INFO=none run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8
+expect_rc "docker/run-tests.sh runs with no cpu count from docker info" 0
+expect_invocation "docker/run-tests.sh gives the container the host's cores" "\-\-cpus=8.00 "
 
 reset_stub
 docker_cpus=0 run_case "${cassandra_dir}/.build/docker/run-tests.sh" -a test -c 1/8

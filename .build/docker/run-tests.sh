@@ -271,6 +271,9 @@ elif [[ ! "${docker_cpus}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || (( ! $(echo "${docker_cp
     error 1 "docker_cpus must be a number above 0, it is set to ${docker_cpus}"
 fi
 docker_cpus_limit=$(docker info | grep CPUs | cut -d" " -f3)
+# podman's info has no " CPUs: <n>" line
+[[ "${docker_cpus_limit}" =~ ^[0-9]+$ ]] || docker_cpus_limit=$(docker info --format '{{.Host.CPUs}}' 2>/dev/null)
+[[ "${docker_cpus_limit}" =~ ^[0-9]+$ ]] || docker_cpus_limit=${cores}
 if (( $(echo "${docker_cpus} > ${docker_cpus_limit}" |bc -l) )) ; then
     echo "WARNING: requested more cpus (${docker_cpus}) than docker cpu limit (${docker_cpus_limit}), reducing cpus…"
     docker_cpus=${docker_cpus_limit}
