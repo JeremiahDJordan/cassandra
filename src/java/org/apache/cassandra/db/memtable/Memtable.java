@@ -269,7 +269,8 @@ public interface Memtable extends Comparable<Memtable>
 
     /**
      * Minimum local deletion time of all stored data, for the reads of tables that only purge repaired tombstones, or
-     * UNKNOWN_MIN_LOCAL_DELETION_TIME if the memtable doesn't keep it.
+     * UNKNOWN_MIN_LOCAL_DELETION_TIME if the memtable doesn't keep it; implementations should keep it. It goes down before
+     * a write is visible, as these reads take it again at each purge decision.
      */
     default int getMinLocalDeletionTime()
     {

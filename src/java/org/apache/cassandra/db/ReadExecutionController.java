@@ -18,6 +18,8 @@
 package org.apache.cassandra.db;
 
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -25,6 +27,7 @@ import com.google.common.annotations.VisibleForTesting;
 import com.codahale.metrics.Histogram;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.marshal.Redaction;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.metrics.DecayingEstimatedHistogramReservoir;
 import org.apache.cassandra.schema.TableMetadata;
@@ -54,6 +57,10 @@ public class ReadExecutionController implements AutoCloseable
 
     private final RepairedDataInfo repairedDataInfo;
     private int oldestUnrepairedTombstone = Integer.MAX_VALUE;
+    // The memtables opened by a read of a table that only purges repaired tombstones. Their min local deletion time goes
+    // down when they get older tombstones, which the read may see, so the read takes their current one
+    private Memtable openedMemtable;
+    private List<Memtable> otherOpenedMemtables;
 
     private final Histogram sstablesScannedPerRowRead;
 
@@ -114,7 +121,38 @@ public class ReadExecutionController implements AutoCloseable
 
     int oldestUnrepairedTombstone()
     {
-        return oldestUnrepairedTombstone;
+        int oldest = oldestUnrepairedTombstone;
+        if (openedMemtable != null)
+            oldest = Math.min(oldest, openedMemtable.getMinLocalDeletionTime());
+        if (otherOpenedMemtables != null)
+        {
+            for (Memtable other : otherOpenedMemtables)
+                oldest = Math.min(oldest, other.getMinLocalDeletionTime());
+        }
+        return oldest;
+    }
+
+    /**
+     * @return whether the read follows the memtable's min local deletion time; a memtable that doesn't keep it counts
+     * through the values the read takes from its data
+     */
+    boolean updateMinOldestUnrepairedTombstone(Memtable opened)
+    {
+        if (opened == openedMemtable || (otherOpenedMemtables != null && otherOpenedMemtables.contains(opened)))
+            return true;
+        if (opened.getMinLocalDeletionTime() == Memtable.UNKNOWN_MIN_LOCAL_DELETION_TIME)
+            return false;
+        if (openedMemtable == null)
+        {
+            openedMemtable = opened;
+        }
+        else
+        {
+            if (otherOpenedMemtables == null)
+                otherOpenedMemtables = new ArrayList<>(1);
+            otherOpenedMemtables.add(opened);
+        }
+        return true;
     }
 
     void updateMinOldestUnrepairedTombstone(int candidate)

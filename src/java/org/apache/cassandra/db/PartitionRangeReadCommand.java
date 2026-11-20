@@ -317,16 +317,17 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
         InputCollector<UnfilteredPartitionIterator> inputCollector = iteratorsForRange(view, controller);
         try
         {
-            // avoid iterating over the memtable if we purge all tombstones
+            // reads of tables that only purge repaired tombstones follow the memtables' min local deletion time
             boolean useMinLocalDeletionTime = cfs.onlyPurgeRepairedTombstones();
 
             for (Memtable memtable : view.memtables)
             {
                 @SuppressWarnings("resource") // We close on exception and on closing the result returned by this method
                 Memtable.MemtableUnfilteredPartitionIterator iter = memtable.makePartitionIterator(columnFilter(), dataRange());
-                if (useMinLocalDeletionTime)
-                    controller.updateMinOldestUnrepairedTombstone(iter.getMinLocalDeletionTime());
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
+                // a memtable that doesn't keep its minimum gives the one of the partitions of the range, once
+                if (useMinLocalDeletionTime && !controller.updateMinOldestUnrepairedTombstone(memtable))
+                    controller.updateMinOldestUnrepairedTombstone(iter.getMinLocalDeletionTime());
             }
 
             SSTableReadsListener readCountUpdater = newReadCountUpdater();
