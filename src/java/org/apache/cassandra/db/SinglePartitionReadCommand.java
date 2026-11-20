@@ -771,6 +771,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         {
             SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
 
+            boolean onlyPurgeRepairedTombstones = cfs.onlyPurgeRepairedTombstones();
             for (Memtable memtable : view.memtables)
             {
                 UnfilteredRowIterator iter = memtable.rowIterator(partitionKey(), filter.getSlices(metadata()), columnFilter(), filter.isReversed(), metricsCollector);
@@ -784,7 +785,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     iter = Transformation.apply(iter, rowTransformer.apply(memtable));
 
                 // Memtable data is always considered unrepaired
-                controller.updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+                controller.updateMinOldestUnrepairedTombstone(memtable, onlyPurgeRepairedTombstones);
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
 
                 mostRecentPartitionTombstone = Math.max(mostRecentPartitionTombstone,
@@ -1026,6 +1027,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Merging memtable contents");
 
+        boolean onlyPurgeRepairedTombstones = cfs.onlyPurgeRepairedTombstones();
         for (Memtable memtable : view.memtables)
         {
             try (UnfilteredRowIterator iter = memtable.rowIterator(partitionKey, filter.getSlices(metadata()), columnFilter(), isReversed(), metricsCollector))
@@ -1034,7 +1036,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     continue;
 
                 // Memtable data is always considered unrepaired
-                controller.updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+                controller.updateMinOldestUnrepairedTombstone(memtable, onlyPurgeRepairedTombstones);
 
                 UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable))
                                                                        : iter;
