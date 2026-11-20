@@ -19,6 +19,7 @@
 package org.apache.cassandra.net;
 
 import java.nio.ByteBuffer;
+import java.nio.ReadOnlyBufferException;
 import java.util.Arrays;
 import java.util.Random;
 
@@ -28,6 +29,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.utils.memory.BufferPool;
 
 import io.netty.buffer.ByteBuf;
 
@@ -113,6 +115,67 @@ public class BufferPoolAllocatorTest
         buffer.writeBytes(new byte[500]);
 
         buffer.release();
+        ensureThatAllMemoryIsReturnedBackToBufferPool();
+    }
+
+    @Test
+    public void testReleaseAfterResizeToOverflow()
+    {
+        int size = BufferPool.NORMAL_CHUNK_SIZE + 1;
+        ByteBuf buffer = allocateByteBuf(256, size);
+        buffer.writeInt(42);
+        buffer.capacity(size);
+        assertEquals(size, GlobalBufferPoolAllocator.instance.overflowMemoryInBytes());
+        assertEquals(42, buffer.readInt());
+        buffer.release();
+        ensureThatAllMemoryIsReturnedBackToBufferPool();
+    }
+
+    @Test
+    public void testAdoptAfterResizeToOverflow()
+    {
+        int size = BufferPool.NORMAL_CHUNK_SIZE + 1;
+        BufferPoolAllocator.Wrapped buffer = (BufferPoolAllocator.Wrapped) allocateByteBuf(256, size);
+        buffer.writeInt(42);
+        buffer.capacity(size);
+        buffer.capacity(256);
+        assertEquals(0, GlobalBufferPoolAllocator.instance.overflowMemoryInBytes());
+        buffer.capacity(size);
+        ByteBuffer adopted = buffer.adopt();
+        buffer.release();
+        assertEquals(size, GlobalBufferPoolAllocator.instance.overflowMemoryInBytes());
+        assertEquals(42, adopted.getInt());
+        GlobalBufferPoolAllocator.instance.put(adopted);
+        ensureThatAllMemoryIsReturnedBackToBufferPool();
+    }
+
+    @Test
+    public void testFailedResizeKeepsPreviousAllocation()
+    {
+        GlobalBufferPoolAllocator allocator = GlobalBufferPoolAllocator.instance;
+        int size = BufferPool.NORMAL_CHUNK_SIZE + 1;
+        ByteBuffer initial = allocator.getAtLeast(256);
+        ByteBuf buffer = new BufferPoolAllocator.Wrapped(allocator, initial, size)
+        {
+            @Override
+            protected ByteBuffer allocateDirect(int capacity)
+            {
+                // Fail Netty's copy after the pool has supplied a replacement.
+                return super.allocateDirect(capacity).asReadOnlyBuffer();
+            }
+        };
+        try
+        {
+            buffer.clear().writeInt(42);
+            Assertions.assertThatThrownBy(() -> buffer.capacity(size)).isInstanceOf(ReadOnlyBufferException.class);
+            assertEquals(0, allocator.overflowMemoryInBytes());
+            assertEquals(initial.capacity(), allocator.usedSizeInBytes());
+            assertEquals(42, buffer.readInt());
+        }
+        finally
+        {
+            buffer.release();
+        }
         ensureThatAllMemoryIsReturnedBackToBufferPool();
     }
 
