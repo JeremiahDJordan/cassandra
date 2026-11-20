@@ -20,6 +20,7 @@ package org.apache.cassandra.db.partitions;
 import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.function.LongPredicate;
+import java.util.function.LongSupplier;
 
 import com.google.common.collect.Iterators;
 import org.junit.Before;
@@ -65,6 +66,34 @@ public final class PurgeFunctionTest
         }
 
         return Transformation.apply(iterator, new WithoutPurgeableTombstones());
+    }
+
+    private static UnfilteredPartitionIterator withoutPurgeableRepairedTombstones(UnfilteredPartitionIterator iterator,
+                                                                                  long gcBefore,
+                                                                                  long oldestUnrepairedTombstone,
+                                                                                  LongSupplier currentOldestUnrepairedTombstone)
+    {
+        class WithoutPurgeableRepairedTombstones extends PurgeFunction
+        {
+            private WithoutPurgeableRepairedTombstones()
+            {
+                super(FBUtilities.nowInSeconds(), gcBefore, oldestUnrepairedTombstone, true, false);
+            }
+
+            @Override
+            protected long oldestUnrepairedTombstone()
+            {
+                return currentOldestUnrepairedTombstone == null ? super.oldestUnrepairedTombstone()
+                                                                : currentOldestUnrepairedTombstone.getAsLong();
+            }
+
+            protected LongPredicate getPurgeEvaluator()
+            {
+                return time -> true;
+            }
+        }
+
+        return Transformation.apply(iterator, new WithoutPurgeableRepairedTombstones());
     }
 
     @Before
@@ -206,6 +235,70 @@ public final class PurgeFunctionTest
         UnfilteredPartitionIterator expected = iter(true
         , bound(Kind.EXCL_END_BOUND, 1L, 1, "b")
         , bound(Kind.INCL_START_BOUND, 1L, 1, "a")
+        );
+        assertIteratorsEqual(expected, purged);
+    }
+
+    @Test
+    public void testOnlyPurgeRepairedTombstones()
+    {
+        UnfilteredPartitionIterator original = iter(false
+        , bound(Kind.INCL_START_BOUND, 0L, 0, "a")
+        , boundary(Kind.EXCL_END_INCL_START_BOUNDARY, 0L, 0, 1L, 1, "b")
+        , bound(Kind.INCL_END_BOUND, 1L, 1, "c")
+        );
+        UnfilteredPartitionIterator purged = withoutPurgeableRepairedTombstones(original, 2, 1, null);
+
+        UnfilteredPartitionIterator expected = iter(false
+        , bound(Kind.INCL_START_BOUND, 1L, 1, "b")
+        , bound(Kind.INCL_END_BOUND, 1L, 1, "c")
+        );
+        assertIteratorsEqual(expected, purged);
+    }
+
+    @Test
+    public void testOnlyPurgeRepairedTombstonesLoweredBetweenBounds()
+    {
+        UnfilteredPartitionIterator original = iter(false
+        , bound(Kind.INCL_START_BOUND, 0L, 0, "a")
+        , boundary(Kind.EXCL_END_INCL_START_BOUNDARY, 0L, 0, 1L, 1, "b")
+        , bound(Kind.INCL_END_BOUND, 1L, 1, "c")
+        );
+        // the oldest unrepaired tombstone goes down after the first range tombstone is opened
+        long[] oldestUnrepairedTombstone = { Long.MAX_VALUE };
+        UnfilteredPartitionIterator purged = withoutPurgeableRepairedTombstones(original, 2, Long.MAX_VALUE, () -> {
+            long current = oldestUnrepairedTombstone[0];
+            oldestUnrepairedTombstone[0] = 0;
+            return current;
+        });
+
+        UnfilteredPartitionIterator expected = iter(false
+        , bound(Kind.INCL_START_BOUND, 1L, 1, "b")
+        , bound(Kind.INCL_END_BOUND, 1L, 1, "c")
+        );
+        assertIteratorsEqual(expected, purged);
+    }
+
+    @Test
+    public void testOnlyPurgeRepairedTombstonesLoweredInsideBounds()
+    {
+        UnfilteredPartitionIterator original = iter(false
+        , bound(Kind.INCL_START_BOUND, 0L, 0, "a")
+        , bound(Kind.INCL_END_BOUND, 0L, 0, "b")
+        , bound(Kind.INCL_START_BOUND, 1L, 3, "c")
+        , bound(Kind.INCL_END_BOUND, 1L, 3, "d")
+        );
+        // the oldest unrepaired tombstone goes down after the range tombstone is opened
+        long[] oldestUnrepairedTombstone = { Long.MAX_VALUE };
+        UnfilteredPartitionIterator purged = withoutPurgeableRepairedTombstones(original, 2, Long.MAX_VALUE, () -> {
+            long current = oldestUnrepairedTombstone[0];
+            oldestUnrepairedTombstone[0] = 0;
+            return current;
+        });
+
+        UnfilteredPartitionIterator expected = iter(false
+        , bound(Kind.INCL_START_BOUND, 1L, 3, "c")
+        , bound(Kind.INCL_END_BOUND, 1L, 3, "d")
         );
         assertIteratorsEqual(expected, purged);
     }
