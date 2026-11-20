@@ -702,7 +702,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
                 var wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable)) : iter;
 
-                if (onlyPurgeRepairedTombstones)
+                if (onlyPurgeRepairedTombstones && !controller.updateMinOldestUnrepairedTombstone(memtable))
                     updateMinOldestUnrepairedTombstone(controller, partition, iter);
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false));
 
@@ -943,7 +943,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 if (iter.isEmpty())
                     continue;
 
-                if (onlyPurgeRepairedTombstones)
+                if (onlyPurgeRepairedTombstones && !controller.updateMinOldestUnrepairedTombstone(memtable))
                     updateMinOldestUnrepairedTombstone(controller, partition, iter);
 
                 var wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable)) : iter;

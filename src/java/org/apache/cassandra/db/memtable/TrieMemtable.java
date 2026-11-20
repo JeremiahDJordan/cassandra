@@ -656,6 +656,9 @@ public class TrieMemtable extends AbstractAllocatorMemtable
             }
             try
             {
+                // The stats give the minimum local deletion time, which goes down before the update is visible, for the
+                // reads that purge the tombstones older than it
+                stats = stats.mergeWith(update.stats());
                 try
                 {
                     indexer.start();
@@ -687,7 +690,6 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                     updateCurrentOperations(update.operationCount());
 
                     columns = columns.mergeTo(update.columns());
-                    stats = stats.mergeWith(update.stats());
                     // last, so that a failure in Indexer#finish doesn't skip the updates above
                     indexer.commit();
                 }

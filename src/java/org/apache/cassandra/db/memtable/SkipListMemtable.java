@@ -192,6 +192,10 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
             }
         }
 
+        // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the update is
+        // visible, for the reads that purge the tombstones older than it
+        if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+            minLocalDeletionTime.accumulateAndGet(update.stats().minLocalDeletionTime, Math::min);
         BTreePartitionUpdater updater;
         try
         {
@@ -201,9 +205,6 @@ public class SkipListMemtable extends AbstractAllocatorMemtable
         {
             // addAll can fail after applying the update (in Indexer#finish), so record its columns and stats anyway
             updateMin(minTimestamp, previous.stats().minTimestamp);
-            // EncodingStats uses a synthetic epoch for no local deletion time
-            if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
-                minLocalDeletionTime.accumulateAndGet(update.stats().minLocalDeletionTime, Math::min);
             columnsCollector.update(update.columns());
             statsCollector.update(update.stats());
             currentOperations.addAndGet(update.operationCount());
