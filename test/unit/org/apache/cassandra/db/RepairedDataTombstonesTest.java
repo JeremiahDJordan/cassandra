@@ -48,6 +48,8 @@ import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.index.StubIndex;
+import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.ColumnMetadata;
@@ -963,6 +965,106 @@ public class RepairedDataTombstonesTest extends CQLTester
                 collect = false;
         }
         return unfiltereds;
+    }
+
+    @Test
+    public void readTestRangeOldDeletionWrittenAfterOpenSkipList() throws Throwable
+    {
+        readTestRangeOldDeletionWrittenAfterOpen(" and memtable = 'skiplist'");
+    }
+
+    @Test
+    public void readTestReadDuringOldDeletionWriteSkipList() throws Throwable
+    {
+        readTestReadDuringOldDeletionWrite(" and memtable = 'skiplist'", "org.apache.cassandra.db.memtable.SkipListMemtable", "addAll");
+    }
+
+    @Test
+    public void readTestRangeOldDeletionWrittenAfterOpenShardedSkipList() throws Throwable
+    {
+        readTestRangeOldDeletionWrittenAfterOpen(" and memtable = 'skiplist_sharded'");
+    }
+
+    @Test
+    public void readTestReadDuringOldDeletionWriteShardedSkipList() throws Throwable
+    {
+        readTestReadDuringOldDeletionWrite(" and memtable = 'skiplist_sharded'", "org.apache.cassandra.db.memtable.ShardedSkipListMemtable$MemtableShard", "addAll");
+    }
+
+    @Test
+    public void readTestRangeOldDeletionWrittenAfterOpenTrie() throws Throwable
+    {
+        readTestRangeOldDeletionWrittenAfterOpen(" and memtable = 'trie'");
+    }
+
+    @Test
+    public void readTestReadDuringOldDeletionWriteTrie() throws Throwable
+    {
+        readTestReadDuringOldDeletionWrite(" and memtable = 'trie'", "org.apache.cassandra.db.memtable.TrieMemtable$MemtableShard", "putSingleton");
+    }
+
+    private void readTestRangeOldDeletionWrittenAfterOpen(String memtableOption) throws Throwable
+    {
+        createTable("create table %s (id int, id2 int, t text, t2 text, primary key (id, id2)) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true}" + memtableOption);
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+        for (int i = 0; i < 10; i++)
+            execute("insert into %s (id, id2, t, t2) values (?, 5, 'live', 'old') using timestamp 1", i);
+        ReadCommand cmd = Util.cmd(cfs).build();
+        int partitions = 0;
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            // the deletions reach the memtable after the read opened it, and before it reads their partitions
+            for (int i = 0; i < 10; i++)
+                deleteT2WithOldLocalDeletionTime(i, 5);
+            while (iterator.hasNext())
+            {
+                try (UnfilteredRowIterator partition = iterator.next())
+                {
+                    partitions++;
+                    // the row has either the value of t2 or its deletion
+                    assertNotNull(t2((Row) partition.next()));
+                }
+            }
+        }
+        assertEquals(10, partitions);
+    }
+
+    private void readTestReadDuringOldDeletionWrite(String memtableOption, String memtableClass, String publishingMethod) throws Throwable
+    {
+        createTable("create table %s (id int, id2 int, t text, t2 text, primary key (id, id2)) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true}" + memtableOption);
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+        execute("insert into %s (id, id2, t, t2) values (1, 5, 'live', 'old') using timestamp 1");
+        // the write of the deletion stops once its data is visible in the memtable
+        Injections.Barrier published = Injections.newBarrier("published", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint().onClass(memtableClass).onMethod("put").after("INVOKE " + publishingMethod))
+                                                 .build();
+        Injections.inject(published);
+        Thread writer = new Thread(() -> deleteT2WithOldLocalDeletionTime(1, 5));
+        try
+        {
+            writer.start();
+            Util.spinAssertEquals(1L, published::getCount, 10);
+            ReadCommand cmd = Util.cmd(cfs, Util.dk(ByteBufferUtil.bytes(1))).build();
+            try (ReadExecutionController executionController = cmd.executionController();
+                 UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+            {
+                assertTrue(iterator.hasNext());
+                try (UnfilteredRowIterator partition = iterator.next())
+                {
+                    // the row has either the value of t2 or its deletion
+                    assertNotNull(t2((Row) partition.next()));
+                }
+            }
+        }
+        finally
+        {
+            published.countDown();
+            writer.join();
+            Injections.deleteAll();
+        }
     }
 
     private ColumnFamilyStore createWidePartitionForBatches() throws Throwable
