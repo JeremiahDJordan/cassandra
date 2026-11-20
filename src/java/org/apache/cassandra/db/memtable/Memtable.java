@@ -264,6 +264,18 @@ public interface Memtable extends Comparable<Memtable>
     /** Minimum timestamp of all stored data */
     long getMinTimestamp();
 
+    /** {@link #getMinLocalDeletionTime()} of a memtable that doesn't keep it; as a limit, it purges nothing */
+    public static final int UNKNOWN_MIN_LOCAL_DELETION_TIME = Integer.MIN_VALUE;
+
+    /**
+     * Minimum local deletion time of all stored data, for the reads of tables that only purge repaired tombstones, or
+     * UNKNOWN_MIN_LOCAL_DELETION_TIME if the memtable doesn't keep it.
+     */
+    default int getMinLocalDeletionTime()
+    {
+        return UNKNOWN_MIN_LOCAL_DELETION_TIME;
+    }
+
     /** Min partition key inserted so far. */
     DecoratedKey minPartitionKey();
 
