@@ -115,18 +115,30 @@ public abstract class BufferPoolAllocator extends AbstractByteBufAllocator
             if (newCapacity == capacity())
                 return this;
 
-            ByteBuf newBuffer = super.capacity(newCapacity);
-            ByteBuffer nioBuffer = newBuffer.nioBuffer(0, newBuffer.capacity());
-
-            bufferPool.put(wrapped);
-            wrapped = nioBuffer;
-            return newBuffer;
+            ByteBuffer previous = wrapped;
+            try
+            {
+                super.capacity(newCapacity);
+            }
+            catch (Throwable t)
+            {
+                // If the resize failed during the copy, Netty still uses the previous allocation.
+                ByteBuffer replacement = wrapped;
+                wrapped = previous;
+                if (replacement != previous)
+                    bufferPool.put(replacement);
+                throw t;
+            }
+            bufferPool.put(previous);
+            return this;
         }
 
         @Override
         protected ByteBuffer allocateDirect(int initialCapacity)
         {
-            return bufferPool.getAtLeast(initialCapacity, BufferType.OFF_HEAP);
+            // The pool must get back this allocation, not a view of it.
+            wrapped = bufferPool.getAtLeast(initialCapacity, BufferType.OFF_HEAP);
+            return wrapped;
         }
 
         @Override
