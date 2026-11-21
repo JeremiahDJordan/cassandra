@@ -25,6 +25,7 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
 
 import com.google.common.base.Predicate;
+import com.google.common.collect.Iterables;
 
 import org.apache.cassandra.db.compaction.RepairFinalizationOperation;
 
@@ -92,6 +93,13 @@ public class CassandraTableRepairManager implements TableRepairManager
         LifecycleTransaction txn = cfs.getTracker().tryModify(pendingRepairSSTables, OperationType.COMPACTION);
         if (txn == null)
             return;
+
+        // the sstables can leave the session between getPendingRepairSSTables and tryModify
+        if (!Iterables.all(txn.originals(), sstable -> sessionID.equals(sstable.getPendingRepair())))
+        {
+            txn.abort();
+            return;
+        }
 
         boolean isTransient = false;
         for (SSTableReader sstable : pendingRepairSSTables)
