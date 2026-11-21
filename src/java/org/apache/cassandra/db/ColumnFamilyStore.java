@@ -2905,6 +2905,15 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             FBUtilities.waitOnFuture(dumpMemtable(ColumnFamilyStore.FlushReason.DROP));
     }
 
+    /**
+     * @return whether an operation runs with compactions disabled on this table
+     * (see {@link #runWithCompactionsDisabled})
+     */
+    public boolean isRunningWithCompactionsDisabled()
+    {
+        return longRunningSerializedOperationsLock.isLocked();
+    }
+
     @Override
     public <V> V runWithCompactionsDisabled(Callable<V> callable, boolean interruptValidation, boolean interruptViews, TableOperation.StopTrigger trigger)
     {

@@ -31,10 +31,12 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Maps;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.compaction.CompactionInterruptedException;
@@ -80,6 +82,14 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     // make sure only one builder can write to per sstable files when multiple storage-attached indexes are created simultaneously.
     private static final Map<SSTableReader, CountDownLatch> inProgress = Maps.newConcurrentMap();
 
+    /**
+     * How long, at most, a build stopped by a truncate waits for the truncate to be over (see
+     * {@link #removedByTruncate}): longer than a truncate waits for the operations it stops.
+     */
+    @VisibleForTesting
+    static volatile long TRUNCATED_SSTABLES_WAIT_MILLIS =
+        TimeUnit.SECONDS.toMillis(CassandraRelevantProperties.CESSATION_WAIT_SECONDS.getInt(60) + 60);
+
     private final StorageAttachedIndexGroup group;
     private final TableMetadata metadata;
     private final Tracker tracker;
@@ -88,6 +98,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     private final boolean isInitialBuild;
 
     private final SortedMap<SSTableReader, Set<StorageAttachedIndex>> sstables;
+    // the SSTables this build hasn't built yet
+    private final Set<SSTableReader> unbuilt;
 
     private long bytesProcessed = 0;
     private final long totalSizeInBytes;
@@ -97,6 +109,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         this.group = group;
         this.metadata = group.metadata();
         this.sstables = sstables;
+        this.unbuilt = new HashSet<>(sstables.keySet());
         this.tracker = group.table().getTracker();
         this.isFullRebuild = isFullRebuild;
         this.isInitialBuild = isInitialBuild;
@@ -116,6 +129,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             if (existing.isEmpty())
             {
                 logger.debug(logMessage("{} dropped during index build"), indexes);
+                unbuilt.remove(sstable);
                 continue;
             }
 
@@ -123,6 +137,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             {
                 return;
             }
+            unbuilt.remove(sstable);
         }
     }
 
@@ -235,7 +250,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         {
             if (indexWriter != null)
             {
-                indexWriter.abort(t, true);
+                // A stop by a truncate that removed the SSTables this build hasn't built isn't a failure of the index
+                boolean truncated = t instanceof CompactionInterruptedException && removedByTruncate();
+                indexWriter.abort(t, !truncated);
             }
 
             if (t instanceof InterruptedException)
@@ -272,6 +289,49 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             {
                 inProgress.remove(sstable);
                 perSSTableFileLock.countDown();
+            }
+        }
+    }
+
+    /**
+     * @return whether the build was stopped by a truncate that has removed all the SSTables it hasn't built, so the
+     * build is complete. Waits for the truncate to be over (it runs with compactions disabled on the table) for at most
+     * {@link #TRUNCATED_SSTABLES_WAIT_MILLIS}, as it may still fail to remove them.
+     */
+    private boolean removedByTruncate()
+    {
+        if (trigger() != TRUNCATE)
+            return false;
+
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(TRUNCATED_SSTABLES_WAIT_MILLIS);
+        while (true)
+        {
+            // Looked at before the SSTables: once the truncate is over, whatever it removed is removed.
+            boolean truncating = group.table().isRunningWithCompactionsDisabled();
+
+            // Removed means obsolete: an SSTable also leaves the live set for a while when an operation that
+            // opens its results early has read it, and comes back if that operation aborts.
+            Set<SSTableReader> live = tracker.getView().liveSSTables();
+            if (unbuilt.stream().noneMatch(sstable -> live.contains(sstable) || !sstable.isMarkedCompacted()))
+                return true;
+            if (!truncating || System.nanoTime() - deadline > 0)
+            {
+                logger.warn(logMessage("The index build stopped by a truncate fails: {} of the SSTables it hasn't " +
+                                       "built are still live, or may be again, {}"),
+                            unbuilt.stream()
+                                   .filter(sstable -> live.contains(sstable) || !sstable.isMarkedCompacted())
+                                   .count(),
+                            truncating ? "and the truncate isn't over" : "after the truncate");
+                return false;
+            }
+            try
+            {
+                Thread.sleep(100);
+            }
+            catch (InterruptedException e)
+            {
+                Thread.currentThread().interrupt();
+                return false;
             }
         }
     }
