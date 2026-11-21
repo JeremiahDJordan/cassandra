@@ -139,6 +139,18 @@ public class SegmentFlushTest
     private void testFlushBetweenRowIds(long sstableRowId1, long sstableRowId2, int segments) throws Exception
     {
         Path tmpDir = Files.createTempDirectory("SegmentFlushTest");
+        try
+        {
+            testFlushBetweenRowIds(tmpDir, sstableRowId1, sstableRowId2, segments);
+        }
+        finally
+        {
+            new File(tmpDir).deleteRecursive();
+        }
+    }
+
+    private void testFlushBetweenRowIds(Path tmpDir, long sstableRowId1, long sstableRowId2, int segments) throws Exception
+    {
         IndexDescriptor indexDescriptor = IndexDescriptor.empty(new Descriptor(new File(tmpDir.toFile()), "ks", "cf", new SequenceBasedSSTableId(1)));
 
         ColumnMetadata column = ColumnMetadata.regularColumn("sai", "internal", "column", UTF8Type.instance);
