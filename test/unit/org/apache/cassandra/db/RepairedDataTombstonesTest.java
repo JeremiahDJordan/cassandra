@@ -29,6 +29,7 @@ import com.google.common.collect.Iterables;
 import org.junit.Test;
 
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.Operator;
@@ -42,6 +43,7 @@ import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.AbstractRow;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
@@ -723,6 +725,29 @@ public class RepairedDataTombstonesTest extends CQLTester
     }
 
     @Test
+    public void readTestSAISearchOldRangeDeletionAroundRowBetweenBatches() throws Throwable
+    {
+        // the search reads the partition in batches of keys, and the deleted row starts the third batch
+        int batchSize = CassandraRelevantProperties.SAI_PARTITION_ROW_BATCH_SIZE.getInt();
+        int deleted = 2 * batchSize;
+        ColumnFamilyStore cfs = createWidePartitionWithStaticRow(deleted + 50);
+        ReadCommand cmd = staticExpressionSearch(cfs);
+        try (ReadExecutionController executionController = cmd.executionController();
+             UnfilteredPartitionIterator iterator = cmd.executeLocally(executionController))
+        {
+            assertTrue(iterator.hasNext());
+            try (UnfilteredRowIterator partition = iterator.next())
+            {
+                assertEquals(0, clustering((Row) partition.next()));
+                // the range deletion reaches the memtable after the first batch of keys; it is older than the row
+                deleteRangeWithOldLocalDeletionTime(2, 1, deleted);
+                assertEquals(Arrays.asList("row " + (deleted - 1), "open", "row " + deleted, "close", "row " + (deleted + 1)),
+                             around(partition, deleted));
+            }
+        }
+    }
+
+    @Test
     public void readTestRowCacheHitAfterRepairAndCompaction() throws Throwable
     {
         CacheService.instance.setRowCacheCapacityInMB(1);
@@ -1089,6 +1114,52 @@ public class RepairedDataTombstonesTest extends CQLTester
     private void deleteT2WithOldLocalDeletionTime(int id, int id2)
     {
         new RowUpdateBuilder(getCurrentColumnFamilyStore().metadata(), FBUtilities.nowInSeconds() - 100, 2L, id).clustering(id2).delete("t2").build().apply();
+    }
+
+    // a partition with a static row, which an SAI search with a static column expression reads in batches of keys
+    private ColumnFamilyStore createWidePartitionWithStaticRow(int rows) throws Throwable
+    {
+        createTable("create table %s (id int, id2 int, s text static, t text, t2 text, primary key (id, id2)) with gc_grace_seconds=0 and compaction = {'class':'SizeTieredCompactionStrategy', 'only_purge_repaired_tombstones':true}");
+        createIndex("create custom index on %s (t) using 'StorageAttachedIndex'");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+        execute("insert into %s (id, s) values (1, 'x') using timestamp 10");
+        for (int i = 0; i < rows; i++)
+            execute("insert into %s (id, id2, t, t2) values (1, ?, 'live', 'old') using timestamp 10", i);
+        flush();
+        return cfs;
+    }
+
+    private ReadCommand staticExpressionSearch(ColumnFamilyStore cfs)
+    {
+        ReadCommand cmd = Util.cmd(cfs).filterOn("t", Operator.EQ, "live").filterOn("s", Operator.EQ, "x").build();
+        assertNotNull(cmd.indexQueryPlan());
+        assertTrue(cmd.rowFilter().hasStaticExpression());
+        return cmd;
+    }
+
+    // a deletion of one clustering by a range tombstone with a local deletion time in the past
+    private void deleteRangeWithOldLocalDeletionTime(long timestamp, int id, int id2)
+    {
+        new RowUpdateBuilder(getCurrentColumnFamilyStore().metadata(), FBUtilities.nowInSeconds() - 100, timestamp, id).addRangeTombstone(id2, id2).build().apply();
+    }
+
+    // what the read returns from the row before the given clustering to the row after it
+    private static List<String> around(UnfilteredRowIterator partition, int clustering)
+    {
+        List<String> unfiltereds = new ArrayList<>();
+        boolean collect = false;
+        while (partition.hasNext())
+        {
+            Unfiltered unfiltered = partition.next();
+            if (unfiltered.isRow() && clustering((Row) unfiltered) == clustering - 1)
+                collect = true;
+            if (collect)
+                unfiltereds.add(unfiltered.isRow() ? "row " + clustering((Row) unfiltered) : ((RangeTombstoneMarker) unfiltered).isOpen(false) ? "open" : "close");
+            if (unfiltered.isRow() && clustering((Row) unfiltered) == clustering + 1)
+                collect = false;
+        }
+        return unfiltereds;
     }
 
     // an sstable that holds only a deletion of t2 with an old local deletion time, flushed and removed from the table
