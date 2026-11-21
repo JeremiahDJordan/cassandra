@@ -79,37 +79,37 @@ public class SaiDiskSizeTest extends SAITester
                               {
                                   case "aa":
                                       return Stream.of(
-                                      new Object[]{ v, 24989, 24989, "pk", 1 },
-                                      new Object[]{ v, 26026, 26181, "pk, v_int", 2 },
-                                      new Object[]{ v, 28526, 26603, "pk, v_int", 100 });
+                                      new Object[]{ v, 25055, 25022, "pk", 1 },
+                                      new Object[]{ v, 26092, 26214, "pk, v_int", 2 },
+                                      new Object[]{ v, 28592, 26636, "pk, v_int", 100 });
                                   case "ba":
                                   case "ca":
                                   case "db":
                                   case "dc":
                                       return Stream.of(
-                                      new Object[]{ v, 131489, 131312, "pk", 1 },
-                                      new Object[]{ v, 115177, 115009, "pk, v_int", 2 },
-                                      new Object[]{ v, 55861, 55720, "pk, v_int", 100 });
+                                      new Object[]{ v, 131555, 131345, "pk", 1 },
+                                      new Object[]{ v, 115243, 115042, "pk, v_int", 2 },
+                                      new Object[]{ v, 55927, 55753, "pk, v_int", 100 });
                                   case "eb":
                                   case "ec":
                                       return Stream.of(
-                                      new Object[]{ v, 134761, 132841, "pk", 1 },
-                                      new Object[]{ v, 118449, 116538, "pk, v_int", 2 },
-                                      new Object[]{ v, 59133, 57249, "pk, v_int", 100 });
+                                      new Object[]{ v, 134827, 132874, "pk", 1 },
+                                      new Object[]{ v, 118515, 116571, "pk, v_int", 2 },
+                                      new Object[]{ v, 59199, 57282, "pk, v_int", 100 });
                                   case "ed":
                                   case "fa":
                                   case "fb":
                                       return Stream.of(
-                                      new Object[]{ v, 134777, 132849, "pk", 1 },
-                                      new Object[]{ v, 118465, 116546, "pk, v_int", 2 },
-                                      new Object[]{ v, 59149, 57257, "pk, v_int", 100 });
+                                      new Object[]{ v, 134843, 132882, "pk", 1 },
+                                      new Object[]{ v, 118531, 116579, "pk, v_int", 2 },
+                                      new Object[]{ v, 59215, 57290, "pk, v_int", 100 });
                                   case "ga":
                                   default:
                                       return // A new version assumes the latest size by default
                                       Stream.of(
-                                      new Object[]{ v, 34901, 34689, "pk", 1 },
-                                      new Object[]{ v, 39313, 39313, "pk, v_int", 2 },
-                                      new Object[]{ v, 33549, 31315, "pk, v_int", 100 });
+                                      new Object[]{ v, 34967, 34722, "pk", 1 },
+                                      new Object[]{ v, 39379, 39346, "pk, v_int", 2 },
+                                      new Object[]{ v, 33615, 31348, "pk, v_int", 100 });
                               }
                           })
                           .collect(Collectors.toList());

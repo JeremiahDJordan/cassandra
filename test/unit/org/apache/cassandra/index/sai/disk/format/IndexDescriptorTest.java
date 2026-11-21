@@ -356,7 +356,9 @@ public class IndexDescriptorTest
 
     static void createFakePerIndexComponents(Descriptor descriptor, IndexContext context, Version version, int generation, int sizeInBytes) throws IOException
     {
+        // a completion marker that isn't empty must hold the digest of the index definition
         for (IndexComponentType type : version.onDiskFormat().perIndexComponentTypes(context))
-            createileOnDisk(descriptor, version.fileNameFormatter().format(type, context, generation), sizeInBytes);
+            createileOnDisk(descriptor, version.fileNameFormatter().format(type, context, generation),
+                            type == IndexComponentType.COLUMN_COMPLETION_MARKER ? 0 : sizeInBytes);
     }
 }

@@ -22,6 +22,7 @@ import java.lang.invoke.MethodHandles;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 
 import com.google.common.base.Stopwatch;
 import org.slf4j.Logger;
@@ -60,11 +61,13 @@ public class MemtableIndexWriter implements PerIndexWriter
     private final MemtableIndex memtableIndex;
     private final PrimaryKey.Factory pkFactory;
     private final RowMapping rowMapping;
+    private final BooleanSupplier isIndexDropped;
 
     public MemtableIndexWriter(MemtableIndex memtableIndex,
                                IndexComponents.ForWrite perIndexComponents,
                                PrimaryKey.Factory pkFactory,
-                               RowMapping rowMapping)
+                               RowMapping rowMapping,
+                               BooleanSupplier isIndexDropped)
     {
         assert rowMapping != null && rowMapping != RowMapping.DUMMY : "Row mapping must exist during FLUSH.";
 
@@ -72,6 +75,7 @@ public class MemtableIndexWriter implements PerIndexWriter
         this.memtableIndex = memtableIndex;
         this.pkFactory = pkFactory;
         this.rowMapping = rowMapping;
+        this.isIndexDropped = isIndexDropped;
     }
 
     @Override
@@ -105,6 +109,16 @@ public class MemtableIndexWriter implements PerIndexWriter
     public void complete(Stopwatch stopwatch) throws IOException
     {
         long start = stopwatch.elapsed(TimeUnit.MILLISECONDS);
+
+        // A dropped index leaves no components on the flushed SSTable; not on unload, when the index must keep the
+        // flushed data.
+        if (isIndexDropped.getAsBoolean())
+        {
+            logger.info(perIndexComponents.logMessage("Not flushing the dropped index to SSTable {}."),
+                        perIndexComponents.descriptor());
+            perIndexComponents.forceDeleteAllComponents();
+            return;
+        }
 
         try
         {

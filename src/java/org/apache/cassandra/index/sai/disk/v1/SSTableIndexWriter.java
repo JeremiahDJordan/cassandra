@@ -37,6 +37,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SSTableIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.PerIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
@@ -188,7 +189,15 @@ public class SSTableIndexWriter implements PerIndexWriter
             }
 
             writeSegmentsMetadata();
-            perIndexComponents.markComplete();
+
+            // No completion marker once the index is dropped: an index of the same name created since may have
+            // deleted some of these files (see StorageAttachedIndex#onAddedToExistingTable)
+            synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+            {
+                if (maybeAbort())
+                    return;
+                perIndexComponents.markComplete();
+            }
         }
         finally
         {

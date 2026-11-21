@@ -18,17 +18,22 @@
 
 package org.apache.cassandra.index.sai;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.SortedMap;
@@ -89,15 +94,23 @@ import org.apache.cassandra.index.sai.analyzer.AnalyzerEqOperatorSupport;
 import org.apache.cassandra.index.sai.analyzer.LuceneAnalyzer;
 import org.apache.cassandra.index.sai.analyzer.NonTokenizingOptions;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
+import org.apache.cassandra.index.sai.disk.format.ComponentsBuildId;
+import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
+import org.apache.cassandra.index.sai.disk.format.IndexComponents;
+import org.apache.cassandra.index.sai.disk.format.IndexDefinitionDigest;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
+import org.apache.cassandra.index.sai.disk.v1.SSTableIndexWriter;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.index.sai.view.View;
 import org.apache.cassandra.index.transactions.IndexTransaction;
+import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTableWatcher;
 import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
@@ -105,7 +118,9 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VALIDATE_TERMS_AT_COORDINATOR;
 import static org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig.MAX_TOP_K;
@@ -196,6 +211,14 @@ public class StorageAttachedIndex implements Index
     // Used to build indexes on newly added SSTables:
     private static final StorageAttachedIndexBuildingSupport INDEX_BUILDER_SUPPORT = new StorageAttachedIndexBuildingSupport();
 
+    /**
+     * Serializes the discarding of the components of an index name ({@link #onAddedToExistingTable}) with the deletion
+     * of the files of a dropped index once its last reader is released ({@link SSTableIndex#release}), and with the
+     * completion of the components an index builds ({@link SSTableIndexWriter#complete}): all go by file names,
+     * which an index created again with the same name reuses.
+     */
+    public static final Object SAME_NAME_FILES_LOCK = new Object();
+
     private static final Set<String> VALID_OPTIONS = ImmutableSet.of(NonTokenizingOptions.CASE_SENSITIVE,
                                                                      NonTokenizingOptions.NORMALIZE,
                                                                      NonTokenizingOptions.ASCII,
@@ -238,6 +261,12 @@ public class StorageAttachedIndex implements Index
     // Tracks whether the index has been dropped due to removal, a table drop, etc or index schema is unloaded after schema unassignment
     private volatile boolean dropped = false;
     private volatile boolean unloaded = false;
+
+    // Why this index must not be built and made queryable, if it must not: components of its name that it must not use
+    // may be left on disk (see onAddedToExistingTable). Only the initialization task reads it, which
+    // SecondaryIndexManager runs once per instance, so it is never cleared: a rebuild (nodetool rebuild_index) doesn't
+    // read it, and builds every SSTable from the data, deleting the files of the index's names first.
+    private volatile String cannotBuildReason = null;
 
     /**
      * Called via reflection from SecondaryIndexManager
@@ -430,6 +459,190 @@ public class StorageAttachedIndex implements Index
         return false;
     }
 
+    /**
+     * Discards the per-index components named after this index that are already on disk for the table's SSTables and
+     * weren't built for its definition, so that it is built from the data: in particular, components written before
+     * their completion marker carried the definition of their index (see {@link IndexDefinitionDigest}) don't say which
+     * index they were written for (e.g. a dropped index of the same name). They are found from the TOC and from the
+     * files on disk, and deleted right away, even while a stream or a rebuild holds the SSTable, as the build of this
+     * index would append to them. If a completion marker of them is still on disk afterwards, the initial build of this
+     * index fails rather than use them.
+     */
+    @Override
+    public void onAddedToExistingTable()
+    {
+        synchronized (SAME_NAME_FILES_LOCK)
+        {
+            Collection<SSTableReader> sstables = baseCfs.getLiveSSTables();
+            Map<SSTableReader, Set<String>> filesOnDisk;
+            try
+            {
+                filesOnDisk = Objects.requireNonNull(SSTableWatcher.instance.listSAIComponentFiles(sstables),
+                                                     "SSTableWatcher#listSAIComponentFiles returned null");
+            }
+            catch (Throwable t)
+            {
+                // Files of the name that the TOC doesn't list may be left: don't build over them
+                JVMStabilityInspector.inspectThrowable(t);
+                logger.error(indexContext.logMessage("Could not list the SAI files of the table's SSTables, " +
+                                                     "to find the components of an index of the same name. " +
+                                                     "This index won't be built on this node until it is rebuilt: " +
+                                                     "run nodetool rebuild_index before restarting this node."), t);
+                cannotBuildReason = "could not list the SAI files of the table's SSTables, " +
+                                    "to find the components of an index of the same name";
+                filesOnDisk = Collections.emptyMap();
+            }
+            for (SSTableReader sstable : sstables)
+            {
+                if (!discardComponentsOfName(sstable, filesOnDisk.getOrDefault(sstable, Collections.emptySet())))
+                    cannotBuildReason = "could not delete the components of an index of the same name on " +
+                                        sstable.descriptor;
+            }
+        }
+    }
+
+    /**
+     * Unregisters from the TOC, and deletes, the per-index components named after this index on the provided SSTable
+     * that weren't built for its definition: those the TOC lists, and those of the provided files on disk.
+     *
+     * @param filesOnDisk names of SAI component files of the SSTable on disk
+     *                    (see {@link SSTableWatcher#listSAIComponentFiles})
+     * @return false if a completion marker of those components is still on disk, so that they could still be used
+     */
+    private boolean discardComponentsOfName(SSTableReader sstable, Set<String> filesOnDisk)
+    {
+        String name = indexContext.getIndexName();
+        Map<Component, ComponentsBuildId> listed = new HashMap<>();
+        Set<ComponentsBuildId> builds = new HashSet<>();
+        for (Component component : sstable.components())
+        {
+            Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(component.name);
+            if (parsed.isEmpty() || !name.equals(parsed.get().indexName))
+                continue;
+            listed.put(component, parsed.get().buildId);
+            builds.add(parsed.get().buildId);
+        }
+        for (String file : filesOnDisk)
+        {
+            Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(file);
+            if (parsed.isPresent() && name.equals(parsed.get().indexName))
+                builds.add(parsed.get().buildId);
+        }
+
+        // Components built for this definition are what a build of this index would write
+        IndexDescriptor descriptor = IndexDescriptor.empty(sstable.descriptor, sstable.metadata().comparator);
+        builds.removeIf(buildId -> isBuiltForDefinition(descriptor, buildId));
+        if (builds.isEmpty())
+            return true;
+        Set<Component> stale = new HashSet<>();
+        listed.forEach((component, buildId) -> {
+            if (builds.contains(buildId))
+                stale.add(component);
+        });
+
+        Ref<? extends SSTableReader> ref = sstable.tryRef();
+        if (ref == null)
+            return true; // gone, and its files with it
+        try
+        {
+            try
+            {
+                if (!stale.isEmpty())
+                    sstable.unregisterComponents(stale, baseCfs.getTracker());
+            }
+            catch (Throwable t)
+            {
+                // Deleting the files, completion markers included, is then what keeps them from being used.
+                JVMStabilityInspector.inspectThrowable(t);
+                logger.warn(indexContext.logMessage("Failed to unregister the components of an index of the same " +
+                                                    "name from {}. Deleting their files."),
+                            sstable.descriptor, t);
+            }
+
+            boolean discarded = true;
+            for (ComponentsBuildId buildId : builds)
+            {
+                // All types, including any the TOC doesn't list: the build of this index would append to them.
+                EnumSet<IndexComponentType> types = EnumSet.allOf(IndexComponentType.class);
+                IndexComponents.ForWrite components =
+                    descriptor.perIndexComponentsOfBuild(indexContext, buildId, types);
+                try
+                {
+                    SSTableWatcher.instance.onIndexDropped(sstable.metadata(), components);
+                }
+                catch (Throwable t)
+                {
+                    // The local check below doesn't see storage that isn't local: a failure counts as such
+                    JVMStabilityInspector.inspectThrowable(t);
+                    logger.warn(indexContext.logMessage("Failed to delete the components of an index of the same " +
+                                                        "name from {}"),
+                                sstable.descriptor, t);
+                    discarded = false;
+                }
+                discarded &= completionMarkerDeleted(descriptor, buildId);
+            }
+            if (discarded)
+                logger.info(indexContext.logMessage("Discarded the components of an index of the same name on {}"),
+                            sstable.descriptor);
+            else
+                logger.error(indexContext.logMessage("Could not delete the completion marker of the components " +
+                                                     "of an index of the same name on {}. " +
+                                                     "This index won't be built on this node until they are deleted " +
+                                                     "and the index is rebuilt."),
+                             sstable.descriptor);
+            return discarded;
+        }
+        finally
+        {
+            ref.release();
+        }
+    }
+
+    /**
+     * Whether the completion marker of the provided build of this index's name holds the digest of this index's
+     * definition (see {@link IndexDefinitionDigest}).
+     */
+    private boolean isBuiltForDefinition(IndexDescriptor descriptor, ComponentsBuildId buildId)
+    {
+        EnumSet<IndexComponentType> types = EnumSet.of(IndexComponentType.COLUMN_COMPLETION_MARKER);
+        IndexComponents.ForWrite marker = descriptor.perIndexComponentsOfBuild(indexContext, buildId, types);
+        if (!marker.has(IndexComponentType.COLUMN_COMPLETION_MARKER))
+            return false;
+        try
+        {
+            File file = marker.get(IndexComponentType.COLUMN_COMPLETION_MARKER).file();
+            return Arrays.equals(Files.readAllBytes(file.toPath()), IndexDefinitionDigest.markerContent(config));
+        }
+        catch (IOException e)
+        {
+            return false;
+        }
+    }
+
+    /**
+     * Makes sure the completion marker of the provided build of this index's name is not on disk: deletes it if it is.
+     *
+     * @return whether the completion marker is not on disk
+     */
+    private boolean completionMarkerDeleted(IndexDescriptor descriptor, ComponentsBuildId buildId)
+    {
+        EnumSet<IndexComponentType> types = EnumSet.of(IndexComponentType.COLUMN_COMPLETION_MARKER);
+        IndexComponents.ForWrite marker = descriptor.perIndexComponentsOfBuild(indexContext, buildId, types);
+        if (!marker.has(IndexComponentType.COLUMN_COMPLETION_MARKER))
+            return true;
+        File file = marker.get(IndexComponentType.COLUMN_COMPLETION_MARKER).file();
+        try
+        {
+            file.delete();
+        }
+        catch (Throwable t)
+        {
+            JVMStabilityInspector.inspectThrowable(t);
+            logger.warn(indexContext.logMessage("Failed to delete {}"), file, t);
+        }
+        return !file.exists();
+    }
+
     @Override
     public Callable<?> getInitializationTask()
     {
@@ -437,7 +650,18 @@ public class StorageAttachedIndex implements Index
         // New storage-attached indexes will be available for queries after on disk index data are built.
         // Memtable data will be indexed via flushing triggered by schema change
         // We only want to validate the index files if we are starting up
-        return () -> startInitialBuild(baseCfs, StorageService.instance.isStarting(), decision.skipped()).get();
+        return () -> {
+            checkCanBuild();
+            return startInitialBuild(baseCfs, StorageService.instance.isStarting(), decision.skipped()).get();
+        };
+    }
+
+    private void checkCanBuild()
+    {
+        String reason = cannotBuildReason;
+        if (reason != null)
+            throw new IllegalStateException(indexContext.logMessage("Cannot build the index: " + reason + ". " +
+                                                                    "Rebuild the index once the cause is fixed."));
     }
 
     private Future<?> startInitialBuild(ColumnFamilyStore baseCfs, boolean validate, boolean skipIndexBuild)

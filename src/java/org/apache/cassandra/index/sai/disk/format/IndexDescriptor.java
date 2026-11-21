@@ -21,6 +21,7 @@ package org.apache.cassandra.index.sai.disk.format;
 import java.io.IOException;
 import java.lang.invoke.MethodHandles;
 import java.nio.ByteOrder;
+import java.nio.file.Files;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumMap;
@@ -56,6 +57,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.storage.StorageProvider;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileHandle;
+import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.lucene.store.BufferedChecksumIndexInput;
@@ -112,6 +114,21 @@ public class IndexDescriptor
     public static IndexDescriptor empty(Descriptor descriptor)
     {
         return empty(descriptor, new ClusteringComparator());
+    }
+
+    /**
+     * The per-index components of the build of the index that exist on disk, among the types, whether or not this
+     * descriptor uses them (e.g. to delete them through
+     * {@link org.apache.cassandra.io.sstable.SSTableWatcher#onIndexDropped}).
+     */
+    public IndexComponents.ForWrite perIndexComponentsOfBuild(IndexContext context,
+                                                              ComponentsBuildId buildId,
+                                                              Set<IndexComponentType> types)
+    {
+        IndexComponentsImpl components = new IndexComponentsImpl(context, buildId);
+        types.forEach(components::addIfExists);
+        components.sealed = true;
+        return components;
     }
 
     public static IndexDescriptor empty(Descriptor descriptor, ClusteringComparator comparator)
@@ -174,7 +191,7 @@ public class IndexDescriptor
             // have incomplete groups if either 1) a build failed mid-way, 2) we detected some corrupted components and
             // deleting the completion marker, or 3) we've lost the file, and all of those should be rare, so having
             // a warning here feels appropriate.
-            if (!components.isComplete())
+            if (!components.isComplete() && !components.has(components.completionMarkerComponent()))
             {
                 logger.warn("Discovered group of {} for SSTable {} has no completion marker and cannot be used. This will lead to some indexes not being queriable",
                              context == null ? "per-SSTable SAI components" : "per-index SAI components of " + context.getIndexName(), descriptor);
@@ -395,6 +412,9 @@ public class IndexDescriptor
         // This is just to catch errors where we'd try to add a component after the completion marker was written.
         private volatile boolean sealed;
 
+        // Whether the completion marker of this per-index group was written for the definition of its index, once read
+        private volatile Boolean builtForDefinition;
+
         private IndexComponentsImpl(@Nullable IndexContext context, ComponentsBuildId buildId)
         {
             this.context = context;
@@ -435,6 +455,29 @@ public class IndexDescriptor
         public boolean has(IndexComponentType component)
         {
             return components.containsKey(component);
+        }
+
+        @Override
+        public boolean isComplete()
+        {
+            return has(completionMarkerComponent()) && (!isPerIndexGroup() || isBuiltForDefinition());
+        }
+
+        private boolean isBuiltForDefinition()
+        {
+            Boolean built = builtForDefinition;
+            if (built == null)
+            {
+                IndexMetadata index = context.getIndexMetadata();
+                byte[] content = index == null ? null : components.get(completionMarkerComponent()).readContent();
+                built = index == null || (content != null && IndexDefinitionDigest.matches(content, index));
+                if (content != null && !built)
+                    logger.info(logMessage("Per-index SAI components of SSTable {} were built for another definition " +
+                                           "of the index and won't be used"),
+                                descriptor);
+                builtForDefinition = built;
+            }
+            return built;
         }
 
         @Override
@@ -584,7 +627,17 @@ public class IndexDescriptor
         @Override
         public void markComplete() throws IOException
         {
-            addOrGet(completionMarkerComponent()).createEmpty();
+            IndexComponentImpl marker = (IndexComponentImpl) addOrGet(completionMarkerComponent());
+            IndexMetadata index = isPerIndexGroup() ? context.getIndexMetadata() : null;
+            if (index == null)
+            {
+                marker.createEmpty();
+            }
+            else
+            {
+                marker.create(IndexDefinitionDigest.markerContent(index));
+                builtForDefinition = true;
+            }
             sealed = true;
             // Until this call, the group is not attached to the parent. This creates the link.
             updateParentLink(this);
@@ -743,6 +796,32 @@ public class IndexDescriptor
             public void createEmpty() throws IOException
             {
                 com.google.common.io.Files.touch(file().toJavaIOFile());
+            }
+
+            private void create(byte[] content) throws IOException
+            {
+                // synced on close, as the other components are
+                try (IndexOutputWriter output = openOutput(false))
+                {
+                    output.writeBytes(content, content.length);
+                }
+            }
+
+            /**
+             * @return the content of this component's file, or null if it can't be read
+             */
+            private @Nullable byte[] readContent()
+            {
+                try
+                {
+                    return Files.readAllBytes(file().toPath());
+                }
+                catch (IOException e)
+                {
+                    logger.warn(parent().logMessage("Unable to read storage attached index component file {}"),
+                                file(), e);
+                    return null;
+                }
             }
 
             @Override
