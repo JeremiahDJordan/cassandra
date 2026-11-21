@@ -396,7 +396,16 @@ public class LocalSessions
         long repairedAt = getFinalSessionRepairedAt(session);
         boolean isTransient = sstables.iterator().next().isTransient();
         LifecycleTransaction txn = realm.tryModify(sstables, OperationType.COMPACTION);
-        return txn == null ? null : new RepairFinalizationOperation(realm, txn, session, repairedAt, isTransient);
+        if (txn == null)
+            return null;
+
+        // the sstables can leave the session between the caller's selection and tryModify
+        if (!Iterables.all(txn.originals(), sstable -> session.equals(sstable.getPendingRepair())))
+        {
+            txn.abort();
+            return null;
+        }
+        return new RepairFinalizationOperation(realm, txn, session, repairedAt, isTransient);
     }
 
     /**
@@ -408,10 +417,11 @@ public class LocalSessions
         for (CompactionSSTable sstable : sstables)
         {
             TableMetadata tableMetadata = Schema.instance.getTableMetadata(sstable.getKeyspaceName(), sstable.getColumnFamilyName());
-            if (tableMetadata != null && sstable.isPendingRepair() && canCleanup(sstable.getPendingRepair()))
+            UUID pendingRepair = sstable.getPendingRepair();
+            if (tableMetadata != null && pendingRepair != null && canCleanup(pendingRepair))
             {
-                logger.debug("Going to cleanup sstable {} for already finalized repair {}", sstable.getPendingRepair(), tableMetadata.toDebugString());
-                finalizations.computeIfAbsent(sstable.getPendingRepair(), pr -> new ArrayList<>()).add(sstable);
+                logger.debug("Going to cleanup sstable {} for already completed repair {}", sstable, pendingRepair);
+                finalizations.computeIfAbsent(pendingRepair, pr -> new ArrayList<>()).add(sstable);
             }
         }
 
