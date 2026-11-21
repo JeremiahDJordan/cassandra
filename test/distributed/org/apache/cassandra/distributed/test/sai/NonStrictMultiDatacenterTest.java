@@ -24,6 +24,9 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
@@ -145,6 +148,69 @@ public class NonStrictMultiDatacenterTest extends TestBaseImpl
             }
         }
         assertThat(mismatches).isEmpty();
+    }
+
+    /**
+     * Filters on a static column and another column, and aggregates, at LOCAL_QUORUM in a datacenter with one replica.
+     * The aggregates page internally by 1 KiB, and every row is larger, so a candidate row that doesn't match can fill
+     * an internal page of the aggregate over all partitions, which then needs short read protection.
+     */
+    @Test
+    public void testStaticsAndAggregates()
+    {
+        String keyspace = "statics_rf_1_1";
+        CLUSTER.schemaChange(String.format("CREATE KEYSPACE %s WITH replication = {'class': 'NetworkTopologyStrategy', '%s': 1, '%s': 1}",
+                                           keyspace, DC1, DC2));
+        for (String table : new String[]{ "indexed", "reference" })
+            CLUSTER.schemaChange("CREATE TABLE " + keyspace + '.' + table + " (k int, c int, s int static, a int, b int, p text, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'");
+        for (String column : new String[]{ "s", "a", "b" })
+            CLUSTER.schemaChange("CREATE INDEX ON " + keyspace + ".indexed(" + column + ") USING 'sai'");
+        SAIUtil.waitForIndexQueryableOnAllNodes(CLUSTER, keyspace);
+
+        // s = 1 in partitions 1 and 3, a = 1 on rows 8 and 9, b = 2 on the even rows
+        String payload = "x".repeat(2048);
+        for (String table : new String[]{ "indexed", "reference" })
+            for (int k = 0; k < 4; k++)
+            {
+                CLUSTER.coordinator(1).execute("INSERT INTO " + keyspace + '.' + table + " (k, s) VALUES (?, ?)", ConsistencyLevel.ALL, k, k % 2);
+                for (int c = 0; c < 10; c++)
+                    CLUSTER.coordinator(1).execute("INSERT INTO " + keyspace + '.' + table + " (k, c, a, b, p) VALUES (?, ?, ?, ?, ?)", ConsistencyLevel.ALL,
+                                                   k, c, c >= 8 ? 1 : 0, c % 2 == 0 ? 2 : 0, payload);
+            }
+        CLUSTER.forEach(node -> node.runOnInstance(() -> DatabaseDescriptor.getRawConfig().aggregation_subpage_size = new DataStorageSpec.IntKibibytesBound(1)));
+
+        String[] queries = {
+            "SELECT k, c, s FROM %s WHERE s = 1 AND a = 1 ALLOW FILTERING",
+            "SELECT k, c, s FROM %s WHERE s = 1 AND a = 1 LIMIT 2 ALLOW FILTERING",
+            "SELECT count(*) FROM %s WHERE a = 1 AND b = 2 ALLOW FILTERING",
+            "SELECT k, count(*) FROM %s WHERE k = 1 AND a = 1 AND b = 2 ALLOW FILTERING",
+        };
+
+        List<String> mismatches = new ArrayList<>();
+        for (String query : queries)
+        {
+            String select = String.format(query, keyspace + ".indexed");
+            String reference = String.format(query, keyspace + ".reference");
+            for (int coordinator : COORDINATORS)
+            {
+                String context = select + " at LOCAL_QUORUM from " + (coordinator <= 3 ? DC1 : DC2);
+                List<String> expected = toStrings(CLUSTER.coordinator(coordinator).execute(reference, ConsistencyLevel.LOCAL_QUORUM));
+                assertThat(expected).as(reference).isNotEmpty();
+                long shortReadRequests = shortReadProtectionRequests(coordinator, keyspace);
+                check(context, expected, () -> toStrings(CLUSTER.coordinator(coordinator).execute(select, ConsistencyLevel.LOCAL_QUORUM)), mismatches);
+                if (query.startsWith("SELECT count(*)") && shortReadProtectionRequests(coordinator, keyspace) == shortReadRequests)
+                    mismatches.add(context + ": no short read protection request");
+                for (int pageSize : new int[]{ 1, 2 })
+                    check(context + " page size " + pageSize, expected,
+                          () -> toStrings(CLUSTER.coordinator(coordinator).executeWithPaging(select, ConsistencyLevel.LOCAL_QUORUM, pageSize)), mismatches);
+            }
+        }
+        assertThat(mismatches).isEmpty();
+    }
+
+    private static long shortReadProtectionRequests(int node, String keyspace)
+    {
+        return CLUSTER.get(node).callOnInstance(() -> Keyspace.open(keyspace).getColumnFamilyStore("indexed").metric.shortReadProtectionRequests.getCount());
     }
 
     private static String keyspace(int[] replication)
