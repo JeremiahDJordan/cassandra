@@ -16,6 +16,8 @@
 
 package org.apache.cassandra.service.pager;
 
+import java.util.Arrays;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -35,8 +37,11 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.dht.ExcludingBounds;
+import org.apache.cassandra.dht.IncludingExcludingBounds;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.transport.ProtocolVersion;
 
@@ -142,6 +147,59 @@ public class PartitionRangeQueryPagerTest
 
         // the per-partition limit has been reached in the last partition of the range
         assertThat(nextPage(command, right, row(1), 0)).isNull();
+    }
+
+    /**
+     * Ranges that exclude their end never return it, so paging them goes on after the last returned partition.
+     */
+    @Test
+    public void testRangeExcludingEnd()
+    {
+        DecoratedKey[] keys = sortedKeys(3);
+        DecoratedKey left = keys[0];
+        DecoratedKey last = keys[1];
+        DecoratedKey right = keys[2];
+
+        for (AbstractBounds<PartitionPosition> bounds : Arrays.<AbstractBounds<PartitionPosition>>asList(new IncludingExcludingBounds<>(left, right),
+                                                                                                         new ExcludingBounds<>(left, right)))
+        {
+            PartitionRangeReadCommand command = command(bounds);
+            assertThat(nextPage(command, last, row(1), 0).dataRange().keyRange()).isEqualTo(new ExcludingBounds<>(last, right));
+            assertThat(nextPage(command, last, row(1), 3).dataRange().keyRange()).isEqualTo(new IncludingExcludingBounds<>(last, right));
+        }
+    }
+
+    /**
+     * Token-restricted reads end at a token bound, not at a key: the last returned key is never the end of the range,
+     * and the next page is the rest of the range up to that bound, which doesn't wrap around the ring.
+     */
+    @Test
+    public void testTokenRange()
+    {
+        DecoratedKey key = key(0);
+        Token token = key.getToken();
+        Token minimum = Murmur3Partitioner.instance.getMinimumToken();
+
+        // token(k) = token(0), and token(k) >= token(0), which goes on to the end of the ring
+        for (PartitionPosition right : Arrays.<PartitionPosition>asList(token.maxKeyBound(), minimum.maxKeyBound()))
+        {
+            PartitionRangeReadCommand command = command(new Range<>(token.minKeyBound(), right));
+            PartitionRangeReadCommand next = nextPage(command, key, row(1), 0);
+            assertThat(next).isNotNull();
+            assertThat(next.dataRange().keyRange()).isEqualTo(new Range<>(key, right));
+            assertThat(next.dataRange().keyRange().contains(key)).isFalse();
+            // the token of k = 2 is after the token of k = 0
+            assertThat(next.dataRange().keyRange().contains(key(2))).isEqualTo(right.isMinimum());
+        }
+    }
+
+    private static DecoratedKey[] sortedKeys(int n)
+    {
+        DecoratedKey[] keys = new DecoratedKey[n];
+        for (int i = 0; i < n; i++)
+            keys[i] = key(i);
+        Arrays.sort(keys);
+        return keys;
     }
 
     private static PartitionRangeReadCommand nextPage(PartitionRangeReadCommand command,
