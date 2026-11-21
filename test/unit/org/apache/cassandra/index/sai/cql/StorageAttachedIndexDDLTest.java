@@ -26,6 +26,7 @@ import java.util.EnumSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -630,6 +631,65 @@ public class StorageAttachedIndexDDLTest extends SAITester
         waitForAssert(() -> assertEquals(1, indexBuildCounter.get()));
         waitForCompactions();
 
+        assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+    }
+
+    @Test
+    public void shouldRejectQueriesAfterTruncateThatKeepsUnindexedSSTable() throws Throwable
+    {
+        verifyTruncateAfterIndexInitializationFailure(false);
+    }
+
+    @Test
+    public void shouldMakeIndexQueryableAfterTruncateThatKeepsIndexedSSTable() throws Throwable
+    {
+        verifyTruncateAfterIndexInitializationFailure(true);
+    }
+
+    private void verifyTruncateAfterIndexInitializationFailure(boolean keptSSTableIndexed) throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+
+        int rowCount = 10;
+        for (int i = 0; i < rowCount; i++)
+            execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', " + i + ", '0')");
+        flush();
+
+        if (keptSSTableIndexed)
+            createIndexWithFailedInitialBuild();
+
+        // hold the truncation after it has picked the time before which it drops SSTables
+        Injections.Barrier delayTruncate = Injections.newBarrier("delayTruncate", 2, false)
+                                                     .add(InvokePointBuilder.newInvokePoint().onClass(ColumnFamilyStore.class).onMethod("runWithCompactionsDisabled"))
+                                                     .build();
+        Injections.inject(delayTruncate);
+        CompletableFuture<Void> truncate = CompletableFuture.runAsync(() -> truncate(false));
+        waitForAssert(() -> assertEquals(1, delayTruncate.getCount()));
+
+        for (int i = rowCount; i < rowCount * 2; i++)
+            execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', " + i + ", '0')");
+        flush();
+
+        if (!keptSSTableIndexed)
+            createIndexWithFailedInitialBuild();
+
+        assertFalse(truncate.isDone());
+        delayTruncate.countDown();
+        truncate.get(30, TimeUnit.SECONDS);
+        assertEquals(1, getCurrentColumnFamilyStore().getLiveSSTables().size());
+
+        if (keptSSTableIndexed)
+            assertEquals(rowCount, executeNet("SELECT id1 FROM %s WHERE v1>=0").all().size());
+        else
+            assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+    }
+
+    private void createIndexWithFailedInitialBuild() throws Throwable
+    {
+        Injections.inject(failSAIInitialializaion);
+        String index = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+        waitForIndexBuilds(index);
         assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
     }
 
