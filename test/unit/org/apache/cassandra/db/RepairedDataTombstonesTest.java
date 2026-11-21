@@ -221,6 +221,22 @@ public class RepairedDataTombstonesTest extends CQLTester
     }
 
     @Test
+    public void readTestWithShardedSkipListMemtableData() throws Throwable
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        // sharded memtables need storage compatibility with Cassandra 5.0
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.NONE);
+        try
+        {
+            readTestWithMemtableData("skiplist_sharded");
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
+    }
+
+    @Test
     public void readTestWithTrieMemtableData() throws Throwable
     {
         readTestWithMemtableData("trie");
