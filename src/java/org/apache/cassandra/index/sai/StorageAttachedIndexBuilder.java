@@ -22,8 +22,10 @@
 package org.apache.cassandra.index.sai;
 
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.HashSet;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.SortedMap;
 import java.util.UUID;
@@ -45,8 +47,10 @@ import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.index.SecondaryIndexBuilder;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.ComponentsBuildId;
+import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
@@ -164,7 +168,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             // build the per-index components
             boolean perIndexComponentsOnly = perSSTableFileLock == null;
             for (StorageAttachedIndex index : indexes)
+            {
+                replaceListedComponentsOfName(sstable, indexDescriptor, index.getIndexContext(), replacedComponents);
                 prepareForRebuild(indexDescriptor.perIndexComponents(index.getIndexContext()), replacedComponents);
+                deleteLeftoversUnderNewBuildNames(indexDescriptor, index.getIndexContext());
+            }
 
             long keyCount = SSTableReader.getApproximateKeyCount(Set.of(sstable));
             indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes, txn, keyCount, perIndexComponentsOnly, group.table().metric);
@@ -306,6 +314,47 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         return null;
     }
 
+    /**
+     * The components named after the index that the TOC lists are those of previous builds of the name, possibly of
+     * component types the new build doesn't write (e.g. of a dropped index of the same name on a column of another
+     * type): the new build replaces them all. Without immutable components, their files are deleted before the build,
+     * so they are unregistered now; otherwise, once the new build has registered its own.
+     */
+    private void replaceListedComponentsOfName(SSTableReader sstable,
+                                               IndexDescriptor indexDescriptor,
+                                               IndexContext context,
+                                               Set<Component> replacedComponents)
+    {
+        Set<Component> listed = new HashSet<>();
+        for (Component component : sstable.components())
+        {
+            Optional<Version.ParsedFileName> parsed = Version.tryParseFileName(component.name);
+            if (parsed.isPresent() && context.getIndexName().equals(parsed.get().indexName))
+                listed.add(component);
+        }
+
+        if (indexDescriptor.versionForNewComponents().useImmutableComponentFiles())
+            replacedComponents.addAll(listed);
+        else if (!listed.isEmpty())
+            sstable.unregisterComponents(listed, tracker);
+    }
+
+    /**
+     * Without immutable components, the new build of an index writes the files of generation 0, and most of them are
+     * opened to append. Deletes any file there may be under those names, of any component type, so that the build
+     * doesn't append to the files of another build (e.g. left by a crash, or by a dropped index of the same name), and
+     * that its completion marker doesn't certify them.
+     */
+    private static void deleteLeftoversUnderNewBuildNames(IndexDescriptor indexDescriptor, IndexContext context)
+    {
+        Version version = indexDescriptor.versionForNewComponents();
+        if (version.useImmutableComponentFiles())
+            return;
+        EnumSet<IndexComponentType> types = EnumSet.allOf(IndexComponentType.class);
+        indexDescriptor.perIndexComponentsOfBuild(context, ComponentsBuildId.forNewSSTable(version), types)
+                       .forceDeleteAllComponents();
+    }
+
     private static void prepareForRebuild(IndexComponents.ForRead components, Set<Component> replacedComponents)
     {
         // The current components are "replaced" (by "other" components) if the build create different components than
@@ -372,7 +421,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
         // Register components from the descriptor that owns the writers. The context cache may have been
         // evicted before this point, and a reader lookup would reconstruct a descriptor from the pre-build TOC.
-        sstable.registerComponents(group.activeComponents(indexDescriptor), tracker);
+        Set<Component> activeComponents = group.activeComponents(indexDescriptor);
+        sstable.registerComponents(activeComponents, tracker);
+        // the new build may reuse names the TOC listed (e.g. files deleted while the TOC couldn't be rewritten)
+        replacedComponents.removeAll(activeComponents);
         if (!replacedComponents.isEmpty())
             sstable.unregisterComponents(replacedComponents, tracker);
 
