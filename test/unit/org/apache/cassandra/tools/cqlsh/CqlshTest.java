@@ -111,7 +111,7 @@ public class CqlshTest extends CQLTester
         assertTrue("table should be empty", execute("SELECT * FROM %s").isEmpty());
 
         // when running COPY FROM via cqlsh
-        ToolRunner.ToolResult copyFromResult = ToolRunner.invokeCqlsh(format("COPY %s.%s FROM '%s'", KEYSPACE, currentTable(), csv.toAbsolutePath()));
+        ToolRunner.ToolResult copyFromResult = copyFrom(csv);
 
         // then all rows should be imported
         copyFromResult.asserts().success();
@@ -135,7 +135,7 @@ public class CqlshTest extends CQLTester
         Path csv = prepareCSVFile(rows);
 
         // when running COPY via cqlsh
-        ToolRunner.ToolResult result = ToolRunner.invokeCqlsh(format("COPY %s.%s FROM '%s'", KEYSPACE, currentTable(), csv.toAbsolutePath()));
+        ToolRunner.ToolResult result = copyFrom(csv);
 
         // then only rows that match type size should be imported
         result.asserts().failure();
@@ -143,6 +143,14 @@ public class CqlshTest extends CQLTester
         UntypedResultSet importedRows = execute("SELECT * FROM %s");
         assertRowsIgnoringOrder(importedRows, row(1, vector(1, 2, 3, 4, 5, 6)),
                                 row(3, vector(1, 2, 3, 4, 6, 7)));
+    }
+
+    private ToolRunner.ToolResult copyFrom(Path csv)
+    {
+        Path errFile = csv.resolveSibling(csv.getFileName() + ".err");
+        errFile.toFile().deleteOnExit();
+        return ToolRunner.invokeCqlsh(format("COPY %s.%s FROM '%s' WITH ERRFILE = '%s'",
+                                             KEYSPACE, currentTable(), csv.toAbsolutePath(), errFile.toAbsolutePath()));
     }
 
     private static Path prepareCSVFile(Object[][] rows) throws IOException
