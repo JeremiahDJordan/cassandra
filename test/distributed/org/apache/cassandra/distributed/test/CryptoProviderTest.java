@@ -21,6 +21,7 @@ package org.apache.cassandra.distributed.test;
 import java.security.Provider;
 import java.security.Security;
 import java.util.HashMap;
+import java.util.Map;
 
 import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
 
@@ -33,6 +34,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IIsolatedExecutor.SerializableCallable;
+import org.apache.cassandra.io.compress.DefaultCompressionProvider;
 import org.apache.cassandra.security.DefaultCryptoProvider;
 import org.apache.cassandra.security.JREProvider;
 
@@ -54,12 +56,13 @@ public class CryptoProviderTest extends TestBaseImpl
     @Test
     public void testDefaultCryptoProvider() throws Throwable
     {
+        Map<String, Object> compressor = Map.of("class_name", CryptoAwareCompressor.class.getName(),
+                                               "parameters", Map.of("fail_on_missing_provider", "true"));
         try (Cluster cluster = init(Cluster.build(1)
-                                           .withConfig(config -> config.set("crypto_provider",
-                                                                            new HashMap<>()
-                                                                            {{
-                                                                                put("class_name", DefaultCryptoProvider.class.getName());
-                                                                            }}))
+                                           .withConfig(config -> {
+                                               config.set("crypto_provider", Map.of("class_name", DefaultCryptoProvider.class.getName()));
+                                               config.set("compressor_providers", Map.of("lz4", compressor));
+                                           })
                                            .start()))
         {
             assertTrue("Amazon Corretto Crypto Provider should be installed!",
@@ -184,6 +187,16 @@ public class CryptoProviderTest extends TestBaseImpl
     {
         for (Provider provider : Security.getProviders())
             assertNotEquals(AmazonCorrettoCryptoProvider.PROVIDER_NAME, provider.getName());
+    }
+
+    public static class CryptoAwareCompressor extends DefaultCompressionProvider
+    {
+        @Override
+        public boolean isHealthy()
+        {
+            // Startup plugins can allocate from BufferPool, which chooses its layout on first use.
+            return AmazonCorrettoCryptoProvider.PROVIDER_NAME.equals(Security.getProviders()[0].getName());
+        }
     }
 
     public static class BB

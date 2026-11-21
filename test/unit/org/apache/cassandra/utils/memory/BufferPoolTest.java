@@ -20,6 +20,7 @@
 package org.apache.cassandra.utils.memory;
 
 import java.nio.ByteBuffer;
+import java.security.Provider;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
@@ -29,16 +30,26 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import javax.crypto.Cipher;
+import javax.crypto.KeyGenerator;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.GCMParameterSpec;
 
 import com.google.common.collect.Iterables;
 
+import org.junit.After;
 import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.util.RandomAccessReader;
+import org.apache.cassandra.utils.concurrent.Ref;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.BUFFER_POOL_ATTACHMENT_MODE;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
@@ -51,12 +62,20 @@ import static org.junit.Assert.fail;
 
 public class BufferPoolTest
 {
-    private BufferPool bufferPool;
+    BufferPool bufferPool;
 
     @Before
     public void setUp()
     {
         bufferPool = new BufferPool("test_pool", 8 * 1024 * 1024, true);
+    }
+
+    @After
+    public void tearDown() throws InterruptedException, TimeoutException
+    {
+        bufferPool.shutdownLocalCleaner(10, TimeUnit.SECONDS);
+        bufferPool.releaseLocal();
+        bufferPool.unsafeReset();
     }
 
     @Test
@@ -77,6 +96,162 @@ public class BufferPoolTest
         bufferPool.put(buffer);
         assertEquals(null, bufferPool.unsafeCurrentChunk());
         assertEquals(BufferPool.GlobalPool.MACRO_CHUNK_SIZE, bufferPool.sizeInBytes());
+        assertEquals(0, bufferPool.usedSizeInBytes());
+    }
+
+    @Test
+    public void testGcmWithPooledBuffers() throws Exception
+    {
+        Provider effective = Cipher.getInstance("AES/GCM/NoPadding").getProvider();
+        checkGcmWithPooledBuffers(effective.getName());
+        if (BUFFER_POOL_ATTACHMENT_MODE.getString().equalsIgnoreCase("slab") && !effective.getName().equals("SunJCE"))
+            checkGcmWithPooledBuffers("SunJCE");
+    }
+
+    private void checkGcmWithPooledBuffers(String provider) throws Exception
+    {
+        for (int size : new int[] { 512, 16 << 10 })
+        {
+            ByteBuffer input = bufferPool.tryGet(size + 64);
+            ByteBuffer separate = bufferPool.tryGet(size + 64);
+            assertNotNull(input);
+            assertNotNull(separate);
+            try
+            {
+                for (ByteBuffer output : new ByteBuffer[] { separate, input })
+                {
+                    byte[] plaintext = new byte[size];
+                    new Random(1).nextBytes(plaintext);
+                    input.clear().position(7);
+                    ByteBuffer src = input.slice();
+                    src.put(plaintext).flip();
+
+                    // JDK 11 SunJCE cannot handle forward overlap even on ordinary allocateDirect buffers.
+                    int outputOffset = Runtime.version().feature() >= 17 ? 23 : 7;
+                    output.clear().position(outputOffset);
+                    ByteBuffer dst = output.slice();
+                    SecretKey key = KeyGenerator.getInstance("AES").generateKey();
+                    GCMParameterSpec params = new GCMParameterSpec(128, new byte[12]);
+                    Cipher cipher = Cipher.getInstance("AES/GCM/NoPadding", provider);
+                    cipher.init(Cipher.ENCRYPT_MODE, key, params);
+                    assertEquals(size + 16, cipher.doFinal(src.asReadOnlyBuffer(), dst));
+                    dst.flip();
+                    separate.clear();
+                    cipher.init(Cipher.DECRYPT_MODE, key, params);
+                    assertEquals(size, cipher.doFinal(dst, separate));
+                    separate.flip();
+                    assertEquals(ByteBuffer.wrap(plaintext), separate);
+                }
+            }
+            finally
+            {
+                bufferPool.put(separate);
+                bufferPool.put(input);
+            }
+        }
+        assertEquals(0, bufferPool.usedSizeInBytes());
+    }
+
+    @Test
+    public void testAttachmentForActiveProvider() throws Exception
+    {
+        Provider provider = Cipher.getInstance("AES/GCM/NoPadding").getProvider();
+        boolean accp = provider.getClass().getName().equals("com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider");
+        boolean slab = BUFFER_POOL_ATTACHMENT_MODE.getString().equalsIgnoreCase("slab") || (Runtime.version().feature() >= 25 && !accp);
+        for (int size : new int[] { 512, BufferPool.NORMAL_CHUNK_SIZE })
+        {
+            ByteBuffer buffer = bufferPool.tryGet(size);
+            ByteBuffer view = buffer.duplicate();
+            Object marker = MemoryUtil.getAttachment(buffer);
+            BufferPool.Chunk owner = bufferPool.getParentChunk(buffer);
+            assertNotNull(owner);
+            assertSame(owner, bufferPool.getParentChunk(bufferPool.unwrapBufferPoolManagedBuffer(view)));
+            if (slab)
+            {
+                assertTrue(marker instanceof ByteBuffer);
+                // Identical addresses on unrelated marker objects must not resolve to a pool owner.
+                ByteBuffer unrelated = buffer.duplicate();
+                MemoryUtil.setAttachment(unrelated, ((ByteBuffer) marker).duplicate());
+                assertNull(bufferPool.getParentChunk(unrelated));
+            }
+            else if (Ref.TRACE_ENABLED)
+            {
+                assertTrue(marker instanceof Ref.DirectBufferRef);
+                assertSame(owner, ((Ref.DirectBufferRef<?>) marker).get());
+            }
+            else
+            {
+                assertSame(owner, marker);
+            }
+
+            MemoryUtil.setAttachment(view, marker);
+            bufferPool.put(buffer);
+            if (slab)
+                assertNull(bufferPool.getParentChunk(view));
+            else if (Ref.TRACE_ENABLED)
+                assertNull(((Ref.DirectBufferRef<?>) marker).tryRef());
+        }
+    }
+
+    @Test
+    public void testRecycledAddressGetsNewOwner()
+    {
+        int chunkSize = BufferPool.NORMAL_CHUNK_SIZE;
+        List<ByteBuffer> pinned = new ArrayList<>();
+        for (int i = 1; i < BufferPool.GlobalPool.MACRO_CHUNK_SIZE / chunkSize; ++i)
+            pinned.add(bufferPool.tryGet(chunkSize));
+
+        for (int size : new int[] { chunkSize, 512 })
+        {
+            // Keep the tiny chunk's parent live while the tiny slot changes generations.
+            ByteBuffer anchor = size == 512 ? bufferPool.tryGet(BufferPool.NORMAL_ALLOCATION_UNIT) : null;
+            ByteBuffer previous = bufferPool.tryGet(size);
+            long address = MemoryUtil.getAddress(previous);
+            BufferPool.Chunk oldOwner = bufferPool.getParentChunk(previous);
+            assertNotNull(oldOwner);
+            ByteBuffer stale = previous.duplicate();
+            Object marker = MemoryUtil.getAttachment(previous);
+            MemoryUtil.setAttachment(stale, marker);
+            bufferPool.put(previous);
+
+            ByteBuffer current = bufferPool.tryGet(size);
+            assertEquals(address, MemoryUtil.getAddress(current));
+            BufferPool.Chunk currentOwner = bufferPool.getParentChunk(current);
+            assertNotNull(currentOwner);
+            assertNotSame(oldOwner, currentOwner);
+            if (marker instanceof ByteBuffer)
+            {
+                assertNull(bufferPool.getParentChunk(stale));
+                assertSame(stale, bufferPool.unwrapBufferPoolManagedBuffer(stale));
+            }
+            bufferPool.put(current);
+            if (anchor != null)
+                bufferPool.put(anchor);
+        }
+
+        for (ByteBuffer buffer : pinned)
+            bufferPool.put(buffer);
+        assertEquals(0, bufferPool.usedSizeInBytes());
+    }
+
+    @Test
+    public void testFindOwnerAcrossMacroChunks() throws InterruptedException, TimeoutException
+    {
+        int size = BufferPool.NORMAL_CHUNK_SIZE;
+        tearDown();
+        bufferPool = new BufferPool("two_macros", 2L * BufferPool.GlobalPool.MACRO_CHUNK_SIZE, true);
+        List<ByteBuffer> buffers = new ArrayList<>();
+        for (int i = 0; i <= BufferPool.GlobalPool.MACRO_CHUNK_SIZE / size; ++i)
+            buffers.add(bufferPool.tryGet(size));
+
+        for (ByteBuffer buffer : buffers)
+        {
+            assertNotNull(buffer);
+            BufferPool.Chunk owner = bufferPool.getParentChunk(buffer);
+            assertNotNull(owner);
+            assertSame(owner, bufferPool.getParentChunk(bufferPool.unwrapBufferPoolManagedBuffer(buffer.duplicate())));
+            bufferPool.put(buffer);
+        }
         assertEquals(0, bufferPool.usedSizeInBytes());
     }
 
@@ -173,8 +348,9 @@ public class BufferPoolTest
     }
 
     @Test
-    public void testMaxMemoryExceeded_SmallerThanChunkSize()
+    public void testMaxMemoryExceeded_SmallerThanChunkSize() throws InterruptedException, TimeoutException
     {
+        tearDown();
         bufferPool = new BufferPool("test_pool", BufferPool.GlobalPool.MACRO_CHUNK_SIZE / 2, false);
         requestDoubleMaxMemory();
     }
@@ -902,18 +1078,18 @@ public class BufferPoolTest
 
         // allocate three buffers on different chunks
         ByteBuffer buffer0 = bufferPool.get(halfNormalChunk, BufferType.OFF_HEAP);
-        BufferPool.Chunk chunk0 = BufferPool.Chunk.getParentChunk(buffer0);
+        BufferPool.Chunk chunk0 = bufferPool.getParentChunk(buffer0);
         assertFalse(chunk0.isFree());
         allocate(1, halfNormalChunk, toRelease); // allocate remaining buffers in the chunk
 
         ByteBuffer buffer1 = bufferPool.get(halfNormalChunk, BufferType.OFF_HEAP);
-        BufferPool.Chunk chunk1 = BufferPool.Chunk.getParentChunk(buffer1);
+        BufferPool.Chunk chunk1 = bufferPool.getParentChunk(buffer1);
         assertFalse(chunk1.isFree());
         assertNotEquals(chunk0, chunk1);
         allocate(1, halfNormalChunk, toRelease); // allocate remaining buffers in the chunk
 
         ByteBuffer buffer2 = bufferPool.get(halfNormalChunk, BufferType.OFF_HEAP);
-        BufferPool.Chunk chunk2 = BufferPool.Chunk.getParentChunk(buffer2);
+        BufferPool.Chunk chunk2 = bufferPool.getParentChunk(buffer2);
         assertFalse(chunk2.isFree());
         assertNotEquals(chunk0, chunk2);
         assertNotEquals(chunk1, chunk2);
@@ -921,7 +1097,7 @@ public class BufferPoolTest
 
         // now all 3 chunks in local pool is full, allocate one more buffer to evict chunk2
         ByteBuffer buffer3 = bufferPool.get(halfNormalChunk, BufferType.OFF_HEAP);
-        BufferPool.Chunk chunk3 = BufferPool.Chunk.getParentChunk(buffer3);
+        BufferPool.Chunk chunk3 = bufferPool.getParentChunk(buffer3);
         assertNotEquals(chunk0, chunk3);
         assertNotEquals(chunk1, chunk3);
         assertNotEquals(chunk2, chunk3);
@@ -1076,7 +1252,7 @@ public class BufferPoolTest
         for (int i = 0; i < num; i++)
             buffers.add(bufferPool.get(bufferSize, BufferType.OFF_HEAP));
 
-        return BufferPool.Chunk.getParentChunk(buffers.get(buffers.size() - 1));
+        return bufferPool.getParentChunk(buffers.get(buffers.size() - 1));
     }
 
     private void release(List<ByteBuffer> toRelease)

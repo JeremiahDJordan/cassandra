@@ -101,6 +101,8 @@ public enum CassandraRelevantProperties
     BTI_PARTITION_INDEX_PRELOAD_SIZE("cassandra.bti.partition_index_preload_size", "-1B"),
     BTREE_BRANCH_SHIFT("cassandra.btree.branchshift", "5"),
     BTREE_FAN_FACTOR("cassandra.btree.fanfactor"),
+    /** Selects chunk or slab attachments at startup according to the JDK and AES-GCM provider, or forces slabs. */
+    BUFFER_POOL_ATTACHMENT_MODE("cassandra.buffer_pool_attachment_mode", "auto"),
     BUILD_DATE("cassandra.buildDate"),
     /** Represents the maximum size (in bytes) of a serialized mutation that can be cached **/
     CACHEABLE_MUTATION_SIZE_LIMIT("cassandra.cacheable_mutation_size_limit_bytes", convertToString(1_000_000)),

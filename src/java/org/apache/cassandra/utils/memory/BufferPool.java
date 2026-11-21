@@ -22,7 +22,9 @@ import java.lang.ref.PhantomReference;
 import java.lang.ref.ReferenceQueue;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.security.GeneralSecurityException;
 import java.util.ArrayDeque;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.Queue;
 import java.util.Set;
@@ -32,11 +34,17 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceArray;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
+import javax.crypto.Cipher;
+
+import com.amazon.corretto.crypto.provider.AmazonCorrettoCryptoProvider;
+import com.github.benmanes.caffeine.cache.Cache;
+import com.github.benmanes.caffeine.cache.Caffeine;
 import com.google.common.annotations.VisibleForTesting;
 
 import net.nicoulaj.compilecommand.annotations.Inline;
@@ -60,6 +68,7 @@ import sun.nio.ch.DirectBuffer;
 import static com.google.common.collect.ImmutableList.of;
 import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
 import static org.apache.cassandra.concurrent.InfiniteLoopExecutor.SimulatorSafe.UNSAFE;
+import static org.apache.cassandra.config.CassandraRelevantProperties.BUFFER_POOL_ATTACHMENT_MODE;
 import static org.apache.cassandra.utils.ExecutorUtils.shutdownAndWait;
 import static org.apache.cassandra.utils.FBUtilities.prettyPrintMemory;
 import static org.apache.cassandra.utils.Shared.Scope.SIMULATION;
@@ -141,6 +150,144 @@ public class BufferPool
 
     private volatile Debug debug = Debug.NO_OP;
     private volatile DebugLeaks debugLeaks = DebugLeaks.NO_OP;
+
+    private enum AttachmentMode
+    {
+        AUTO, SLAB;
+
+        // Resolve once when the first pool is constructed, including in tools that skip crypto provider setup.
+        static final boolean USE_SLAB = useSlabAttachments();
+
+        static
+        {
+            logger.info("Using {} attachments for pooled direct buffers", USE_SLAB ? "slab" : "chunk");
+        }
+
+        private static boolean useSlabAttachments()
+        {
+            if (BUFFER_POOL_ATTACHMENT_MODE.getEnum(true, AttachmentMode.class) == SLAB)
+                return true;
+            if (Runtime.version().feature() < 25)
+                return false;
+
+            // SunJCE in JDK 25 casts direct buffer attachments to java.nio.Buffer during AES-GCM.
+            try
+            {
+                return Cipher.getInstance("AES/GCM/NoPadding").getProvider().getClass() != AmazonCorrettoCryptoProvider.class;
+            }
+            catch (GeneralSecurityException | RuntimeException | LinkageError e)
+            {
+                logger.debug("Unable to identify the default AES-GCM provider; using slab attachments", e);
+                return true;
+            }
+        }
+    }
+
+    private final Attachments attachments = AttachmentMode.USE_SLAB ? new Attachments() : null;
+
+    /**
+     * The JDK can follow every pooled buffer's attachment to the native allocation. Keep the reverse mapping here.
+     * An address locates the macro chunk and its child slots. Slab identity distinguishes generations of a slot.
+     */
+    private static final class Attachments
+    {
+        // Macro chunks remain allocated for the life of the pool. Read a single snapshot on returns from any thread.
+        private volatile SlabChunk[] macros = new SlabChunk[0];
+        // A distinct weak key per traced allocation preserves leak reporting when the last view disappears.
+        private final Cache<ByteBuffer, Ref<Chunk>> traces = REF_TRACE_ENABLED
+                                                            ? Caffeine.newBuilder().weakKeys().executor(Runnable::run).build()
+                                                            : null;
+
+        Chunk owner(Object attachment)
+        {
+            if (attachment == null)
+                return null;
+
+            if (REF_TRACE_ENABLED)
+                return tracedOwner(attachment, false);
+
+            if (!(attachment instanceof ByteBuffer) || !isExactlyDirect((ByteBuffer) attachment))
+                return null;
+
+            ByteBuffer marker = (ByteBuffer) attachment;
+            long address = MemoryUtil.getAddress(marker);
+            SlabChunk[] snapshot = macros;
+            int low = 0, high = snapshot.length - 1;
+            while (low <= high)
+            {
+                int mid = (low + high) >>> 1;
+                SlabChunk macro = snapshot[mid];
+                long offset = address - macro.baseAddress;
+                if (offset < 0)
+                    high = mid - 1;
+                else if (offset >= GlobalPool.MACRO_CHUNK_SIZE)
+                    low = mid + 1;
+                else
+                {
+                    if (marker == macro.slab)
+                        return macro;
+                    SlabChunk normal = macro.childAt(address);
+                    if (normal == null || marker == normal.slab)
+                        return normal;
+                    SlabChunk tiny = normal.childAt(address);
+                    return tiny != null && marker == tiny.slab ? tiny : null;
+                }
+            }
+            return null;
+        }
+
+        private Chunk tracedOwner(Object marker, boolean returning)
+        {
+            Ref<Chunk> trace = marker instanceof ByteBuffer ? traces.getIfPresent((ByteBuffer) marker) : null;
+            if (trace == null)
+                return null;
+
+            synchronized (trace)
+            {
+                if (trace.globalCount() != 0)
+                    return trace.get();
+
+                // A stale view has no owner. Returning it again should report the original allocation and release.
+                if (returning)
+                    trace.release();
+                return null;
+            }
+        }
+
+        private void releaseTrace(ByteBuffer marker)
+        {
+            // Keep the released Ref under its weak key while a caller can still return that lease.
+            Ref<Chunk> trace = traces.getIfPresent(marker);
+            synchronized (trace)
+            {
+                trace.release();
+            }
+        }
+
+        synchronized void addMacro(SlabChunk chunk)
+        {
+            SlabChunk[] updated = Arrays.copyOf(macros, macros.length + 1);
+            int i = macros.length;
+            while (i > 0 && updated[i - 1].baseAddress > chunk.baseAddress)
+            {
+                updated[i] = updated[i - 1];
+                --i;
+            }
+            updated[i] = chunk;
+            macros = updated;
+        }
+    }
+
+    @VisibleForTesting
+    Chunk getParentChunk(ByteBuffer buffer)
+    {
+        return AttachmentMode.USE_SLAB ? attachments.owner(MemoryUtil.getAttachment(buffer)) : Chunk.getParentChunk(buffer);
+    }
+
+    private Chunk newChunk(Recycler recycler, Chunk parent, ByteBuffer slab)
+    {
+        return AttachmentMode.USE_SLAB ? new SlabChunk(recycler, (SlabChunk) parent, slab) : new Chunk(recycler, slab);
+    }
 
     protected final String name;
     protected final BufferPoolMetrics metrics;
@@ -461,7 +608,7 @@ public class BufferPool
             Chunk chunk;
             try
             {
-                chunk = new Chunk(null, allocateDirectAligned(MACRO_CHUNK_SIZE));
+                chunk = newChunk(null, null, allocateDirectAligned(MACRO_CHUNK_SIZE));
             }
             catch (OutOfMemoryError oom)
             {
@@ -475,11 +622,11 @@ public class BufferPool
             chunk.acquire(null);
             macroChunks.add(chunk);
 
-            final Chunk callerChunk = new Chunk(this, chunk.get(NORMAL_CHUNK_SIZE));
+            final Chunk callerChunk = newChunk(this, chunk, chunk.get(NORMAL_CHUNK_SIZE));
             debug.registerNormal(callerChunk);
             for (int i = NORMAL_CHUNK_SIZE; i < MACRO_CHUNK_SIZE; i += NORMAL_CHUNK_SIZE)
             {
-                Chunk add = new Chunk(this, chunk.get(NORMAL_CHUNK_SIZE));
+                Chunk add = newChunk(this, chunk, chunk.get(NORMAL_CHUNK_SIZE));
                 chunks.add(add);
                 debug.registerNormal(add);
             }
@@ -489,7 +636,7 @@ public class BufferPool
         @Override
         public void recycle(Chunk chunk)
         {
-            Chunk recycleAs = new Chunk(chunk);
+            Chunk recycleAs = chunk.nextGeneration();
             debug.recycleNormal(chunk, recycleAs);
             chunks.add(recycleAs);
         }
@@ -798,7 +945,11 @@ public class BufferPool
         {
             this.parent = () -> {
                 ByteBuffer buffer = parent.tryGetInternal(TINY_CHUNK_SIZE, false);
-                return buffer == null ? null : new Chunk(parent, buffer);
+                if (buffer == null)
+                    return null;
+
+                Chunk parentChunk = AttachmentMode.USE_SLAB ? parent.getParentChunk(buffer) : null;
+                return newChunk(parent, parentChunk, buffer);
             };
             this.tinyLimit = 0; // we only currently permit one layer of nesting (which brings us down to 32 byte allocations, so is plenty)
             this.reuseObjects = parent.reuseObjects; // we share the same ByteBuffer object reuse pool, as we both have the same exclusive access to it
@@ -812,9 +963,30 @@ public class BufferPool
             return tinyPool;
         }
 
+        private Chunk getParentChunk(ByteBuffer buffer)
+        {
+            if (!AttachmentMode.USE_SLAB)
+                return Chunk.getParentChunk(buffer);
+
+            Object attachment = MemoryUtil.getAttachment(buffer);
+            if (!REF_TRACE_ENABLED && attachment != null)
+            {
+                // Most buffers return to their allocating thread while the same chunk is still current.
+                LocalPool local = buffer.capacity() <= TINY_ALLOCATION_LIMIT ? tinyPool : this;
+                if (local != null)
+                {
+                    Chunk current = local.chunks.chunk0;
+                    if (current != null && current.slab == attachment)
+                        return current;
+                }
+            }
+            return attachments.owner(attachment);
+        }
+
         public void put(ByteBuffer buffer)
         {
-            Chunk chunk = Chunk.getParentChunk(buffer);
+            boolean traceSlab = AttachmentMode.USE_SLAB && REF_TRACE_ENABLED;
+            Chunk chunk = traceSlab ? attachments.tracedOwner(MemoryUtil.getAttachment(buffer), true) : getParentChunk(buffer);
             int size = buffer.capacity();
 
             if (chunk == null)
@@ -824,17 +996,18 @@ public class BufferPool
             }
             else
             {
-                put(buffer, chunk);
+                // In trace mode retain the lease marker even if its allocating thread wins a racing return.
+                put(buffer, chunk, !traceSlab);
                 memoryInUse.dec(size);
             }
         }
 
-        private void put(ByteBuffer buffer, Chunk chunk)
+        private void put(ByteBuffer buffer, Chunk chunk, boolean reuseWrapper)
         {
             LocalPool owner = chunk.owner;
             if (owner != null && owner == tinyPool)
             {
-                tinyPool.put(buffer, chunk);
+                tinyPool.put(buffer, chunk, reuseWrapper);
                 return;
             }
 
@@ -870,7 +1043,7 @@ public class BufferPool
                 chunk.tryRecycle();
             }
 
-            if (owner == this && owningThread == Thread.currentThread())
+            if (reuseWrapper && owner == this && owningThread == Thread.currentThread())
             {
                 MemoryUtil.setAttachment(buffer, null);
                 MemoryUtil.setDirectByteBuffer(buffer, 0, 0);
@@ -880,7 +1053,7 @@ public class BufferPool
 
         public void putUnusedPortion(ByteBuffer buffer)
         {
-            Chunk chunk = Chunk.getParentChunk(buffer);
+            Chunk chunk = getParentChunk(buffer);
             if (chunk == null)
             {
                 // unpooled buffers are not shrunk; put() releases their full capacity
@@ -987,9 +1160,12 @@ public class BufferPool
         public void recycle(Chunk chunk)
         {
             ByteBuffer buffer = chunk.slab;
-            Chunk parentChunk = Chunk.getParentChunk(buffer);
+            Chunk parentChunk = chunk.parent();
             assert parentChunk != null;  // tiny chunk always has a parent chunk
-            put(buffer, parentChunk);
+            if (AttachmentMode.USE_SLAB && !REF_TRACE_ENABLED)
+                ((SlabChunk) chunk).clearParentSlot();
+            // Slab attachments identify the retired generation to any surviving views.
+            put(buffer, parentChunk, !AttachmentMode.USE_SLAB);
         }
 
         @Override
@@ -1010,7 +1186,7 @@ public class BufferPool
         {
             chunks.remove(chunk);
             if (tinyPool != null)
-                tinyPool.chunks.removeIf((child, parent) -> Chunk.getParentChunk(child.slab) == parent, chunk);
+                tinyPool.chunks.removeIf((child, parent) -> child.parent() == parent, chunk);
         }
 
         private Chunk addChunkFromParent()
@@ -1031,7 +1207,7 @@ public class BufferPool
             {
                 if (tinyPool != null)
                     // releasing tiny chunks may result in releasing current evicted chunk
-                    tinyPool.chunks.removeIf((child, parent) -> Chunk.getParentChunk(child.slab) == parent, evict);
+                    tinyPool.chunks.removeIf((child, parent) -> child.parent() == parent, evict);
                 evict.release();
             }
         }
@@ -1086,6 +1262,8 @@ public class BufferPool
     private void cleanupOneReference() throws InterruptedException
     {
         Object obj = localPoolRefQueue.remove(100);
+        if (AttachmentMode.USE_SLAB && REF_TRACE_ENABLED)
+            attachments.traces.cleanUp();
         if (obj instanceof LocalPoolRef)
         {
             debugLeaks.leak();
@@ -1134,7 +1312,7 @@ public class BufferPool
      * When we reiceve a release request we work out the position by comparing the buffer
      * address to our base address and we simply release the units.
      */
-    final static class Chunk implements DirectBuffer
+    static class Chunk implements DirectBuffer
     {
         enum Status
         {
@@ -1144,9 +1322,9 @@ public class BufferPool
             EVICTED;
         }
 
-        private final ByteBuffer slab;
+        final ByteBuffer slab;
         final long baseAddress;
-        private final int shift;
+        final int shift;
 
         // it may be 0L when all slots are allocated after "get" or when all slots are freed after "free"
         private volatile long freeSlots;
@@ -1165,10 +1343,10 @@ public class BufferPool
         @VisibleForTesting
         Object debugAttachment;
 
-        Chunk(Chunk recycle)
+        Chunk(Chunk recycle, ByteBuffer slab)
         {
             assert recycle.freeSlots == 0L;
-            this.slab = recycle.slab;
+            this.slab = slab;
             this.baseAddress = recycle.baseAddress;
             this.shift = recycle.shift;
             this.freeSlots = -1L;
@@ -1205,6 +1383,16 @@ public class BufferPool
         public Cleaner cleaner()
         {
             return null;
+        }
+
+        Chunk nextGeneration()
+        {
+            return new Chunk(this, slab);
+        }
+
+        Chunk parent()
+        {
+            return getParentChunk(slab);
         }
 
         /**
@@ -1312,11 +1500,7 @@ public class BufferPool
             recycler.recycle(this);
         }
 
-        /**
-         * We stash the chunk in the attachment of a buffer
-         * that was returned by get(), this method simply
-         * retrives the chunk that sliced a buffer, if any.
-         */
+        /** Returns the chunk that supplied the buffer when it is attached directly or through a tracing reference. */
         static Chunk getParentChunk(ByteBuffer buffer)
         {
             Object attachment = MemoryUtil.getAttachment(buffer);
@@ -1560,7 +1744,7 @@ public class BufferPool
         @VisibleForTesting
         void unsafeFree()
         {
-            Chunk parent = getParentChunk(slab);
+            Chunk parent = parent();
             if (parent != null)
                 parent.free(slab);
             else
@@ -1602,6 +1786,109 @@ public class BufferPool
         }
     }
 
+    /** A slab identifies its chunk generation while its attachment retains the backing direct allocation. */
+    private final class SlabChunk extends Chunk
+    {
+        private final SlabChunk parent;
+        private volatile AtomicReferenceArray<SlabChunk> children;
+
+        SlabChunk(Recycler recycler, SlabChunk parent, ByteBuffer slab)
+        {
+            super(recycler, slab);
+            this.parent = parent;
+            if (!REF_TRACE_ENABLED)
+            {
+                if (parent == null)
+                    attachments.addMacro(this);
+                else
+                {
+                    MemoryUtil.setAttachment(slab, MemoryUtil.getAttachment(parent.slab));
+                    parent.setChild(this);
+                }
+            }
+        }
+
+        SlabChunk(SlabChunk recycle)
+        {
+            super(recycle, REF_TRACE_ENABLED ? recycle.slab : recycle.slab.duplicate());
+            this.parent = recycle.parent;
+            // Tiny chunks clear their slots before freeing the parent slab, so the next generation can reuse the array.
+            this.children = recycle.children;
+            if (!REF_TRACE_ENABLED)
+            {
+                MemoryUtil.setAttachment(slab, MemoryUtil.getAttachment(recycle.slab));
+                parent.setChild(this);
+            }
+        }
+
+        @Override
+        Chunk nextGeneration()
+        {
+            return new SlabChunk(this);
+        }
+
+        @Override
+        Chunk parent()
+        {
+            return parent;
+        }
+
+        private int slot(long address)
+        {
+            return (int) (address - baseAddress) >>> shift;
+        }
+
+        private SlabChunk childAt(long address)
+        {
+            AtomicReferenceArray<SlabChunk> slots = children;
+            return slots == null ? null : slots.get(slot(address));
+        }
+
+        private void setChild(SlabChunk child)
+        {
+            // Only the allocating thread initializes this array. Later replacements may come from returning threads.
+            if (children == null)
+                children = new AtomicReferenceArray<>(64);
+            children.set(slot(child.baseAddress), child);
+        }
+
+        private void clearParentSlot()
+        {
+            parent.children.set(parent.slot(baseAddress), null);
+        }
+
+        @Override
+        void setAttachment(ByteBuffer buffer)
+        {
+            if (REF_TRACE_ENABLED)
+            {
+                ByteBuffer marker = slab.duplicate();
+                SlabChunk macro = this;
+                while (macro.parent != null)
+                    macro = macro.parent;
+                MemoryUtil.setAttachment(marker, MemoryUtil.getAttachment(macro.slab));
+                attachments.traces.put(marker, new Ref<>(this, null));
+                MemoryUtil.setAttachment(buffer, marker);
+            }
+            else
+            {
+                MemoryUtil.setAttachment(buffer, slab);
+            }
+        }
+
+        @Override
+        boolean releaseAttachment(ByteBuffer buffer)
+        {
+            Object attachment = MemoryUtil.getAttachment(buffer);
+            if (attachment == null)
+                return false;
+
+            if (REF_TRACE_ENABLED)
+                attachments.releaseTrace((ByteBuffer) attachment);
+            return true;
+        }
+    }
+
     @VisibleForTesting
     public static int roundUp(int size)
     {
@@ -1638,6 +1925,12 @@ public class BufferPool
         memoryAllocated.set(0);
         localPool.get().unsafeRecycle();
         globalPool.unsafeFree();
+        if (AttachmentMode.USE_SLAB)
+        {
+            attachments.macros = new SlabChunk[0];
+            if (REF_TRACE_ENABLED)
+                attachments.traces.invalidateAll();
+        }
     }
 
     @VisibleForTesting
@@ -1656,8 +1949,7 @@ public class BufferPool
     }
 
     /**
-     * @return the inner buffer if it has a BufferPool.Chunk attached
-     *  and originalBuffer in other cases
+     * @return the first buffer with a pool-managed attachment, or originalBuffer if none is found
      */
     public ByteBuffer unwrapBufferPoolManagedBuffer(ByteBuffer originalBuffer)
     {
@@ -1668,7 +1960,7 @@ public class BufferPool
         {
             if (buffer == null || !isExactlyDirect(buffer))
                 return originalBuffer;
-            if (Chunk.getParentChunk(buffer) != null)
+            if (getParentChunk(buffer) != null)
                 return buffer;
 
             Object attachment = MemoryUtil.getAttachment(buffer);

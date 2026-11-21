@@ -150,8 +150,8 @@ public abstract class MemoryUtil
         return unsafe.getObject(instance, DIRECT_BYTE_BUFFER_ATTACHMENT_OFFSET);
     }
 
-    // Note: If encryption is used, the Object attached must implement sun.nio.ch.DirectBuffer
-    // @see CASSANDRA-18081
+    // SunJCE follows the entire attachment chain of direct cipher buffers as DirectBuffer (CASSANDRA-18180)
+    // and, on JDK 25, as java.nio.Buffer to recover the backing allocation address.
     public static void setAttachment(ByteBuffer instance, Object next)
     {
         assert instance.getClass() == DIRECT_BYTE_BUFFER_CLASS;

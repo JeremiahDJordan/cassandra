@@ -578,11 +578,12 @@ public class DatabaseDescriptor
     {
         applyCompatibilityMode();
 
+        // Format and compressor plugins can construct the first buffer pool, which uses the installed AES-GCM provider.
+        applyCryptoProvider();
+
         applySSTableFormats();
 
         applyCompressorProviders();
-
-        applyCryptoProvider();
 
         applySimpleConfig();
 
