@@ -976,14 +976,16 @@ public class SAITester extends CQLTester
         });
     }
 
-    /** Builds the provided index on the provided SSTable as a partial build, and returns what it threw, if anything. */
-    protected static Throwable partialBuild(StorageAttachedIndexGroup group, SSTableReader sstable, String indexName)
+    /** Builds the provided indexes on the provided SSTable as a partial build, and returns what it threw, if anything. */
+    protected static Throwable partialBuild(StorageAttachedIndexGroup group, SSTableReader sstable, String... indexNames)
     {
         try
         {
-            StorageAttachedIndex index = (StorageAttachedIndex) group.table().indexManager.getIndexByName(indexName);
+            Set<StorageAttachedIndex> indexes = new HashSet<>();
+            for (String indexName : indexNames)
+                indexes.add((StorageAttachedIndex) group.table().indexManager.getIndexByName(indexName));
             TreeMap<SSTableReader, Set<StorageAttachedIndex>> sstables = new TreeMap<>(SSTableReader.idComparator);
-            sstables.put(sstable, Set.of(index));
+            sstables.put(sstable, indexes);
             new StorageAttachedIndexBuilder(group, sstables, false, false, false).build();
             return null;
         }

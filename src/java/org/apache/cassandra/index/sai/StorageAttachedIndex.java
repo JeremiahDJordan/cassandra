@@ -406,8 +406,9 @@ public class StorageAttachedIndex implements Index
 
     // Why this index must not be built and made queryable, if it must not: components of its name that it must not use
     // may be left on disk (see onAddedToExistingTable). Only the initialization task, which SecondaryIndexManager runs
-    // once per instance, and the pre-join task read it. It is never cleared: a rebuild (nodetool rebuild_index) doesn't
-    // read it, and builds every SSTable from the data, deleting the files of the index's names first.
+    // once per instance, and the pre-join and truncate tasks read it. It is never cleared: a rebuild (nodetool
+    // rebuild_index) doesn't read it, and builds every SSTable from the data, deleting the files of the index's names
+    // first.
     private volatile String cannotBuildReason = null;
 
     // SSTables added without this index while it was being built, which its initial build must build before it
@@ -1457,9 +1458,60 @@ public class StorageAttachedIndex implements Index
         /*
          * index files will be removed as part of base sstable lifecycle in {@link LogTransaction#delete(java.io.File)}
          * asynchronously, but we need to mark the index queryable because if the truncation is during the initial
-         * build of the index it won't get marked queryable by the build.
+         * build of the index it won't get marked queryable by the build. An SSTable kept by the truncation that the
+         * index doesn't cover leaves the index as it is.
          */
         return () -> {
+            // The index may be dropped while the table is truncated
+            StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
+            if (group == null || !group.containsIndex(this))
+                return null;
+
+            // Until the initialization task flushes them, the memtables can have rows written before the index was
+            // created, which its memtable index doesn't have. That task makes the index queryable once they're flushed.
+            if (!canFlushFromMemtableIndex)
+                return null;
+
+            // The SSTables may have the components of a dropped index of the same name, which mustn't be loaded
+            String reason = cannotBuildReason;
+            if (reason != null)
+            {
+                logger.warn(indexContext.logMessage("Not making index queryable during table truncation: {}"), reason);
+                return null;
+            }
+
+            List<SSTableReader> nonIndexed;
+            try
+            {
+                nonIndexed = baseCfs.indexManager.selectSSTablesForInitialBuild(() -> {
+                    // Checked again once the selection can start: the SSTables mustn't be loaded for an index that was
+                    // dropped, or found unbuildable, while this waited for it
+                    if (dropped || !group.containsIndex(this) || cannotBuildReason != null)
+                        return null;
+                    return findNonIndexedSSTables(baseCfs, group, false);
+                });
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                // Failing here would fail the truncation after its SSTables are discarded
+                logger.warn(indexContext.logMessage("Not making index queryable during table truncation"), t);
+                return null;
+            }
+
+            if (nonIndexed == null)
+                return null;
+
+            if (!nonIndexed.isEmpty())
+            {
+                logger.info(indexContext.logMessage("Not making index queryable during table truncation, as the kept SSTables {} are not indexed"),
+                            nonIndexed.stream().map(sstable -> sstable.descriptor).collect(Collectors.toList()));
+                return null;
+            }
+
+            if (dropped || !group.containsIndex(this))
+                return null;
+
             logger.info(indexContext.logMessage("Making index queryable during table truncation"));
             baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);
             return null;
