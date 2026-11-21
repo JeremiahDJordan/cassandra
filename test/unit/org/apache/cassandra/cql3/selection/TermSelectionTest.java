@@ -30,6 +30,9 @@ import java.util.UUID;
 
 import org.junit.Test;
 
+import com.datastax.driver.core.PreparedStatement;
+import com.datastax.driver.core.ResultSet;
+import com.datastax.driver.core.Row;
 import com.datastax.driver.core.TupleValue;
 import com.datastax.driver.core.UDTValue;
 import com.datastax.driver.core.exceptions.InvalidQueryException;
@@ -51,6 +54,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 public class TermSelectionTest extends CQLTester
 {
@@ -724,6 +728,165 @@ public class TermSelectionTest extends CQLTester
                                             "[tp, (i, j)]", "[fv, {a: i, b: 1}]", "[v, fv]", "[fv, v]", "[v, (v)]",
                                             "[fv, (v)]", "[v, tp]", "[[v], [fv]]", "[[fv], [v]]" })
             assertNotNull(literal, executeNet("SELECT " + literal + " FROM %s").one().getObject(0));
+    }
+
+    @Test
+    public void testSetLiteralWithCastOrFunctionParameterType() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int)");
+        execute("INSERT INTO %s (k, i) VALUES (0, 30)");
+        String varintSet = createFunction(KEYSPACE, "set<varint>",
+                                          "CREATE FUNCTION %s (x set<varint>) CALLED ON NULL INPUT " +
+                                          "RETURNS text LANGUAGE java AS 'return String.valueOf(x);'");
+
+        // the set keeps the int type of its elements, so it is sorted and deduplicated as ints and read as varints
+        assertRowsNet(executeNet("SELECT collection_count((set<varint>){i, 30}) FROM %s"), row(1));
+        assertRowsNet(executeNet("SELECT to_json((set<varint>){i, 1}) FROM %s"), row("[1, 30]"));
+        assertRowsNet(executeNet("SELECT " + varintSet + "({i, 1}) FROM %s"), row("[1, 30]"));
+    }
+
+    @Test
+    public void testBindMarkersInCollectionLiteralWithCastOrFunctionParameterType() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int)");
+        execute("INSERT INTO %s (k, i) VALUES (0, 30)");
+        String varintSet = createFunction(KEYSPACE, "set<varint>",
+                                          "CREATE FUNCTION %s (x set<varint>) CALLED ON NULL INPUT " +
+                                          "RETURNS text LANGUAGE java AS 'return String.valueOf(x);'");
+        String varintLists = createFunction(KEYSPACE, "list<frozen<list<varint>>>",
+                                            "CREATE FUNCTION %s (x list<frozen<list<varint>>>) CALLED ON NULL INPUT " +
+                                            "RETURNS text LANGUAGE java AS 'return String.valueOf(x);'");
+
+        // bind markers keep the element type of the literal if all its elements are of it, as without a cast or function
+        for (String selector : new String[]{ "(list<varint>)[i, ?]", varintSet + "({i, ?})", varintLists + "([[i], [?]])" })
+        {
+            PreparedStatement prepared = sessionNet().prepare(formatQuery("SELECT " + selector + " FROM %s"));
+            assertEquals(selector, "int", prepared.getVariables().getType(0).toString());
+            assertRowCountNet(sessionNet().execute(prepared.bind(5)), 1);
+        }
+    }
+
+    @Test
+    public void testTupleLiteralWithTooManyComponents() throws Throwable
+    {
+        String type = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, v " + type + ", " +
+                    "tp frozen<tuple<int, int>>, tp3 frozen<tuple<int, int, int>>)");
+        execute("INSERT INTO %s (k, i, v, tp, tp3) VALUES (0, 7, {a: 1, b: 2}, (5, 6), (1, 2, 3))");
+
+        String message = "(1, 2, 3) is not of the expected type: tuple<int, int>";
+        assertInvalidMessage(message, "SELECT [tp, (1, 2, 3)] FROM %s");
+        assertInvalidMessage(message, "SELECT {tp, (1, 2, 3)} FROM %s");
+        assertInvalidMessage(message, "SELECT [[tp], [(1, 2, 3)]] FROM %s");
+        assertInvalidMessage("(tp, (1, 2, 3)) is not of the expected type: tuple<tuple<int, int>, tuple<int, int>>",
+                             "SELECT [(tp, tp), (tp, (1, 2, 3))] FROM %s");
+        assertInvalidMessage("{1: (1, 2, 3)} is not of the expected type: frozen<map<int, tuple<int, int>>>",
+                             "SELECT [(map<int, frozen<tuple<int, int>>>){1: tp}, {1: (1, 2, 3)}] FROM %s");
+        assertInvalidMessage("(1, 2, 3, 4) is not of the expected type: tuple<int, int, int>",
+                             "SELECT [tp, tp3, (1, 2, 3, 4)] FROM %s");
+        assertInvalidMessage("(1, 2, 3) is not of the expected type: " + type, "SELECT [v, (1, 2, 3)] FROM %s");
+
+        // a tuple literal may have fewer components than its type
+        assertRows(execute("SELECT [tp3, (1, 2)] FROM %s"), row(list(tuple(1, 2, 3), tuple(1, 2))));
+        assertRows(execute("SELECT [tp3, (i, i)] FROM %s"), row(list(tuple(1, 2, 3), tuple(7, 7))));
+    }
+
+    @Test
+    public void testCollectionLiteralTypeOfWiderElement() throws Throwable
+    {
+        String type = createType("CREATE TYPE %s (a int, b int)");
+        String type3 = createType("CREATE TYPE %s (a int, b int, c int)");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v " + type + ", fv3 frozen<" + type3 + ">, " +
+                    "tp frozen<tuple<int, int>>, tp3 frozen<tuple<int, int, int>>, tt frozen<tuple<text, int>>, " +
+                    "l list<frozen<tuple<int, int>>>, l3 list<frozen<tuple<int, int, int>>>)");
+        execute("INSERT INTO %s (k, v, fv3, tp, tp3, tt, l, l3) VALUES " +
+                "(0, {a: 4, b: 5}, {a: 6, b: 7, c: 8}, (9, 10), (11, 12, 13), ('x', 14), [(15, 16)], [(17, 18, 19)])");
+
+        // a tuple or user type with more components is the type of the literal, whatever the order of the elements
+        String tupleList = "(list<frozen<tuple<int, int, int>>>)";
+        assertSameResultNet("SELECT [tp, tp3] FROM %s", "SELECT " + tupleList + "[tp, tp3] FROM %s");
+        assertSameResultNet("SELECT [tp3, tp] FROM %s", "SELECT " + tupleList + "[tp3, tp] FROM %s");
+        assertSameResultNet("SELECT [tp, null, tp3] FROM %s", "SELECT " + tupleList + "[tp, null, tp3] FROM %s");
+        assertSameResultNet("SELECT [v, tp3] FROM %s", "SELECT " + tupleList + "[v, tp3] FROM %s");
+        assertSameResultNet("SELECT [tp, v, tp3] FROM %s", "SELECT " + tupleList + "[tp, v, tp3] FROM %s");
+        assertSameResultNet("SELECT {tp, tp3} FROM %s", "SELECT (set<frozen<tuple<int, int, int>>>){tp, tp3} FROM %s");
+        assertEquals(executeNet("SELECT [l3, l3] FROM %s").getColumnDefinitions().getType(0),
+                     executeNet("SELECT [l, l3] FROM %s").getColumnDefinitions().getType(0));
+        assertSameResultNet("SELECT [[tp], [tp3]] FROM %s",
+                            "SELECT (list<frozen<list<frozen<tuple<int, int, int>>>>>)[[tp], [tp3]] FROM %s");
+
+        List<TupleValue> tuples = executeNet("SELECT [tp, tp3] FROM %s").one().getList(0, TupleValue.class);
+        assertEquals(10, tuples.get(0).getInt(1));
+        assertTrue(tuples.get(0).isNull(2));
+        assertEquals(13, tuples.get(1).getInt(2));
+
+        ResultSet result = executeNet("SELECT [v, fv3] FROM %s");
+        assertEquals(executeNet("SELECT [fv3, fv3] FROM %s").getColumnDefinitions().getType(0),
+                     result.getColumnDefinitions().getType(0));
+        List<UDTValue> values = result.one().getList(0, UDTValue.class);
+        assertEquals(5, values.get(0).getInt("b"));
+        assertTrue(values.get(0).isNull("c"));
+        assertEquals(8, values.get(1).getInt("c"));
+
+        assertRowsNet(executeNet("SELECT collection_count([[tp], [tp3]]) FROM %s"), row(2));
+        String tupleLists = createFunction(KEYSPACE, "list<frozen<list<frozen<tuple<int, int, int>>>>>",
+                                           "CREATE FUNCTION %s (x list<frozen<list<frozen<tuple<int, int, int>>>>>) " +
+                                           "CALLED ON NULL INPUT RETURNS text LANGUAGE java AS 'return String.valueOf(x);'");
+        assertRowsNet(executeNet("SELECT " + tupleLists + "([[tp], [tp3]]) FROM %s"), row("[[(9,10,NULL)], [(11,12,13)]]"));
+
+        // the first element type is kept when all the elements are of it
+        assertEquals(executeNet("SELECT [tp, tp] FROM %s").getColumnDefinitions().getType(0),
+                     executeNet("SELECT [tp, v] FROM %s").getColumnDefinitions().getType(0));
+        assertEquals(executeNet("SELECT [v, v] FROM %s").getColumnDefinitions().getType(0),
+                     executeNet("SELECT [v, tp] FROM %s").getColumnDefinitions().getType(0));
+
+        // no element type of which all the elements are
+        String incompatible = "Invalid collection literal: all selectors must have the same CQL type inside collection literals";
+        assertInvalidMessage(incompatible, "SELECT [tp, tt, tp3] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [tp3, tt] FROM %s");
+    }
+
+    @Test
+    public void testCollectionLiteralTypeOfWiderNativeElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, b bigint, vi varint, at ascii, txt text, bl blob, " +
+                    "d date, tm time, ts timestamp, u uuid, tu timeuuid)");
+        execute("INSERT INTO %s (k, i, b, vi, at, txt, bl, d, tm, ts, u, tu) VALUES (0, 1, 2, 3, 'a', 'b', 0xcafe, " +
+                "'2020-01-01', '01:00:00', '2020-01-01 00:00:00+0000', 3e5e9a3a-3f6e-4d0a-9a39-7c2b5e3f4a10, " +
+                "6d3d1c40-c25b-11ee-8000-000000000000)");
+
+        // a text reads and orders the values of an ascii as an ascii does, and a blob those of a text
+        assertSameResultNet("SELECT [at, txt] FROM %s", "SELECT (list<text>)[at, txt] FROM %s");
+        assertSameResultNet("SELECT {at, txt} FROM %s", "SELECT (set<text>){at, txt} FROM %s");
+        assertSameResultNet("SELECT [at, txt, bl] FROM %s", "SELECT (list<blob>)[at, txt, bl] FROM %s");
+
+        // a first element type that reads the values of the others is kept
+        assertSameResultNet("SELECT [bl, i] FROM %s", "SELECT (list<blob>)[bl, i] FROM %s");
+        assertSameResultNet("SELECT [vi, b] FROM %s", "SELECT (list<varint>)[vi, b] FROM %s");
+        assertSameResultNet("SELECT [u, tu] FROM %s", "SELECT (list<uuid>)[u, tu] FROM %s");
+
+        // a later type that reads the values of the earlier ones but doesn't order them in the same way isn't used, and
+        // neither is one whose values are those of another type but mean other values
+        String incompatible = "Invalid collection literal: all selectors must have the same CQL type inside collection literals";
+        assertInvalidMessage(incompatible, "SELECT [i, bl] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [b, vi] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [tu, u] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [i, d] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [b, tm] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [ts, vi] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [[i], [d]] FROM %s");
+        assertInvalidMessage(incompatible, "SELECT [(i, i), (d, i)] FROM %s");
+    }
+
+    private void assertSameResultNet(String query, String expectedQuery)
+    {
+        ResultSet result = executeNet(query);
+        ResultSet expected = executeNet(expectedQuery);
+        assertEquals(expected.getColumnDefinitions().getType(0), result.getColumnDefinitions().getType(0));
+        Row row = result.one();
+        Row expectedRow = expected.one();
+        assertEquals(expectedRow.getBytesUnsafe(0), row.getBytesUnsafe(0));
+        assertEquals(expectedRow.getObject(0), row.getObject(0));
     }
 
     private ByteBuffer selectedValue(String query) throws Throwable
