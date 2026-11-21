@@ -121,7 +121,7 @@ public class SecondaryIndexTest extends CQLTester
                              format("DROP INDEX %s.%s", KEYSPACE, indexName));
 
         createTable("CREATE TABLE %s (a int primary key, b int);");
-        createIndexAsync("CREATE INDEX " + indexName + " ON %s(b);");
+        createIndex("CREATE INDEX " + indexName + " ON %s(b);");
         createIndexAsync("CREATE INDEX IF NOT EXISTS " + indexName + " ON %s(b);");
 
         assertInvalidMessage(format("Index '%s' already exists",
@@ -379,10 +379,10 @@ public class SecondaryIndexTest extends CQLTester
     {
         createTable("CREATE TABLE %s (pk0 int, pk1 int, ck0 int, ck1 int, ck2 int, value int, PRIMARY KEY ((pk0, pk1), ck0, ck1, ck2))");
 
-        execute("CREATE INDEX ON %s (pk0)");
-        execute("CREATE INDEX ON %s (ck0)");
-        execute("CREATE INDEX ON %s (ck1)");
-        execute("CREATE INDEX ON %s (ck2)");
+        createIndex("CREATE INDEX ON %s (pk0)");
+        createIndex("CREATE INDEX ON %s (ck0)");
+        createIndex("CREATE INDEX ON %s (ck1)");
+        createIndex("CREATE INDEX ON %s (ck2)");
 
         execute("INSERT INTO %s (pk0, pk1, ck0, ck1, ck2, value) VALUES (0, 1, 2, 3, 4, 5)");
         execute("INSERT INTO %s (pk0, pk1, ck0, ck1, ck2, value) VALUES (1, 2, 3, 4, 5, 0)");
@@ -415,7 +415,7 @@ public class SecondaryIndexTest extends CQLTester
     {
         createTable("CREATE TABLE %s (interval text, seq int, id int, severity int, PRIMARY KEY ((interval, seq), id) ) WITH CLUSTERING ORDER BY (id DESC)");
 
-        execute("CREATE INDEX ON %s (severity)");
+        createIndex("CREATE INDEX ON %s (severity)");
 
         execute("insert into %s (interval, seq, id , severity) values('t',1, 1, 1)");
         execute("insert into %s (interval, seq, id , severity) values('t',1, 2, 1)");
@@ -952,7 +952,7 @@ public class SecondaryIndexTest extends CQLTester
         createTable("CREATE TABLE %s ( id1 int, id2 int, author text, time bigint, v1 text, v2 text, PRIMARY KEY ((id1, id2), author, time))");
 
         createIndex("CREATE INDEX ON %s (time)");
-        execute("CREATE INDEX ON %s (id2)");
+        createIndex("CREATE INDEX ON %s (id2)");
 
         execute("INSERT INTO %s (id1, id2, author, time, v1, v2) VALUES(0, 0, 'bob', 0, 'A', 'A')");
         execute("INSERT INTO %s (id1, id2, author, time, v1, v2) VALUES(0, 0, 'bob', 1, 'B', 'B')");
