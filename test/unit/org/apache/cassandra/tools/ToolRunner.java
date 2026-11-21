@@ -32,6 +32,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -709,7 +710,23 @@ public class ToolRunner
         {
             if (!process.isAlive())
                 return;
-            process.destroyForcibly();
+            // tool scripts run java as a child of the shell; kill it first so the shell reaps it
+            List<ProcessHandle> descendants = process.descendants().collect(Collectors.toList());
+            descendants.forEach(ProcessHandle::destroyForcibly);
+            try
+            {
+                if (descendants.isEmpty() || !process.waitFor(10, TimeUnit.SECONDS))
+                {
+                    if (!process.destroyForcibly().waitFor(10, TimeUnit.SECONDS))
+                        logger.warn("Process {} did not exit after being destroyed", process.pid());
+                }
+            }
+            catch (InterruptedException e)
+            {
+                process.destroyForcibly();
+                Thread.currentThread().interrupt();
+                throw new RuntimeException(e);
+            }
         }
     }
 
