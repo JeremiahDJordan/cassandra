@@ -55,6 +55,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
+import com.google.common.collect.MapMaker;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.FutureCallback;
@@ -238,6 +239,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private final Map<String, AtomicInteger> inProgressBuilds = Maps.newConcurrentMap();
 
     /**
+     * The index instances that were removed and unregistered, whose builds no longer count under their name.
+     */
+    private final Set<Index> removedIndexes = Collections.newSetFromMap(new MapMaker().weakKeys().makeMap());
+
+    /**
      * Read: held by {@link #buildSSTableAttachedIndexesBeforeAdding} until the SSTables are added. Write: held while
      * the initial build of an SSTable-attached index selects the live SSTables.
      */
@@ -271,10 +277,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     {
         // figure out what needs to be added and dropped.
         Indexes tableIndexes = baseCfs.metadata().indexes;
-        indexes.keySet()
-               .stream()
-               .filter(indexName -> !tableIndexes.has(indexName))
-               .forEach(this::removeIndex);
+        // writableIndexes also has the indexes that didn't register themselves
+        Sets.union(indexes.keySet(), writableIndexes.keySet())
+            .immutableCopy()
+            .stream()
+            .filter(indexName -> !tableIndexes.has(indexName))
+            .forEach(this::removeIndex);
 
         // we call add for every index definition in the collection as
         // some may not have been created here yet, only added to schema
@@ -293,7 +301,14 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
     private synchronized Future<Void> createIndex(IndexMetadata indexDef, boolean isNewCF)
     {
+        // an index that didn't register itself isn't dropped first when a schema change replaces it
+        Index unregistered = writableIndexes.get(indexDef.name);
+        if (unregistered != null && !unregistered.getIndexMetadata().equals(indexDef))
+            markIndexRemoved(unregistered);
         final Index index = createInstance(indexDef);
+        // before registering it, so that no write or read reaches the index before it has been told
+        if (!isNewCF)
+            index.onAddedToExistingTable();
         index.register(this);
         if (writableIndexes.put(index.getIndexMetadata().name, index) == null)
             logger.info("Index [{}] registered and writable.", index.getIndexMetadata().name);
@@ -448,6 +463,13 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
             markIndexRemoved(removed);
             executeBlocking(removed.getInvalidateTask(), null);
+        }
+        else
+        {
+            // an index that didn't register itself keeps its build state under its name until its initialization ends
+            Index unregistered = writableIndexes.get(indexName);
+            if (unregistered != null)
+                markIndexRemoved(unregistered);
         }
     }
 
@@ -826,17 +848,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * Performs an asynchronous (re)indexing of the specified SSTables for the specified indexes.
      *
      * @param sstables the SSTables to be (re)indexed
-     * @param indexes the indexes to be (re)built for the specified SSTables
+     * @param allIndexes the indexes to be (re)built for the specified SSTables
      * @param isFullRebuild True if this method is invoked as a full index rebuild, false otherwise
      */
-    private java.util.concurrent.Future<?> buildIndexesAsync(Collection<SSTableReader> sstables, Set<Index> indexes, boolean isFullRebuild)
+    private java.util.concurrent.Future<?> buildIndexesAsync(Collection<SSTableReader> sstables, Set<Index> allIndexes, boolean isFullRebuild)
     {
-        if (indexes.isEmpty())
+        if (allIndexes.isEmpty())
             return ImmediateFuture.success(null);
 
         // Mark all indexes as building: this step must happen first, because if any index can't be marked, the whole
-        // process needs to abort
-        markIndexesBuilding(indexes, isFullRebuild, false);
+        // process needs to abort. Only the marked indexes are built: the others were dropped.
+        Set<Index> indexes = markIndexesBuilding(allIndexes, isFullRebuild, false);
+        if (indexes.isEmpty())
+            return ImmediateFuture.success(null);
 
         // Build indexes in a try/catch, so that any index not marked as either built or failed will be marked as failed:
         final Set<Index> builtIndexes = Sets.newConcurrentHashSet();
@@ -970,15 +994,21 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * {@link #markIndexBuilt(Index, boolean)} or {@link #markIndexFailed(Index, boolean)} should be always called after
      * the rebuilding has finished, so that the index build state can be correctly managed and the index rebuilt.
      *
-     * @param indexes the index to be marked as building
+     * @param allIndexes the index to be marked as building
      * @param isFullRebuild {@code true} if this method is invoked as a full index rebuild, {@code false} otherwise
      * @param isNewCF {@code true} if this method is invoked when initializing a new table/columnfamily (i.e. loading a CF at startup),
      * {@code false} for all other cases (i.e. newly added index)
+     * @return the indexes marked as building: those that weren't replaced or removed
      */
     @VisibleForTesting
-    public synchronized void markIndexesBuilding(Set<Index> indexes, boolean isFullRebuild, boolean isNewCF)
+    public synchronized Set<Index> markIndexesBuilding(Set<Index> allIndexes, boolean isFullRebuild, boolean isNewCF)
     {
         String keyspaceName = baseCfs.getKeyspaceName();
+        // markIndexBuilt and markIndexFailed ignore an index that has been replaced by another one with the same name,
+        // so it mustn't be counted as building under that name either: its replacement would look as building forever.
+        Set<Index> indexes = allIndexes.stream().filter(index -> !isReplaced(index)).collect(Collectors.toSet());
+        // The same goes for a removed index, whose builds may end after another index of its name is created
+        indexes.removeIf(removedIndexes::contains);
 
         // First step is to validate against concurrent rebuilds; it would be more optimized to do everything on a single
         // step, but we're not really expecting a very high number of indexes, and this isn't on any hot path, so
@@ -1007,6 +1037,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                             if (counter.getAndIncrement() == 0 && DatabaseDescriptor.isDaemonInitialized() && !isNewCF)
                                 SystemKeyspace.setIndexRemoved(keyspaceName, indexName);
                         });
+        return indexes;
     }
 
     /**
@@ -1019,6 +1050,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     public synchronized void markIndexBuilt(Index index, boolean isFullRebuild)
     {
         String indexName = index.getIndexMetadata().name;
+        if (isReplaced(index) || removedIndexes.contains(index))
+            return;
+
         if (isFullRebuild)
             makeIndexQueryable(index, Index.Status.BUILD_SUCCEEDED);
 
@@ -1045,6 +1079,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private synchronized void markIndexFailed(Index index, boolean isInitialBuild)
     {
         String indexName = index.getIndexMetadata().name;
+        if (isReplaced(index) || removedIndexes.contains(index))
+            return;
 
         AtomicInteger counter = inProgressBuilds.get(indexName);
         if (counter != null)
@@ -1066,6 +1102,16 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
             makeIndexNonQueryable(index, Index.Status.BUILD_FAILED);
         }
+    }
+
+    /**
+     * Whether the index was dropped and replaced by one of the same name, whose build state (kept by index name) its
+     * builds must not change. An index is not replaced while no index of its name is registered.
+     */
+    private boolean isReplaced(Index index)
+    {
+        Index registered = indexes.get(index.getIndexMetadata().name);
+        return registered != null && registered != index;
     }
 
     private void logAndMarkIndexesFailed(Set<Index> indexes, Throwable indexBuildFailure, boolean isInitialBuild)
@@ -1091,6 +1137,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         writableIndexes.remove(indexName);
         needsFullRebuild.remove(indexName);
         inProgressBuilds.remove(indexName);
+        if (indexes.get(indexName) != index)
+            removedIndexes.add(index);
         // remove existing indexing status
         IndexStatusManager.instance.propagateLocalIndexStatus(keyspace.getName(), indexName, Index.Status.DROPPED);
     }
@@ -1619,6 +1667,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     {
         String name = index.getIndexMetadata().name;
         indexes.put(name, index);
+        removedIndexes.remove(index);
         updatePreparesWrites();
         logger.trace("Registered index {}", name);
 

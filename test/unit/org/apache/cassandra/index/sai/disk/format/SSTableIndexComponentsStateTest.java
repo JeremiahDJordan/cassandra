@@ -346,16 +346,16 @@ public class SSTableIndexComponentsStateTest
 
             createFakeDataFile(descriptor);
             createFakePerSSTableComponents(descriptor, SAIUtil.currentVersion(), 0, 1 * 1024 * 1024); // 1mb per file
-            createFakePerIndexComponents(descriptor, idx1, SAIUtil.currentVersion(), 1, 2 * 1024 * 1024); // 2mb per file
-            createFakePerIndexComponents(descriptor, idx2, Version.DB, 0, 3 * 1024 * 1024); // 3mb per file
+            createFakePerIndexComponents(descriptor, idx1, SAIUtil.currentVersion(), 1, 2 * 1024 * 1024); // 2mb per file but the marker
+            createFakePerIndexComponents(descriptor, idx2, Version.DB, 0, 3 * 1024 * 1024); // 3mb per file but the marker
 
             SSTableReader sstable = Mockito.mock(SSTableReader.class);
             Mockito.when(sstable.getDescriptor()).thenReturn(descriptor);
             SSTableIndexComponentsState discovered = IndexComponentDiscovery.instance().discoverComponents(sstable);
             assertEquals(6, discovered.perSSTable().sizeInMB);
-            assertEquals(8, discovered.perIndex(idx1.getIndexName()).sizeInMB);
-            assertEquals(12, discovered.perIndex(idx2.getIndexName()).sizeInMB);
-            assertEquals(26, discovered.totalSizeInMB());
+            assertEquals(6, discovered.perIndex(idx1.getIndexName()).sizeInMB);
+            assertEquals(9, discovered.perIndex(idx2.getIndexName()).sizeInMB);
+            assertEquals(21, discovered.totalSizeInMB());
 
             IndexDescriptor indexDescriptor = loadDescriptor(descriptor, idx1, idx2);
 
@@ -370,13 +370,13 @@ public class SSTableIndexComponentsStateTest
 
             assertEquals(SAIUtil.currentVersion(), state.perIndex(idx1.getIndexName()).buildId.version());
             assertEquals(1, state.perIndex(idx1.getIndexName()).buildId.generation());
-            assertEquals(8, state.perIndex(idx1.getIndexName()).sizeInMB);
+            assertEquals(6, state.perIndex(idx1.getIndexName()).sizeInMB);
 
             assertEquals(Version.DB, state.perIndex(idx2.getIndexName()).buildId.version());
             assertEquals(0, state.perIndex(idx2.getIndexName()).buildId.generation());
-            assertEquals(12, state.perIndex(idx2.getIndexName()).sizeInMB);
+            assertEquals(9, state.perIndex(idx2.getIndexName()).sizeInMB);
 
-            assertEquals(26, state.totalSizeInMB());
+            assertEquals(21, state.totalSizeInMB());
         }
         finally
         {

@@ -117,16 +117,15 @@ public class MetadataTest extends SaiRandomizedTest
     public void shouldFailCrcCheckWhenFileIsTruncated() throws IOException
     {
         IndexComponents.ForWrite components = indexDescriptor.newPerIndexComponentsForWrite(indexContext);
-        final IndexOutputWriter output = writeRandomBytes(components);
+        final File indexFile = writeRandomBytes(components);
 
-        final File indexFile = output.getFile();
         final long length = indexFile.length();
         assertTrue(length > 0);
         final File renamed = new File(temporaryFolder.newFile());
         indexFile.move(renamed);
-        assertFalse(output.getFile().exists());
+        assertFalse(indexFile.exists());
 
-        try (FileOutputStream outputStream = new FileOutputStream(output.getFile().toJavaIOFile());
+        try (FileOutputStream outputStream = new FileOutputStream(indexFile.toJavaIOFile());
              RandomAccessFile input = new RandomAccessFile(renamed.toJavaIOFile(), "r"))
         {
             // skip last byte when copying
@@ -142,16 +141,15 @@ public class MetadataTest extends SaiRandomizedTest
     public void shouldFailCrcCheckWhenFileIsCorrupted() throws IOException
     {
         IndexComponents.ForWrite components = indexDescriptor.newPerIndexComponentsForWrite(indexContext);
-        final IndexOutputWriter output = writeRandomBytes(components);
+        final File indexFile = writeRandomBytes(components);
 
-        final File indexFile = output.getFile();
         final long length = indexFile.length();
         assertTrue(length > 0);
         final File renamed = new File(temporaryFolder.newFile());
         indexFile.move(renamed);
-        assertFalse(output.getFile().exists());
+        assertFalse(indexFile.exists());
 
-        try (FileOutputStream outputStream = new FileOutputStream(output.getFile().toJavaIOFile());
+        try (FileOutputStream outputStream = new FileOutputStream(indexFile.toJavaIOFile());
              RandomAccessFile file = new RandomAccessFile(renamed.toJavaIOFile(), "r"))
         {
             // copy most of the file untouched
@@ -174,7 +172,7 @@ public class MetadataTest extends SaiRandomizedTest
         MetadataSource.loadMetadata(components);
     }
 
-    private IndexOutputWriter writeRandomBytes(IndexComponents.ForWrite components) throws IOException
+    private File writeRandomBytes(IndexComponents.ForWrite components) throws IOException
     {
         try (MetadataWriter writer = new MetadataWriter(components))
         {
@@ -185,6 +183,6 @@ public class MetadataTest extends SaiRandomizedTest
                 builder.writeBytes(bytes, 0, bytes.length);
             }
         }
-        return components.addOrGet(components.metadataComponent()).openOutput();
+        return components.get(components.metadataComponent()).file();
     }
 }
