@@ -1627,6 +1627,7 @@
       <mkdir dir="${build.test.dir}/cassandra"/>
       <mkdir dir="${build.test.dir}/output"/>
       <mkdir dir="${build.test.dir}/output/${tag}"/>
+      <mkdir dir="${build.test.dir}/logs"/>
       <junit-timeout fork="on" forkmode="@{forkmode}" failureproperty="testfailed" maxmemory="1024m" timeout="@{timeout}" showoutput="@{showoutput}">
         <formatter classname="org.apache.cassandra.CassandraXMLJUnitResultFormatter" extension=".xml" usefile="true"/>
         <formatter classname="org.apache.cassandra.CassandraBriefJUnitResultFormatter" usefile="false"/>
@@ -1645,6 +1646,8 @@
         -->
         <jvmarg value="-XX:SoftRefLRUPolicyMSPerMB=0" />
         <jvmarg value="-XX:ActiveProcessorCount=${cassandra.test.processorCount}" />
+        <jvmarg value="-XX:ErrorFile=${build.test.dir}/hs_err_pid%p.log" />
+        <jvmarg value="-Dcassandra.logdir=${build.test.dir}/logs"/>
         <jvmarg value="-Dcassandra.test.driver.connection_timeout_ms=${test.driver.connection_timeout_ms}"/>
         <jvmarg value="-Dcassandra.test.driver.read_timeout_ms=${test.driver.read_timeout_ms}"/>
         <jvmarg value="-Dcassandra.memtable_row_overhead_computation_step=100"/>
