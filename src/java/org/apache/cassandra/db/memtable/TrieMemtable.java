@@ -777,6 +777,12 @@ public class TrieMemtable extends AbstractShardedMemtable
                                                       opGroup,
                                                       updater);
                     partitionCount += partitionsAdded;
+                    // A failed merge leaves the trie unchanged, so the update's effects must not be applied.
+                    updateLiveDataSize(updater.dataSize);
+                    updateMinTimestamp(update.stats().minTimestamp);
+                    updateCurrentOperations(update.operationCount());
+
+                    stats = stats.mergeWith(update.stats());
                 }
                 catch (Throwable t)
                 {
@@ -785,23 +791,12 @@ public class TrieMemtable extends AbstractShardedMemtable
                 }
                 finally
                 {
-                    try
-                    {
-                        // A failed merge leaves the trie without any of the update's rows and deletions, so the
-                        // indexes must not see it either.
-                        if (mergeFailure == null)
-                            indexer.commit();
-                        else
-                            abortIndexTransaction(indexer, mergeFailure);
-                    }
-                    finally
-                    {
-                        updateMinTimestamp(update.stats().minTimestamp);
-                        updateLiveDataSize(updater.dataSize);
-                        updateCurrentOperations(update.operationCount());
-
-                        stats = stats.mergeWith(update.stats());
-                    }
+                    // A failed merge leaves the trie without any of the update's rows and deletions, so the indexes
+                    // must not see it either.
+                    if (mergeFailure == null)
+                        indexer.commit();
+                    else
+                        abortIndexTransaction(indexer, mergeFailure);
                 }
                 this.cellDataBufferManager.opOrderGroup = null;
             }
