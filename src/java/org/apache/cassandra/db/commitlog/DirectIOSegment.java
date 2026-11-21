@@ -45,6 +45,7 @@ public class DirectIOSegment extends CommitLogSegment
 {
     private final int fsBlockSize;
     private final int fsBlockRemainderMask;
+    private final ByteBuffer tailBlock;
 
     // Needed to track number of bytes written to disk in multiple of page size.
     long lastWritten = 0;
@@ -65,6 +66,7 @@ public class DirectIOSegment extends CommitLogSegment
 
         this.fsBlockSize = fsBlockSize;
         this.fsBlockRemainderMask = fsBlockSize - 1;
+        this.tailBlock = ByteBuffer.allocateDirect(2 * fsBlockSize - 1).alignedSlice(fsBlockSize);
     }
 
     @Override
@@ -118,9 +120,22 @@ public class DirectIOSegment extends CommitLogSegment
             // Align last byte to end of block
             flushLimit = (flushLimit + fsBlockSize - 1) & -fsBlockSize;
 
-            duplicate.limit(flushLimit);
-
-            channel.write(duplicate);
+            // Mutations allocated after nextMarker may still be copying into the last block. Write that block
+            // from a private copy: filesystems that checksum the caller's buffer (ZFS) fail a direct write
+            // whose source changes while it is in flight.
+            int tailStart = nextMarker & -fsBlockSize;
+            if (tailStart == flushLimit)
+            {
+                duplicate.limit(flushLimit);
+                channel.write(duplicate);
+            }
+            else
+            {
+                duplicate.limit(tailStart);
+                tailBlock.clear();
+                tailBlock.put(buffer.duplicate().limit(flushLimit).position(tailStart)).flip();
+                channel.write(new ByteBuffer[]{ duplicate, tailBlock });
+            }
 
             // Direct I/O always writes flushes in block size and writes more than the flush size.
             // File size on disk will always multiple of block size and taking this into account
@@ -150,6 +165,7 @@ public class DirectIOSegment extends CommitLogSegment
         {
             manager.getBufferPool().releaseBuffer(buffer);
             super.internalClose();
+            FileUtils.clean((ByteBuffer) ((DirectBuffer) tailBlock).attachment());
         }
         finally
         {
