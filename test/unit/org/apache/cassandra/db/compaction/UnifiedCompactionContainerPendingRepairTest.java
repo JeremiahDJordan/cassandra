@@ -26,11 +26,18 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableList;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
 
 import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy.Arena;
 import org.apache.cassandra.db.compaction.unified.UnifiedCompactionTask;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.lifecycle.Tracker;
+import org.apache.cassandra.inject.ActionBuilder;
+import org.apache.cassandra.inject.Injection;
+import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.repair.consistent.LocalSession;
@@ -39,9 +46,11 @@ import org.apache.cassandra.repair.consistent.LocalSessions;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.TimeUUID;
 
+import static org.apache.cassandra.inject.InvokePointBuilder.newInvokePoint;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
@@ -50,6 +59,15 @@ import static org.junit.Assert.assertTrue;
  */
 public class UnifiedCompactionContainerPendingRepairTest extends AbstractPendingRepairTest implements CompactionStrategyContainerPendingRepairTest
 {
+    private static final ThreadLocal<Runnable> injectedAction = new ThreadLocal<>();
+
+    @After
+    public void removeInjections()
+    {
+        injectedAction.remove();
+        Injections.deleteAll();
+    }
+
     @Override
     public String createTableCql()
     {
@@ -719,6 +737,147 @@ public class UnifiedCompactionContainerPendingRepairTest extends AbstractPending
         assertShardContainsSstable(sstable2, false, true, false, repairID2, true, true);
         // expecting sstable3 exists in repaired shards
         assertShardContainsSstable(sstable3, true, false, false, null, true, true);    }
+
+    /**
+     * Tests that a session completing while compaction looks for completed sessions' pending sstables leaves the
+     * sstables repaired
+     */
+    @Test
+    public void testSessionCompletedDuringZombieFinalization() throws Throwable
+    {
+        TimeUUID repairID = registerSession(cfs, true, true);
+        LocalSessionAccessor.prepareUnsafe(repairID, COORDINATOR, PARTICIPANTS);
+
+        SSTableReader sstable = makeSSTable(true);
+        cfs.mutateRepaired(Collections.singletonList(sstable), 0, repairID, false);
+        long repairedAt = LocalSessionAccessor.finalizeUnsafe(repairID);
+
+        // complete the session after compaction has seen the sstable pending
+        LocalSession session = ARS.consistent.local.getSession(repairID);
+        injectOnce(newInvokePoint().onClass(LocalSessions.class).onMethod("canCleanup"),
+                   () -> ARS.consistent.local.sessionCompleted(session));
+
+        for (AbstractCompactionTask task : compactionStrategyContainer.getNextBackgroundTasks(FBUtilities.nowInSeconds()))
+            task.execute();
+        assertInjectedActionRan();
+
+        assertTrue(sstable.isRepaired());
+        assertFalse(sstable.isPendingRepair());
+        assertEquals(repairedAt, sstable.getRepairedAt());
+    }
+
+    /**
+     * Tests that finishing the sstables of a failed session leaves alone an sstable that a new session took after
+     * compaction had seen it pending for the failed session
+     */
+    @Test
+    public void testSSTableTakenByNewSessionDuringZombieFinalization() throws Throwable
+    {
+        TimeUUID repairID1 = registerSession(cfs, true, true);
+        TimeUUID repairID2 = registerSession(cfs, true, true);
+        LocalSessionAccessor.prepareUnsafe(repairID1, COORDINATOR, PARTICIPANTS);
+        LocalSessionAccessor.prepareUnsafe(repairID2, COORDINATOR, PARTICIPANTS);
+
+        SSTableReader sstable = makeSSTable(true);
+        cfs.mutateRepaired(Collections.singletonList(sstable), 0, repairID1, false);
+        LocalSessionAccessor.failUnsafe(repairID1);
+
+        // complete session 1 and move the sstable to session 2 after compaction has seen it pending for session 1
+        LocalSession session1 = ARS.consistent.local.getSession(repairID1);
+        injectOnce(newInvokePoint().onClass(LocalSessions.class).onMethod("canCleanup"), () -> {
+            ARS.consistent.local.sessionCompleted(session1);
+            mutateRepaired(sstable, repairID2, false);
+        });
+
+        for (AbstractCompactionTask task : compactionStrategyContainer.getNextBackgroundTasks(FBUtilities.nowInSeconds()))
+            task.execute();
+        assertInjectedActionRan();
+
+        assertFalse(sstable.isRepaired());
+        assertEquals(repairID2, sstable.getPendingRepair());
+    }
+
+    /**
+     * Tests that completing a failed session leaves alone an sstable that a new session took after the completion
+     * had selected it
+     */
+    @Test
+    public void testSSTableTakenByNewSessionDuringSessionCompletion() throws Throwable
+    {
+        TimeUUID repairID1 = registerSession(cfs, true, true);
+        TimeUUID repairID2 = registerSession(cfs, true, true);
+        LocalSessionAccessor.prepareUnsafe(repairID1, COORDINATOR, PARTICIPANTS);
+        LocalSessionAccessor.prepareUnsafe(repairID2, COORDINATOR, PARTICIPANTS);
+
+        SSTableReader sstable = makeSSTable(true);
+        cfs.mutateRepaired(Collections.singletonList(sstable), 0, repairID1, false);
+        LocalSessionAccessor.failUnsafe(repairID1);
+
+        // move the sstable to session 2 after the completion of session 1 has selected it
+        injectOnce(newInvokePoint().onClass(Tracker.class).onMethod("tryModify"),
+                   () -> mutateRepaired(sstable, repairID2, false));
+        ARS.consistent.local.sessionCompleted(ARS.consistent.local.getSession(repairID1));
+        assertInjectedActionRan();
+
+        assertFalse(sstable.isRepaired());
+        assertEquals(repairID2, sstable.getPendingRepair());
+    }
+
+    /**
+     * Tests that completing a session leaves alone an sstable that an anticompaction holds and marks pending for the
+     * session while the completion acquires the session's sstables
+     */
+    @Test
+    public void testSSTableMarkedPendingDuringSessionCompletion() throws Throwable
+    {
+        TimeUUID repairID = registerSession(cfs, true, true);
+        LocalSessionAccessor.prepareUnsafe(repairID, COORDINATOR, PARTICIPANTS);
+
+        SSTableReader sstable1 = makeSSTable(true);
+        SSTableReader sstable2 = makeSSTable(true);
+        cfs.mutateRepaired(Collections.singletonList(sstable1), 0, repairID, false);
+        LocalSessionAccessor.failUnsafe(repairID);
+
+        try (LifecycleTransaction anticompaction = cfs.getTracker().tryModify(sstable2, OperationType.ANTICOMPACTION))
+        {
+            // mark sstable2 pending after the completion has marked sstable1 compacting
+            injectOnce(newInvokePoint().onClass(LifecycleTransaction.class).onMethod("<init>"),
+                       () -> mutateRepaired(sstable2, repairID, false));
+            ARS.consistent.local.sessionCompleted(ARS.consistent.local.getSession(repairID));
+            assertInjectedActionRan();
+
+            assertFalse(sstable1.isPendingRepair());
+            assertEquals(repairID, sstable2.getPendingRepair());
+            assertTrue(cfs.getTracker().getCompacting().contains(sstable2));
+        }
+    }
+
+    // runs the action once, on the calling thread, when that thread reaches the invoke point
+    private static void injectOnce(InvokePointBuilder invokePoint, Runnable action) throws Throwable
+    {
+        injectedAction.set(action);
+        Injection injection = Injections.newCustom("inject_once")
+                                        .add(invokePoint.atEntry())
+                                        .add(ActionBuilder.newActionBuilder()
+                                                          .actions()
+                                                          .doAction("org.apache.cassandra.db.compaction.UnifiedCompactionContainerPendingRepairTest.runInjectedAction()"))
+                                        .build();
+        Injections.inject(injection);
+    }
+
+    @SuppressWarnings("unused")
+    public static void runInjectedAction()
+    {
+        Runnable action = injectedAction.get();
+        injectedAction.remove();
+        if (action != null)
+            action.run();
+    }
+
+    private static void assertInjectedActionRan()
+    {
+        assertNull("the injected action did not run", injectedAction.get());
+    }
 
     private void assertNumberOfShards(int expectedNumberOfShards)
     {

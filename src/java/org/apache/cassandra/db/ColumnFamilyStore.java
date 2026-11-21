@@ -4432,7 +4432,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
 
     public Set<SSTableReader> getPendingRepairSSTables(TimeUUID sessionID)
     {
-        return Sets.filter(data.getLiveSSTables(), pendingRepairPredicate(sessionID));
+        return ImmutableSet.copyOf(Iterables.filter(data.getLiveSSTables(), pendingRepairPredicate(sessionID)));
     }
 
     public static Predicate<SSTableReader> pendingRepairPredicate(@Nonnull TimeUUID sessionID)
