@@ -112,6 +112,13 @@ public class GuardrailQueryFiltersTest extends GuardrailTester
         assertFails("SELECT * FROM %s WHERE x = '1' OR x = '2 3 4 5'", 5);
         assertFails("SELECT * FROM %s WHERE x = '1' OR x = '2 3 4 5 6'", 6);
 
+        // single column, IN (analyzed)
+        assertValid("SELECT * FROM %s WHERE x IN ('1', '2')");
+        assertValid("SELECT * FROM %s WHERE x IN ('1', '" + "2".repeat(128) + "')");
+        assertWarns("SELECT * FROM %s WHERE x IN ('1', '2 3')", 3);
+        assertWarns("SELECT * FROM %s WHERE x IN ('1', '2 3 4')", 4);
+        assertFails("SELECT * FROM %s WHERE x IN ('1', '2 3 4 5')", 5);
+
         // multiple columns (analyzed, AND)
         assertValid("SELECT * FROM %s WHERE x = '1' AND y = '2'");
         assertWarns("SELECT * FROM %s WHERE x = '1' AND y = '2 3'", 3);

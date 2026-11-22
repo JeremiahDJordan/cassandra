@@ -274,8 +274,15 @@ public abstract class SingleColumnRestriction implements SingleRestriction
                 checkNotNull(v, "Invalid null value for column %s", columnDef.name);
                 checkBindValueSet(v, "Invalid unset value for column %s", columnDef.name);
             }
-            ByteBuffer buffer = ListSerializer.pack(values, values.size(), ProtocolVersion.V3);
-            filter.add(columnDef, Operator.IN, buffer);
+            addToRowFilter(filter, values);
+        }
+
+        /**
+         * Adds the given bound values of this IN to the row filter.
+         */
+        protected void addToRowFilter(RowFilter.Builder filter, List<ByteBuffer> values)
+        {
+            filter.add(columnDef, Operator.IN, ListSerializer.pack(values, values.size(), ProtocolVersion.V3));
         }
 
         @Override
@@ -294,6 +301,35 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         public String toString()
         {
             return String.format("IN(%s)", terms);
+        }
+    }
+
+    /**
+     * The IN of a non-primary-key column whose analyzed index serves EQ as MATCH, as {@link AnalyzerMatchesRestriction}
+     * is the EQ: the row filter gets the disjunction of the {@code :} of its values, which, as for EQ, a node without
+     * the analyzer can't evaluate.
+     */
+    public static class AnalyzerMatchesINRestriction extends INRestriction
+    {
+        public AnalyzerMatchesINRestriction(ColumnMetadata columnDef, MarkerOrTerms terms)
+        {
+            super(columnDef, terms);
+        }
+
+        @Override
+        protected void addToRowFilter(RowFilter.Builder filter, List<ByteBuffer> values)
+        {
+            // an IN without values matches no row, as the plain IN does
+            if (values.isEmpty())
+                super.addToRowFilter(filter, values);
+            else
+                filter.addDisjunction(columnDef, Operator.ANALYZER_MATCHES, values);
+        }
+
+        @Override
+        public String toString()
+        {
+            return String.format("ANALYZER_MATCHES_IN(%s)", terms);
         }
     }
 
@@ -1318,12 +1354,12 @@ public abstract class SingleColumnRestriction implements SingleRestriction
         @Override
         public boolean shouldMerge(SingleRestriction other)
         {
-            // we don't want to merge MATCH restrictions with ORDER BY BM25
+            // we don't want to merge MATCH restrictions, nor an IN of them, with ORDER BY BM25
             // so shouldMerge = false for that scenario, and true for others
             // (because even though we can't meaningfully merge with others, we want doMergeWith to be called to throw)
             //
             // (Note that because ORDER BY is processed before WHERE, we only need this check in the BM25 class)
-            return !other.isAnalyzerMatches();
+            return !other.isAnalyzerMatches() && !(other instanceof AnalyzerMatchesINRestriction);
         }
     }
 

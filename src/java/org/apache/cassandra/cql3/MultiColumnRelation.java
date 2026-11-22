@@ -177,7 +177,7 @@ public class MultiColumnRelation extends Relation
     }
 
     @Override
-    protected Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames)
+    protected Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames, IndexHints indexHints)
     {
         List<ColumnMetadata> receivers = receivers(table);
         List<Term> terms = toTerms(receivers, inValues, table.keyspace, boundNames);

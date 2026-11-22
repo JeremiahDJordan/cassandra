@@ -193,7 +193,7 @@ public abstract class Relation
             case LTE: return newSliceRestriction(table, boundNames, Bound.END, true);
             case GTE: return newSliceRestriction(table, boundNames, Bound.START, true);
             case GT: return newSliceRestriction(table, boundNames, Bound.START, false);
-            case IN: return newINRestriction(table, boundNames);
+            case IN: return newINRestriction(table, boundNames, indexHints);
             case NOT_IN: return newNotINRestriction(table, boundNames);
             case CONTAINS: return newContainsRestriction(table, boundNames, false);
             case CONTAINS_KEY: return newContainsRestriction(table, boundNames, true);
@@ -243,10 +243,11 @@ public abstract class Relation
      *
      * @param table the table metadata
      * @param boundNames the variables specification where to collect the bind variables
+     * @param indexHints the user-provided index hints, used to choose behaviour on analyzed columns
      * @return a new IN restriction instance
      * @throws InvalidRequestException if the relation cannot be converted into an IN restriction.
      */
-    protected abstract Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames);
+    protected abstract Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames, IndexHints indexHints);
 
 
     /**
