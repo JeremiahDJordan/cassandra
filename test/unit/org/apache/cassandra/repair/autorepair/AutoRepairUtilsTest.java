@@ -20,6 +20,8 @@ package org.apache.cassandra.repair.autorepair;
 
 import java.net.UnknownHostException;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
@@ -553,6 +555,37 @@ public class AutoRepairUtilsTest extends CQLTester
         assertNotNull(repairPriority);
         assertEquals(1, repairPriority.size());
         assertTrue(repairPriority.contains(hostId));
+    }
+
+    @Test
+    public void testAddPriorityHostRejectsUnknownHost() throws UnknownHostException
+    {
+        InetAddressAndPort unknownHost = InetAddressAndPort.getByName("127.0.0.250");
+        assertThatThrownBy(() -> AutoRepairUtils.addPriorityHosts(repairType, ImmutableSet.of(localEndpoint, unknownHost)))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessageContaining(unknownHost.toString());
+
+        UntypedResultSet result = QueryProcessor.executeInternal(String.format(
+        "SELECT * FROM %s.%s WHERE repair_type = '%s'",
+        SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, SystemDistributedKeyspace.AUTO_REPAIR_PRIORITY,
+        repairType.toString()));
+        assertTrue(result.isEmpty());
+    }
+
+    @Test
+    public void testMyTurnToRunRepairRemovesEmptyPriorityHost()
+    {
+        long currentMillis = System.currentTimeMillis();
+        AutoRepairUtils.insertNewRepairHistory(repairType, hostId, currentMillis - 100, currentMillis);
+        // an empty element, as written for a host id that couldn't be resolved
+        Set<UUID> priority = new HashSet<>(Arrays.asList(null, hostId));
+        QueryProcessor.executeInternal(String.format(
+        "UPDATE %s.%s SET repair_priority = repair_priority + ? WHERE repair_type = ?",
+        SchemaConstants.DISTRIBUTED_KEYSPACE_NAME, SystemDistributedKeyspace.AUTO_REPAIR_PRIORITY),
+        priority, repairType.toString());
+
+        assertEquals(AutoRepairUtils.RepairTurn.MY_TURN_DUE_TO_PRIORITY, AutoRepairUtils.myTurnToRunRepair(repairType, hostId));
+        assertEquals(ImmutableSet.of(hostId), AutoRepairUtils.getPriorityHostIds(repairType));
     }
 
     @Test
