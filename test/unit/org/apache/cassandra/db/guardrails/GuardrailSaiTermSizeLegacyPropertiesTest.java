@@ -26,6 +26,7 @@ import com.google.common.primitives.Floats;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.IntegerType;
@@ -39,12 +40,15 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static java.nio.ByteBuffer.allocate;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_STRING_TERM_SIZE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MAX_VECTOR_TERM_SIZE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR;
 import static org.apache.cassandra.config.DataStorageSpec.DataStorageUnit.BYTES;
+import static org.apache.cassandra.index.sai.NotIndexedValues.NGRAM_ANALYZER;
+import static org.apache.cassandra.index.sai.NotIndexedValues.NGRAM_VALUE;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
@@ -217,22 +221,133 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
     public void testAnalyzedValueOverMaxAnalyzedSize() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-        createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
         disableCompaction();
 
-        // the write is accepted, with a warning that the value isn't indexed
+        // the write is accepted, with a warning that the value isn't indexed, given once by the coordinator and the replica
         String document = words(IndexContext.MAX_ANALYZED_SIZE + 4000);
+        assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                              () -> execute("INSERT INTO %s (k, v) VALUES (0, ?)", ByteBufferUtil.bytes(document)));
+        assertAnalyzedRows("w7", 0);
+    }
+
+    /**
+     * An analyzed value under the term size warning threshold whose terms add up to the max analyzed size isn't indexed,
+     * and the replica warns, for an internal write.
+     */
+    @Test
+    public void testReplicaAnalyzedValueOverMaxAnalyzedSizeInternal() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = " + NGRAM_ANALYZER);
+
+        assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                              () -> executeInternal("INSERT INTO %s (k, v) VALUES (0, ?)", NGRAM_VALUE));
+        assertEquals(1, rows("SELECT k FROM %s WHERE k = 0"));
+        assertEquals(0, rows("SELECT k FROM %s WHERE v : 'ab'"));
+    }
+
+    /**
+     * The same as {@link #testReplicaAnalyzedValueOverMaxAnalyzedSizeInternal}, for a client write applied locally.
+     */
+    @Test
+    public void testReplicaAnalyzedValueOverMaxAnalyzedSize() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = " + NGRAM_ANALYZER);
+
+        assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                              () -> execute("INSERT INTO %s (k, v) VALUES (0, ?)", ByteBufferUtil.bytes(NGRAM_VALUE)));
+        assertEquals(1, rows("SELECT k FROM %s WHERE k = 0"));
+        assertEquals(0, rows("SELECT k FROM %s WHERE v : 'ab'"));
+    }
+
+    /**
+     * Replacing or deleting a value that isn't indexed because of its analyzed size, in the same memtable, doesn't warn.
+     */
+    @Test
+    public void testAnalyzedValueOverMaxAnalyzedSizeReplacedOrDeleted() throws Throwable
+    {
+        for (String memtable : new String[]{ "skiplist", "trie" })
+        {
+            createTable("CREATE TABLE %s (k int PRIMARY KEY, v text) WITH memtable = '" + memtable + "'");
+            String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = " + NGRAM_ANALYZER);
+
+            ByteBuffer value = ByteBufferUtil.bytes(NGRAM_VALUE);
+            assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                                  () -> execute("INSERT INTO %s (k, v) VALUES (0, ?)", value));
+            assertValid(() -> execute("INSERT INTO %s (k, v) VALUES (0, ?)", ByteBufferUtil.bytes("ab")));
+            assertEquals(memtable, 1, rows("SELECT k FROM %s WHERE v : 'ab'"));
+
+            assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                                  () -> execute("INSERT INTO %s (k, v) VALUES (1, ?)", value));
+            assertValid(() -> execute(userClientState, "DELETE FROM %s WHERE k = 1"));
+            assertEquals(memtable, 0, rows("SELECT k FROM %s WHERE k = 1"));
+        }
+    }
+
+    /**
+     * A value that has already expired when it's written isn't indexed either, but doesn't warn, inserted or updating a
+     * row in the memtable, and as a collection element.
+     */
+    @Test
+    public void testExpiredAnalyzedValue() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, s set<text>)");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = " + NGRAM_ANALYZER);
+        String setIndex = createIndex("CREATE CUSTOM INDEX ON %s (s) USING 'StorageAttachedIndex' WITH OPTIONS = " + NGRAM_ANALYZER);
+        long past = FBUtilities.nowInSeconds() - 10;
+
+        assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                              () -> executeInternal("INSERT INTO %s (k, v) VALUES (0, ?)", NGRAM_VALUE));
+        assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, "s", setIndex,
+                              () -> executeInternal("INSERT INTO %s (k, s) VALUES (1, ?)", Collections.singleton(NGRAM_VALUE)));
+
+        assertNoWarnings(() -> executeInternalWithNowInSec("INSERT INTO %s (k, v, s) VALUES (2, ?, ?) USING TTL 1",
+                                                           past, NGRAM_VALUE, Collections.singleton(NGRAM_VALUE)));
+
+        executeInternal("INSERT INTO %s (k, v, s) VALUES (3, 'ab', {'ab'})");
+        assertNoWarnings(() -> executeInternalWithNowInSec("UPDATE %s USING TTL 1 SET v = ?, s = s + ? WHERE k = 3",
+                                                           past, NGRAM_VALUE, Collections.singleton(NGRAM_VALUE)));
+    }
+
+    private void executeInternalWithNowInSec(String query, long nowInSec, Object... values)
+    {
+        QueryProcessor.executeInternalWithNowInSec(formatQuery(query), nowInSec, values);
+    }
+
+    private static void assertNoWarnings(CheckedFunction write) throws Throwable
+    {
         ClientWarn.instance.captureWarnings();
         try
         {
-            execute("INSERT INTO %s (k, v) VALUES (0, ?)", ByteBufferUtil.bytes(document));
-            assertThat(ClientWarn.instance.getWarnings()).anyMatch(w -> w.contains("the value is written, but not indexed"));
+            write.apply();
+            assertThat(ClientWarn.instance.getWarnings()).isNull();
         }
         finally
         {
             ClientWarn.instance.resetWarnings();
         }
-        assertAnalyzedRows("w7", 0);
+    }
+
+    /** Checks that the write gives exactly the warning of the given format that a value of v isn't indexed. */
+    private void assertWarnsNotIndexed(String format, String index, CheckedFunction write) throws Throwable
+    {
+        assertWarnsNotIndexed(format, "v", index, write);
+    }
+
+    private void assertWarnsNotIndexed(String format, String column, String index, CheckedFunction write) throws Throwable
+    {
+        ClientWarn.instance.captureWarnings();
+        try
+        {
+            write.apply();
+            assertThat(ClientWarn.instance.getWarnings()).containsExactly(String.format(format, column, keyspace(), index));
+        }
+        finally
+        {
+            ClientWarn.instance.resetWarnings();
+        }
     }
 
     /**
@@ -463,10 +578,19 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
                     }
                     else
                     {
-                        assertThatThrownBy(() -> execute(query, ByteBufferUtil.bytes(document)))
-                        .as("fail threshold " + failThreshold + ", terms adding up to " + termsSize + " bytes")
-                        .isInstanceOf(InvalidRequestException.class)
-                        .hasMessage("Term's analyzed size for column v exceeds the cumulative limit for index. Max allowed size 8.000KiB.");
+                        ClientWarn.instance.captureWarnings();
+                        try
+                        {
+                            assertThatThrownBy(() -> execute(query, ByteBufferUtil.bytes(document)))
+                            .as("fail threshold " + failThreshold + ", terms adding up to " + termsSize + " bytes")
+                            .isInstanceOf(InvalidRequestException.class)
+                            .hasMessage("Term's analyzed size for column v exceeds the cumulative limit for index. Max allowed size 8.000KiB.");
+                            assertThat(ClientWarn.instance.getWarnings()).isNull();
+                        }
+                        finally
+                        {
+                            ClientWarn.instance.resetWarnings();
+                        }
                     }
                 }
             }

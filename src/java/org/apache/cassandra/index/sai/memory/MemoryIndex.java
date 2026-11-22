@@ -22,10 +22,12 @@ import java.nio.ByteBuffer;
 import java.util.Iterator;
 import java.util.List;
 import java.util.function.LongConsumer;
+import javax.annotation.Nullable;
 
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
@@ -46,11 +48,25 @@ public abstract class MemoryIndex
         this.indexContext = indexContext;
     }
 
+    public void add(DecoratedKey key,
+                    Clustering clustering,
+                    ByteBuffer value,
+                    LongConsumer onHeapAllocationsTracker,
+                    LongConsumer offHeapAllocationsTracker)
+    {
+        add(key, clustering, value, onHeapAllocationsTracker, offHeapAllocationsTracker, null);
+    }
+
+    /**
+     * Adds the value, warning the client if it isn't (fully) indexed and is live in the given row, the row it comes
+     * from (see {@link IndexContext#isLiveValue}). There's no warning without a row.
+     */
     public abstract void add(DecoratedKey key,
                              Clustering clustering,
                              ByteBuffer value,
                              LongConsumer onHeapAllocationsTracker,
-                             LongConsumer offHeapAllocationsTracker);
+                             LongConsumer offHeapAllocationsTracker,
+                             @Nullable Row row);
 
     /**
      * Update the index value for the given key and clustering by removing the old value and adding the new value.
@@ -61,7 +77,8 @@ public abstract class MemoryIndex
                                 ByteBuffer oldValue,
                                 ByteBuffer newValue,
                                 LongConsumer onHeapAllocationsTracker,
-                                LongConsumer offHeapAllocationsTracker);
+                                LongConsumer offHeapAllocationsTracker,
+                                @Nullable Row newRow);
 
     /**
      * Update the index value for the given key and clustering by removing the old values and adding the new values.
@@ -72,7 +89,8 @@ public abstract class MemoryIndex
                                 Iterator<ByteBuffer> oldValues,
                                 Iterator<ByteBuffer> newValues,
                                 LongConsumer onHeapAllocationsTracker,
-                                LongConsumer offHeapAllocationsTracker);
+                                LongConsumer offHeapAllocationsTracker,
+                                @Nullable Row newRow);
 
     public abstract CloseableIterator<PrimaryKeyWithSortKey> orderBy(Orderer orderer, Expression slice);
 

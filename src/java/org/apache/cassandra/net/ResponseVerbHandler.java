@@ -82,6 +82,15 @@ public class ResponseVerbHandler implements IVerbHandler
                 JVMStabilityInspector.inspectThrowable(e);
                 NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 1, MINUTES, "Error for response callback {} and message {}, no sensors will be tracked.", cb, message, e);
             }
+            try
+            {
+                cb.addReplicaWarnings(message);
+            }
+            catch (Throwable e)
+            {
+                JVMStabilityInspector.inspectThrowable(e);
+                NoSpamLogger.log(logger, NoSpamLogger.Level.ERROR, 1, MINUTES, "Error for response callback {} and message {}, no replica warnings will be kept.", cb, message, e);
+            }
             cb.onResponse(message);
         }
     }

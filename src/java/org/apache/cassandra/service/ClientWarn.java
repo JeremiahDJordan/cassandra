@@ -51,10 +51,14 @@ public class ClientWarn extends ExecutorLocals.Impl
     }
 
     /**
-     * Issue the given warning if this is the first time `key` is seen.
+     * Issue the given warning if this is the first time `key` is seen. While a replica applies a write, the warning
+     * goes to the coordinator instead, deduplicated by text (see {@link ReplicaWarnings}).
      */
     public void warn(String text, Object key)
     {
+        if (ReplicaWarnings.add(text))
+            return;
+
         State state = get();
         if (state != null)
             state.add(text, key);

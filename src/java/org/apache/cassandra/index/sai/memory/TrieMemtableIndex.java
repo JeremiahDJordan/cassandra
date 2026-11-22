@@ -43,6 +43,7 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.memtable.AbstractShardedMemtable;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.memtable.ShardBoundaries;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
@@ -206,6 +207,12 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
     @Override
     public void index(DecoratedKey key, Clustering clustering, ByteBuffer value, Memtable memtable, OpOrder.Group opGroup)
     {
+        index(key, clustering, value, memtable, opGroup, null);
+    }
+
+    @Override
+    public void index(DecoratedKey key, Clustering clustering, ByteBuffer value, Memtable memtable, OpOrder.Group opGroup, @Nullable Row row)
+    {
         if (!TypeUtil.indexesValue(value, validator))
             return;
 
@@ -224,7 +231,8 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
                                                              estimatedOffHeapMemoryUsed.add(allocatedBytes);
                                                              if (sensors != null)
                                                                  sensors.incrementSensor(sensorContext, Type.INDEX_WRITE_BYTES, allocatedBytes);
-                                                         });
+                                                         },
+                                                         row);
         writeCount.increment();
         onIndexUpdated();
     }
@@ -232,16 +240,22 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
     @Override
     public void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup)
     {
-        update(key, clustering, oldValue, newValue, memtable, opGroup, true);
+        update(key, clustering, oldValue, newValue, memtable, opGroup, null, true);
+    }
+
+    @Override
+    public void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup, @Nullable Row newRow)
+    {
+        update(key, clustering, oldValue, newValue, memtable, opGroup, newRow, true);
     }
 
     @Override
     public void remove(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, Memtable memtable, OpOrder.Group opGroup)
     {
-        update(key, clustering, oldValue, null, memtable, opGroup, false);
+        update(key, clustering, oldValue, null, memtable, opGroup, null, false);
     }
 
-    private void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup, boolean countWrite)
+    private void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup, @Nullable Row newRow, boolean countWrite)
     {
         // Ignore the values the index doesn't hold, such as the empty values of the types that skip them, but not the
         // empty values of those that index them: an update from or to an empty value changes the index
@@ -272,7 +286,8 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
                                                                 estimatedOffHeapMemoryUsed.add(allocatedBytes);
                                                                 if (sensors != null)
                                                                     sensors.incrementSensor(sensorContext, Type.INDEX_WRITE_BYTES, allocatedBytes);
-                                                            });
+                                                            },
+                                                            newRow);
         if (countWrite)
             writeCount.increment();
         onIndexUpdated();
@@ -281,16 +296,22 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
     @Override
     public void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup)
     {
-        update(key, clustering, oldValues, newValues, memtable, opGroup, true);
+        update(key, clustering, oldValues, newValues, memtable, opGroup, null, true);
+    }
+
+    @Override
+    public void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup, @Nullable Row newRow)
+    {
+        update(key, clustering, oldValues, newValues, memtable, opGroup, newRow, true);
     }
 
     @Override
     public void remove(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Memtable memtable, OpOrder.Group opGroup)
     {
-        update(key, clustering, oldValues, Collections.emptyIterator(), memtable, opGroup, false);
+        update(key, clustering, oldValues, Collections.emptyIterator(), memtable, opGroup, null, false);
     }
 
-    private void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup, boolean countWrite)
+    private void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup, @Nullable Row newRow, boolean countWrite)
     {
         RequestSensors sensors = requestTracker.get();
 
@@ -312,7 +333,8 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
                                                                 estimatedOffHeapMemoryUsed.add(allocatedBytes);
                                                                 if (sensors != null)
                                                                     sensors.incrementSensor(sensorContext, Type.INDEX_WRITE_BYTES, allocatedBytes);
-                                                            });
+                                                            },
+                                                            newRow);
         if (countWrite)
             writeCount.increment();
     }

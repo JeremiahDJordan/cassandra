@@ -698,6 +698,15 @@ public class Message<T>
             return doBuild(hasId ? id : nextId());
         }
 
+        /**
+         * The serialized size of the message as built so far, for the given version; with the largest id if none is
+         * set yet, as the size depends on it.
+         */
+        public int currentSerializedSize(int version)
+        {
+            return doBuild(hasId ? id : Long.MAX_VALUE).serializedSize(version);
+        }
+
         public int currentPayloadSize(int version)
         {
             // use dummy id just for the sake of computing the serialized size

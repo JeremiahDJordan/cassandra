@@ -19,20 +19,26 @@
 package org.apache.cassandra.net;
 
 import java.util.Collections;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.service.ReplicaWarnings;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MonotonicClock;
 
 import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
 import static org.apache.cassandra.utils.MonotonicClock.Global.preciseTime;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assume.assumeTrue;
 
@@ -93,5 +99,44 @@ public class ResponseVerbHandlerTest
         long latency = reportedLatencyNanos.get();
         assertTrue("latency was not reported", latency != Long.MIN_VALUE);
         assertTrue("latency must not be negative but was " + latency, latency >= 0);
+    }
+
+    @Test
+    public void testReplicaWarnings()
+    {
+        assertEquals(Collections.singletonList("w"), respondWithWarnings(ReplicaWarnings.encode(Collections.singletonList("w"))));
+    }
+
+    @Test
+    public void testMalformedReplicaWarnings()
+    {
+        assertNull(respondWithWarnings(new byte[]{ 1, 5, 'a' }));
+    }
+
+    // the replica warnings a callback without sensors gets for a response with the given value, which it acknowledges
+    private static List<String> respondWithWarnings(byte[] value)
+    {
+        InetAddressAndPort replica = FBUtilities.getBroadcastAddressAndPort();
+        Message<NoPayload> request = Message.out(Verb.ECHO_REQ, NoPayload.noPayload);
+        AtomicReference<List<String>> warnings = new AtomicReference<>();
+        AtomicBoolean acknowledged = new AtomicBoolean();
+        MessagingService.instance().callbacks.addWithExpiration(new RequestCallback<NoPayload>()
+        {
+            @Override
+            public void onResponse(Message<NoPayload> msg)
+            {
+                acknowledged.set(true);
+            }
+
+            @Override
+            public void addReplicaWarnings(Message<?> response)
+            {
+                warnings.set(ReplicaWarnings.fromResponse(response));
+            }
+        }, request, replica);
+
+        ResponseVerbHandler.instance.doVerb(request.emptyResponseBuilder().withCustomParam(ReplicaWarnings.KEY, value).build());
+        assertTrue(acknowledged.get());
+        return warnings.get();
     }
 }

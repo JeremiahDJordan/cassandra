@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
@@ -93,6 +94,10 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
 
     protected final RequestSensors requestSensors;
 
+    private static final AtomicReferenceFieldUpdater<AbstractWriteResponseHandler, ReplicaWarnings.Received> replicaWarningsUpdater =
+        AtomicReferenceFieldUpdater.newUpdater(AbstractWriteResponseHandler.class, ReplicaWarnings.Received.class, "replicaWarnings");
+    private volatile ReplicaWarnings.Received replicaWarnings;
+
     /**
       * Delegate to another WriteResponseHandler or possibly this one to track if the ideal consistency level was reached.
       * Will be set to null if ideal CL was not configured
@@ -136,19 +141,27 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
 
     public void get() throws WriteTimeoutException, WriteFailureException
     {
-        boolean signaled = await();
-
-        if (!signaled)
-            throwTimeout();
-
-        if (blockFor() + failures > candidateReplicaCount())
+        try
         {
-            if (RequestCallback.isTimeout(this.failureReasonByEndpoint.keySet().stream()
-                                                                      .filter(this::waitingFor) // DatacenterWriteResponseHandler filters errors from remote DCs
-                                                                      .collect(Collectors.toMap(Function.identity(), this.failureReasonByEndpoint::get))))
+            boolean signaled = await();
+
+            if (!signaled)
                 throwTimeout();
 
-            throw new WriteFailureException(replicaPlan.consistencyLevel(), ackCount(), blockFor(), writeType, this.failureReasonByEndpoint);
+            if (blockFor() + failures > candidateReplicaCount())
+            {
+                if (RequestCallback.isTimeout(this.failureReasonByEndpoint.keySet().stream()
+                                                                          .filter(this::waitingFor) // DatacenterWriteResponseHandler filters errors from remote DCs
+                                                                          .collect(Collectors.toMap(Function.identity(), this.failureReasonByEndpoint::get))))
+                    throwTimeout();
+
+                throw new WriteFailureException(replicaPlan.consistencyLevel(), ackCount(), blockFor(), writeType, this.failureReasonByEndpoint);
+            }
+        }
+        finally
+        {
+            // after a timeout, the replies counted until here have added their warnings
+            ReplicaWarnings.publish(ReplicaWarnings.close(replicaWarningsUpdater, this));
         }
     }
 
@@ -352,6 +365,8 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
             }
         }
 
+        // the reply that completes the handler, and those counted before it, have added their warnings
+        ReplicaWarnings.seal(replicaWarningsUpdater, this);
         condition.signalAll();
         if (callback != null)
             callback.run();
@@ -404,6 +419,20 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
     public RequestSensors getRequestSensors()
     {
         return requestSensors;
+    }
+
+    @Override
+    public void addReplicaWarnings(Message<?> response)
+    {
+        byte[] encoded = ReplicaWarnings.encoded(response);
+        if (encoded != null && waitingFor(response.from()))
+            ReplicaWarnings.keep(replicaWarningsUpdater, this, encoded);
+    }
+
+    @Override
+    public void addReplicaWarnings(List<String> warnings)
+    {
+        ReplicaWarnings.keep(replicaWarningsUpdater, this, warnings);
     }
 
     @Override

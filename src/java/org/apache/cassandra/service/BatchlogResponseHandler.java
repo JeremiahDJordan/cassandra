@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.service;
 
+import java.util.List;
 import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 
 import org.apache.cassandra.exceptions.RequestFailureReason;
@@ -107,6 +108,18 @@ public class BatchlogResponseHandler<T> extends AbstractWriteResponseHandler<T>
     public void accumulateExecutionTimeSensor(Context context, Type type, double value)
     {
         wrapped.accumulateExecutionTimeSensor(context, type, value);
+    }
+
+    @Override
+    public void addReplicaWarnings(Message<?> response)
+    {
+        wrapped.addReplicaWarnings(response);
+    }
+
+    @Override
+    public void addReplicaWarnings(List<String> warnings)
+    {
+        wrapped.addReplicaWarnings(warnings);
     }
 
     public static class BatchlogCleanup

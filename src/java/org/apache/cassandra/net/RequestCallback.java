@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.net;
 
+import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
 
@@ -104,6 +105,22 @@ public interface RequestCallback<T>
      * <p>Default is a no-op; callbacks that track execution time override this.</p>
      */
     default void accumulateExecutionTimeSensor(Context context, Type type, double value)
+    {
+    }
+
+    /**
+     * Called with a successful response before {@link #onResponse(Message)}, for the callback to keep the client
+     * warnings the replica sent with it (see {@link org.apache.cassandra.service.ReplicaWarnings}).
+     */
+    default void addReplicaWarnings(Message<?> response)
+    {
+    }
+
+    /**
+     * Called by a local apply with the client warnings it raised, before {@link #onResponse(Message)} or
+     * {@link #onFailure(InetAddressAndPort, RequestFailureReason)}.
+     */
+    default void addReplicaWarnings(List<String> warnings)
     {
     }
 }

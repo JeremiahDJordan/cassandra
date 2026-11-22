@@ -28,6 +28,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.service.ReplicaWarnings;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.NoSpamLogger;
@@ -129,8 +130,10 @@ public abstract class Guardrail
         {
             logger.error(message);
             // Note that ClientWarn will simply ignore the message if we're not running this as part of a user query
-            // (the internal "state" will be null)
-            ClientWarn.instance.warn(message);
+            // (the internal "state" will be null). Without a state nothing is rejected, so a replica applying a write
+            // doesn't send this to the client.
+            if (state != null || !ReplicaWarnings.isCapturing())
+                ClientWarn.instance.warn(message);
             // Similarly, tracing will also ignore the message if we're not running tracing on the current thread.
             Tracing.trace(message);
             GuardrailsDiagnostics.failed(name, decorateMessage(redactedMessage));

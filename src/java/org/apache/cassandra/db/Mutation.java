@@ -296,8 +296,17 @@ public class Mutation implements IMutation, Supplier<Mutation>
 
     public Future<?> applyFuture(WriteOptions writeOptions)
     {
+        return applyFuture(writeOptions, false);
+    }
+
+    /**
+     * @param captureWarnings whether the value of the future is the client warnings the write raised (see
+     *                        {@link org.apache.cassandra.service.ReplicaWarnings}), instead of {@code null}
+     */
+    public Future<List<String>> applyFuture(WriteOptions writeOptions, boolean captureWarnings)
+    {
         Keyspace ks = Keyspace.open(keyspaceName);
-        return ks.applyFuture(this, writeOptions, true).addListener(f -> {
+        return ks.applyFuture(this, writeOptions, true, captureWarnings).addListener(f -> {
             RequestSensors sensors = requestTracker.get();
             if (sensors != null)
                 sensors.syncAllSensors();

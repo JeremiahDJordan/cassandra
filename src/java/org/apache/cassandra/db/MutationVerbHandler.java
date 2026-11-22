@@ -18,9 +18,11 @@
 package org.apache.cassandra.db;
 
 import java.util.Collection;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
@@ -37,6 +39,7 @@ import org.apache.cassandra.sensors.RequestTracker;
 import org.apache.cassandra.sensors.SensorsCustomParams;
 import org.apache.cassandra.sensors.SensorsFactory;
 import org.apache.cassandra.sensors.Type;
+import org.apache.cassandra.service.ReplicaWarnings;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.Clock;
 
@@ -48,13 +51,14 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
 {
     public static final MutationVerbHandler instance = new MutationVerbHandler();
 
-    private void respond(RequestSensors requestSensors, Message<Mutation> respondToMessage, InetAddressAndPort respondToAddress)
+    private void respond(RequestSensors requestSensors, Message<Mutation> respondToMessage, InetAddressAndPort respondToAddress, @Nullable List<String> warnings)
     {
         Tracing.trace("Enqueuing response to {}", respondToAddress);
 
         Message.Builder<NoPayload> response = respondToMessage.emptyResponseBuilder();
         // no need to calculate outbound internode bytes because the response is NoPayload
         SensorsCustomParams.addSensorsToInternodeResponse(requestSensors, response);
+        ReplicaWarnings.addToResponse(warnings, response, respondToAddress);
         MessagingService.instance().send(response.build(), respondToAddress);
     }
 
@@ -136,15 +140,15 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
 
         long writeStartNanos = Clock.Global.nanoTime();
         // The origin was stamped in doVerb, before the payload could be handed to the forwarding path.
-        message.payload.applyFuture(WriteOptions.DEFAULT)
-                       .addCallback(o -> {
+        message.payload.applyFuture(WriteOptions.DEFAULT, true)
+                       .addCallback(warnings -> {
                                         long writeElapsedNanos = Clock.Global.nanoTime() - writeStartNanos;
                                         for (Context writeContext : writeContexts)
                                         {
                                             requestSensors.incrementSensor(writeContext, Type.WRITE_EXECUTION_TIME, (double) writeElapsedNanos / writeContexts.size());
                                         }
                                         requestSensors.syncAllSensors();
-                                        respond(requestSensors, message, respondToAddress);
+                                        respond(requestSensors, message, respondToAddress, warnings);
                                     },
                                     t -> failed(message, t));
     }

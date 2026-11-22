@@ -2092,6 +2092,23 @@ public class StorageProxy implements StorageProxyMBean
         });
     }
 
+    // Applies the mutation and gives the handler the client warnings the write raised, also if it fails
+    private static void applyCapturingWarnings(IMutation mutation, RequestCallback<?> handler)
+    {
+        Object previousWarnings = ReplicaWarnings.capture();
+        try
+        {
+            mutation.apply();
+        }
+        finally
+        {
+            List<String> warnings = ReplicaWarnings.drain();
+            ReplicaWarnings.restore(previousWarnings);
+            if (warnings != null)
+                handler.addReplicaWarnings(warnings);
+        }
+    }
+
     private static void performMutationLocally(Stage stage, Replica localReplica, IMutation mutation, RequestCallback<?> handler, Dispatcher.RequestTime requestTime)
     {
         Collection<TableMetadata> tables =
@@ -2107,7 +2124,7 @@ public class StorageProxy implements StorageProxyMBean
                 try
                 {
                     long writeStartNanos = nanoTime();
-                    mutation.apply();
+                    applyCapturingWarnings(mutation, handler);
                     long writeElapsedNanos = nanoTime() - writeStartNanos;
 
                     if (!tables.isEmpty())

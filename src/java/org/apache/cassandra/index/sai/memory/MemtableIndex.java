@@ -28,6 +28,7 @@ import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
@@ -71,8 +72,34 @@ public interface MemtableIndex extends MemtableOrdering
 
     void index(DecoratedKey key, Clustering clustering, ByteBuffer value, Memtable memtable, OpOrder.Group opGroup);
 
+    /**
+     * Indexes the value of the given row, warning the client if it isn't (fully) indexed and is live in that row.
+     */
+    default void index(DecoratedKey key, Clustering clustering, ByteBuffer value, Memtable memtable, OpOrder.Group opGroup, Row row)
+    {
+        index(key, clustering, value, memtable, opGroup);
+    }
+
     void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup);
     void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup);
+
+    /**
+     * Updates the value of the given new row, warning the client if the new value isn't (fully) indexed and is live in
+     * that row.
+     */
+    default void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup, Row newRow)
+    {
+        update(key, clustering, oldValue, newValue, memtable, opGroup);
+    }
+
+    /**
+     * Updates the values of the given new row, warning the client if a new value isn't (fully) indexed and is live in
+     * that row.
+     */
+    default void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup, Row newRow)
+    {
+        update(key, clustering, oldValues, newValues, memtable, opGroup);
+    }
 
     /** Removes a value the memtable no longer holds for a row (see {@link IndexContext#removeRowData}); not a write. */
     default void remove(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, Memtable memtable, OpOrder.Group opGroup)

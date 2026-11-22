@@ -20,6 +20,7 @@ package org.apache.cassandra.index.sai.analyzer;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 
@@ -44,6 +45,12 @@ public class ByteLimitedMaterializer
                                                                 " for key: {}, analzyed term size {}, but max allowed size {}.";
 
     /**
+     * What {@link #materializeTokens} returns for a value it doesn't index, compared by identity: unlike the empty
+     * list of a value without tokens, it tells that the value was dropped.
+     */
+    public static final List<ByteBuffer> NOT_INDEXED = Collections.unmodifiableList(new ArrayList<>(0));
+
+    /**
      * Whether the analyzed tokens of a value, given their number and total size, are too large to index the value:
      * when there are several of them and they add up to {@link IndexContext#MAX_ANALYZED_SIZE}. A single token is not
      * concerned, as it is already bounded by the max term size of the index (see {@link IndexContext#maxTermSize()}),
@@ -64,8 +71,8 @@ public class ByteLimitedMaterializer
      * @param term the term to analyze
      * @param indexContext the index context used for logging
      * @param primaryKey the primary key of the row being indexed
-     * @return all the terms produced by the analyzer, or an empty list if the cumulative size of the analyzed term
-     * exceeds the configured maximum
+     * @return all the terms produced by the analyzer, or {@link #NOT_INDEXED} if the cumulative size of the analyzed
+     * term exceeds the configured maximum
      */
     public static List<ByteBuffer> materializeTokens(AbstractAnalyzer analyzer, ByteBuffer term, IndexContext indexContext, PrimaryKey primaryKey)
     {
@@ -89,7 +96,7 @@ public class ByteLimitedMaterializer
                                       indexContext.keyValidator().getString(primaryKey.partitionKey().getKey()),
                                       FBUtilities.prettyPrintMemory(bytesCount),
                                       FBUtilities.prettyPrintMemory(IndexContext.MAX_ANALYZED_SIZE));
-                    return List.of();
+                    return NOT_INDEXED;
                 }
             }
             return tokens;

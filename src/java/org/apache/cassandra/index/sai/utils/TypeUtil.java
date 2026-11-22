@@ -663,7 +663,7 @@ public class TypeUtil
         return canonicalize(component, type).remaining();
     }
 
-    private static ByteBuffer cellValue(ColumnMetadata columnMetadata, IndexTarget.Type indexType, Cell<?> cell)
+    public static ByteBuffer cellValue(ColumnMetadata columnMetadata, IndexTarget.Type indexType, Cell<?> cell)
     {
         if (columnMetadata.type.isCollection() && columnMetadata.type.isMultiCell())
         {

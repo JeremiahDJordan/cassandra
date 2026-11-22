@@ -21,10 +21,16 @@ package org.apache.cassandra.service;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
 
 import com.google.common.base.Predicates;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.locator.EndpointsForToken;
@@ -40,6 +46,7 @@ import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.WriteType;
 import org.apache.cassandra.exceptions.WriteFailureException;
+import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.locator.IEndpointSnitch;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
@@ -371,6 +378,136 @@ public class WriteResponseHandlerTest
         assertThatThrownBy(awr::get).isInstanceOf(WriteFailureException.class);
     }
 
+    @Test
+    public void testReplicaWarningsOfCompletingReply()
+    {
+        AbstractWriteResponseHandler<?> awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_QUORUM);
+
+        respond(awr, createDummyMessage(0, "first"));
+        respond(awr, createDummyMessage(1, "completing"));
+        assertThat(awr.isCompleted()).isTrue();
+        respond(awr, createDummyMessage(2, "late"));
+
+        assertThat(publishedWarnings(awr)).containsExactly("first", "completing");
+    }
+
+    @Test
+    public void testReplicaWarningsOfIneligibleReply()
+    {
+        AbstractWriteResponseHandler<?> awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_QUORUM);
+
+        // a reply from the other datacenter doesn't count for LOCAL_QUORUM
+        respond(awr, createDummyMessage(3, "remote"));
+        respond(awr, createDummyMessage(0, "local"));
+        awr.addReplicaWarnings(Collections.singletonList("self"));
+        respond(awr, createDummyMessage(1, null));
+
+        assertThat(publishedWarnings(awr)).containsExactly("local", "self");
+    }
+
+    @Test
+    public void testReplicaWarningsAfterTimeout() throws Throwable
+    {
+        for (int i = 0; i < 20; i++)
+        {
+            AbstractWriteResponseHandler<?> awr = createWriteResponseHandler(ConsistencyLevel.ALL, ConsistencyLevel.ALL,
+                                                                             new Dispatcher.RequestTime(nanoTime() - DAYS.toNanos(1)));
+
+            // replies racing the close of the timed-out request
+            CountDownLatch start = new CountDownLatch(1);
+            List<Thread> threads = new ArrayList<>();
+            for (int target = 0; target < 4; target++)
+            {
+                Message<?> message = createDummyMessage(target, "w" + target);
+                Thread thread = new Thread(() -> {
+                    Uninterruptibles.awaitUninterruptibly(start);
+                    respond(awr, message);
+                });
+                thread.start();
+                threads.add(thread);
+            }
+
+            ClientWarn.instance.captureWarnings();
+            try
+            {
+                start.countDown();
+                assertThatThrownBy(awr::get).isInstanceOf(WriteTimeoutException.class);
+                List<String> published = ClientWarn.instance.getWarnings();
+                for (Thread thread : threads)
+                    thread.join();
+
+                // nothing is added after the close
+                respond(awr, createDummyMessage(5, "after"));
+                ClientWarn.instance.resetWarnings();
+                assertThat(publishedWarnings(awr)).isEqualTo(published);
+            }
+            finally
+            {
+                ClientWarn.instance.resetWarnings();
+            }
+        }
+    }
+
+    @Test
+    public void testReplicaWarningsAlsoGivenByCoordinator()
+    {
+        AbstractWriteResponseHandler<?> awr = createWriteResponseHandler(ConsistencyLevel.ONE, ConsistencyLevel.ONE);
+        respond(awr, createDummyMessage(0, "w"));
+
+        ClientWarn.instance.captureWarnings();
+        try
+        {
+            ClientWarn.instance.warn("w", "w");
+            awr.get();
+            assertThat(ClientWarn.instance.getWarnings()).containsExactly("w");
+        }
+        finally
+        {
+            ClientWarn.instance.resetWarnings();
+        }
+    }
+
+    @Test
+    public void testBatchlogResponseHandlerReplicaWarnings()
+    {
+        AbstractWriteResponseHandler<?> wrapped = createWriteResponseHandler(ConsistencyLevel.ALL, ConsistencyLevel.ALL);
+        BatchlogResponseHandler<?> handler = new BatchlogResponseHandler<>(wrapped, targets.size(),
+                                                                           new BatchlogResponseHandler.BatchlogCleanup(1, () -> {}),
+                                                                           Dispatcher.RequestTime.forImmediateExecution());
+
+        handler.addReplicaWarnings(Collections.singletonList("local"));
+        for (int target = 0; target < targets.size(); target++)
+            respond(handler, createDummyMessage(target, target == 0 ? "remote" : null));
+
+        assertThat(publishedWarnings(handler)).containsExactly("local", "remote");
+    }
+
+    // what ResponseVerbHandler does with a reply
+    @SuppressWarnings({ "unchecked", "rawtypes" })
+    private static void respond(AbstractWriteResponseHandler handler, Message<?> message)
+    {
+        handler.addReplicaWarnings(message);
+        handler.onResponse(message);
+    }
+
+    private static List<String> publishedWarnings(AbstractWriteResponseHandler<?> handler)
+    {
+        ClientWarn.instance.captureWarnings();
+        try
+        {
+            handler.get();
+            return ClientWarn.instance.getWarnings();
+        }
+        catch (WriteTimeoutException e)
+        {
+            return ClientWarn.instance.getWarnings();
+        }
+        finally
+        {
+            ClientWarn.instance.resetWarnings();
+        }
+    }
+
     private static AbstractWriteResponseHandler createWriteResponseHandler(ConsistencyLevel cl, ConsistencyLevel ideal)
     {
         return createWriteResponseHandler(cl, ideal, Dispatcher.RequestTime.forImmediateExecution());
@@ -387,6 +524,15 @@ public class WriteResponseHandlerTest
         return Message.builder(Verb.ECHO_REQ, noPayload)
                       .from(targets.get(target).endpoint())
                       .build();
+    }
+
+    private static Message<?> createDummyMessage(int target, @Nullable String warning)
+    {
+        Message.Builder<?> builder = Message.builder(Verb.MUTATION_RSP, noPayload)
+                                            .from(targets.get(target).endpoint());
+        if (warning != null)
+            builder.withCustomParam(ReplicaWarnings.KEY, ReplicaWarnings.encode(Collections.singletonList(warning)));
+        return builder.build();
     }
 
     /**

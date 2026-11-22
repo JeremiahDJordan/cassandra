@@ -67,6 +67,7 @@ import org.apache.cassandra.schema.SchemaProvider;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.service.ReplicaWarnings;
 import org.apache.cassandra.service.snapshot.TableSnapshot;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -540,12 +541,21 @@ public class Keyspace
 
     public Future<?> applyFuture(Mutation mutation, WriteOptions writeOptions)
     {
-        return applyInternal(mutation, writeOptions, true, new AsyncPromise<>());
+        return applyFuture(mutation, writeOptions, true, false);
     }
 
     public Future<?> applyFuture(Mutation mutation, WriteOptions writeOptions, boolean isDeferrable)
     {
-        return applyInternal(mutation, writeOptions, isDeferrable, new AsyncPromise<>());
+        return applyFuture(mutation, writeOptions, isDeferrable, false);
+    }
+
+    /**
+     * @param captureWarnings whether the value of the future is the client warnings the write raised (see
+     *                        {@link ReplicaWarnings}), instead of {@code null}
+     */
+    public Future<List<String>> applyFuture(Mutation mutation, WriteOptions writeOptions, boolean isDeferrable, boolean captureWarnings)
+    {
+        return applyInternal(mutation, writeOptions, isDeferrable, captureWarnings, new AsyncPromise<>());
     }
 
     /**
@@ -559,14 +569,14 @@ public class Keyspace
      */
     public void apply(Mutation mutation, WriteOptions writeOptions)
     {
-        applyInternal(mutation, writeOptions, false, null);
+        applyInternal(mutation, writeOptions, false, false, null);
     }
 
     /**
      * Close this keyspace to further mutations, called when draining or shutting down.
      *
      * A final write barrier is issued and returned. After this barrier is set, new mutations
-     * will be rejected, see {@link Keyspace#applyInternal(Mutation, WriteOptions, boolean, Promise)}.
+     * will be rejected, see {@link Keyspace#applyInternal(Mutation, WriteOptions, boolean, boolean, Promise)}.
      */
     public OpOrder.Barrier stopMutations()
     {
@@ -583,11 +593,13 @@ public class Keyspace
      *                     may happen concurrently, depending on the CL Executor type.
      * @param writeOptions describes desired write properties
      * @param isDeferrable true if caller is not waiting for future to complete, so that future may be deferred
+     * @param captureWarnings whether the future completes with the client warnings the write raised
      */
-    private Future<?> applyInternal(Mutation mutation,
-                                    WriteOptions writeOptions,
-                                    boolean isDeferrable,
-                                    Promise<?> future)
+    private Future<List<String>> applyInternal(Mutation mutation,
+                                               WriteOptions writeOptions,
+                                               boolean isDeferrable,
+                                               boolean captureWarnings,
+                                               Promise<List<String>> future)
     {
         if (TEST_FAIL_WRITES && metadata.name.equals(TEST_FAIL_WRITES_KS))
             throw new RuntimeException("Testing write failures");
@@ -650,7 +662,7 @@ public class Keyspace
                             Stage.MUTATION.execute(() -> {
                                 try
                                 {
-                                    applyInternal(mutation, writeOptions, true, future);
+                                    applyInternal(mutation, writeOptions, true, captureWarnings, future);
                                 }
                                 catch (Throwable t)
                                 {
@@ -695,6 +707,8 @@ public class Keyspace
                     columnFamilyStores.get(tableId).metric.viewLockAcquireTime.update(acquireTime, MILLISECONDS);
             }
         }
+        Object previousWarnings = captureWarnings ? ReplicaWarnings.capture() : null;
+        boolean capturing = captureWarnings;
         try (WriteContext ctx = getWriteHandler().beginWrite(mutation, writeOptions))
         {
             for (PartitionUpdate upd : mutation.getPartitionUpdates())
@@ -730,12 +744,22 @@ public class Keyspace
             }
 
             if (future != null) {
-                future.trySuccess(null);
+                List<String> warnings = null;
+                if (capturing)
+                {
+                    warnings = ReplicaWarnings.drain();
+                    ReplicaWarnings.restore(previousWarnings);
+                    capturing = false;
+                }
+                future.trySuccess(warnings);
             }
             return future;
         }
         finally
         {
+            if (capturing)
+                ReplicaWarnings.restore(previousWarnings);
+
             if (locks != null)
             {
                 for (Lock lock : locks)
@@ -745,7 +769,7 @@ public class Keyspace
         }
     }
 
-    private Promise<?> failDueToWriteBarrier(Mutation mutation, Promise<?> future)
+    private Promise<List<String>> failDueToWriteBarrier(Mutation mutation, Promise<List<String>> future)
     {
         assert writeBarrier != null : "Expected non-null write barrier";
 

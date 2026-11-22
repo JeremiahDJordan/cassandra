@@ -30,9 +30,12 @@ import java.util.function.Consumer;
 import org.junit.Assert;
 import org.junit.Test;
 
+import org.apache.cassandra.service.ReplicaWarnings;
+
 import static java.lang.String.format;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class GuardrailsTest extends GuardrailTester
@@ -155,6 +158,34 @@ public class GuardrailsTest extends GuardrailTester
         assertFails(() -> guard.guard(101, "z", false, userClientState), "Failure: for z, 101 > 100");
         assertValid(() -> guard.guard(101, "z", false, systemClientState));
         assertValid(() -> guard.guard(101, "z", false, superClientState));
+    }
+
+    @Test
+    public void testMaxThresholdWithoutUserOnReplica()
+    {
+        MaxThreshold guard = new MaxThreshold("x",
+                                              REASON,
+                                              state -> 10,
+                                              state -> 100,
+                                              (isWarn, featureName, v, t) -> format("%s: for %s, %s > %s",
+                                                                             isWarn ? "Warning" : "Failure", featureName, v, t));
+
+        // while a replica applies a write, a failure without user doesn't reach the client, a warning does
+        Object previous = ReplicaWarnings.capture();
+        try
+        {
+            guard.guard(101, "z", false, null);
+            assertNull(ReplicaWarnings.drain());
+            listener.assertFailed("Failure: for z, 101 > 100");
+
+            guard.guard(100, "y", false, null);
+            assertEquals(Collections.singletonList(guard.decorateMessage("Warning: for y, 100 > 10")), ReplicaWarnings.drain());
+        }
+        finally
+        {
+            ReplicaWarnings.restore(previous);
+            listener.clear();
+        }
     }
 
     @Test

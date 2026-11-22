@@ -149,8 +149,8 @@ public class IndexContext
     "Term of column %s exceeds the byte limit for index. Term size %s. Max allowed size %s.";
 
     public static final String ANALYZED_VALUE_NOT_INDEXED_WARNING =
-    "The analyzed terms of the value of column %s add up to %s, which reaches the limit of %s " +
-    "(cassandra.sai.max_analyzed_size_kb): the value is written, but not indexed by %s.";
+    "The analyzed terms of the value of column %s reach the limit of cassandra.sai.max_analyzed_size_kb: the value " +
+    "is written, but not indexed by %s.%s.";
 
     private static final String CANONICAL_SIZE_NOTE =
     "%s The size is that of the value in canonical form, which is what the index holds; the value is %d bytes as " +
@@ -394,14 +394,14 @@ public class IndexContext
                 while (bufferIterator.hasNext())
                 {
                     ByteBuffer value = bufferIterator.next();
-                    target.index(key, row.clustering(), value, mt, opGroup);
+                    target.index(key, row.clustering(), value, mt, opGroup, row);
                 }
             }
         }
         else
         {
             ByteBuffer value = withoutOversizedVector(key, getValueOf(key, row, 0));
-            target.index(key, row.clustering(), value, mt, opGroup);
+            target.index(key, row.clustering(), value, mt, opGroup, row);
         }
         indexMetrics.flatMap(metrics -> metrics.memtableIndexWriteLatency).ifPresent(timer ->
                 timer.update(nanoTime() - start, TimeUnit.NANOSECONDS));
@@ -626,16 +626,54 @@ public class IndexContext
             // A value whose analyzed terms add up to the max analyzed size is accepted, but not indexed (see
             // ByteLimitedMaterializer): tell the client, since we've analyzed the value anyway.
             if (ByteLimitedMaterializer.exceedsMaxAnalyzedSize(termCount, termsSize))
-                ClientWarn.instance.warn(String.format(ANALYZED_VALUE_NOT_INDEXED_WARNING,
-                                                       getColumnName(),
-                                                       FBUtilities.prettyPrintMemory(termsSize),
-                                                       FBUtilities.prettyPrintMemory(MAX_ANALYZED_SIZE),
-                                                       getIndexName()));
+                warnNotIndexed(ANALYZED_VALUE_NOT_INDEXED_WARNING);
         }
         finally
         {
             analyzer.end();
         }
+    }
+
+    /**
+     * Whether the given value of the row, which the memtable index gets whether it's live or not (see
+     * {@link #index(DecoratedKey, Row, Memtable, OpOrder.Group)}), is live now: the value of a primary key column
+     * is in every row of the key, so it's live if the row has live data.
+     */
+    public boolean isLiveValue(Row row, ByteBuffer value)
+    {
+        long nowInSec = FBUtilities.nowInSeconds();
+        if (column.isPrimaryKeyColumn())
+            return row.hasLiveData(nowInSec, cfs.metadata().enforceStrictLiveness());
+
+        if (isNonFrozenCollection())
+        {
+            ComplexColumnData cells = row.getComplexColumnData(column);
+            if (cells == null)
+                return false;
+            for (Cell<?> cell : cells)
+            {
+                // as TypeUtil#collectionIterator, which leaves out the map entries that are too large for the index
+                if (cell.isLive(nowInSec)
+                    && (indexType != IndexTarget.Type.KEYS_AND_VALUES || TypeUtil.fitsMapEntryTerm(cell))
+                    && value.equals(TypeUtil.cellValue(column, indexType, cell)))
+                    return true;
+            }
+            return false;
+        }
+
+        Cell<?> cell = row.getCell(column);
+        return cell != null && cell.isLive(nowInSec);
+    }
+
+    /**
+     * Warns the client that a value isn't (fully) indexed, with the given format of the column, keyspace and index
+     * names. The warning is keyed by its text, which is the same on the coordinator and on the replicas, so that they
+     * warn once.
+     */
+    public void warnNotIndexed(String format)
+    {
+        String warning = String.format(format, getColumnName(), keyspace, getIndexName());
+        ClientWarn.instance.warn(warning, warning);
     }
 
     /**
@@ -773,13 +811,13 @@ public class IndexContext
         {
             Iterator<ByteBuffer> oldValues = getValuesOf(oldRow, 0);
             Iterator<ByteBuffer> newValues = getValuesOf(newRow, 0);
-            target.update(key, oldRow.clustering(), oldValues, newValues, memtable, opGroup);
+            target.update(key, oldRow.clustering(), oldValues, newValues, memtable, opGroup, newRow);
         }
         else
         {
             ByteBuffer oldValue = getValueOf(key, oldRow, 0);
             ByteBuffer newValue = withoutOversizedVector(key, getValueOf(key, newRow, 0));
-            target.update(key, oldRow.clustering(), oldValue, newValue, memtable, opGroup);
+            target.update(key, oldRow.clustering(), oldValue, newValue, memtable, opGroup, newRow);
         }
     }
 

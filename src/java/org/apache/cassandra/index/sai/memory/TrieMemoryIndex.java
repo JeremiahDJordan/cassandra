@@ -56,6 +56,7 @@ import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.memtable.TrieMemtable;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.tries.InMemoryTrie;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.Trie;
@@ -166,14 +167,16 @@ public class TrieMemoryIndex extends MemoryIndex
         return totalTermCount;
     }
 
+    @Override
     public synchronized void add(DecoratedKey key,
                                  Clustering clustering,
                                  ByteBuffer value,
                                  LongConsumer onHeapAllocationsTracker,
-                                 LongConsumer offHeapAllocationsTracker)
+                                 LongConsumer offHeapAllocationsTracker,
+                                 @Nullable Row row)
     {
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
-        int tokenCount = applyTransformer(primaryKey, value, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+        int tokenCount = applyTransformer(primaryKey, value, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator, row);
         recordAddedDocLength(primaryKey, tokenCount, onHeapAllocationsTracker);
     }
 
@@ -182,7 +185,8 @@ public class TrieMemoryIndex extends MemoryIndex
                                     ByteBuffer oldValue,
                                     ByteBuffer newValue,
                                     LongConsumer onHeapAllocationsTracker,
-                                    LongConsumer offHeapAllocationsTracker)
+                                    LongConsumer offHeapAllocationsTracker,
+                                    @Nullable Row newRow)
     {
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
 
@@ -196,10 +200,10 @@ public class TrieMemoryIndex extends MemoryIndex
         {
             boolean indexesNewValue = TypeUtil.indexesValue(newValue, indexContext.getValidator());
             int newTokenCount = indexesNewValue
-                                ? applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator)
+                                ? applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator, newRow)
                                 : 0;
             if (TypeUtil.indexesValue(oldValue, indexContext.getValidator()))
-                applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+                applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover, null);
 
             // The document length is that of the new value, or none if the update indexes no new value
             if (indexesNewValue)
@@ -219,7 +223,8 @@ public class TrieMemoryIndex extends MemoryIndex
                                     Iterator<ByteBuffer> oldValues,
                                     Iterator<ByteBuffer> newValues,
                                     LongConsumer onHeapAllocationsTracker,
-                                    LongConsumer offHeapAllocationsTracker)
+                                    LongConsumer offHeapAllocationsTracker,
+                                    @Nullable Row newRow)
     {
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
 
@@ -231,7 +236,7 @@ public class TrieMemoryIndex extends MemoryIndex
             ByteBuffer newValue = newValues.next();
             if (TypeUtil.indexesValue(newValue, indexContext.getValidator()))
             {
-                int tokenCount = applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+                int tokenCount = applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator, newRow);
                 recordAddedDocLength(primaryKey, tokenCount, onHeapAllocationsTracker);
             }
         }
@@ -241,24 +246,30 @@ public class TrieMemoryIndex extends MemoryIndex
             ByteBuffer oldValue = oldValues.next();
             if (TypeUtil.indexesValue(oldValue, indexContext.getValidator()))
             {
-                int tokenCount = applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+                int tokenCount = applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover, null);
                 if (docLengths.containsKey(primaryKey))
                     totalTermCount -= tokenCount;
             }
         }
     }
 
-    // Adds or removes the terms of a value of the row with the transformer, and returns the number of terms
+    // Adds or removes the terms of a value of the row with the transformer, and returns the number of terms. An added
+    // value that isn't (fully) indexed warns the client if it's live in the given row it comes from.
     private int applyTransformer(PrimaryKey primaryKey,
                                  ByteBuffer value,
                                  LongConsumer onHeapAllocationsTracker,
                                  LongConsumer offHeapAllocationsTracker,
-                                 InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey> transformer)
+                                 InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey> transformer,
+                                 @Nullable Row row)
     {
+        ByteBuffer rowValue = value;
         // The terms the sstable writers produce (see SegmentBuilder#analyzeAndAdd), so a value is indexed the same way
         // in memtables and sstables.
         value = indexContext.asIndexTerm(value);
         List<ByteBuffer> terms = ByteLimitedMaterializer.materializeTokens(indexContext.getAnalyzerFactory().create(), value, indexContext, primaryKey);
+        boolean warn = row != null && transformer == primaryKeysAccumulator;
+        if (warn && terms == ByteLimitedMaterializer.NOT_INDEXED && indexContext.isLiveValue(row, rowValue))
+            indexContext.warnNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING);
         final long initialSizeOnHeap = data.usedSizeOnHeap();
         final long initialSizeOffHeap = data.usedSizeOffHeap();
         final long initialPrimaryKeysHeapAllocations = primaryKeysHeapAllocations.longValue();
