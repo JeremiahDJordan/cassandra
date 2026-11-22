@@ -26,6 +26,7 @@ package org.apache.cassandra.index.sai.memory;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.math.MathContext;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -509,8 +510,9 @@ public class TrieMemoryIndex extends MemoryIndex
         assert queryLowerBound.compareTo(queryUpperBound) <= 0
             : "query lower bound (" + queryLowerBound + ") should be less than or equal to query upper bound (" + queryUpperBound + ')';
 
-        BigDecimal indexRangeSize = indexUpperBound.subtract(indexLowerBound);
-        BigDecimal queryRangeSize = queryUpperBound.subtract(queryLowerBound);
+        MathContext subtraction = TermsDistribution.subtractionContext(indexLowerBound, indexUpperBound, queryLowerBound, queryUpperBound);
+        BigDecimal indexRangeSize = TermsDistribution.subtract(indexUpperBound, indexLowerBound, subtraction);
+        BigDecimal queryRangeSize = TermsDistribution.subtract(queryUpperBound, queryLowerBound, subtraction);
         double selectivity = indexRangeSize.signum() == 0
                              ? 1.0
                              : TermsDistribution.divide(queryRangeSize, indexRangeSize);
