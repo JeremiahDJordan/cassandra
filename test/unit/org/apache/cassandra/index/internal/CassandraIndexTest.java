@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.index.internal;
 
+import java.math.BigDecimal;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -109,6 +110,21 @@ public class CassandraIndexTest extends CQLTester
                                 row(1, 1, 2, 9, 2),
                                 row(3, 1, null, 9, null),
                                 row(4, 1, 1, 9, 1));
+    }
+
+    @Test
+    public void indexOnDecimalAtScaleLimitWithTrieMemtable() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v decimal) WITH memtable = 'trie'");
+        createIndex("CREATE INDEX ON %s (v)");
+
+        BigDecimal[] values = { new BigDecimal("1E-2147483647"), new BigDecimal("-5E-2147483647"), new BigDecimal("1.5") };
+        for (int i = 0; i < values.length; i++)
+            execute("INSERT INTO %s (k, v) VALUES (?, ?)", i, values[i]);
+        flush();
+
+        for (int i = 0; i < values.length; i++)
+            assertRows(execute("SELECT k FROM %s WHERE v = ?", values[i]), row(i));
     }
 
     @Test

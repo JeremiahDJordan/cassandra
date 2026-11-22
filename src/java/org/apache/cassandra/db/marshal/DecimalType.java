@@ -267,7 +267,15 @@ public class DecimalType extends NumberType<BigDecimal>
             mantissa = mantissa.multiply(BigInteger.TEN.pow(exponentReduction));
             base10NonBigDecimalFormatExp = Integer.MAX_VALUE;
         }
-        assert base10NonBigDecimalFormatExp >= Integer.MIN_VALUE && base10NonBigDecimalFormatExp <= Integer.MAX_VALUE;
+        else if (base10NonBigDecimalFormatExp < -Integer.MAX_VALUE)
+        {
+            // A decimal whose scale is Integer.MAX_VALUE once trailing zeros are stripped is encoded with a trailing
+            // zero digit (the digits come in pairs and that scale is odd), so its base-10 exponent decodes as
+            // Integer.MIN_VALUE, whose negation doesn't fit in the scale. Drop that zero from the mantissa instead.
+            mantissa = mantissa.divide(BigInteger.TEN);
+            base10NonBigDecimalFormatExp = -Integer.MAX_VALUE;
+        }
+        assert base10NonBigDecimalFormatExp >= -Integer.MAX_VALUE && base10NonBigDecimalFormatExp <= Integer.MAX_VALUE;
         // Here we negate the exponent, as we are not using BigDecimal.scaleByPowerOfTen, where a positive number means
         // "multiplying by a positive power of 10", but to BigDecimal's internal scale representation, where a positive
         // number means "dividing by a positive power of 10".
