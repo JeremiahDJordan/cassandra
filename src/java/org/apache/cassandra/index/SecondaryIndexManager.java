@@ -728,23 +728,44 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                            List<SecondaryIndexBuilder> builders = buildingSupport.getParallelIndexBuildTasks(baseCfs, groupedIndexes, sstables, isFullRebuild);
                            List<ListenableFuture<?>> builderFutures = builders.stream().map(CompactionManager.instance::submitIndexBuild).collect(Collectors.toList());
                            final SettableFuture<Object> build = SettableFuture.create();
-                           Futures.addCallback(Futures.allAsList(builderFutures), new FutureCallback<Object>()
+                           // Like allAsList(builderFutures), but done only once every builder is: allAsList fails as
+                           // soon as one builder fails, while the others may still be building.
+                           ListenableFuture<List<Object>> builds = Futures.whenAllComplete(builderFutures)
+                                                                         .callAsync(() -> Futures.allAsList(builderFutures), ImmediateExecutor.INSTANCE);
+                           Futures.addCallback(builds, new FutureCallback<Object>()
                            {
                                @Override
                                public void onFailure(Throwable t)
                                {
-                                   logAndMarkIndexesFailed(groupedIndexes, t, false);
-                                   unbuiltIndexes.addAll(groupedIndexes);
-                                   build.setException(t);
+                                   try
+                                   {
+                                       logAndMarkIndexesFailed(groupedIndexes, t, false);
+                                   }
+                                   finally
+                                   {
+                                       unbuiltIndexes.addAll(groupedIndexes);
+                                       build.setException(t);
+                                   }
                                }
 
                                @Override
                                public void onSuccess(Object o)
                                {
-                                   groupedIndexes.forEach(i -> markIndexBuilt(i, isFullRebuild));
-                                   logger.info("Index build of {} completed", Index.joinNames(groupedIndexes));
-                                   builtIndexes.addAll(groupedIndexes);
-                                   build.set(o);
+                                   try
+                                   {
+                                       for (Index index : groupedIndexes)
+                                       {
+                                           markIndexBuilt(index, isFullRebuild);
+                                           builtIndexes.add(index);
+                                       }
+                                       logger.info("Index build of {} completed", Index.joinNames(groupedIndexes));
+                                       build.set(o);
+                                   }
+                                   catch (Throwable t)
+                                   {
+                                       // the indexes that aren't marked built are marked failed once every group is done
+                                       build.setException(t);
+                                   }
                                }
                            }, ImmediateExecutor.INSTANCE);
                            futures.add(build);
@@ -752,15 +773,17 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         ListenableFuture<List<Object>> allIndexBuilds = Futures.allAsList(futures);
         SettableFuture finalResult = SettableFuture.create();
-        allIndexBuilds.addListener(() -> {
+        // Finish once every group is done: allIndexBuilds fails as soon as one group fails, while the others may
+        // still be building.
+        Futures.whenAllComplete(futures).run(() -> {
             try
             {
                 finalizeIndexBuild(indexes, builtIndexes, unbuiltIndexes);
                 finalResult.setFuture(allIndexBuilds);
             }
-            catch (Exception ex)
+            catch (Throwable t)
             {
-                finalResult.setException(ex);
+                finalResult.setException(t);
             }
         }, ImmediateExecutor.INSTANCE);
         return finalResult;
@@ -933,12 +956,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
     private void logAndMarkIndexesFailed(Set<Index> indexes, Throwable indexBuildFailure, boolean isInitialBuild)
     {
-        JVMStabilityInspector.inspectThrowable(indexBuildFailure);
-        if (indexBuildFailure != null)
-            logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes), indexBuildFailure);
-        else
-            logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes));
-        indexes.forEach(i -> this.markIndexFailed(i, isInitialBuild));
+        try
+        {
+            // (this rethrows a failure caused by an InterruptedException)
+            JVMStabilityInspector.inspectThrowable(indexBuildFailure);
+        }
+        finally
+        {
+            if (indexBuildFailure != null)
+                logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes), indexBuildFailure);
+            else
+                logger.warn("Index build of {} failed. Please run full index rebuild to fix it.", Index.joinNames(indexes));
+            indexes.forEach(i -> this.markIndexFailed(i, isInitialBuild));
+        }
     }
 
     /**
