@@ -256,6 +256,96 @@ public class TermsDistributionTest
     }
 
     @Test
+    public void testFractionalBucketsDecimalFarApartExponents()
+    {
+        // The exact differences of these values overflow a BigInteger.
+        AbstractType<BigDecimal> type = DecimalType.instance;
+        var builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        builder.add(encodeAsDecimal(new BigDecimal("1E-700000000")), 1);
+        for (int i = 1; i <= 100; i++)
+            builder.add(encodeAsDecimal(BigDecimal.valueOf(i)), 1);
+        builder.add(encodeAsDecimal(new BigDecimal("1E+700000000")), 1);
+        var td = builder.build();
+
+        assertEquals(100, td.estimateNumRowsInRange(encodeAsDecimal(new BigDecimal("0.5")), encodeAsDecimal(BigDecimal.valueOf(1000))), 10);
+    }
+
+    @Test
+    public void testFractionalBucketsDecimalLargestDouble()
+    {
+        // The differences of these values are finite doubles, but exceed Double.MAX_VALUE when rounded to 16 digits.
+        AbstractType<BigDecimal> type = DecimalType.instance;
+        var builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        for (int i = 1; i <= 100; i++)
+            builder.add(encodeAsDecimal(BigDecimal.valueOf(i)), 1);
+        builder.add(encodeAsDecimal(BigDecimal.valueOf(Double.MAX_VALUE)), 1);
+        var td = builder.build();
+
+        assertEquals(101, td.estimateNumRowsInRange(encodeAsDecimal(new BigDecimal("0.5")), encodeAsDecimal(BigDecimal.valueOf(Double.MAX_VALUE))), 10);
+    }
+
+    @Test
+    public void testFractionalBucketsDecimalTinyTerms()
+    {
+        // The fractions of the buckets below these terms are smaller than the smallest double.
+        AbstractType<BigDecimal> type = DecimalType.instance;
+        var builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        for (int i = 0; i <= 100; i++)
+            builder.add(encodeAsDecimal(BigDecimal.valueOf(i)), 1);
+        var td = builder.build();
+        assertEquals(50, td.estimateNumRowsInRange(encodeAsDecimal(new BigDecimal("1E-2147483640")), encodeAsDecimal(BigDecimal.valueOf(50))), 1);
+
+        builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        builder.add(encodeAsDecimal(BigDecimal.ZERO), 1);
+        builder.add(encodeAsDecimal(new BigDecimal("1E+100")), 1);
+        td = builder.build();
+        assertEquals(0, td.estimateNumRowsInRange(encodeAsDecimal(BigDecimal.ZERO), encodeAsDecimal(new BigDecimal("1E-2147483600"))));
+    }
+
+    @Test
+    public void testFractionalBucketsDecimalSmallestScale()
+    {
+        // The differences of these terms have more than 16 digits at a scale close to Integer.MIN_VALUE.
+        AbstractType<BigDecimal> type = DecimalType.instance;
+        var builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        for (int i = 0; i <= 100; i++)
+            builder.add(encodeAsDecimal(atSmallestScale(i)), 1);
+        var td = builder.build();
+        assertEquals(50, td.estimateNumRowsInRange(encodeAsDecimal(atSmallestScale(0)), encodeAsDecimal(atSmallestScale(50))), 1);
+
+        // and from 0, whose scale is far from theirs
+        builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        builder.add(encodeAsDecimal(BigDecimal.ZERO), 1);
+        for (int i = 1; i <= 100; i++)
+            builder.add(encodeAsDecimal(atSmallestScale(i)), 1);
+        td = builder.build();
+        assertEquals(50, td.estimateNumRowsInRange(encodeAsDecimal(BigDecimal.ZERO), encodeAsDecimal(atSmallestScale(50))), 1);
+    }
+
+    @Test
+    public void testFractionalBucketsDecimalZeroNearScaleLimits()
+    {
+        // The difference of 0 and 18 nines at the scale Integer.MIN_VALUE + 2 rounds up to the scale Integer.MIN_VALUE.
+        AbstractType<BigDecimal> type = DecimalType.instance;
+        BigDecimal nines = new BigDecimal(new BigInteger("999999999999999999"), Integer.MIN_VALUE + 2);
+        var builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        builder.add(encodeAsDecimal(BigDecimal.ZERO), 1);
+        builder.add(encodeAsDecimal(nines), 1);
+        var td = builder.build();
+        assertEquals(0, td.estimateNumRowsInRange(encodeAsDecimal(BigDecimal.ZERO), encodeAsDecimal(new BigDecimal(new BigInteger("500000000000000000"), Integer.MIN_VALUE + 2))));
+        assertEquals(1, td.estimateNumRowsInRange(encodeAsDecimal(BigDecimal.ZERO), encodeAsDecimal(nines)));
+
+        // and 0 with decimals at the scale Integer.MAX_VALUE
+        BigDecimal two = new BigDecimal(BigInteger.valueOf(2), Integer.MAX_VALUE);
+        builder = new TermsDistribution.Builder(type, VERSION, 13, 13, SAIUtil.currentVersion());
+        builder.add(encodeAsDecimal(BigDecimal.ZERO), 1);
+        builder.add(encodeAsDecimal(two), 1);
+        td = builder.build();
+        assertEquals(0, td.estimateNumRowsInRange(encodeAsDecimal(BigDecimal.ZERO), encodeAsDecimal(new BigDecimal(BigInteger.ONE, Integer.MAX_VALUE))));
+        assertEquals(1, td.estimateNumRowsInRange(encodeAsDecimal(BigDecimal.ZERO), encodeAsDecimal(two)));
+    }
+
+    @Test
     public void testSerde() throws IOException
     {
         AbstractType<Double> type = DoubleType.instance;
@@ -342,7 +432,12 @@ public class TermsDistributionTest
 
     private ByteComparable encodeAsDecimal(double value)
     {
-        ByteBuffer raw = DecimalType.instance.decompose(BigDecimal.valueOf(value));
+        return encodeAsDecimal(BigDecimal.valueOf(value));
+    }
+
+    private ByteComparable encodeAsDecimal(BigDecimal value)
+    {
+        ByteBuffer raw = DecimalType.instance.decompose(value);
         return v -> TypeUtil.asComparableBytes(TypeUtil.encode(raw, DecimalType.instance), DecimalType.instance, v);
     }
 
@@ -350,5 +445,14 @@ public class TermsDistributionTest
     {
         ByteBuffer raw = IntegerType.instance.decompose(BigInteger.valueOf(value));
         return v -> TypeUtil.asComparableBytes(TypeUtil.encode(raw, IntegerType.instance), IntegerType.instance, v);
+    }
+
+    /**
+     * Returns {@code 100000000000000001 + i * 40000000000000001} at the scale {@code Integer.MIN_VALUE + 1}.
+     */
+    private static BigDecimal atSmallestScale(int i)
+    {
+        BigInteger unscaled = BigInteger.valueOf(40000000000000001L).multiply(BigInteger.valueOf(i)).add(BigInteger.valueOf(100000000000000001L));
+        return new BigDecimal(unscaled, Integer.MIN_VALUE + 1);
     }
 }

@@ -21,6 +21,8 @@ package org.apache.cassandra.index.sai.disk.v6;
 import java.io.IOException;
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.math.MathContext;
+import java.math.RoundingMode;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -63,6 +65,10 @@ import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 @Immutable
 public class TermsDistribution
 {
+    // Big decimals whose scales are at most this far apart are subtracted exactly: their difference then has at most
+    // this many more digits than the longest of them, plus one.
+    private static final int MAX_EXACT_SUBTRACTION_SCALE_GAP = 100;
+
     // Special virtual bucket placed before all the other buckets of the histogram.
     // Can be considered a bucket at index -1. The existence of this instance allows us to never return null
     // when looking up the bucket by an index and simplifies the code.
@@ -201,16 +207,17 @@ public class TermsDistribution
         // Estimate the fraction of the bucket on the left side of the term.
         // We assume terms are distributed evenly.
         BigDecimal termValue = toBigDecimal(term).min(bucketMaxValue).max(bucketMinValue);
-        double termDistance = termValue.subtract(bucketMinValue).doubleValue();
-        double bucketSize = bucketMaxValue.subtract(bucketMinValue).doubleValue();
+        MathContext subtraction = subtractionContext(bucketMinValue, bucketMaxValue, termValue);
+        BigDecimal termDistance = subtract(termValue, bucketMinValue, subtraction);
+        BigDecimal bucketSize = subtract(bucketMaxValue, bucketMinValue, subtraction);
 
         // Edge case: this can theoretically happen if our big decimals have insufficient resolution
         // to distinguish terms. If we didn't return early in this case,
         // the later interpolation logic would divide by 0.
-        if (bucketSize < Double.MIN_NORMAL)
+        if (bucketSize.signum() <= 0)
             return new Bucket(term, bucket.cumulativePointCount, bucket.cumulativeRowCount);
 
-        double fraction = termDistance / bucketSize;
+        double fraction = divide(termDistance, bucketSize);
         assert fraction >= 0.0 && fraction <= 1.0: "Invalid fraction value: " + fraction;
 
         // Total number of points and rows in this bucket:
@@ -247,6 +254,71 @@ public class TermsDistribution
         return new Bucket(term, cumulativePointCount, cumulativeRowCount);
     }
 
+
+    /**
+     * Returns the context in which to subtract the given big decimals from each other. Big decimals whose scales are
+     * close are subtracted exactly. Otherwise, the exact difference would have as many digits as the scales are apart,
+     * so it is rounded to the precision of {@link MathContext#DECIMAL64}, or to the greater precision that keeps the
+     * scale of the rounded difference within the range of an int. All the differences of an estimate are computed in
+     * the same context with {@link #subtract}, so that rounding keeps their order.
+     */
+    public static MathContext subtractionContext(BigDecimal... values)
+    {
+        long minScale = Long.MAX_VALUE;
+        long maxScale = Long.MIN_VALUE;
+        long maxExponent = Long.MIN_VALUE;
+        for (BigDecimal value : values)
+        {
+            minScale = Math.min(minScale, value.scale());
+            maxScale = Math.max(maxScale, value.scale());
+            maxExponent = Math.max(maxExponent, exponent(value));
+        }
+        if (maxScale - minScale <= MAX_EXACT_SUBTRACTION_SCALE_GAP)
+            return MathContext.UNLIMITED;
+
+        // A difference is below 10^(maxExponent + 1), so rounding it to this many digits gives it a scale of at least
+        // Integer.MIN_VALUE.
+        long precision = Math.max(MathContext.DECIMAL64.getPrecision(), maxExponent + 1 + Integer.MIN_VALUE);
+        return new MathContext((int) precision, RoundingMode.HALF_EVEN);
+    }
+
+    /**
+     * Returns the difference of big decimals rounded in a context returned by {@link #subtractionContext}. Unlike
+     * {@link BigDecimal#subtract(BigDecimal, MathContext)}, this doesn't fail when an operand is zero and the scale of
+     * the rounded difference is far from the zero's, nor on operands whose scales are close to Integer.MAX_VALUE: a
+     * zero operand isn't subtracted, and operands whose scales are close are subtracted exactly and then rounded.
+     */
+    public static BigDecimal subtract(BigDecimal minuend, BigDecimal subtrahend, MathContext mc)
+    {
+        if (subtrahend.signum() == 0)
+            return minuend.round(mc);
+        if (minuend.signum() == 0)
+            return subtrahend.negate(mc);
+        if (Math.abs((long) minuend.scale() - subtrahend.scale()) <= MAX_EXACT_SUBTRACTION_SCALE_GAP)
+            return minuend.subtract(subtrahend).round(mc);
+        return minuend.subtract(subtrahend, mc);
+    }
+
+    /**
+     * Divides a non-negative big decimal by a positive one that is not smaller, to the precision of a double. Big
+     * decimals are divided rather than doubles because their differences can exceed the range of a double.
+     */
+    public static double divide(BigDecimal dividend, BigDecimal divisor)
+    {
+        // A quotient below 1E-325 is 0 as a double, and dividing big decimals with exponents that far apart can
+        // overflow the scale of the quotient.
+        if (dividend.signum() == 0 || exponent(divisor) - exponent(dividend) > 325)
+            return 0.0;
+        return dividend.divide(divisor, MathContext.DECIMAL64).doubleValue();
+    }
+
+    /**
+     * Returns the exponent {@code e} of the value such that {@code 10^(e-1) <= |value| < 10^e}.
+     */
+    private static long exponent(BigDecimal value)
+    {
+        return (long) value.precision() - value.scale();
+    }
 
     /**
      * @see #toBigDecimal(ByteComparable, AbstractType, Version, ByteComparable.Version)
