@@ -956,7 +956,7 @@ public class AutoRepairUtils
                     for (UUID priorityID : currentRepairStatus.priority)
                     {
                         // remove ids doesn't belong to this ring
-                        if (!hostIdsInCurrentRing.contains(priorityID))
+                        if (priorityID == null || !hostIdsInCurrentRing.contains(priorityID))
                         {
                             logger.info("{} is not part of the current ring, will be removed from priority list.", priorityID);
                             removePriorityStatus(repairType, priorityID);
@@ -1110,14 +1110,13 @@ public class AutoRepairUtils
         {
             //find hostId from IP address
             UUID hostId = StorageService.instance.getTokenMetadata().getHostId(host);
+            if (hostId == null)
+                throw new IllegalArgumentException("Unknown host " + host);
             hostIds.add(hostId);
-            if (hostId != null)
-            {
-                logger.info("Add host {} to the priority list", hostId);
-            }
         }
         if (!hostIds.isEmpty())
         {
+            logger.info("Add hosts {} to the priority list", hostIds);
             SetSerializer<UUID> serializer = SetSerializer.getInstance(UUIDSerializer.instance, UTF8Type.instance.comparatorSet);
             addPriorityHost.execute(QueryState.forInternalCalls(),
                                     QueryOptions.forInternalCalls(internalQueryCL,
@@ -1132,7 +1131,7 @@ public class AutoRepairUtils
         logger.info("Remove host {} from priority list", hostId);
         delStatementPriorityStatus.execute(QueryState.forInternalCalls(),
                                            QueryOptions.forInternalCalls(internalQueryCL,
-                                                                         Lists.newArrayList(ByteBufferUtil.bytes(hostId),
+                                                                         Lists.newArrayList(UUIDSerializer.instance.serialize(hostId),
                                                                                             ByteBufferUtil.bytes(repairType.toString()))),
                                            Dispatcher.RequestTime.forImmediateExecution());
     }
