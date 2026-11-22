@@ -24,6 +24,7 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -36,26 +37,37 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.dynamic.ClassFileLocator;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.MethodDelegation;
 import net.bytebuddy.implementation.bind.annotation.Argument;
+import net.bytebuddy.implementation.bind.annotation.RuntimeType;
 import net.bytebuddy.implementation.bind.annotation.SuperCall;
+import net.bytebuddy.pool.TypePool;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
+import org.apache.cassandra.distributed.api.SimpleQueryResult;
 import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.memory.TrieMemoryIndex;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.Message;
+import org.apache.cassandra.net.NoPayload;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.service.AbstractWriteResponseHandler;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.ReplicaWarnings;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.paxos.Paxos;
+import org.apache.cassandra.service.paxos.PaxosCommit;
+import org.apache.cassandra.service.paxos.PaxosCommitAndPrepare;
+import org.apache.cassandra.service.paxos.PaxosPrepareRefresh;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.concurrent.ConditionAsConsumer;
 
 import static net.bytebuddy.matcher.ElementMatchers.named;
 import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
@@ -64,13 +76,16 @@ import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.index.sai.NotIndexedValues.NGRAM_ANALYZER;
 import static org.apache.cassandra.index.sai.NotIndexedValues.NGRAM_VALUE;
+import static org.apache.cassandra.index.sai.NotIndexedValues.letters;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Tests that the client warnings that replicas raise while applying a write reach the client, here those of SAI
- * values that aren't indexed. In-JVM dtests have no authentication, so the coordinator doesn't check the values.
+ * Tests that the client warnings that replicas raise while applying a write, LWT commits included, reach the client,
+ * here those of SAI values that aren't indexed. In-JVM dtests have no authentication, so the coordinator doesn't check
+ * the values.
  * <p>
  * The cluster has two datacenters: nodes 1 and 2 in datacenter1, nodes 3 and 4 in datacenter2.
  */
@@ -93,7 +108,8 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
             cluster = Cluster.build(4)
                              .withDCs(2)
                              .withConfig(config -> config.with(GOSSIP, NETWORK)
-                                                         .set("materialized_views_enabled", true))
+                                                         .set("materialized_views_enabled", true)
+                                                         .set("hinted_handoff_enabled", false))
                              .withInstanceInitializer(BBHelper::install)
                              .start();
         }
@@ -114,7 +130,13 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
     public void after()
     {
         cluster.filters().reset();
-        cluster.forEach(node -> node.runOnInstance(() -> BBHelper.warnings = null));
+        cluster.forEach(node -> node.runOnInstance(() -> {
+            BBHelper.warnings = null;
+            BBHelper.timeOutCommitWaitUntilReplyFrom = null;
+            BBHelper.timedOutThread = null;
+            BBHelper.timedOutWaitFor = null;
+            BBHelper.commitRepliesFrom.clear();
+        }));
     }
 
     @Test
@@ -291,6 +313,158 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
         }));
     }
 
+    @Test
+    public void testLwt()
+    {
+        for (String variant : new String[]{ "v1", "v2" })
+        {
+            setPaxosVariant(variant);
+            String table = createTable(KS_ONE);
+            List<Integer> keys = keys(KS_ONE, table, 2, 2);
+            String warning = notIndexedWarning(KS_ONE, table);
+
+            // through a coordinator that isn't a replica, then through the replica, whose commit gives its warnings to
+            // the response handler
+            for (int i = 0; i < 2; i++)
+            {
+                int coordinator = i + 1;
+                int localHookCalls = cluster.get(2).callOnInstance(() -> BBHelper.localHookCalls.get());
+                String insert = String.format("INSERT INTO %s.%s (k, v) VALUES (?, ?) IF NOT EXISTS", KS_ONE, table);
+                assertThat(cas(coordinator, insert, ConsistencyLevel.SERIAL, ConsistencyLevel.ALL, keys.get(i), NGRAM_VALUE))
+                .as(variant + " insert through node " + coordinator).containsExactly(warning);
+
+                String update = String.format("UPDATE %s.%s SET v = ? WHERE k = ? IF EXISTS", KS_ONE, table);
+                assertThat(cas(coordinator, update, ConsistencyLevel.SERIAL, ConsistencyLevel.ALL, letters(512, 1), keys.get(i)))
+                .as(variant + " update through node " + coordinator).containsExactly(warning);
+                assertEquals(variant + " through node " + coordinator, localHookCalls + 2 * i,
+                             (int) cluster.get(2).callOnInstance(() -> BBHelper.localHookCalls.get()));
+            }
+        }
+    }
+
+    @Test
+    public void testLwtCommitTimeoutRace()
+    {
+        setPaxosVariant("v2");
+        String table = createTable(KS_THREE);
+        int key = keys(KS_THREE, table, 1, 1, 2, 3).get(0);
+        cluster.get(1).runOnInstance(() -> BBHelper.warnings = List.of("node1"));
+
+        // node 4's wait for the commit times out before node 1's reply, the last the commit needs, which is counted
+        // before the outcome is read
+        String node1 = host(1);
+        String node2 = host(2);
+        String node3 = host(3);
+        int timeouts = cluster.get(4).callOnInstance(() -> BBHelper.commitWaitTimeouts.get());
+        cluster.get(4).runOnInstance(() -> BBHelper.timeOutCommitWaitUntilReplyFrom = node1);
+        hold(Verb.PAXOS_COMMIT_RSP, 1, 4, () -> cluster.get(4).callOnInstance(() -> BBHelper.commitWaitTimeouts.get() > timeouts
+                                                                                    && BBHelper.commitRepliesFrom.contains(node2)
+                                                                                    && BBHelper.commitRepliesFrom.contains(node3)));
+
+        String insert = String.format("INSERT INTO %s.%s (k, v) VALUES (?, ?) IF NOT EXISTS", KS_THREE, table);
+        SimpleQueryResult result = cluster.coordinator(4).executeWithResult(insert, ConsistencyLevel.SERIAL, ConsistencyLevel.ALL, key, "abc");
+        assertThat(result.warnings()).containsExactly("node1");
+        assertTrue(result.hasNext());
+        assertEquals(true, result.next().get("[applied]"));
+        assertEquals(timeouts + 1, (int) cluster.get(4).callOnInstance(() -> BBHelper.commitWaitTimeouts.get()));
+    }
+
+    @Test
+    public void testLwtWarningsOverSizeLimit()
+    {
+        List<String> warnings = new ArrayList<>();
+        for (int i = 0; i < ReplicaWarnings.MAX_WARNINGS; i++)
+            warnings.add(String.format("%02d", i) + "x".repeat(ReplicaWarnings.MAX_WARNING_BYTES - 2));
+        cluster.get(2).runOnInstance(() -> BBHelper.warnings = warnings);
+
+        for (String variant : new String[]{ "v1", "v2" })
+        {
+            setPaxosVariant(variant);
+            String table = createTable(KS_ONE);
+            int key = keys(KS_ONE, table, 1, 2).get(0);
+            String insert = String.format("INSERT INTO %s.%s (k, v) VALUES (?, ?) IF NOT EXISTS", KS_ONE, table);
+            assertThat(cas(1, insert, ConsistencyLevel.SERIAL, ConsistencyLevel.ALL, key, "abc"))
+            .as(variant).containsExactlyElementsOf(warnings.subList(0, 3));
+        }
+    }
+
+    @Test
+    public void testLwtRecoveredProposal()
+    {
+        for (String variant : new String[]{ "v1", "v2" })
+        {
+            setPaxosVariant(variant);
+            String table = createTable(KS_THREE);
+            int key = keys(KS_THREE, table, 1, 1, 2, 3).get(0);
+
+            // client A's commit doesn't reach the replicas
+            cluster.filters().verbs(Verb.PAXOS_COMMIT_REQ.id, Verb.PAXOS2_COMMIT_REMOTE_REQ.id).from(4).to(1, 2, 3).drop();
+            String insert = String.format("INSERT INTO %s.%s (k, v) VALUES (?, ?) IF NOT EXISTS", KS_THREE, table);
+            assertThatThrownBy(() -> cas(4, insert, ConsistencyLevel.SERIAL, ConsistencyLevel.QUORUM, key, NGRAM_VALUE))
+            .as(variant).satisfies(e -> assertThat(e.getClass().getSimpleName()).contains("Timeout"));
+            cluster.filters().reset();
+            String select = String.format("SELECT k FROM %s.%s WHERE k = ?", KS_THREE, table);
+            for (int node = 1; node <= 3; node++)
+                assertEquals(variant, 0, cluster.get(node).executeInternal(select, key).length);
+
+            // client B's read finishes A's proposal, whose warnings aren't B's
+            int captured = capturedNotIndexedWarnings();
+            int discards = cluster.get(1).callOnInstance(() -> BBHelper.discardCalls.get());
+            int commitAndPrepares = cluster.get(1).callOnInstance(() -> BBHelper.commitAndPrepareCalls.get());
+            SimpleQueryResult result = cluster.coordinator(1).executeWithResult(select, ConsistencyLevel.SERIAL, key);
+            assertThat(result.warnings()).as(variant).isEmpty();
+            assertTrue(variant, result.hasNext());
+            assertThat(capturedNotIndexedWarnings()).as(variant).isGreaterThan(captured);
+            if (variant.equals("v1"))
+                assertThat((int) cluster.get(1).callOnInstance(() -> BBHelper.discardCalls.get())).isGreaterThan(discards);
+            else
+                assertThat((int) cluster.get(1).callOnInstance(() -> BBHelper.commitAndPrepareCalls.get())).isGreaterThan(commitAndPrepares);
+        }
+    }
+
+    @Test
+    public void testLwtRefresh()
+    {
+        setPaxosVariant("v2");
+        String table = createTable(KS_THREE);
+        int key = keys(KS_THREE, table, 1, 1, 2, 3).get(0);
+
+        // only node 2 gets the commit
+        cluster.filters().verbs(Verb.PAXOS_COMMIT_REQ.id).from(2).to(1, 3).drop();
+        String insert = String.format("INSERT INTO %s.%s (k, v) VALUES (?, ?) IF NOT EXISTS", KS_THREE, table);
+        cas(2, insert, ConsistencyLevel.SERIAL, ConsistencyLevel.ONE, key, NGRAM_VALUE);
+        cluster.filters().reset();
+
+        // a CAS that applies nothing, whose prepare quorum is nodes 1 and 2, so node 1 refreshes itself
+        cluster.filters().verbs(Verb.PAXOS2_PREPARE_RSP.id).from(3).to(1).drop();
+        int refreshes = cluster.get(1).callOnInstance(() -> BBHelper.refreshCalls.get());
+        int warnings = cluster.get(1).callOnInstance(() -> BBHelper.notIndexedWarnings.get());
+        String update = String.format("UPDATE %s.%s SET v = 'abc' WHERE k = ? IF v = 'other'", KS_THREE, table);
+        assertThat(cas(1, update, ConsistencyLevel.SERIAL, ConsistencyLevel.ONE, key)).isEmpty();
+
+        assertThat((int) cluster.get(1).callOnInstance(() -> BBHelper.refreshCalls.get())).isGreaterThan(refreshes);
+        assertThat((int) cluster.get(1).callOnInstance(() -> BBHelper.notIndexedWarnings.get())).isGreaterThan(warnings);
+        assertEquals(1, cluster.get(1).executeInternal(String.format("SELECT k FROM %s.%s WHERE k = ?", KS_THREE, table), key).length);
+    }
+
+    @Test
+    public void testLwtCommitInRemoteDatacenter()
+    {
+        setPaxosVariant("v2");
+        String table = createTable(KS_FOUR);
+        List<Integer> keys = keys(KS_FOUR, table, 2, 1, 2, 3, 4);
+        cluster.get(3).runOnInstance(() -> BBHelper.warnings = List.of("datacenter2"));
+        cluster.get(4).runOnInstance(() -> BBHelper.warnings = List.of("datacenter2"));
+        String insert = String.format("INSERT INTO %s.%s (k, v) VALUES (?, ?) IF NOT EXISTS", KS_FOUR, table);
+
+        assertThat(cas(1, insert, ConsistencyLevel.LOCAL_SERIAL, ConsistencyLevel.ALL, keys.get(0), "abc")).containsExactly("datacenter2");
+
+        // node 2 answers once a datacenter2 reply was processed, which doesn't count
+        int remoteHookCalls = cluster.get(1).callOnInstance(() -> BBHelper.remoteDcHookCalls.get());
+        hold(Verb.PAXOS_COMMIT_RSP, 2, 1, () -> cluster.get(1).callOnInstance(() -> BBHelper.remoteDcHookCalls.get()) > remoteHookCalls);
+        assertThat(cas(1, insert, ConsistencyLevel.LOCAL_SERIAL, ConsistencyLevel.LOCAL_QUORUM, keys.get(1), "abc")).isEmpty();
+    }
+
     // creates a table with an n-gram index on v, named <table>_idx
     private static String createTable(String keyspace)
     {
@@ -312,6 +486,29 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
         return cluster.coordinator(coordinator)
                       .executeWithResult(String.format("INSERT INTO %s.%s (k, v) VALUES (?, ?)", keyspace, table), cl, key, value)
                       .warnings();
+    }
+
+    private static List<String> cas(int coordinator, String query, ConsistencyLevel serial, ConsistencyLevel commit, Object... values)
+    {
+        return cluster.coordinator(coordinator).executeWithResult(query, serial, commit, values).warnings();
+    }
+
+    private static String host(int node)
+    {
+        return cluster.get(node).broadcastAddress().getAddress().getHostAddress();
+    }
+
+    private static void setPaxosVariant(String variant)
+    {
+        cluster.forEach(node -> node.runOnInstance(() -> Paxos.setPaxosVariant(Config.PaxosVariant.valueOf(variant))));
+    }
+
+    private static int capturedNotIndexedWarnings()
+    {
+        int captured = 0;
+        for (int node = 1; node <= 4; node++)
+            captured += cluster.get(node).callOnInstance(() -> BBHelper.capturedNotIndexedWarnings.get());
+        return captured;
     }
 
     private static List<String> execute(int coordinator, String query, ConsistencyLevel cl)
@@ -363,6 +560,19 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
         public static volatile List<String> warnings;
         public static final AtomicInteger localHookCalls = new AtomicInteger();
         public static final AtomicInteger remoteDcHookCalls = new AtomicInteger();
+        public static final AtomicInteger discardCalls = new AtomicInteger();
+        public static final AtomicInteger commitAndPrepareCalls = new AtomicInteger();
+        public static final AtomicInteger refreshCalls = new AtomicInteger();
+        public static final AtomicInteger notIndexedWarnings = new AtomicInteger();
+        public static final AtomicInteger capturedNotIndexedWarnings = new AtomicInteger();
+
+        // the next wait for a Paxos commit times out, and its outcome is read once this node processed a commit reply
+        // from that host
+        public static volatile String timeOutCommitWaitUntilReplyFrom;
+        public static final AtomicInteger commitWaitTimeouts = new AtomicInteger();
+        public static final Set<String> commitRepliesFrom = ConcurrentHashMap.newKeySet();
+        static volatile Thread timedOutThread;
+        static volatile String timedOutWaitFor;
 
         @SuppressWarnings("resource")
         public static void install(ClassLoader classLoader, Integer node)
@@ -378,8 +588,54 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
                            .intercept(MethodDelegation.to(LocalHook.class))
                            .method(named("addReplicaWarnings").and(takesArguments(Message.class)))
                            .intercept(MethodDelegation.to(RemoteHook.class))
+                           .method(named("discardReplicaWarnings"))
+                           .intercept(MethodDelegation.to(DiscardHook.class))
                            .make()
                            .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+
+            new ByteBuddy().rebase(IndexContext.class)
+                           .method(named("warnNotIndexed"))
+                           .intercept(MethodDelegation.to(NotIndexedHook.class))
+                           .make()
+                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+
+            new ByteBuddy().rebase(PaxosCommitAndPrepare.RequestHandler.class)
+                           .method(named("execute"))
+                           .intercept(MethodDelegation.to(CommitAndPrepareHook.class))
+                           .make()
+                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+
+            new ByteBuddy().rebase(PaxosPrepareRefresh.RequestHandler.class)
+                           .method(named("execute"))
+                           .intercept(MethodDelegation.to(RefreshHook.class))
+                           .make()
+                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+
+            new ByteBuddy().rebase(PaxosCommit.class)
+                           .method(named("onResponse").and(takesArguments(NoPayload.class, InetAddressAndPort.class)))
+                           .intercept(MethodDelegation.to(CommitReplyHook.class))
+                           .method(named("status"))
+                           .intercept(MethodDelegation.to(CommitStatusHook.class))
+                           .make()
+                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+
+            new ByteBuddy().rebase(ConditionAsConsumer.Async.class)
+                           .method(named("awaitUntil"))
+                           .intercept(MethodDelegation.to(CommitWaitHook.class))
+                           .make()
+                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+
+            TypePool.Resolution async = TypePool.Default.of(classLoader).describe(PaxosCommit.class.getName() + "$Async");
+            if (async.isResolved())
+            {
+                new ByteBuddy().rebase(async.resolve(), ClassFileLocator.ForClassLoader.of(classLoader))
+                               .method(named("addReplicaWarnings").and(takesArguments(List.class)))
+                               .intercept(MethodDelegation.to(LocalHook.class))
+                               .method(named("addReplicaWarnings").and(takesArguments(Message.class)))
+                               .intercept(MethodDelegation.to(RemoteHook.class))
+                               .make()
+                               .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
+            }
         }
     }
 
@@ -415,6 +671,102 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
             String datacenter = DatabaseDescriptor.getEndpointSnitch().getDatacenter(response.from());
             if (!datacenter.equals(DatabaseDescriptor.getLocalDataCenter()))
                 BBHelper.remoteDcHookCalls.incrementAndGet();
+        }
+    }
+
+    public static class DiscardHook
+    {
+        @SuppressWarnings("unused")
+        public static void discardReplicaWarnings(@SuperCall Callable<?> zuper) throws Exception
+        {
+            zuper.call();
+            BBHelper.discardCalls.incrementAndGet();
+        }
+    }
+
+    public static class NotIndexedHook
+    {
+        @SuppressWarnings("unused")
+        public static void warnNotIndexed(@SuperCall Callable<?> zuper) throws Exception
+        {
+            BBHelper.notIndexedWarnings.incrementAndGet();
+            if (ReplicaWarnings.isCapturing())
+                BBHelper.capturedNotIndexedWarnings.incrementAndGet();
+            zuper.call();
+        }
+    }
+
+    public static class CommitAndPrepareHook
+    {
+        @RuntimeType
+        @SuppressWarnings("unused")
+        public static Object execute(@SuperCall Callable<?> zuper) throws Exception
+        {
+            BBHelper.commitAndPrepareCalls.incrementAndGet();
+            return zuper.call();
+        }
+    }
+
+    public static class RefreshHook
+    {
+        @RuntimeType
+        @SuppressWarnings("unused")
+        public static Object execute(@SuperCall Callable<?> zuper) throws Exception
+        {
+            BBHelper.refreshCalls.incrementAndGet();
+            return zuper.call();
+        }
+    }
+
+    public static class CommitReplyHook
+    {
+        @SuppressWarnings("unused")
+        public static void onResponse(@Argument(1) InetAddressAndPort from, @SuperCall Callable<?> zuper) throws Exception
+        {
+            zuper.call();
+            BBHelper.commitRepliesFrom.add(from.getAddress().getHostAddress());
+        }
+    }
+
+    public static class CommitWaitHook
+    {
+        // the wait for a Paxos commit returns as timed out, when armed
+        @RuntimeType
+        @SuppressWarnings("unused")
+        public static Object awaitUntil(@SuperCall Callable<?> zuper) throws Exception
+        {
+            String waitFor = BBHelper.timeOutCommitWaitUntilReplyFrom;
+            if (waitFor == null || !inPaxosCommit())
+                return zuper.call();
+
+            BBHelper.timeOutCommitWaitUntilReplyFrom = null;
+            BBHelper.timedOutWaitFor = waitFor;
+            BBHelper.timedOutThread = Thread.currentThread();
+            BBHelper.commitWaitTimeouts.incrementAndGet();
+            return false;
+        }
+
+        private static boolean inPaxosCommit()
+        {
+            return StackWalker.getInstance().walk(frames -> frames.anyMatch(f -> f.getClassName().startsWith(PaxosCommit.class.getName() + '$')));
+        }
+    }
+
+    public static class CommitStatusHook
+    {
+        // after a timed out wait, the outcome is read once the awaited reply was processed
+        @RuntimeType
+        @SuppressWarnings("unused")
+        public static Object status(@SuperCall Callable<?> zuper) throws Exception
+        {
+            if (Thread.currentThread() == BBHelper.timedOutThread)
+            {
+                BBHelper.timedOutThread = null;
+                long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+                while (!BBHelper.commitRepliesFrom.contains(BBHelper.timedOutWaitFor) && System.nanoTime() < deadline)
+                    FBUtilities.sleepQuietly(10);
+            }
+            return zuper.call();
         }
     }
 }

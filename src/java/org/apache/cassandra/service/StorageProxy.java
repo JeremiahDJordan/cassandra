@@ -886,7 +886,7 @@ public class StorageProxy implements StorageProxyMBean
         try
         {
             MutatorProvider.notifyCasCommit(proposal, consistencyForCommit, origin);
-            commitPaxos(proposal, consistencyForCommit, allowHints, requestTime, casMetrics);
+            commitPaxos(proposal, consistencyForCommit, allowHints, requestTime, casMetrics, origin);
         }
         catch (RuntimeException e)
         {
@@ -1160,11 +1160,14 @@ public class StorageProxy implements StorageProxyMBean
 
     @Nullable
     private static void commitPaxos(Commit proposal, ConsistencyLevel consistencyLevel, boolean allowHints, Dispatcher.RequestTime requestTime,
-                                    CASClientRequestMetrics casMetrics) throws WriteTimeoutException
+                                    CASClientRequestMetrics casMetrics, Mutator.CasCommitOrigin origin) throws WriteTimeoutException
     {
         long startTimeNanos = Clock.Global.nanoTime();
         boolean shouldBlock = consistencyLevel != ConsistencyLevel.ANY;
         AbstractWriteResponseHandler<Commit> responseHandler = mutator.mutatePaxos(proposal, consistencyLevel, allowHints, requestTime);
+        // the warnings of another proposer's commit aren't for this request's client
+        if (responseHandler != null && origin != Mutator.CasCommitOrigin.CLIENT_OPERATION)
+            responseHandler.discardReplicaWarnings();
         if (shouldBlock && responseHandler != null)
         {
             try
@@ -1245,7 +1248,18 @@ public class StorageProxy implements StorageProxyMBean
                 try
                 {
                     // WRITE_EXECUTION_TIME is tracked in PaxosState.applyCommit and SystemKeyspace.savePaxosCommit
-                    PaxosState.commitDirect(message.payload, p -> mutator.onAppliedProposal(p));
+                    Object previousWarnings = ReplicaWarnings.capture();
+                    try
+                    {
+                        PaxosState.commitDirect(message.payload, p -> mutator.onAppliedProposal(p));
+                    }
+                    finally
+                    {
+                        List<String> warnings = ReplicaWarnings.drain();
+                        ReplicaWarnings.restore(previousWarnings);
+                        if (warnings != null && responseHandler != null)
+                            responseHandler.addReplicaWarnings(warnings);
+                    }
                     if (responseHandler != null)
                         responseHandler.onResponse(null);
                 }

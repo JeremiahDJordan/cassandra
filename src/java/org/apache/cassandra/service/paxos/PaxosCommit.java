@@ -18,7 +18,9 @@
 
 package org.apache.cassandra.service.paxos;
 
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
+import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.Set;
 import java.util.function.Consumer;
 
@@ -48,6 +50,7 @@ import org.apache.cassandra.sensors.RequestTracker;
 import org.apache.cassandra.sensors.SensorsCustomParams;
 import org.apache.cassandra.sensors.SensorsFactory;
 import org.apache.cassandra.sensors.Type;
+import org.apache.cassandra.service.ReplicaWarnings;
 import org.apache.cassandra.service.paxos.Paxos.Participants;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.concurrent.ConditionAsConsumer;
@@ -163,33 +166,61 @@ public class PaxosCommit<OnDone extends Consumer<? super PaxosCommit.Status>> ex
      */
     static Paxos.Async<Status> commit(Agreed commit, Participants participants, ConsistencyLevel consistencyForConsensus, ConsistencyLevel consistencyForCommit, /** @deprecated See CASSANDRA-17164 */ @Deprecated(since = "4.1") boolean allowHints)
     {
-        // to avoid unnecessary object allocations we extend PaxosPropose to implements Paxos.Async
-        class Async extends PaxosCommit<ConditionAsConsumer<Status>> implements Paxos.Async<Status>
-        {
-            private Async(Agreed commit, boolean allowHints, ConsistencyLevel consistencyForConsensus, ConsistencyLevel consistencyForCommit, Participants participants)
-            {
-                super(commit, allowHints, consistencyForConsensus, consistencyForCommit, participants, newConditionAsConsumer());
-            }
-
-            public Status awaitUntil(long deadline)
-            {
-                try
-                {
-                    onDone.awaitUntil(deadline);
-                }
-                catch (InterruptedException e)
-                {
-                    Thread.currentThread().interrupt();
-                    return new Status(new Paxos.MaybeFailure(true, replicas.size(), required, 0, emptyMap()));
-                }
-
-                return status();
-            }
-        }
-
         Async async = new Async(commit, allowHints, consistencyForConsensus, consistencyForCommit, participants);
         async.start(participants, false);
         return async;
+    }
+
+    // to avoid unnecessary object allocations we extend PaxosCommit to implement Paxos.Async
+    private static final class Async extends PaxosCommit<ConditionAsConsumer<Status>> implements Paxos.Async<Status>
+    {
+        private static final AtomicReferenceFieldUpdater<Async, ReplicaWarnings.Received> replicaWarningsUpdater =
+            AtomicReferenceFieldUpdater.newUpdater(Async.class, ReplicaWarnings.Received.class, "replicaWarnings");
+        private volatile ReplicaWarnings.Received replicaWarnings;
+
+        private Async(Agreed commit, boolean allowHints, ConsistencyLevel consistencyForConsensus, ConsistencyLevel consistencyForCommit, Participants participants)
+        {
+            super(commit, allowHints, consistencyForConsensus, consistencyForCommit, participants, newConditionAsConsumer());
+        }
+
+        public Status awaitUntil(long deadline)
+        {
+            try
+            {
+                onDone.awaitUntil(deadline);
+                // the status counts replies that have added their warnings, so it's read before closing
+                return status();
+            }
+            catch (InterruptedException e)
+            {
+                Thread.currentThread().interrupt();
+                return new Status(new Paxos.MaybeFailure(true, replicas.size(), required, 0, emptyMap()));
+            }
+            finally
+            {
+                ReplicaWarnings.publish(ReplicaWarnings.close(replicaWarningsUpdater, this));
+            }
+        }
+
+        @Override
+        protected void beforeDone()
+        {
+            ReplicaWarnings.seal(replicaWarningsUpdater, this);
+        }
+
+        @Override
+        public void addReplicaWarnings(Message<?> response)
+        {
+            byte[] encoded = ReplicaWarnings.encoded(response);
+            if (encoded != null && waitingFor(response.from()))
+                ReplicaWarnings.keep(replicaWarningsUpdater, this, encoded);
+        }
+
+        @Override
+        public void addReplicaWarnings(List<String> warnings)
+        {
+            ReplicaWarnings.keep(replicaWarningsUpdater, this, warnings);
+        }
     }
 
     /**
@@ -269,7 +300,7 @@ public class PaxosCommit<OnDone extends Consumer<? super PaxosCommit.Status>> ex
      */
     public void executeOnSelf()
     {
-        executeOnSelf(commit, RequestHandler::execute);
+        executeOnSelf(commit, RequestHandler::execute, true);
     }
 
     @Override
@@ -287,15 +318,36 @@ public class PaxosCommit<OnDone extends Consumer<? super PaxosCommit.Status>> ex
      */
     private void response(boolean success, InetAddressAndPort from)
     {
-        if (consistencyForCommit.isDatacenterLocal() && !InOurDc.endpoints().test(from))
+        if (!waitingFor(from))
             return;
 
         long responses = responsesUpdater.addAndGet(this, success ? 0x1L : 0x100000000L);
         // next two clauses mutually exclusive to ensure we only invoke onDone once, when either failed or succeeded
         if (accepts(responses) == required) // if we have received _precisely_ the required accepts, we have succeeded
+        {
+            beforeDone();
             onDone.accept(status());
+        }
         else if (replicas.size() - failures(responses) == required - 1) // if we are _unable_ to receive the required accepts, we have failed
+        {
+            beforeDone();
             onDone.accept(status());
+        }
+    }
+
+    /**
+     * Whether the response of {@code from} counts for the consistency of the commit.
+     */
+    boolean waitingFor(InetAddressAndPort from)
+    {
+        return !consistencyForCommit.isDatacenterLocal() || InOurDc.endpoints().test(from);
+    }
+
+    /**
+     * Called on the thread of the response that gives the final outcome of the commit, right before {@code onDone}.
+     */
+    protected void beforeDone()
+    {
     }
 
     /**
@@ -345,7 +397,18 @@ public class PaxosCommit<OnDone extends Consumer<? super PaxosCommit.Status>> ex
 
             // WRITE_EXECUTION_TIME is tracked in PaxosState.applyCommit (user-table apply) and
             // SystemKeyspace.savePaxosCommit (system.paxos write) separately, covering the full commit work.
-            NoPayload response = execute(message.payload, message.from());
+            NoPayload response;
+            List<String> warnings;
+            Object previousWarnings = ReplicaWarnings.capture();
+            try
+            {
+                response = execute(message.payload, message.from());
+            }
+            finally
+            {
+                warnings = ReplicaWarnings.drain();
+                ReplicaWarnings.restore(previousWarnings);
+            }
 
             if (response != null)
             {
@@ -353,6 +416,7 @@ public class PaxosCommit<OnDone extends Consumer<? super PaxosCommit.Status>> ex
                 // no need to calculate outbound internode bytes because the response is NoPayload
                 sensors.syncAllSensors();
                 SensorsCustomParams.addSensorsToInternodeResponse(sensors, reply);
+                ReplicaWarnings.addToResponse(warnings, reply, message.from());
                 MessagingService.instance().send(reply.build(), message.from());
             }
             else

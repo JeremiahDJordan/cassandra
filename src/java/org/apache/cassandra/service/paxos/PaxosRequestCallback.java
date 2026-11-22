@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.service.paxos;
 
+import java.util.List;
 import java.util.function.BiFunction;
 
 import org.slf4j.Logger;
@@ -29,6 +30,7 @@ import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.service.FailureRecordingCallback;
+import org.apache.cassandra.service.ReplicaWarnings;
 
 import static org.apache.cassandra.exceptions.RequestFailureReason.TIMEOUT;
 import static org.apache.cassandra.exceptions.RequestFailureReason.UNKNOWN;
@@ -49,24 +51,51 @@ public abstract class PaxosRequestCallback<T> extends FailureRecordingCallback<T
 
     protected <I> void executeOnSelf(I parameter, BiFunction<I, InetAddressAndPort, T> execute)
     {
-        T response;
+        executeOnSelf(parameter, execute, false);
+    }
+
+    /**
+     * @param captureWarnings whether the client warnings the execution raises go to
+     *                        {@link #addReplicaWarnings(List)}, before the response or failure
+     */
+    protected <I> void executeOnSelf(I parameter, BiFunction<I, InetAddressAndPort, T> execute, boolean captureWarnings)
+    {
+        T response = null;
+        Exception failure = null;
+        List<String> warnings = null;
+        Object previousWarnings = captureWarnings ? ReplicaWarnings.capture() : null;
         try
         {
             response = execute.apply(parameter, getBroadcastAddressAndPort());
-            if (response == null)
-                return;
         }
         catch (Exception ex)
         {
+            failure = ex;
+        }
+        finally
+        {
+            if (captureWarnings)
+            {
+                warnings = ReplicaWarnings.drain();
+                ReplicaWarnings.restore(previousWarnings);
+            }
+        }
+
+        if (warnings != null)
+            addReplicaWarnings(warnings);
+
+        if (failure != null)
+        {
             RequestFailureReason reason = UNKNOWN;
-            if (ex instanceof WriteTimeoutException) reason = TIMEOUT;
-            else logger.error("Failed to apply {} locally", parameter, ex);
+            if (failure instanceof WriteTimeoutException) reason = TIMEOUT;
+            else logger.error("Failed to apply {} locally", parameter, failure);
 
             onFailure(getBroadcastAddressAndPort(), reason);
             return;
         }
 
-        onResponse(response, getBroadcastAddressAndPort());
+        if (response != null)
+            onResponse(response, getBroadcastAddressAndPort());
     }
 
     static boolean shouldExecuteOnSelf(InetAddressAndPort replica)

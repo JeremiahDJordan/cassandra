@@ -42,6 +42,7 @@ import org.apache.cassandra.sensors.RequestTracker;
 import org.apache.cassandra.sensors.SensorsCustomParams;
 import org.apache.cassandra.sensors.SensorsFactory;
 import org.apache.cassandra.sensors.Type;
+import org.apache.cassandra.service.ReplicaWarnings;
 import org.apache.cassandra.service.paxos.Commit.Agreed;
 import org.apache.cassandra.service.paxos.Commit.Committed;
 import org.apache.cassandra.tracing.Tracing;
@@ -216,7 +217,16 @@ public class PaxosPrepareRefresh implements RequestCallbackWithFailure<PaxosPrep
             try (PaxosState state = PaxosState.get(commit))
             {
                 // The refreshing peer is where this apply came from -- possibly another datacenter.
-                state.commit(commit, WriteOrigin.fromPeer(from));
+                // the commit is another proposer's, whose client isn't this request's
+                Object previousWarnings = ReplicaWarnings.capture();
+                try
+                {
+                    state.commit(commit, WriteOrigin.fromPeer(from));
+                }
+                finally
+                {
+                    ReplicaWarnings.restore(previousWarnings);
+                }
                 Ballot latest = state.current(request.promised).latestWitnessedOrLowBound();
                 if (isAfter(latest, request.promised))
                 {

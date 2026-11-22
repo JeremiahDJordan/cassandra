@@ -468,6 +468,24 @@ public class WriteResponseHandlerTest
     }
 
     @Test
+    public void testDiscardedReplicaWarnings()
+    {
+        // discarded before any reply
+        AbstractWriteResponseHandler<?> awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_QUORUM);
+        awr.discardReplicaWarnings();
+        respond(awr, createDummyMessage(0, "a"));
+        respond(awr, createDummyMessage(1, "b"));
+        assertThat(publishedWarnings(awr)).isNull();
+
+        // discarded after a reply
+        awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.LOCAL_QUORUM);
+        respond(awr, createDummyMessage(0, "a"));
+        awr.discardReplicaWarnings();
+        respond(awr, createDummyMessage(1, "b"));
+        assertThat(publishedWarnings(awr)).isNull();
+    }
+
+    @Test
     public void testBatchlogResponseHandlerReplicaWarnings()
     {
         AbstractWriteResponseHandler<?> wrapped = createWriteResponseHandler(ConsistencyLevel.ALL, ConsistencyLevel.ALL);

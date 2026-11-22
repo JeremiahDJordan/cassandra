@@ -435,6 +435,14 @@ public abstract class AbstractWriteResponseHandler<T> implements RequestCallback
         ReplicaWarnings.keep(replicaWarningsUpdater, this, warnings);
     }
 
+    /**
+     * Drops the replica warnings this handler received and will receive, for a write that isn't the client's.
+     */
+    public void discardReplicaWarnings()
+    {
+        ReplicaWarnings.discard(replicaWarningsUpdater, this);
+    }
+
     @Override
     public void accumulateExecutionTimeSensor(Context context, Type type, double value)
     {
