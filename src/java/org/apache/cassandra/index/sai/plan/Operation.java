@@ -249,7 +249,7 @@ public class Operation
     /**
      * Returns the single token a non-tokenizing analyzer makes of a literal, {@code null} if none.
      */
-    private static ByteBuffer analyzeLiteral(AbstractAnalyzer.AnalyzerFactory analyzerFactory, ByteBuffer literal)
+    static ByteBuffer analyzeLiteral(AbstractAnalyzer.AnalyzerFactory analyzerFactory, ByteBuffer literal)
     {
         AbstractAnalyzer analyzer = analyzerFactory.create();
         try
@@ -370,6 +370,25 @@ public class Operation
 
         abstract Plan.KeysIteration plan(QueryController controller);
 
+        /**
+         * Whether the plan searches the indexes of this node, by the rules the coordinator validates the query with
+         * (see {@code StorageAttachedIndexQueryPlan#searchesIndexes}): a conjunction with an index scanned expression,
+         * or a disjunction where every expression is index scanned and every nested operation uses the indexes.
+         */
+        boolean usesIndexes(QueryController controller)
+        {
+            if (expressionMap != null)
+            {
+                for (Expression expression : expressionMap.values())
+                    if (controller.isIndexScanned(expression))
+                        return true;
+            }
+            for (Node child : children())
+                if (child.canFilter() && child.usesIndexes(controller))
+                    return true;
+            return false;
+        }
+
         static Node buildTree(QueryController controller, List<RowFilter.Expression> expressions, List<RowFilter.FilterElement> children, boolean isDisjunction)
         {
             OperatorNode node = isDisjunction ? new OrNode() : new AndNode();
@@ -397,13 +416,7 @@ public class Operation
                     // a null element (which a coordinator of another version can send) matches nothing
                     int length = ByteBufferAccessor.instance.getInt(expression.getIndexValue(), offset);
                     if (length >= 0)
-                        node.add(new ExpressionNode(new RowFilter.SimpleExpression(expression.column(),
-                                                                                   Operator.EQ,
-                                                                                   ListSerializer.readValue(expression.getIndexValue(),
-                                                                                                            ByteBufferAccessor.instance,
-                                                                                                            offset),
-                                                                                   expression.analyzer(),
-                                                                                   expression.annOptions())));
+                        node.add(new ExpressionNode(inElement(expression, offset)));
                     offset += TypeSizes.INT_SIZE + Math.max(0, length);
                 }
                 if (node.children().size() == 1)
@@ -426,6 +439,33 @@ public class Operation
             }
             else
                 return new ExpressionNode(expression);
+        }
+
+        /**
+         * Returns the equality to the first element of an IN restriction, which is searched like those to its other
+         * elements (see {@link #buildExpression}), or {@code null} if it has no element, as it then matches nothing.
+         */
+        static RowFilter.Expression firstInElement(RowFilter.Expression expression)
+        {
+            int size = ListSerializer.readCollectionSize(expression.getIndexValue(), ByteBufferAccessor.instance);
+            int offset = ListSerializer.sizeOfCollectionSize();
+            for (int index = 0; index < size; index++)
+            {
+                int length = ByteBufferAccessor.instance.getInt(expression.getIndexValue(), offset);
+                if (length >= 0)
+                    return inElement(expression, offset);
+                offset += TypeSizes.INT_SIZE;
+            }
+            return null;
+        }
+
+        private static RowFilter.Expression inElement(RowFilter.Expression expression, int offset)
+        {
+            return new RowFilter.SimpleExpression(expression.column(),
+                                                  Operator.EQ,
+                                                  ListSerializer.readValue(expression.getIndexValue(), ByteBufferAccessor.instance, offset),
+                                                  expression.analyzer(),
+                                                  expression.annOptions());
         }
 
         Node analyzeTree(QueryController controller)
@@ -566,6 +606,33 @@ public class Operation
         }
 
         @Override
+        boolean usesIndexes(QueryController controller)
+        {
+            if (!canFilter())
+                return false;
+            if (expressionMap != null)
+            {
+                for (Expression expression : expressionMap.values())
+                    if (!controller.isIndexScanned(expression))
+                        return false;
+            }
+            for (Node child : children())
+                if (child.canFilter() && !child.usesIndexes(controller))
+                    return false;
+            return true;
+        }
+
+        @Override
+        Plan.KeysIteration plan(QueryController controller)
+        {
+            // the rows come from the other indexes of the query, and are filtered (without searching the indexes of
+            // this disjunction, whose expressions the coordinator doesn't validate for an index search)
+            if (!usesIndexes(controller))
+                return controller.planFactory.everything;
+            return super.plan(controller);
+        }
+
+        @Override
         public String toString()
         {
             return "OrNode";
@@ -636,6 +703,12 @@ public class Operation
         FilterTree filterTree(QueryController controller, boolean isStrict)
         {
             return EMPTY_TREE;
+        }
+
+        @Override
+        boolean usesIndexes(QueryController controller)
+        {
+            return true;
         }
 
         @Override

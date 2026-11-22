@@ -1079,9 +1079,10 @@ public abstract class SingleColumnRestriction implements SingleRestriction
             filter.checkOnce(LikeRestriction.class,
                              () -> checkReplicasSupportLike(columnDef, options.getConsistency()));
 
-            // whatever index serves it, the rows are filtered with the pattern (Operator#isSatisfiedBy): reject a
-            // pattern that can't be compiled here rather than on the replicas
-            if (operation.left != Operator.LIKE_PREFIX)
+            // the rows are filtered with the automaton of a LIKE_MATCHES pattern: reject one that can't be compiled here
+            // rather than on the replicas (an index searching with the automaton of a suffix or contains literal is
+            // checked by its query plan, see StorageAttachedIndexQueryPlan#validate)
+            if (operation.left == Operator.LIKE_MATCHES)
                 LikePatterns.forPatternOperator(operation.left, operation.right, columnDef.name);
         }
 

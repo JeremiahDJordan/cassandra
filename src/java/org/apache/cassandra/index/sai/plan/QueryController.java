@@ -539,7 +539,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         // matches in unrepaired data before building the plan, as the post-filtering depends on it, and the plan
         // optimizer might not use the index scans that would tell us.
         if (!usesStrictFiltering())
-            detectUnrepairedMatches(tree);
+            detectUnrepairedMatches(tree, true);
 
         whereKeysPlan = tree.plan(this);
 
@@ -934,10 +934,13 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * indexes on unrepaired SSTables; the searches are kept for the execution of the plan. Negations are searched
      * without subtracting (see {@link IndexContext#canSubtractMatches}): a stale entry could hide a matching key.
      */
-    private void detectUnrepairedMatches(Operation.Node node)
+    private void detectUnrepairedMatches(Operation.Node node, boolean searched)
     {
         if (queryContext.hasUnrepairedMatches())
             return;
+
+        // the plan doesn't search the indexes of a disjunction that doesn't use them (see Operation.OrNode#plan)
+        searched &= !(node instanceof Operation.OrNode) || node.usesIndexes(this);
 
         if (node.expressionMap != null)
         {
@@ -946,6 +949,18 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
                 // ORDER BY expressions are not filters, and their queries are always strict
                 if (expression.getOp() == Expression.Op.ORDER_BY)
                     continue;
+
+                // The automaton of a suffix or contains literal that the plan doesn't search may not compile (see
+                // StorageAttachedIndexQueryPlan#validatePatterns): any unrepaired data of its index may match.
+                if (!searched && isLiteralPattern(expression))
+                {
+                    if (hasUnrepairedData(expression.context))
+                    {
+                        queryContext.markUnrepairedMatches();
+                        return;
+                    }
+                    continue;
+                }
 
                 KeyRangeIterator iterator = buildIterator(expression, Plan.DataScope.UNREPAIRED, false);
                 keyIterators.put(Pair.create(expression, Plan.DataScope.UNREPAIRED), iterator);
@@ -961,7 +976,24 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         }
 
         for (Operation.Node child : node.children())
-            detectUnrepairedMatches(child);
+            detectUnrepairedMatches(child, searched);
+    }
+
+    private static boolean isLiteralPattern(Expression expression)
+    {
+        return expression.getOp() == Expression.Op.AUTOMATON
+               && (expression.getPatternOperator() == Operator.LIKE_SUFFIX || expression.getPatternOperator() == Operator.LIKE_CONTAINS);
+    }
+
+    private boolean hasUnrepairedData(IndexContext context)
+    {
+        QueryView unrepaired = getQueryView(context).forScope(Plan.DataScope.UNREPAIRED);
+        if (!unrepaired.sstableIndexes.isEmpty())
+            return true;
+        for (MemtableIndex index : unrepaired.memtableIndexes)
+            if (!index.isEmpty())
+                return true;
+        return false;
     }
 
     @Override

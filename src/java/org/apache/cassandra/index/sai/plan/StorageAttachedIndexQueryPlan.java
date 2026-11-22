@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.index.sai.plan;
 
+import java.nio.ByteBuffer;
 import java.util.HashSet;
 import java.util.Optional;
 import java.util.Set;
@@ -26,6 +27,8 @@ import javax.annotation.Nullable;
 import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.LikePatterns;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.ReadCommand;
@@ -276,6 +279,7 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
     public void validate(ReadCommand command) throws InvalidRequestException
     {
         Index.QueryPlan.super.validate(command);
+        validatePatterns(command.rowFilter().root(), command.rowFilter().indexHints);
 
         if (orderer != null
             && !QueryController.isOrderingSupported(indexFeatureSet, cfs.metadata())
@@ -283,6 +287,78 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
         {
             throw new InvalidRequestException(QueryController.orderingNotSupportedMessage(orderer, cfs.metadata()));
         }
+    }
+
+    /**
+     * Rejects a LIKE suffix or contains literal that the replicas search with an automaton, if the automaton can't be
+     * compiled. Filtering compares the bytes of such a literal (see Expression#isSatisfiedBy), so the coordinator only
+     * checks the LIKE patterns with inner wildcards (see LikeRestriction#addToRowFilter).
+     */
+    private void validatePatterns(RowFilter.FilterElement element, IndexHints hints)
+    {
+        if (element.isDisjunction() && !searchesIndexes(element, hints))
+            return;
+
+        for (RowFilter.Expression expression : element.expressions())
+        {
+            if (expression.operator() != Operator.LIKE_SUFFIX && expression.operator() != Operator.LIKE_CONTAINS)
+                continue;
+
+            Optional<StorageAttachedIndex> index = cfs.indexManager.getBestIndexFor(expression, hints, StorageAttachedIndex.class);
+            if (index.isEmpty())
+                continue;
+
+            ByteBuffer literal = Operation.analyzeLiteral(index.get().getIndexContext().getQueryAnalyzerFactory(), expression.getIndexValue());
+            if (literal != null)
+                LikePatterns.forPatternOperator(expression.operator(), literal, expression.column().name);
+        }
+        for (RowFilter.FilterElement child : element.children())
+            validatePatterns(child, hints);
+    }
+
+    /**
+     * Whether the replicas search the indexes of an element, as they decide it on the tree they build from it (see
+     * Operation.Node#usesIndexes): a conjunction with an expression an index serves, or a disjunction whose expressions
+     * an index all serve and whose nested operations all search the indexes. Unlike {@link #selectedIndexes}, an IN is
+     * judged as the equalities to its elements, which is how the replicas search it.
+     */
+    private boolean searchesIndexes(RowFilter.FilterElement element, IndexHints hints)
+    {
+        if (element.isDisjunction())
+        {
+            if (element.expressions().isEmpty() && element.children().isEmpty())
+                return false;
+            for (RowFilter.Expression expression : element.expressions())
+                if (!searchesIndex(expression, hints))
+                    return false;
+            for (RowFilter.FilterElement child : element.children())
+                if (!searchesIndexes(child, hints))
+                    return false;
+            return true;
+        }
+
+        for (RowFilter.Expression expression : element.expressions())
+            if (searchesIndex(expression, hints))
+                return true;
+        for (RowFilter.FilterElement child : element.children())
+            if (searchesIndexes(child, hints))
+                return true;
+        return false;
+    }
+
+    private boolean searchesIndex(RowFilter.Expression expression, IndexHints hints)
+    {
+        if (expression.isUserDefined())
+            return false;
+
+        if (expression.operator() == Operator.IN)
+        {
+            // an IN without elements matches nothing, which needs no index
+            expression = Operation.Node.firstInElement(expression);
+            if (expression == null)
+                return true;
+        }
+        return cfs.indexManager.getBestIndexFor(expression, hints, StorageAttachedIndex.class).isPresent();
     }
 
     @Override

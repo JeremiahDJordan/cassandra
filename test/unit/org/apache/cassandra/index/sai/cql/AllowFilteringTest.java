@@ -33,6 +33,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.exceptions.InvalidPatternException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.gms.DataStaxFeatureSupport;
 import org.apache.cassandra.gms.EndpointState;
@@ -798,6 +799,91 @@ public class AllowFilteringTest extends SAITester
             assertInvalidMessage(StatementRestrictions.REQUIRES_ALLOW_FILTERING_MESSAGE,
                                  "SELECT k FROM %s WHERE " + filter + "v LIKE 'a%%'");
         }
+    }
+
+    /**
+     * LIKE filtering with suffix and contains literals too long or repetitive for an automaton: rows are filtered by
+     * comparing bytes, with or without SAI indexes on other columns, and also with an SAI index on the column if the
+     * query doesn't search it. A query that searches that index is rejected, as the index needs the automaton.
+     */
+    @Test
+    public void testAllowFilteringWithLongLikeLiterals() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i int, x int, z int, j int, f frozen<list<int>>)");
+        String repeated = "a".repeat(500);
+        StringBuilder varied = new StringBuilder();
+        for (int c = 0; c < 2500; c++)
+            varied.append((char) ('a' + c % 26));
+        execute("INSERT INTO %s (k, v, i, x, z) VALUES (1, ?, 1, 0, 1)", "x" + repeated + "x");
+        execute("INSERT INTO %s (k, v, i, x, z) VALUES (2, ?, 1, 0, 1)", "x" + varied);
+        execute("INSERT INTO %s (k, v, i, x, z) VALUES (3, ?, 1, 0, 1)", "x" + varied + "x");
+        execute("INSERT INTO %s (k, v, i, x, z) VALUES (4, 'abc', 1, 0, 1)");
+        execute("INSERT INTO %s (k, v, i, x, z) VALUES (5, ?, 1, 0, 1)", "x" + repeated);
+        String containsRepeated = "%" + repeated + "%";
+
+        for (boolean withIndex : new boolean[]{ false, true })
+        {
+            if (withIndex)
+                createIndex("CREATE INDEX ON %s(i) USING 'sai'");
+            String filter = withIndex ? "i = 1 AND " : "";
+
+            beforeAndAfterFlush(() -> {
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE ? ALLOW FILTERING", containsRepeated),
+                                        row(1), row(5));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE ? ALLOW FILTERING", "%" + repeated),
+                                        row(5));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE ? ALLOW FILTERING", "%" + varied),
+                                        row(2));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE " + filter + "v LIKE ? ALLOW FILTERING", "%" + varied + "%"),
+                                        row(2), row(3));
+            });
+        }
+
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        String legacy = createIndex("CREATE INDEX ON %s(i) USING 'legacy_local_table'");
+        String jIndex = createIndex("CREATE INDEX ON %s(j) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(full(f)) USING 'sai'");
+        beforeAndAfterFlush(() -> {
+            // a read of a single row doesn't use the indexes
+            assertRows(execute("SELECT k FROM %s WHERE k = 5 AND v LIKE ? ALLOW FILTERING", containsRepeated), row(5));
+            // a disjunction with an unindexed column, at the top or under an indexed conjunction, filters the column
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE x = 1 OR v LIKE ? ALLOW FILTERING", containsRepeated),
+                                    row(1), row(5));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE (x = 1 OR v LIKE ?) AND i = 1 ALLOW FILTERING", containsRepeated),
+                                    row(1), row(5));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE (x IN (1, 2) OR v LIKE ?) AND i = 1 ALLOW FILTERING", containsRepeated),
+                                    row(1), row(5));
+            // a disjunction with a conjunction that doesn't use the indexes either, with or without term statistics
+            for (String options : new String[]{ "", " WITH optimizer_options = {'use_term_statistics': 'false'}" })
+            {
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE (x = 1 OR (z = 1 AND v LIKE ?)) AND i = 1 ALLOW FILTERING" + options, containsRepeated),
+                                        row(1), row(5));
+                assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE (v LIKE ? OR (x = 1 AND z = 1)) AND i = 1 ALLOW FILTERING" + options, containsRepeated),
+                                        row(1), row(5));
+            }
+            // the query is served by another index
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE i = 1 AND v LIKE ? ALLOW FILTERING WITH included_indexes = {" + legacy + '}', containsRepeated),
+                                    row(1), row(5));
+        });
+        assertThatThrownBy(() -> execute("SELECT k FROM %s WHERE v LIKE ?", containsRepeated))
+        .isInstanceOf(InvalidPatternException.class);
+        assertThatThrownBy(() -> execute("SELECT k FROM %s WHERE i = 1 AND v LIKE ? ALLOW FILTERING", "%" + varied))
+        .isInstanceOf(InvalidPatternException.class);
+        // the replicas search an IN as the equalities to its elements, which an index on f serves, and an IN without
+        // elements as nothing, so the disjunction searches the index on v
+        String[] searchingV = { "(x IN () OR v LIKE ?) AND i = 1 ALLOW FILTERING",
+                                "((x IN () AND z = 1) OR v LIKE ?) AND i = 1 ALLOW FILTERING",
+                                "(j IN () OR v LIKE ?) AND i = 1 ALLOW FILTERING WITH excluded_indexes = {" + jIndex + '}',
+                                "(f IN () OR v LIKE ?) AND i = 1 ALLOW FILTERING",
+                                "(f IN ([1], [2]) OR v LIKE ?) AND i = 1 ALLOW FILTERING" };
+        for (String where : searchingV)
+        {
+            assertThatThrownBy(() -> execute("SELECT k FROM %s WHERE " + where, containsRepeated))
+            .as(where)
+            .isInstanceOf(InvalidPatternException.class);
+        }
+        assertThatThrownBy(() -> execute("SELECT k FROM %s WHERE (x IN ? OR v LIKE ?) AND i = 1 ALLOW FILTERING", List.of(), containsRepeated))
+        .isInstanceOf(InvalidPatternException.class);
     }
 
     /**

@@ -631,9 +631,12 @@ public class Expression
                         break;
 
                     case AUTOMATON:
-                        // pattern matching over the (possibly normalized) term, with the exact same automaton
-                        // used by the index searchers
-                        isMatch = LikePatterns.accepts(getAutomaton(), term);
+                        // pattern matching over the (possibly normalized) term: a suffix or contains literal by its
+                        // bytes, as its automaton may not compile (see StorageAttachedIndexQueryPlan#validatePatterns),
+                        // any other pattern with the automaton of the index searchers
+                        isMatch = patternOperator == Operator.LIKE_MATCHES
+                                  ? LikePatterns.accepts(getAutomaton(), term)
+                                  : patternOperator.isSatisfiedBy(validator, term, requestedValue);
                         break;
                 }
 
