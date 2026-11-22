@@ -647,9 +647,17 @@ public class Keyspace
 
                             // This view update can't happen right now. so rather than keep this thread busy
                             // we will re-apply ourselve to the queue and try again later
-                            Stage.MUTATION.execute(() ->
-                                                   applyInternal(mutation, writeOptions, true, future)
-                            );
+                            Stage.MUTATION.execute(() -> {
+                                try
+                                {
+                                    applyInternal(mutation, writeOptions, true, future);
+                                }
+                                catch (Throwable t)
+                                {
+                                    future.tryFailure(t);
+                                    throw t;
+                                }
+                            });
                             return future;
                         }
                         else

@@ -64,6 +64,14 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
         Tracing.trace("Payload application resulted in WriteTimeout, not replying");
     }
 
+    private void failed(Message<Mutation> message, Throwable t)
+    {
+        if (t instanceof WriteTimeoutException)
+            failed();
+        else
+            MessagingService.instance().inboundSink.fail(message.header, t);
+    }
+
     @Override
     public void doVerb(Message<Mutation> message)
     {
@@ -145,7 +153,7 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
                                         requestSensors.syncAllSensors();
                                         respond(requestSensors, message, respondToAddress);
                                     },
-                                    wto -> failed());
+                                    t -> failed(message, t));
     }
 
     private static void forwardToLocalNodes(Message<Mutation> originalMessage, ForwardingInfo forwardTo)
