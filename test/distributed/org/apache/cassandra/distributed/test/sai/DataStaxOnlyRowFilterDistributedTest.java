@@ -69,6 +69,10 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         new String[]{ "SELECT k FROM %s.t WHERE v = 'apple'", "The : operator (and = on an analyzed index)" },
         // the index of u has equals_behaviour_when_analyzed: unsupported, so it can't serve = in place of :
         new String[]{ "SELECT k FROM %s.t WHERE u : 'APPLE'", "The : operator (and = on an analyzed index)" },
+        new String[]{ "SELECT k FROM %s.t WHERE v IN ('apple')", "The : operator (and = on an analyzed index)" },
+        // an IN on an analyzed index is the disjunction of the : of its values
+        new String[]{ "SELECT k FROM %s.t WHERE v IN ('apple', 'pear')", "The OR operator" },
+        new String[]{ "SELECT k FROM %s.t WHERE a IN ('APPLE', 'pear')", "The OR operator" },
         new String[]{ "SELECT k FROM %s.t WHERE m['a'] > 0", "The > operator on a map entry" },
         new String[]{ "SELECT k FROM %s.t WHERE n = 1 OR n = 2", "The OR operator" },
         new String[]{ "SELECT k FROM %s.t WHERE GEO_DISTANCE(vec, [1, 1]) < 1000", "GEO_DISTANCE" },
@@ -89,6 +93,8 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE a = 'APPLE'", 3);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE a : 'APPLE'", 3);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE a = 'pear'", 0);
+        // the index of u can't serve IN, which is filtered on the raw values
+        APACHE_QUERIES.put("SELECT k FROM %s.t WHERE u IN ('Apple', 'pear') ALLOW FILTERING", 3);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE m['a'] = 1", 3);
         APACHE_QUERIES.put("SELECT k FROM %s.t ORDER BY vec ANN OF [1, 1] LIMIT 1", 1);
     }

@@ -367,6 +367,25 @@ public class BM25Test extends SAITester
     }
 
     @Test
+    public void testInAllowed() throws Throwable
+    {
+        // IN should be allowed with BM25 on the same column, as the disjunction of its equalities is
+        createSimpleTable();
+
+        execute("INSERT INTO %s (k, v) VALUES (1, 'apple')");
+        execute("INSERT INTO %s (k, v) VALUES (2, 'apple apple')");
+        execute("INSERT INTO %s (k, v) VALUES (3, 'banana')");
+        execute("INSERT INTO %s (k, v) VALUES (4, 'cherry')");
+
+        beforeAndAfterFlush(() ->
+        {
+            Object[][] expected = getRows(execute("SELECT k FROM %s WHERE (v = 'apple' OR v = 'banana') ORDER BY v BM25 OF 'apple' LIMIT 3"));
+            assertRows(execute("SELECT k FROM %s WHERE v IN ('apple', 'banana') ORDER BY v BM25 OF 'apple' LIMIT 3"), expected);
+            assertRows(execute("SELECT k FROM %s WHERE v IN ? ORDER BY v BM25 OF 'apple' LIMIT 3", list("apple", "banana")), expected);
+        });
+    }
+
+    @Test
     public void testUnknownQueryTerm() throws Throwable
     {
         createSimpleTable();

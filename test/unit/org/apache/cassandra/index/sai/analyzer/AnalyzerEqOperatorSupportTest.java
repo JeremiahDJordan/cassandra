@@ -16,15 +16,24 @@
 
 package org.apache.cassandra.index.sai.analyzer;
 
+import java.io.IOException;
+import java.util.List;
+
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.conditions.ColumnCondition;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.partitions.FilteredPartition;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.ClientWarn;
 import org.assertj.core.api.Assertions;
 import org.assertj.core.api.ListAssert;
@@ -33,7 +42,10 @@ import static java.lang.String.format;
 import static org.apache.cassandra.index.sai.analyzer.AnalyzerEqOperatorSupport.EQ_RESTRICTION_ON_ANALYZED_WARNING;
 import static org.apache.cassandra.index.sai.analyzer.AnalyzerEqOperatorSupport.LWT_CONDITION_ON_ANALYZED_WARNING;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.catchThrowable;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 
 /**
  * Tests for {@link AnalyzerEqOperatorSupport}.
@@ -154,6 +166,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertNonTokenizedIndexSupportsEquality();
             assertNonTokenizedIndexSupportsMatches();
             assertNonTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertNonTokenizedIndexSupportsIn();
         });
     }
 
@@ -164,6 +177,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertNonTokenizedIndexSupportsEquality();
             assertNonTokenizedIndexSupportsMatches();
             assertNonTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertNonTokenizedIndexSupportsIn();
         });
     }
 
@@ -201,6 +215,22 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         // LWT
         assertRowsWithLWTWarning("UPDATE %s SET v = 'Quick fox' WHERE k = 1 IF v = 'Quick fox'", row(true));
         assertRowsWithLWTWarning("UPDATE %s SET v = 'Quick fox' WHERE k = 1 IF v = 'fox'", row(false, "Quick fox"));
+    }
+
+    private void assertNonTokenizedIndexSupportsIn()
+    {
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('Quick fox', 'Lazy fox')", row(1), row(2));
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick fox', 'LAZY FOX')", row(1), row(2));
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick', 'lazy fox')", row(2));
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick', 'lazy')");
+
+        // bound values
+        assertRows(execute("SELECT k FROM %s WHERE v IN ?", list("QUICK FOX", "lazy")), row(1));
+        assertRows(execute("SELECT k FROM %s WHERE v IN ?", list("LAZY FOX")), row(2));
+        assertEmpty(execute("SELECT k FROM %s WHERE v IN ?", list()));
+
+        // filtered without the index
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick', 'lazy fox') OR f = 'Lazy' ALLOW FILTERING", row(2));
     }
 
     private void assertNonTokenizedIndexSupportsMatches()
@@ -259,6 +289,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertTokenizedIndexSupportsEquality();
             assertTokenizedIndexSupportsMatches();
             assertTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertTokenizedIndexSupportsIn();
         });
     }
 
@@ -269,6 +300,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertTokenizedIndexSupportsEquality();
             assertTokenizedIndexSupportsMatches();
             assertTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertTokenizedIndexSupportsIn();
         });
     }
 
@@ -311,6 +343,28 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         assertRowsWithSelectWarning("SELECT k FROM %s WHERE v = 'quick' AND v = 'lazy'");
         assertRowsWithSelectWarning("SELECT k FROM %s WHERE (v = 'quick' AND v = 'fox') OR v = 'dog'", row(1));
         assertRowsWithSelectWarning("SELECT k FROM %s WHERE (v = 'quick' AND v = 'fox') OR v = 'Lazy'", row(1), row(2));
+    }
+
+    private void assertTokenizedIndexSupportsIn()
+    {
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('Quick fox', 'Lazy fox')", row(1), row(2));
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick', 'lazy')", row(1), row(2));
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick dog', 'lazy')", row(2));
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick dog', 'lazy cat')");
+
+        // an element whose serialized length isn't valid UTF-8
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('lazy', '" + "a".repeat(128) + "')", row(2));
+
+        // bound values
+        assertRows(execute("SELECT k FROM %s WHERE v IN ?", list("quick dog", "lazy")), row(2));
+        assertRows(execute("SELECT k FROM %s WHERE v IN ?", list("quick")), row(1));
+        assertEmpty(execute("SELECT k FROM %s WHERE v IN ?", list()));
+
+        // the rows returned by the index, without the coordinator filtering them
+        assertRows(executeInternal("SELECT k FROM %s WHERE v IN ('quick dog', 'lazy')"), row(2));
+
+        // filtered without the index
+        assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('quick dog', 'lazy') OR f = 'Lazy' ALLOW FILTERING", row(2));
     }
 
     private void assertTokenizedIndexSupportsMatches()
@@ -361,6 +415,139 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         assertRowsWithoutWarning("SELECT k FROM %s WHERE v : 'Quick' OR f = 'Lazy' ALLOW FILTERING", row(1));
         assertInvalidMessage(errorMsg, "SELECT k FROM %s WHERE v = 'Quick' OR f : 'Lazy' ALLOW FILTERING");
         assertRowsWithSelectWarning("SELECT k FROM %s WHERE v = 'Quick' OR f = 'Lazy' ALLOW FILTERING", row(1));
+    }
+
+    @Test
+    public void testInWithStopWords()
+    {
+        String options = "{'index_analyzer': '{\"tokenizer\":{\"name\":\"standard\"}, " +
+                         "\"filters\":[{\"name\":\"lowercase\"}, {\"name\":\"stop\"}]}'}";
+        assertIndexQueries(options, () -> {
+            // a value of stop words only has no terms, which no row holds
+            assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('the', 'lazy')", row(2));
+            assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('the', 'lazy') OR f = 'Lazy' ALLOW FILTERING", row(2));
+        });
+    }
+
+    @Test
+    public void testInWithQueryAnalyzer()
+    {
+        assertIndexQueries("{'index_analyzer': 'standard', 'query_analyzer': 'whitespace'}", () -> {
+            // the values are analyzed with the query analyzer, which doesn't lowercase them
+            assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('Quick', 'lazy')", row(2));
+            assertRowsWithSelectWarning("SELECT k FROM %s WHERE v IN ('Quick', 'lazy') OR f = 'Lazy' ALLOW FILTERING", row(2));
+        });
+    }
+
+    @Test
+    public void testInWithUnsupportedAndAnotherIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, i int, x int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = " +
+                    "{'index_analyzer': 'standard', 'equals_behaviour_when_analyzed': 'UNSUPPORTED'}");
+        createIndex("CREATE CUSTOM INDEX ON %s(i) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (k, v, i, x) VALUES (1, 'Quick fox', 1, 0)");
+        execute("INSERT INTO %s (k, v, i, x) VALUES (2, 'Lazy fox', 1, 1)");
+        execute("INSERT INTO %s (k, v, i, x) VALUES (3, 'Quick fox', 2, 0)");
+
+        // the IN is filtered on the raw values of the rows the index of i selects
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT k FROM %s WHERE v IN ('Quick fox', 'lazy fox') AND i = 1 ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE (v IN ('Quick fox', 'lazy fox') OR x = 1) AND i = 1 ALLOW FILTERING"),
+                                    row(1), row(2));
+        });
+    }
+
+    @Test
+    public void testInInDisjunction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, s text STATIC, v text, f int, PRIMARY KEY (k, c))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        execute("INSERT INTO %s (k, c, s, v, f) VALUES (1, 1, 'Quick fox', 'Quick fox', 0)");
+        execute("INSERT INTO %s (k, c, v, f) VALUES (1, 2, 'Lazy fox', 1)");
+        execute("INSERT INTO %s (k, c, s, v, f) VALUES (2, 1, 'Lazy fox', 'Quick dog', 0)");
+        execute("INSERT INTO %s (k, s) VALUES (3, 'Quick fox')");
+        execute("INSERT INTO %s (k, c, s, v, f) VALUES (4, 1, 'Quick dog', 'Lazy dog', 1)");
+
+        // an IN matches the rows of the disjunction of its equalities, also next to another column and on a static column
+        beforeAndAfterFlush(() -> {
+            assertSameRows("SELECT k, c FROM %s WHERE v IN ('quick fox', 'lazy fox')",
+                           "SELECT k, c FROM %s WHERE v = 'quick fox' OR v = 'lazy fox'");
+            assertSameRows("SELECT k, c FROM %s WHERE v IN ('quick fox', 'lazy fox') OR f = 1 ALLOW FILTERING",
+                           "SELECT k, c FROM %s WHERE v = 'quick fox' OR v = 'lazy fox' OR f = 1 ALLOW FILTERING");
+            assertSameRows("SELECT k, c FROM %s WHERE s IN ('quick fox', 'lazy fox')",
+                           "SELECT k, c FROM %s WHERE s = 'quick fox' OR s = 'lazy fox'");
+            assertSameRows("SELECT k, c FROM %s WHERE s IN ('quick fox', 'lazy fox') OR f = 1 ALLOW FILTERING",
+                           "SELECT k, c FROM %s WHERE s = 'quick fox' OR s = 'lazy fox' OR f = 1 ALLOW FILTERING");
+        });
+    }
+
+    private void assertSameRows(String query, String equivalentQuery)
+    {
+        assertEquals(parseReadCommand(equivalentQuery).rowFilter().toString(), parseReadCommand(query).rowFilter().toString());
+        Object[][] expected = getRows(execute(equivalentQuery));
+        Assertions.assertThat(expected).isNotEmpty();
+        assertRowsIgnoringOrder(execute(query), expected);
+    }
+
+    @Test
+    public void testEmptyIn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, f text, i int)");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        createIndex("CREATE CUSTOM INDEX ON %s(i) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (k, v, f, i) VALUES (1, 'Quick fox', 'a', 1)");
+        execute("INSERT INTO %s (k, v, f, i) VALUES (2, 'Lazy fox', 'b', 2)");
+
+        // an IN without values matches no row, with and without the index
+        beforeAndAfterFlush(() -> {
+            assertEmpty(execute("SELECT k FROM %s WHERE v IN ?", list()));
+            assertEmpty(execute("SELECT k FROM %s WHERE k = 1 AND v IN ?", list()));
+            Assertions.assertThat(readAll(serialize(parseReadCommand("SELECT k FROM %s WHERE k = 1 AND v IN ()")))).isEmpty();
+            assertRows(execute("SELECT k FROM %s WHERE v IN ? OR i = 2", list()), row(2));
+            assertRows(execute("SELECT k FROM %s WHERE v IN () OR f = 'b' ALLOW FILTERING"), row(2));
+            assertRows(execute("SELECT k FROM %s WHERE v IN (null, null) OR f = 'b' ALLOW FILTERING"), row(2));
+        });
+    }
+
+    @Test
+    public void testInOnReplicaWithoutIndex() throws Throwable
+    {
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        populateTable();
+
+        // a read of a full primary key filters without the index, which a replica without it can't do, for IN as for =
+        ReadCommand eq = parseReadCommand("SELECT k FROM %s WHERE k = 1 AND v = 'quick'");
+        ReadCommand in = parseReadCommand("SELECT k FROM %s WHERE k = 1 AND v IN ('quick', 'dog')");
+        assertNull(eq.indexQueryPlan());
+        assertNull(in.indexQueryPlan());
+        byte[] serializedEq = serialize(eq);
+        byte[] serializedIn = serialize(in);
+        assertEquals(1, readAll(serializedEq).size());
+        assertEquals(1, readAll(serializedIn).size());
+
+        dropIndex("DROP INDEX %s." + index);
+        Throwable eqError = catchThrowable(() -> readAll(serializedEq));
+        assertNotNull(eqError);
+        assertThatThrownBy(() -> readAll(serializedIn)).isInstanceOf(eqError.getClass()).hasMessage(eqError.getMessage());
+    }
+
+    private static byte[] serialize(ReadCommand command) throws IOException
+    {
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            ReadCommand.serializer.serialize(command, out, MessagingService.current_version);
+            return out.toByteArray();
+        }
+    }
+
+    private static List<FilteredPartition> readAll(byte[] command) throws IOException
+    {
+        try (DataInputBuffer in = new DataInputBuffer(command))
+        {
+            return Util.getAll(ReadCommand.serializer.deserialize(in, MessagingService.current_version));
+        }
     }
 
     @Test
@@ -472,6 +659,13 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         // the EQ query should not use any kind of transformation when filtered without index intervention
         assertRowsWithoutWarning("SELECT k FROM %s WHERE v = 'quick fox' ALLOW FILTERING");
         assertRowsWithoutWarning("SELECT k FROM %s WHERE v = 'fox' ALLOW FILTERING");
+
+        // nor the IN query, a disjunction of EQs
+        query = "SELECT k FROM %s WHERE v IN ('Quick fox', 'lazy fox')";
+        assertInvalidMessage("Column 'v' has an index but does not support the operators specified in the query", query);
+        assertRowsWithoutWarning(query + " ALLOW FILTERING", row(1));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v IN ('quick', 'fox') ALLOW FILTERING");
+        assertRows(execute("SELECT k FROM %s WHERE v IN ? ALLOW FILTERING", list("Quick fox", "lazy fox")), row(1));
     }
 
     private void assertIndexDoesNotSupportMatches()
