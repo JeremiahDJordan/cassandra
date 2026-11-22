@@ -91,7 +91,7 @@ public final class TokenRelation extends Relation
     }
 
     @Override
-    protected Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames)
+    protected Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames, IndexHints indexHints)
     {
         throw invalidRequest("%s cannot be used with the token function", operator());
     }

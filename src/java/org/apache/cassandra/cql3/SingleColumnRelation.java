@@ -220,36 +220,53 @@ public final class SingleColumnRelation extends Relation
         if (mapKey == null)
         {
             Term term = toTerm(toReceivers(columnDef), value, table.keyspace, boundNames);
-            // Leave the restriction as EQ if no analyzed index in backwards compatibility mode is present
-            IndexRegistry.EqBehaviorIndexes ebi = IndexRegistry.obtain(table).getEqBehavior(columnDef, indexHints);
-            // The primary key always has ambiguous EQ behavior and we have to defer to later logic to decide
-            // whether the EQ is analayzed or not. This is a legacy behavior that "does the right thing" when
-            // there is a fully restricted partition key or not.
-            if (ebi.behavior == IndexRegistry.EqBehavior.EQ || columnDef.isPrimaryKeyColumn())
-                return new SingleColumnRestriction.EQRestriction(columnDef, term);
-
-            // the index is configured to transform EQ into MATCH for backwards compatibility
-            if (ebi.behavior == IndexRegistry.EqBehavior.MATCH)
-            {
-                ClientWarn.instance.warn(String.format(AnalyzerEqOperatorSupport.EQ_RESTRICTION_ON_ANALYZED_WARNING,
-                                                       columnDef.toString(),
-                                                       Index.joinNames(ebi.matchIndexes)),
-                                         columnDef);
-                return new SingleColumnRestriction.AnalyzerMatchesRestriction(columnDef, term);
-            }
-
-            // multiple indexes support EQ, this is unsupported
-            assert ebi.behavior == IndexRegistry.EqBehavior.AMBIGUOUS;
-            throw invalidRequest(AnalyzerEqOperatorSupport.EQ_AMBIGUOUS_ERROR,
-                                 columnDef.toString(),
-                                 Index.joinNames(ebi.matchIndexes),
-                                 Index.joinNames(ebi.eqIndexes),
-                                 ebi.matchIndexes.iterator().next().getIndexMetadata().name);
+            return newEQRestriction(table, columnDef, term, indexHints);
         }
         List<? extends ColumnSpecification> receivers = toReceivers(columnDef);
         Term entryKey = toTerm(Collections.singletonList(receivers.get(0)), mapKey, table.keyspace, boundNames);
         Term entryValue = toTerm(Collections.singletonList(receivers.get(1)), value, table.keyspace, boundNames);
         return new SingleColumnRestriction.ContainsRestriction(columnDef, entryKey, entryValue, false);
+    }
+
+    private static Restriction newEQRestriction(TableMetadata table, ColumnMetadata columnDef, Term term, IndexHints indexHints)
+    {
+        // The primary key always has ambiguous EQ behavior and we have to defer to later logic to decide
+        // whether the EQ is analayzed or not. This is a legacy behavior that "does the right thing" when
+        // there is a fully restricted partition key or not.
+        if (columnDef.isPrimaryKeyColumn() || eqBehavior(table, columnDef, indexHints) == IndexRegistry.EqBehavior.EQ)
+            return new SingleColumnRestriction.EQRestriction(columnDef, term);
+
+        // the index is configured to transform EQ into MATCH for backwards compatibility
+        return new SingleColumnRestriction.AnalyzerMatchesRestriction(columnDef, term);
+    }
+
+    /**
+     * Returns whether the indexes of the given non-primary-key column serve EQ as EQ or as MATCH, warning about MATCH,
+     * and rejecting the query if they are ambiguous.
+     */
+    private static IndexRegistry.EqBehavior eqBehavior(TableMetadata table, ColumnMetadata columnDef, IndexHints indexHints)
+    {
+        // Leave the restriction as EQ if no analyzed index in backwards compatibility mode is present
+        IndexRegistry.EqBehaviorIndexes ebi = IndexRegistry.obtain(table).getEqBehavior(columnDef, indexHints);
+        if (ebi.behavior == IndexRegistry.EqBehavior.EQ)
+            return ebi.behavior;
+
+        if (ebi.behavior == IndexRegistry.EqBehavior.MATCH)
+        {
+            ClientWarn.instance.warn(String.format(AnalyzerEqOperatorSupport.EQ_RESTRICTION_ON_ANALYZED_WARNING,
+                                                   columnDef.toString(),
+                                                   Index.joinNames(ebi.matchIndexes)),
+                                     columnDef);
+            return ebi.behavior;
+        }
+
+        // multiple indexes support EQ, this is unsupported
+        assert ebi.behavior == IndexRegistry.EqBehavior.AMBIGUOUS;
+        throw invalidRequest(AnalyzerEqOperatorSupport.EQ_AMBIGUOUS_ERROR,
+                             columnDef.toString(),
+                             Index.joinNames(ebi.matchIndexes),
+                             Index.joinNames(ebi.eqIndexes),
+                             ebi.matchIndexes.iterator().next().getIndexMetadata().name);
     }
 
     @Override
@@ -270,22 +287,25 @@ public final class SingleColumnRelation extends Relation
     }
 
     @Override
-    protected Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames)
+    protected Restriction newINRestriction(TableMetadata table, VariableSpecifications boundNames, IndexHints indexHints)
     {
         ColumnMetadata columnDef = table.getExistingColumn(entity);
         List<? extends ColumnSpecification> receivers = toReceivers(columnDef);
         List<Term> terms = toTerms(receivers, inValues, table.keyspace, boundNames);
-        if (terms == null)
-        {
-            Term term = toTerm(receivers, value, table.keyspace, boundNames);
-            return new SingleColumnRestriction.INRestriction(columnDef, new MarkerOrTerms.Marker((Lists.Marker) term));
-        }
 
         // An IN restrictions with only one element is the same than an EQ restriction
-        if (terms.size() == 1)
-            return new SingleColumnRestriction.EQRestriction(columnDef, terms.get(0));
+        if (terms != null && terms.size() == 1)
+            return newEQRestriction(table, columnDef, terms.get(0), indexHints);
 
-        return new SingleColumnRestriction.INRestriction(columnDef, new MarkerOrTerms.Terms(terms));
+        MarkerOrTerms values = terms == null
+                               ? new MarkerOrTerms.Marker((Lists.Marker) toTerm(receivers, value, table.keyspace, boundNames))
+                               : new MarkerOrTerms.Terms(terms);
+
+        // IN is a disjunction of EQs, served by the indexes as EQ is
+        if (!columnDef.isPrimaryKeyColumn() && eqBehavior(table, columnDef, indexHints) == IndexRegistry.EqBehavior.MATCH)
+            return new SingleColumnRestriction.AnalyzerMatchesINRestriction(columnDef, values);
+
+        return new SingleColumnRestriction.INRestriction(columnDef, values);
     }
 
     @Override

@@ -16,6 +16,9 @@
 package org.apache.cassandra.db.guardrails;
 
 
+import java.util.List;
+import java.util.stream.Collectors;
+
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -84,6 +87,13 @@ public class GuardrailQueryFiltersTest extends ThresholdTester
         assertWarns("SELECT * FROM %s WHERE x : '1' OR x : '2 3 4'", 4);
         assertFails("SELECT * FROM %s WHERE x : '1' OR x : '2 3 4 5'", 5);
         assertFails("SELECT * FROM %s WHERE x : '1' OR x : '2 3 4 5 6'", 6);
+
+        // single column, IN (analyzed)
+        assertValid("SELECT * FROM %s WHERE x IN ('1', '2')");
+        assertValid("SELECT * FROM %s WHERE x IN ('1', '" + "2".repeat(128) + "')");
+        assertWarns("SELECT * FROM %s WHERE x IN ('1', '2 3')", 3);
+        assertWarns("SELECT * FROM %s WHERE x IN ('1', '2 3 4')", 4);
+        assertFails("SELECT * FROM %s WHERE x IN ('1', '2 3 4 5')", 5);
 
         // multiple columns (analyzed, AND)
         assertValid("SELECT * FROM %s WHERE x : '1' AND y : '2'");
@@ -229,6 +239,15 @@ public class GuardrailQueryFiltersTest extends ThresholdTester
 
         assertValid("SELECT * FROM %s WHERE v : '1'");
         assertValid("SELECT * FROM %s WHERE v : '1 2 3 4 5 6'");
+    }
+
+    @Override
+    protected List<String> getWarnings()
+    {
+        // filtering out the warnings of IN on the analyzed indexes, which serve it as they serve =
+        return super.getWarnings().stream()
+                    .filter(w -> !w.contains("has analyzed indexes"))
+                    .collect(Collectors.toList());
     }
 
     private void assertWarns(String query, int operations) throws Throwable
