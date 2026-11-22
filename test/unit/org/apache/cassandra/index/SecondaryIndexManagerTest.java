@@ -21,6 +21,7 @@ import java.io.FileNotFoundException;
 import java.lang.reflect.Method;
 import java.net.SocketException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -32,11 +33,13 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import javax.annotation.Nullable;
 
 import com.google.common.base.Throwables;
 import com.google.common.collect.Sets;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -108,6 +111,9 @@ public class SecondaryIndexManagerTest extends CQLTester
     public void after()
     {
         TestingIndex.clear();
+        BlockingBuildIndex.clear();
+        FailingSecondBuilderIndex.clear();
+        ThrowingWhenBuiltIndex.shouldThrow = false;
     }
 
     @Test
@@ -710,6 +716,99 @@ public class SecondaryIndexManagerTest extends CQLTester
     }
 
     @Test
+    public void rebuildWithFailureOfOneIndexWaitsForTheOthers() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        String failingIndex = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", TestingIndex.class.getName()));
+        String blockedIndex = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(b) USING '%s'", BlockingBuildIndex.class.getName()));
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 1, 1)");
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        // the two indexes are built by different building supports: one fails while the other is blocked
+        TestingIndex.shouldFailBuild = true;
+        BlockingBuildIndex.blockBuild();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        Thread rebuild = rebuildInBackground(cfs, error, failingIndex, blockedIndex);
+        BlockingBuildIndex.waitBlockedOnBuild();
+        waitForAssert(() -> assertFalse(cfs.indexManager.isIndexBuilding(failingIndex)));
+        assertStillRunning("the rebuild must wait for the blocked index", rebuild);
+
+        BlockingBuildIndex.unblockBuild();
+        assertEnds(rebuild);
+        assertTrue(error.get().getMessage().contains("configured to fail"));
+        assertNotMarkedAsBuilt(failingIndex);
+        assertMarkedAsBuilt(blockedIndex);
+        assertTrue(isQueryable(blockedIndex));
+        assertFalse(cfs.indexManager.isIndexBuilding(blockedIndex));
+    }
+
+    @Test
+    public void rebuildWithFailureOfOneBuilderWaitsForTheOthers() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        String indexName = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", FailingSecondBuilderIndex.class.getName()));
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 1, 1)");
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        // the index is built by two builders: the second fails while the first is blocked
+        FailingSecondBuilderIndex.failBuild();
+        BlockingBuildIndex.blockBuild();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        Thread rebuild = rebuildInBackground(cfs, error, indexName);
+        BlockingBuildIndex.waitBlockedOnBuild();
+        FailingSecondBuilderIndex.waitFailed();
+        assertStillRunning("the rebuild must wait for the blocked builder", rebuild);
+
+        BlockingBuildIndex.unblockBuild();
+        assertEnds(rebuild);
+        assertTrue(error.get().getMessage().contains("configured to fail"));
+        assertNotMarkedAsBuilt(indexName);
+        assertFalse(cfs.indexManager.isIndexBuilding(indexName));
+    }
+
+    @Test
+    public void rebuildEndsWhenMarkingAnIndexBuiltFails() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        String failingIndex = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", TestingIndex.class.getName()));
+        String throwingIndex = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(b) USING '%s'", ThrowingWhenBuiltIndex.class.getName()));
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 1, 1)");
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        // the build of one index fails, and marking the other one built throws
+        TestingIndex.shouldFailBuild = true;
+        ThrowingWhenBuiltIndex.shouldThrow = true;
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        assertEnds(rebuildInBackground(cfs, error, failingIndex, throwingIndex));
+        assertNotNull(error.get());
+        assertNotMarkedAsBuilt(failingIndex);
+        assertNotMarkedAsBuilt(throwingIndex);
+        assertFalse(cfs.indexManager.isIndexBuilding(failingIndex));
+        assertFalse(cfs.indexManager.isIndexBuilding(throwingIndex));
+    }
+
+    @Test
+    public void rebuildEndsWhenTheBuildIsInterrupted() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        String indexName = createIndex(String.format("CREATE CUSTOM INDEX ON %%s(c) USING '%s'", TestingIndex.class.getName()));
+        execute("INSERT INTO %s (a, b, c) VALUES (1, 1, 1)");
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        TestingIndex.shouldFailBuild = true;
+        TestingIndex.failedBuildTrowable = new InterruptedException();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        assertEnds(rebuildInBackground(cfs, error, indexName));
+        assertNotNull(error.get());
+        assertNotMarkedAsBuilt(indexName);
+        assertFalse(cfs.indexManager.isIndexBuilding(indexName));
+    }
+
+    @Test
     public void initializingIndexNotQueryableButMaybeWritable()
     {
         TestingIndex.blockCreate();
@@ -1168,6 +1267,35 @@ public class SecondaryIndexManagerTest extends CQLTester
         return done;
     }
 
+    /** Starts the blocking rebuild of the given indexes in another thread, which keeps its failure. */
+    private static Thread rebuildInBackground(ColumnFamilyStore cfs, AtomicReference<Throwable> error, String... indexNames)
+    {
+        Thread rebuild = new Thread(() -> {
+            try
+            {
+                cfs.indexManager.rebuildIndexesBlocking(Sets.newHashSet(indexNames));
+            }
+            catch (Throwable t)
+            {
+                error.set(t);
+            }
+        });
+        rebuild.start();
+        return rebuild;
+    }
+
+    private static void assertStillRunning(String message, Thread thread) throws InterruptedException
+    {
+        thread.join(1000);
+        assertTrue(message, thread.isAlive());
+    }
+
+    private static void assertEnds(Thread thread) throws InterruptedException
+    {
+        thread.join(TimeUnit.MINUTES.toMillis(1));
+        assertFalse("the rebuild doesn't end", thread.isAlive());
+    }
+
     private boolean isQueryable(String indexName)
     {
         SecondaryIndexManager manager = getCurrentColumnFamilyStore().indexManager;
@@ -1402,6 +1530,177 @@ public class SecondaryIndexManagerTest extends CQLTester
         @Override
         public void register(IndexRegistry registry)
         {
+        }
+    }
+
+    /**
+     * Index whose builds wait, once {@link #blockBuild()} is called, until {@link #unblockBuild()}.
+     */
+    public static class BlockingBuildIndex extends StubIndex
+    {
+        private static volatile CountDownLatch buildLatch;
+        private static volatile CountDownLatch buildWaitLatch;
+
+        public BlockingBuildIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        static void blockBuild()
+        {
+            buildLatch = new CountDownLatch(1);
+            buildWaitLatch = new CountDownLatch(1);
+        }
+
+        static void unblockBuild()
+        {
+            buildLatch.countDown();
+        }
+
+        static void clear()
+        {
+            if (buildLatch != null)
+                buildLatch.countDown();
+            buildLatch = null;
+            buildWaitLatch = null;
+        }
+
+        static boolean isBlocked()
+        {
+            return buildLatch != null && buildLatch.getCount() > 0;
+        }
+
+        static void waitBlockedOnBuild() throws InterruptedException
+        {
+            assertTrue(buildWaitLatch.await(1, TimeUnit.MINUTES));
+        }
+
+        public IndexBuildingSupport getBuildTaskSupport()
+        {
+            return new CollatedViewIndexBuildingSupport()
+            {
+                public SecondaryIndexBuilder getIndexBuildTask(ColumnFamilyStore cfs, Set<Index> indexes, Collection<SSTableReader> sstables, boolean isFullRebuild)
+                {
+                    SecondaryIndexBuilder builder = super.getIndexBuildTask(cfs, indexes, sstables, isFullRebuild);
+                    return new SecondaryIndexBuilder()
+                    {
+                        @Override
+                        public void build()
+                        {
+                            CountDownLatch latch = buildLatch;
+                            if (latch != null)
+                            {
+                                buildWaitLatch.countDown();
+                                Uninterruptibles.awaitUninterruptibly(latch);
+                            }
+                            builder.build();
+                        }
+
+                        @Override
+                        public Progress getProgress()
+                        {
+                            return builder.getProgress();
+                        }
+                    };
+                }
+            };
+        }
+
+        public boolean shouldBuildBlocking()
+        {
+            return true;
+        }
+    }
+
+    /**
+     * {@link BlockingBuildIndex} whose builds have a second builder, which fails once {@link #failBuild()} is called.
+     */
+    public static class FailingSecondBuilderIndex extends BlockingBuildIndex
+    {
+        private static volatile CountDownLatch failedLatch;
+
+        public FailingSecondBuilderIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        static void failBuild()
+        {
+            failedLatch = new CountDownLatch(1);
+        }
+
+        static void waitFailed() throws InterruptedException
+        {
+            assertTrue(failedLatch.await(1, TimeUnit.MINUTES));
+        }
+
+        static void clear()
+        {
+            failedLatch = null;
+        }
+
+        @Override
+        public IndexBuildingSupport getBuildTaskSupport()
+        {
+            IndexBuildingSupport support = super.getBuildTaskSupport();
+            return new IndexBuildingSupport()
+            {
+                public SecondaryIndexBuilder getIndexBuildTask(ColumnFamilyStore cfs, Set<Index> indexes, Collection<SSTableReader> sstables, boolean isFullRebuild)
+                {
+                    return support.getIndexBuildTask(cfs, indexes, sstables, isFullRebuild);
+                }
+
+                @Override
+                public List<SecondaryIndexBuilder> getParallelIndexBuildTasks(ColumnFamilyStore cfs, Set<Index> indexes, Collection<SSTableReader> sstables, boolean isFullRebuild)
+                {
+                    SecondaryIndexBuilder builder = support.getIndexBuildTask(cfs, indexes, sstables, isFullRebuild);
+                    SecondaryIndexBuilder failing = new SecondaryIndexBuilder()
+                    {
+                        @Override
+                        public void build()
+                        {
+                            CountDownLatch latch = failedLatch;
+                            if (latch == null)
+                                return;
+                            latch.countDown();
+                            throw new IllegalStateException("Second builder is configured to fail.");
+                        }
+
+                        @Override
+                        public Progress getProgress()
+                        {
+                            return builder.getProgress();
+                        }
+                    };
+                    return Arrays.asList(builder, failing);
+                }
+            };
+        }
+    }
+
+    /**
+     * Index whose {@link #isQueryable} throws for a successful build once {@link #shouldThrow} is set.
+     */
+    public static class ThrowingWhenBuiltIndex extends StubIndex
+    {
+        static volatile boolean shouldThrow = false;
+
+        public ThrowingWhenBuiltIndex(ColumnFamilyStore baseCfs, IndexMetadata metadata)
+        {
+            super(baseCfs, metadata);
+        }
+
+        @Override
+        public boolean isQueryable(Status status)
+        {
+            if (shouldThrow && status == Status.BUILD_SUCCEEDED)
+                throw new IllegalStateException("Index is configured to fail when built.");
+            return super.isQueryable(status);
+        }
+
+        public boolean shouldBuildBlocking()
+        {
+            return true;
         }
     }
 
