@@ -21,6 +21,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import org.junit.After;
 import org.junit.Test;
@@ -30,9 +31,11 @@ import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.index.sai.disk.PerIndexFilesOwner;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -42,10 +45,11 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
 /**
- * A full rebuild stopped by a truncate ends as a success only if the truncate has removed the SSTables it hadn't
- * rebuilt. It waits for the truncate to be over to tell, for at most
- * {@link StorageAttachedIndexBuilder#TRUNCATED_SSTABLES_WAIT_MILLIS}, and otherwise fails like any other stopped build.
- * The "truncate" here is {@link ColumnFamilyStore#runWithCompactionsDisabled} with the truncate trigger.
+ * A build stopped by a truncate (a full rebuild, or an initial build waiting for the files of a dropped index of its
+ * name) ends as a success only if the truncate has removed the SSTables it hadn't built. It waits for the truncate to
+ * be over to tell, for at most {@link StorageAttachedIndexBuilder#TRUNCATED_SSTABLES_WAIT_MILLIS}, and otherwise fails
+ * like any other stopped build. The "truncate" here is {@link ColumnFamilyStore#runWithCompactionsDisabled} with the
+ * truncate trigger.
  */
 public class StoppedIndexBuildTest extends SAITester
 {
@@ -173,6 +177,83 @@ public class StoppedIndexBuildTest extends SAITester
         assertFalse(cfs.indexManager.isIndexQueryable(index));
 
         assertRebuildReturnsEveryRow(cfs, index);
+    }
+
+    /**
+     * The initial build of a new index waits for an owner of the files of a dropped index of its name on the SSTable
+     * when a truncate that keeps the SSTable stops it: the build fails, and the index isn't queryable.
+     */
+    @Test
+    public void testInitialBuildWaitingForDroppedIndexStoppedByATruncateThatKeepsTheSSTable() throws Throwable
+    {
+        testInitialBuildWaitingForDroppedIndexStoppedByATruncate(false);
+    }
+
+    /**
+     * Same, with the truncate removing the SSTable: the build ends as a success.
+     */
+    @Test
+    public void testInitialBuildWaitingForDroppedIndexStoppedByATruncateThatRemovesTheSSTable() throws Throwable
+    {
+        testInitialBuildWaitingForDroppedIndexStoppedByATruncate(true);
+    }
+
+    private void testInitialBuildWaitingForDroppedIndexStoppedByATruncate(boolean remove) throws Throwable
+    {
+        String index = "waiting_idx";
+        createTable(CREATE_TABLE_TEMPLATE);
+        for (int i = 0; i < ROWS; i++)
+            execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', 0, '0');");
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
+        AtomicBoolean dropped = new AtomicBoolean();
+        PerIndexFilesOwner owner = PerIndexFilesOwner.tryOwn(sstable.descriptor, index, dropped::get);
+        dropped.set(true);
+        Injections.Counter waits = Injections.newCounter("waits")
+                                             .add(InvokePointBuilder.newInvokePoint()
+                                                                    .onClass(PerIndexFilesOwner.class)
+                                                                    .onMethod("awaitOwnersOfDroppedIndex"))
+                                             .build();
+        Injections.inject(waits);
+        try
+        {
+            createIndexAsync("CREATE CUSTOM INDEX " + index + " ON %s(v1) USING 'StorageAttachedIndex'");
+            waitForAssert(() -> assertThat(waits.get()).isPositive(), 10, TimeUnit.SECONDS);
+
+            CountDownLatch truncating = new CountDownLatch(1);
+            CountDownLatch over = new CountDownLatch(1);
+            CompletableFuture<Void> truncate = truncate(cfs, truncating, over, remove);
+            try
+            {
+                assertTrue(truncating.await(10, TimeUnit.SECONDS));
+                // the build waits for the truncate
+                Thread.sleep(2000);
+                assertTrue(cfs.indexManager.isIndexBuilding(index));
+            }
+            finally
+            {
+                over.countDown();
+            }
+            truncate.get(30, TimeUnit.SECONDS);
+            waitForAssert(() -> assertFalse(cfs.indexManager.isIndexBuilding(index)), 30, TimeUnit.SECONDS);
+        }
+        finally
+        {
+            owner.close();
+        }
+
+        if (remove)
+        {
+            assertThat(cfs.getLiveSSTables()).isEmpty();
+            assertTrue(cfs.indexManager.isIndexQueryable(index));
+        }
+        else
+        {
+            assertThat(cfs.getLiveSSTables()).hasSize(1);
+            assertFalse(cfs.indexManager.isIndexQueryable(index));
+            assertRebuildReturnsEveryRow(cfs, index);
+        }
     }
 
     /**

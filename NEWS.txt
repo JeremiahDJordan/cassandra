@@ -60,6 +60,18 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - The completion marker of the files of a storage-attached index (SAI) on an sstable now holds a digest of the index
+      definition (its kind and options), and an index doesn't use files whose marker holds the digest of another
+      definition: it builds the sstable from the data instead. So the files written for a dropped index, e.g. by a
+      flush, compaction or stream that completes after CREATE INDEX of the same name or after a restart, are no longer
+      used by a new index of that name and another column or other options. Markers written before the upgrade are
+      empty, and their files are used as before; an index created on an existing table (CREATE CUSTOM INDEX ... USING
+      'StorageAttachedIndex') deletes the files of its name on the table's sstables that weren't built for its
+      definition, so that it also builds over such files from the data. Files written before the upgrade can still be
+      used by an index of the same name and another definition on sstables imported once it exists, on a node that
+      receives DROP INDEX and CREATE INDEX as one schema change (e.g. it was down), and after a restart that follows a
+      CREATE INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes
+      concerned. Older versions ignore the content of the marker.
 
 Deprecation
 ---------
