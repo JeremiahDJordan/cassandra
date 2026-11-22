@@ -17,12 +17,21 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Collection;
+
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.db.marshal.InetAddressType;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.SSTableIndex;
+import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
+import org.apache.cassandra.index.sai.utils.TypeUtil;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.assertEquals;
 
 public class ClusteringKeyIndexTest extends SAITester
 {
@@ -95,6 +104,40 @@ public class ClusteringKeyIndexTest extends SAITester
         flush();
         compact();
         runQueries();
+    }
+
+    @Test
+    public void reversedInetClusteringMultiSegment() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck inet, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck DESC)");
+        disableCompaction();
+        // two SSTables with the same terms
+        for (int pk = 1; pk <= 2; pk++)
+        {
+            for (int ck = 10; ck < 22; ck++)
+                execute("INSERT INTO %s (pk, ck) VALUES (?, ?)", pk, inet(ck));
+            flush();
+        }
+
+        // Build the index with a small segment size cap, producing multiple segments.
+        SegmentBuilder.updateLastValidSegmentRowId(3);
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(ck) USING 'StorageAttachedIndex'");
+
+        Collection<SSTableIndex> sstableIndexes = getIndexContext(index).getView().getIndexes();
+        assertEquals(2, sstableIndexes.size());
+        for (SSTableIndex sstableIndex : sstableIndexes)
+        {
+            assertEquals(TypeUtil.encode(InetAddressType.instance.decompose(inet(10)), InetAddressType.instance), sstableIndex.minTerm());
+            assertEquals(TypeUtil.encode(InetAddressType.instance.decompose(inet(21)), InetAddressType.instance), sstableIndex.maxTerm());
+        }
+
+        for (int ck = 10; ck < 22; ck++)
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE ck = ?", inet(ck)), row(1), row(2));
+    }
+
+    private static InetAddress inet(int lastByte) throws UnknownHostException
+    {
+        return InetAddress.getByAddress(new byte[]{ 127, 0, 0, (byte) lastByte });
     }
 
     private Object[] expectedRow(int index)
