@@ -41,6 +41,14 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
         Tracing.trace("Payload application resulted in WriteTimeout, not replying");
     }
 
+    private void failed(Message<Mutation> message, Throwable t)
+    {
+        if (t instanceof WriteTimeoutException)
+            failed();
+        else
+            MessagingService.instance().inboundSink.fail(message.header, t);
+    }
+
     @Override
     public void doVerb(Message<Mutation> message)
     {
@@ -72,7 +80,7 @@ public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
     @Override
     protected void applyMutation(Message<Mutation> message, InetAddressAndPort respondToAddress)
     {
-        message.payload.applyFuture().addCallback(o -> respond(message, respondToAddress), wto -> failed());
+        message.payload.applyFuture().addCallback(o -> respond(message, respondToAddress), t -> failed(message, t));
     }
 
     private static void forwardToLocalNodes(Message<Mutation> originalMessage, ForwardingInfo forwardTo)

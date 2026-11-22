@@ -582,9 +582,17 @@ public class Keyspace
 
                             // This view update can't happen right now. so rather than keep this thread busy
                             // we will re-apply ourself to the queue and try again later
-                            Stage.MUTATION.execute(() ->
-                                                   applyInternal(mutation, makeDurable, true, isDroppable, true, future)
-                            );
+                            Stage.MUTATION.execute(() -> {
+                                try
+                                {
+                                    applyInternal(mutation, makeDurable, true, isDroppable, true, future);
+                                }
+                                catch (Throwable t)
+                                {
+                                    future.tryFailure(t);
+                                    throw t;
+                                }
+                            });
                             return future;
                         }
                         else
