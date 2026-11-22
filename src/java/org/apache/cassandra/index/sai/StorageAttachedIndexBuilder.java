@@ -349,6 +349,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             return;
         }
 
+        // The per-SSTable components are missing if the builder that held the lock failed or was stopped. A removed
+        // SSTable needs no index.
+        if (!sstable.isMarkedCompacted() && !indexDescriptor.perSSTableComponents().isComplete())
+            throw new RuntimeException(logMessage("Failed to build indexes " + existing + " on SSTable " + sstable.descriptor + " as its per-SSTable components were not built."));
+
         // Register components from the descriptor that owns the writers. The context cache may have been
         // evicted before this point, and a reader lookup would reconstruct a descriptor from the pre-build TOC.
         sstable.registerComponents(group.activeComponents(indexDescriptor), tracker);
