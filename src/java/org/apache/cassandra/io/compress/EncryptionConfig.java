@@ -16,14 +16,17 @@
 package org.apache.cassandra.io.compress;
 
 import java.io.IOException;
+import java.lang.reflect.InvocationTargetException;
 import java.util.HashMap;
 import java.util.Map;
 
+import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableMap;
 
 import org.apache.cassandra.config.OptionMap;
 import org.apache.cassandra.crypto.IKeyProvider;
 import org.apache.cassandra.crypto.IKeyProviderFactory;
+import org.apache.cassandra.utils.FBUtilities;
 
 public class EncryptionConfig
 {
@@ -128,19 +131,25 @@ public class EncryptionConfig
 
             try
             {
-                Class<?> keyProviderFactoryClass = getKeyFactory(compressionOptions);
-                IKeyProviderFactory keyProviderFactory = (IKeyProviderFactory) keyProviderFactoryClass.newInstance();
+                Class<? extends IKeyProviderFactory> keyProviderFactoryClass = getKeyFactory(compressionOptions);
+                IKeyProviderFactory keyProviderFactory = keyProviderFactoryClass.getDeclaredConstructor().newInstance();
                 IKeyProvider keyProvider = keyProviderFactory.getKeyProvider(compressionOptions);
                 return new EncryptionConfig(keyProviderFactory, keyProvider, cipherName, keyStrength,
                         ivEnabled, ivLength, compressionOptions);
             }
-            catch (InstantiationException | IllegalAccessException | ClassNotFoundException | IOException e)
+            catch (InvocationTargetException e)
+            {
+                // the key provider factory's constructor failed: keep its exception
+                Throwables.throwIfUnchecked(e.getCause());
+                throw new RuntimeException("Failed to initialize " + callerClass.getSimpleName() + ": " + e.getCause().getMessage(), e.getCause());
+            }
+            catch (ReflectiveOperationException | IOException e)
             {
                 throw new RuntimeException("Failed to initialize " + callerClass.getSimpleName() + ": " + e.getMessage(), e);
             }
         }
 
-        private Class<?> getKeyFactory(Map<String, String> options) throws ClassNotFoundException
+        private Class<? extends IKeyProviderFactory> getKeyFactory(Map<String, String> options)
         {
             String className;
             if (options.containsKey(KEY_PROVIDER))
@@ -162,7 +171,7 @@ public class EncryptionConfig
                 className = "org.apache.cassandra.crypto." + className;
             }
 
-            return Class.forName(className);
+            return FBUtilities.classForName(className, IKeyProviderFactory.class, "key provider factory");
         }
 
         private int getIvLength(String algorithm)

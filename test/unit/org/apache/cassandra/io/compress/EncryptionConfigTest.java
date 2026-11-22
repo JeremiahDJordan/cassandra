@@ -25,11 +25,15 @@ import org.junit.Test;
 
 import org.apache.cassandra.crypto.IKeyProvider;
 import org.apache.cassandra.crypto.IKeyProviderFactory;
+import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
+import org.apache.cassandra.utils.ClassLoadingTestSupport;
 
 import static org.apache.cassandra.io.compress.EncryptionConfig.CIPHER_ALGORITHM;
 import static org.apache.cassandra.io.compress.EncryptionConfig.IV_LENGTH;
 import static org.apache.cassandra.io.compress.EncryptionConfig.KEY_PROVIDER;
 import static org.apache.cassandra.io.compress.EncryptionConfig.SECRET_KEY_STRENGTH;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.*;
 
 public class EncryptionConfigTest
@@ -62,6 +66,28 @@ public class EncryptionConfigTest
         assertNotEquals(baseConfig.hashCode(), configFor(explicitIvLengthOptions).hashCode());
     }
 
+    @Test
+    public void testRejectsNonKeyProviderFactoryWithoutInitializing()
+    {
+        ClassLoadingTestSupport.assertNotInitialized(ClassLoadingTestNonAssignable.class);
+
+        Map<String, String> options = Collections.singletonMap(KEY_PROVIDER, ClassLoadingTestNonAssignable.class.getName());
+        assertThatThrownBy(() -> configFor(options))
+        .isInstanceOf(ConfigurationException.class)
+        .hasMessageContaining("is not a " + IKeyProviderFactory.class.getName());
+
+        assertFalse(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class));
+    }
+
+    @Test
+    public void testKeyProviderFactoryConstructorFailure()
+    {
+        Map<String, String> options = Collections.singletonMap(KEY_PROVIDER, FailingKeyProviderFactory.class.getName());
+        assertThatThrownBy(() -> configFor(options))
+        .isInstanceOf(ConfigurationException.class)
+        .hasMessage(FailingKeyProviderFactory.MESSAGE);
+    }
+
     private static EncryptionConfig configFor(Map<String, String> options)
     {
         return EncryptionConfig.forClass(Encryptor.class)
@@ -81,6 +107,16 @@ public class EncryptionConfigTest
         public Set<String> supportedOptions()
         {
             return Collections.emptySet();
+        }
+    }
+
+    public static class FailingKeyProviderFactory extends TestKeyProviderFactory
+    {
+        static final String MESSAGE = "Invalid key provider configuration";
+
+        public FailingKeyProviderFactory()
+        {
+            throw new ConfigurationException(MESSAGE);
         }
     }
 }
