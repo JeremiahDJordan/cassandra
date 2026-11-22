@@ -25,7 +25,9 @@ import org.junit.Test;
 
 import org.apache.cassandra.crypto.IKeyProvider;
 import org.apache.cassandra.crypto.IKeyProviderFactory;
+import org.apache.cassandra.crypto.LocalFileSystemKeyProviderFactory;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
 import org.apache.cassandra.utils.ClassLoadingTestSupport;
 
@@ -86,6 +88,16 @@ public class EncryptionConfigTest
         assertThatThrownBy(() -> configFor(options))
         .isInstanceOf(ConfigurationException.class)
         .hasMessage(FailingKeyProviderFactory.MESSAGE);
+    }
+
+    @Test
+    public void testDefaultKeyProviderFactory()
+    {
+        String secretKeyFile = FileUtils.createDeletableTempFile("secret_key_file_", ".txt").toPath().toAbsolutePath().toString();
+        EncryptionConfig config = configFor(Collections.singletonMap(LocalFileSystemKeyProviderFactory.SECRET_KEY_FILE, secretKeyFile));
+
+        assertTrue(config.getKeyProviderFactory() instanceof LocalFileSystemKeyProviderFactory);
+        assertNotNull(config.getKeyProvider());
     }
 
     private static EncryptionConfig configFor(Map<String, String> options)
