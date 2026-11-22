@@ -21,6 +21,8 @@ import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.List;
+import java.util.Map;
 
 import com.google.common.primitives.Floats;
 import org.junit.Test;
@@ -33,6 +35,7 @@ import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.VectorType;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.IndexContext;
@@ -102,13 +105,13 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
         try (WithProperties properties = new WithProperties().set(SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR, false))
         {
             createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-            createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+            String index = createIndex("CREATE INDEX ON %s (v) USING 'sai'");
 
-            // no warning nor failure, but the oversized term is not indexed (the max term size is the failure threshold)
+            // no failure, but the oversized term is not indexed (the max term size is the failure threshold)
             ByteBuffer large = allocate(WARN_THRESHOLD + 1);
             ByteBuffer oversized = allocate(FAIL_THRESHOLD + 1);
             assertValid("INSERT INTO %s (k, v) VALUES (0, ?)", large);
-            assertValid("INSERT INTO %s (k, v) VALUES (1, ?)", oversized);
+            assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, index, () -> execute("INSERT INTO %s (k, v) VALUES (1, ?)", oversized));
             assertIndexedRows(large, 1);
             assertIndexedRows(oversized, 0);
         }
@@ -127,11 +130,20 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
             assertValid("INSERT INTO %s (k, v) VALUES (1, ?)", allocate(FAIL_THRESHOLD));
             for (ClientState state : new ClientState[]{ userClientState, superClientState, systemClientState })
             {
-                assertThatThrownBy(() -> execute(state, "INSERT INTO %s (k, v) VALUES (2, ?)",
-                                                 Collections.singletonList(allocate(FAIL_THRESHOLD + 1))))
-                .isInstanceOf(InvalidRequestException.class)
-                .isNotInstanceOf(GuardrailViolatedException.class)
-                .hasMessageContaining("Term of column v exceeds the byte limit for index");
+                ClientWarn.instance.captureWarnings();
+                try
+                {
+                    assertThatThrownBy(() -> execute(state, "INSERT INTO %s (k, v) VALUES (2, ?)",
+                                                     Collections.singletonList(allocate(FAIL_THRESHOLD + 1))))
+                    .isInstanceOf(InvalidRequestException.class)
+                    .isNotInstanceOf(GuardrailViolatedException.class)
+                    .hasMessageContaining("Term of column v exceeds the byte limit for index");
+                    assertThat(ClientWarn.instance.getWarnings()).isNull();
+                }
+                finally
+                {
+                    ClientWarn.instance.resetWarnings();
+                }
             }
         }
     }
@@ -140,13 +152,15 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
     public void testExcludedUsersWriteOversizedTermsWithoutIndexingThem() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-        createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+        String index = createIndex("CREATE INDEX ON %s (v) USING 'sai'");
 
         // the guardrail doesn't apply to superusers and internal writes, but oversized terms are still not indexed
         ByteBuffer oversized1 = allocate(FAIL_THRESHOLD + 1);
         ByteBuffer oversized2 = allocate(FAIL_THRESHOLD + 2);
-        assertValid(() -> execute(superClientState, "INSERT INTO %s (k, v) VALUES (0, ?)", Collections.singletonList(oversized1)));
-        assertValid(() -> execute(systemClientState, "INSERT INTO %s (k, v) VALUES (1, ?)", Collections.singletonList(oversized2)));
+        assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, index,
+                              () -> execute(superClientState, "INSERT INTO %s (k, v) VALUES (0, ?)", Collections.singletonList(oversized1)));
+        assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, index,
+                              () -> execute(systemClientState, "INSERT INTO %s (k, v) VALUES (1, ?)", Collections.singletonList(oversized2)));
         assertIndexedRows(oversized1, 0);
         assertIndexedRows(oversized2, 0);
     }
@@ -159,7 +173,7 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
             // The property overrides the failure threshold as the max size of an indexed term. The guardrail still
             // applies, and client writes of terms over the max size are rejected rather than left out of the index.
             createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-            createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+            String index = createIndex("CREATE INDEX ON %s (v) USING 'sai'");
 
             ByteBuffer small = allocate(2048);
             ByteBuffer large = allocate(2049);
@@ -172,7 +186,8 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
             assertIndexedRows(small, 1);
 
             // writes the guardrail doesn't apply to are accepted, but their terms over the max size aren't indexed
-            assertValid(() -> execute(superClientState, "INSERT INTO %s (k, v) VALUES (4, ?)", Collections.singletonList(large)));
+            assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, index,
+                                  () -> execute(superClientState, "INSERT INTO %s (k, v) VALUES (4, ?)", Collections.singletonList(large)));
             assertIndexedRows(large, 0);
         }
     }
@@ -182,7 +197,7 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
     {
         guardrails().setSaiStringTermSizeThreshold(null, null);
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-        createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+        String index = createIndex("CREATE INDEX ON %s (v) USING 'sai'");
 
         // without a failure threshold, client writes of terms over the default max size are rejected
         assertEquals(IndexContext.MAX_STRING_TERM_SIZE, 8192);
@@ -192,9 +207,106 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
         assertThatThrownBy(() -> execute("INSERT INTO %s (k, v) VALUES (1, ?)", oversized))
         .isInstanceOf(InvalidRequestException.class)
         .hasMessageContaining("Term of column v exceeds the byte limit for index");
-        assertValid(() -> execute(systemClientState, "INSERT INTO %s (k, v) VALUES (1, ?)", Collections.singletonList(oversized)));
+        assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, index,
+                              () -> execute(systemClientState, "INSERT INTO %s (k, v) VALUES (1, ?)", Collections.singletonList(oversized)));
         assertIndexedRows(max, 1);
         assertIndexedRows(oversized, 0);
+    }
+
+    /**
+     * Replacing a term that isn't indexed because of its size, in the same memtable, doesn't warn.
+     */
+    @Test
+    public void testOversizedTermReplaced() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        String index = createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+
+        assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, index,
+                              () -> execute(superClientState, "INSERT INTO %s (k, v) VALUES (0, ?)", Collections.singletonList(allocate(FAIL_THRESHOLD + 1))));
+        assertValid(() -> execute(superClientState, "INSERT INTO %s (k, v) VALUES (0, 'small')"));
+        assertEquals(1, rows("SELECT k FROM %s WHERE v = 'small'"));
+    }
+
+    /**
+     * An oversized term of a primary key column warns when a row with live data enters the memtable, but not for a
+     * deletion of the row, nor for an update of the row in the memtable. A write onto a deletion of the row in the
+     * memtable warns only with the trie memtable, which gives the index the row as inserted; the skiplist memtable
+     * gives it as an update.
+     */
+    @Test
+    public void testOversizedPrimaryKeyTerms() throws Throwable
+    {
+        for (String memtable : new String[]{ "skiplist", "trie" })
+        {
+            createTable("CREATE TABLE %s (k int, c text, x int, PRIMARY KEY (k, c)) WITH memtable = '" + memtable + "'");
+            String index = createIndex("CREATE INDEX ON %s (c) USING 'sai'");
+            checkPrimaryKeyTerm(IndexContext.TERM_NOT_INDEXED_WARNING, index, allocate(FAIL_THRESHOLD + 1), memtable.equals("trie"));
+
+            try
+            {
+                createTable("CREATE TABLE %s (k int, c vector<float, 4>, x int, PRIMARY KEY (k, c)) WITH memtable = '" + memtable + "'");
+                index = createIndex("CREATE INDEX ON %s (c) USING 'sai' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+                guardrails().setSaiVectorTermSizeThreshold(null, "8B");
+                checkPrimaryKeyTerm(IndexContext.VECTOR_NOT_INDEXED_WARNING, index, vectorBytes(1, 2, 3, 4), memtable.equals("trie"));
+            }
+            finally
+            {
+                guardrails().setSaiVectorTermSizeThreshold("16KiB", "32KiB");
+            }
+        }
+    }
+
+    private void checkPrimaryKeyTerm(String format, String index, ByteBuffer c, boolean warnsOnDeletion) throws Throwable
+    {
+        List<ByteBuffer> values = Collections.singletonList(c);
+        assertWarnsNotIndexed(format, "c", index, () -> execute(superClientState, "INSERT INTO %s (k, c, x) VALUES (0, ?, 0)", values));
+        assertValid(() -> execute(superClientState, "UPDATE %s SET x = 1 WHERE k = 0 AND c = ?", values));
+
+        // the deletion of an absent row in a fresh memtable, then a write of the row onto that deletion
+        flush();
+        assertValid(() -> execute(superClientState, "DELETE FROM %s WHERE k = 1 AND c = ?", values));
+        CheckedFunction insert = () -> execute(superClientState, "INSERT INTO %s (k, c, x) VALUES (1, ?, 0)", values);
+        if (warnsOnDeletion)
+            assertWarnsNotIndexed(format, "c", index, insert);
+        else
+            assertValid(insert);
+    }
+
+    /**
+     * A vector over the max term size warns when the index gets it, but not when it loses to the vector in the memtable.
+     */
+    @Test
+    public void testOversizedVector() throws Throwable
+    {
+        try
+        {
+            createTable("CREATE TABLE %s (k int PRIMARY KEY, v vector<float, 4>)");
+            String index = createIndex("CREATE INDEX ON %s (v) USING 'sai' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+            String insert = "INSERT INTO %s (k, v) VALUES (?, ?) USING TIMESTAMP ?";
+            execute(superClientState, insert, Arrays.asList(ByteBufferUtil.bytes(0), vectorBytes(0, 0, 0, 1), ByteBufferUtil.bytes(10L)));
+
+            // the vectors of 16 bytes are now over the max term size
+            guardrails().setSaiVectorTermSizeThreshold(null, "8B");
+            assertWarnsNotIndexed(IndexContext.VECTOR_NOT_INDEXED_WARNING, index,
+                                  () -> execute(superClientState, insert, Arrays.asList(ByteBufferUtil.bytes(1), vectorBytes(1, 1, 1, 1), ByteBufferUtil.bytes(10L))));
+
+            // at the timestamp of the indexed vector, with a greater value that wins
+            assertWarnsNotIndexed(IndexContext.VECTOR_NOT_INDEXED_WARNING, index,
+                                  () -> execute(superClientState, insert, Arrays.asList(ByteBufferUtil.bytes(0), vectorBytes(1, 0, 0, 0), ByteBufferUtil.bytes(10L))));
+
+            // older than the vector in the memtable
+            assertValid(() -> execute(superClientState, insert, Arrays.asList(ByteBufferUtil.bytes(0), vectorBytes(2, 0, 0, 0), ByteBufferUtil.bytes(5L))));
+        }
+        finally
+        {
+            guardrails().setSaiVectorTermSizeThreshold("16KiB", "32KiB");
+        }
+    }
+
+    private static ByteBuffer vectorBytes(float... values)
+    {
+        return VectorType.getInstance(FloatType.instance, values.length).decompose(Floats.asList(values));
     }
 
     /**
@@ -311,6 +423,47 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
                                                            past, NGRAM_VALUE, Collections.singleton(NGRAM_VALUE)));
     }
 
+    /**
+     * The same as {@link #testExpiredAnalyzedValue}, for terms over the max term size.
+     */
+    @Test
+    public void testExpiredOversizedTerm() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, s set<text>)");
+        String index = createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+        String setIndex = createIndex("CREATE INDEX ON %s (s) USING 'sai'");
+        String oversized = "a".repeat(FAIL_THRESHOLD + 1);
+        long past = FBUtilities.nowInSeconds() - 10;
+
+        assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, index,
+                              () -> executeInternal("INSERT INTO %s (k, v) VALUES (0, ?)", oversized));
+        assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, "s", setIndex,
+                              () -> executeInternal("INSERT INTO %s (k, s) VALUES (1, ?)", Collections.singleton(oversized)));
+
+        assertNoWarnings(() -> executeInternalWithNowInSec("INSERT INTO %s (k, v, s) VALUES (2, ?, ?) USING TTL 1",
+                                                           past, oversized, Collections.singleton(oversized)));
+
+        executeInternal("INSERT INTO %s (k, v, s) VALUES (3, 'ab', {'ab'})");
+        assertNoWarnings(() -> executeInternalWithNowInSec("UPDATE %s USING TTL 1 SET v = ?, s = s + ? WHERE k = 3",
+                                                           past, oversized, Collections.singleton(oversized)));
+    }
+
+    /**
+     * A map entry over the max term size of an ENTRIES index warns next to an entry too large for the index, which is
+     * left out without failing the write, for a write that the coordinator doesn't check.
+     */
+    @Test
+    public void testOversizedMapEntryNextToUnindexableEntry() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, m map<int, text>)");
+        String index = createIndex("CREATE INDEX ON %s (ENTRIES(m)) USING 'sai'");
+
+        PartitionUpdate.SimpleBuilder update = PartitionUpdate.simpleBuilder(getCurrentColumnFamilyStore().metadata(), 0);
+        update.row().add("m", Map.of(1, "a".repeat(65536), 2, "b".repeat(FAIL_THRESHOLD + 1)));
+        assertWarnsNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING, "m", index, () -> update.buildAsMutation().apply());
+        assertRows(executeInternal("SELECT k FROM %s WHERE k = 0"), row(0));
+    }
+
     private void executeInternalWithNowInSec(String query, long nowInSec, Object... values)
     {
         QueryProcessor.executeInternalWithNowInSec(formatQuery(query), nowInSec, values);
@@ -343,10 +496,13 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
         {
             write.apply();
             assertThat(ClientWarn.instance.getWarnings()).containsExactly(String.format(format, column, keyspace(), index));
+            listener.assertNotWarned();
+            listener.assertNotFailed();
         }
         finally
         {
             ClientWarn.instance.resetWarnings();
+            listener.clear();
         }
     }
 

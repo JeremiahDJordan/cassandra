@@ -275,10 +275,14 @@ public class TrieMemoryIndex extends MemoryIndex
         final long initialPrimaryKeysHeapAllocations = primaryKeysHeapAllocations.longValue();
 
         int tokenCount = 0;
+        boolean termNotIndexed = false;
         for (ByteBuffer term : terms)
         {
             if (!indexContext.validateMaxTermSize(primaryKey.partitionKey(), term))
+            {
+                termNotIndexed = true;
                 continue;
+            }
 
             tokenCount++;
 
@@ -296,6 +300,9 @@ public class TrieMemoryIndex extends MemoryIndex
                 Throwables.throwAsUncheckedException(e);
             }
         }
+
+        if (warn && termNotIndexed && indexContext.isLiveValue(row, rowValue))
+            indexContext.warnNotIndexed(IndexContext.TERM_NOT_INDEXED_WARNING);
 
         // memory used by the trie
         onHeapAllocationsTracker.accept((data.usedSizeOnHeap() - initialSizeOnHeap) +

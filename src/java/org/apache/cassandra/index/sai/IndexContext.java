@@ -152,6 +152,13 @@ public class IndexContext
     "The analyzed terms of the value of column %s reach the limit of cassandra.sai.max_analyzed_size_kb: the value " +
     "is written, but not indexed by %s.%s.";
 
+    public static final String TERM_NOT_INDEXED_WARNING =
+    "A term of the value of column %s is over the max term size: the value is written, but that term is not indexed " +
+    "by %s.%s.";
+
+    public static final String VECTOR_NOT_INDEXED_WARNING =
+    "The vector of column %s is over the max term size: the value is written, but not indexed by %s.%s.";
+
     private static final String CANONICAL_SIZE_NOTE =
     "%s The size is that of the value in canonical form, which is what the index holds; the value is %d bytes as " +
     "written.";
@@ -400,8 +407,11 @@ public class IndexContext
         }
         else
         {
-            ByteBuffer value = withoutOversizedVector(key, getValueOf(key, row, 0));
-            target.index(key, row.clustering(), value, mt, opGroup, row);
+            ByteBuffer value = getValueOf(key, row, 0);
+            ByteBuffer indexedValue = withoutOversizedVector(key, value);
+            if (indexedValue == null && value != null && isLiveValue(row, value))
+                warnNotIndexed(VECTOR_NOT_INDEXED_WARNING);
+            target.index(key, row.clustering(), indexedValue, mt, opGroup, row);
         }
         indexMetrics.flatMap(metrics -> metrics.memtableIndexWriteLatency).ifPresent(timer ->
                 timer.update(nanoTime() - start, TimeUnit.NANOSECONDS));
@@ -499,11 +509,14 @@ public class IndexContext
         return null;
     }
 
-    // the cell of an oversized vector is indexed as the cell of no vector, see withoutOversizedVector(DecoratedKey, ByteBuffer)
+    // the cell of an oversized vector is indexed as the cell of no vector, see withoutOversizedVector(DecoratedKey, ByteBuffer);
+    // the client is warned if the cell is live, as the memtable only passes the cells a write changed
     private Cell<?> withoutOversizedVector(DecoratedKey key, Cell<?> cell)
     {
         if (cell.isTombstone() || withoutOversizedVector(key, cell.buffer()) != null)
             return cell;
+        if (cell.isLive(FBUtilities.nowInSeconds()))
+            warnNotIndexed(VECTOR_NOT_INDEXED_WARNING);
         return cell.withUpdatedValue(ByteBufferUtil.EMPTY_BYTE_BUFFER);
     }
 

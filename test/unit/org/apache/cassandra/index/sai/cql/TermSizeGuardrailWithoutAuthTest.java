@@ -16,11 +16,14 @@
 
 package org.apache.cassandra.index.sai.cql;
 
+import java.util.List;
+
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import com.datastax.driver.core.ResultSet;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SAITester;
 
 import static org.junit.Assert.assertEquals;
@@ -29,7 +32,7 @@ import static org.junit.Assert.assertTrue;
 /**
  * Without authentication, the SAI term size guardrails don't apply to the anonymous user, although other guardrails
  * do (see {@link CassandraRelevantProperties#ENABLE_GUARDRAILS_FOR_ANONYMOUS_USER}). As for superusers, its oversized
- * terms are written but not indexed.
+ * terms are written but not indexed, with a warning.
  */
 public class TermSizeGuardrailWithoutAuthTest extends SAITester
 {
@@ -44,7 +47,7 @@ public class TermSizeGuardrailWithoutAuthTest extends SAITester
     public void testAnonymousUserIsNotGuarded()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        String index = createIndex("CREATE INDEX ON %s(v) USING 'sai'");
 
         String large = "a".repeat(2048); // over the 1KiB warning threshold
         String oversized = "b".repeat(9000); // over the 8KiB failure threshold
@@ -52,7 +55,8 @@ public class TermSizeGuardrailWithoutAuthTest extends SAITester
         ResultSet result = executeNet("INSERT INTO %s (k, v) VALUES (0, ?)", large);
         assertTrue(result.getExecutionInfo().getWarnings().isEmpty());
         result = executeNet("INSERT INTO %s (k, v) VALUES (1, ?)", oversized);
-        assertTrue(result.getExecutionInfo().getWarnings().isEmpty());
+        assertEquals(List.of(String.format(IndexContext.TERM_NOT_INDEXED_WARNING, "v", keyspace(), index)),
+                     result.getExecutionInfo().getWarnings());
 
         assertEquals(1, execute("SELECT k FROM %s WHERE v = ?", large).size());
         assertEquals(0, execute("SELECT k FROM %s WHERE v = ?", oversized).size());

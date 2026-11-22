@@ -314,6 +314,20 @@ public class ReplicaWriteWarningsTest extends TestBaseImpl
     }
 
     @Test
+    public void testOversizedTerm()
+    {
+        String table = "t_" + seq.getAndIncrement();
+        cluster.schemaChange(String.format("CREATE TABLE %s.%s (k int PRIMARY KEY, v text)", KS_ONE, table));
+        cluster.schemaChange(String.format("CREATE INDEX %s_idx ON %s.%s (v) USING 'sai'", table, KS_ONE, table));
+        SAIUtil.waitForIndexQueryableOnAllNodes(cluster, KS_ONE);
+        int key = keys(KS_ONE, table, 1, 2).get(0);
+
+        // over the default max term size of 8KiB
+        assertThat(write(1, KS_ONE, table, key, "b".repeat(9000), ConsistencyLevel.ALL))
+        .containsExactly(String.format(IndexContext.TERM_NOT_INDEXED_WARNING, "v", KS_ONE, table + "_idx"));
+    }
+
+    @Test
     public void testLwt()
     {
         for (String variant : new String[]{ "v1", "v2" })
