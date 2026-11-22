@@ -17,15 +17,20 @@
 package org.apache.cassandra.index.sai;
 
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import com.google.common.collect.Iterables;
 import org.awaitility.Awaitility;
 import org.junit.Test;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.index.IndexNotAvailableException;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.v1.SSTableIndexWriter;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injection;
@@ -34,11 +39,26 @@ import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class StorageAttachedIndexBuilderTest extends SAITester
 {
     private static volatile ColumnFamilyStore columnFamilyStore;
     private static volatile boolean descriptorCacheEvicted;
+
+    private static final AtomicBoolean holdNextRowWrite = new AtomicBoolean();
+    private static final AtomicBoolean holdNextInitialBuild = new AtomicBoolean();
+    private static final AtomicBoolean holdNextWaiter = new AtomicBoolean();
+    private static volatile boolean failHeldRowWrite;
+    private static volatile boolean failHeldBuildIndexComplete;
+    private static volatile Thread heldBuild;
+    private static volatile CountDownLatch rowWriteHeld;
+    private static volatile CountDownLatch rowWriteRelease;
+    private static volatile CountDownLatch otherBuildWritten;
+    private static volatile CountDownLatch initialBuildHeld;
+    private static volatile CountDownLatch initialBuildRelease;
+    private static volatile CountDownLatch waiterHeld;
+    private static volatile CountDownLatch waiterRelease;
 
     @Test
     public void testRegisterComponentsFromBuildDescriptorAfterCacheEviction() throws Throwable
@@ -100,6 +120,287 @@ public class StorageAttachedIndexBuilderTest extends SAITester
 
         group.sstableContextManager().clear();
         descriptorCacheEvicted = true;
+    }
+
+    @Test
+    public void testBuildWaitingForFailedPerSSTableBuildFails() throws Throwable
+    {
+        String indexA = createTableWithIndexOnA();
+        try
+        {
+            injectHolds();
+
+            // the import's build of a takes the per-SSTable lock and is held, the initial build of b waits for it
+            CompletableFuture<Void> load = holdImport(true);
+            String indexB = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "b"));
+            assertThat(otherBuildWritten.await(30, TimeUnit.SECONDS)).isTrue();
+            assertThat(load).isNotDone();
+
+            rowWriteRelease.countDown();
+            assertThatThrownBy(load::join).hasRootCauseMessage("Injected failure");
+            waitForIndexBuilds(indexB);
+            releaseHolds();
+
+            assertThatThrownBy(() -> executeInternal("SELECT pk FROM %s WHERE b = 3")).isInstanceOf(IndexNotAvailableException.class);
+
+            rebuildIndexes(indexA, indexB);
+            assertRowCount(execute("SELECT pk FROM %s WHERE a < 50"), 50);
+            assertRowCount(execute("SELECT pk FROM %s WHERE b = 3"), 14);
+        }
+        finally
+        {
+            releaseHolds();
+        }
+    }
+
+    @Test
+    public void testBuildWaitingForPerSSTableBuildThatFailsAfterWritingThemSucceeds() throws Throwable
+    {
+        createTableWithIndexOnA();
+        try
+        {
+            injectHolds();
+
+            // the import's build of a writes the per-SSTable components, then fails on its own per-index components
+            failHeldBuildIndexComplete = true;
+            CompletableFuture<Void> load = holdImport(false);
+            String indexB = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "b"));
+            assertThat(otherBuildWritten.await(30, TimeUnit.SECONDS)).isTrue();
+            assertThat(load).isNotDone();
+
+            rowWriteRelease.countDown();
+            assertThatThrownBy(load::join).hasRootCauseMessage("Injected failure");
+            waitForIndexBuilds(indexB);
+            releaseHolds();
+
+            assertRowCount(execute("SELECT pk FROM %s WHERE b = 3"), 14);
+            assertThatThrownBy(() -> executeInternal("SELECT pk FROM %s WHERE a < 50")).isInstanceOf(IndexNotAvailableException.class);
+        }
+        finally
+        {
+            releaseHolds();
+        }
+    }
+
+    @Test
+    public void testBuildWaitingForFailedPerSSTableBuildOfTruncatedSSTableSucceeds() throws Throwable
+    {
+        createTableWithIndexOnA();
+        try
+        {
+            injectHolds();
+
+            // the SSTable is truncated while the import's build of a holds the per-SSTable lock and the initial build
+            // of b waits for it, then the import's build fails
+            CompletableFuture<Void> load = holdImport(true);
+            String indexB = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "b"));
+            assertThat(otherBuildWritten.await(30, TimeUnit.SECONDS)).isTrue();
+            SSTableReader sstable = Iterables.getOnlyElement(getCurrentColumnFamilyStore().getLiveSSTables());
+            truncate(false);
+            assertThat(sstable.isMarkedCompacted()).isTrue();
+            assertThat(load).isNotDone();
+
+            rowWriteRelease.countDown();
+            assertThatThrownBy(load::join).hasRootCauseMessage("Injected failure");
+            waitForIndexBuilds(indexB);
+            releaseHolds();
+
+            waitForIndexQueryable(indexB);
+            assertRowCount(execute("SELECT pk FROM %s WHERE b = 3"), 0);
+            execute("INSERT INTO %s (pk, a, b) VALUES (?, ?, ?)", 1000, 1000, 3);
+            flush();
+            assertRowCount(execute("SELECT pk FROM %s WHERE b = 3"), 1);
+        }
+        finally
+        {
+            releaseHolds();
+        }
+    }
+
+    @Test
+    public void testInitialBuildWaitingForFailedImportBuildFails() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, b int)");
+        disableCompaction();
+        for (int pk = 0; pk < 100; pk++)
+            execute("INSERT INTO %s (pk, b) VALUES (?, ?)", pk, pk % 7);
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.getTracker().unloadSSTables();
+        try
+        {
+            injectHolds();
+
+            // the initial build selects the imported SSTable while the import's build holds the per-SSTable lock
+            holdNextInitialBuild.set(true);
+            String index = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "b"));
+            assertThat(initialBuildHeld.await(30, TimeUnit.SECONDS)).isTrue();
+            CompletableFuture<Void> load = holdImport(true);
+            holdNextWaiter.set(true);
+            initialBuildRelease.countDown();
+            assertThat(otherBuildWritten.await(30, TimeUnit.SECONDS)).isTrue();
+            assertThat(load).isNotDone();
+
+            // the initial build goes on only once the import's build has failed and marked the index failed
+            rowWriteRelease.countDown();
+            assertThatThrownBy(load::join).hasRootCauseMessage("Injected failure");
+            assertThat(waiterHeld.await(30, TimeUnit.SECONDS)).isTrue();
+            waiterRelease.countDown();
+            waitForIndexBuilds(index);
+            releaseHolds();
+
+            assertThatThrownBy(() -> executeInternal("SELECT pk FROM %s WHERE b = 3")).isInstanceOf(IndexNotAvailableException.class);
+
+            rebuildIndexes(index);
+            assertRowCount(execute("SELECT pk FROM %s WHERE b = 3"), 14);
+        }
+        finally
+        {
+            releaseHolds();
+        }
+    }
+
+    /** Creates the table, with an SSTable to import, and an index on a. */
+    private String createTableWithIndexOnA() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, a int, b int)");
+        disableCompaction();
+        for (int pk = 0; pk < 100; pk++)
+            execute("INSERT INTO %s (pk, a, b) VALUES (?, ?, ?)", pk, pk, pk % 7);
+        flush();
+        getCurrentColumnFamilyStore().getTracker().unloadSSTables();
+        return createIndex(String.format(CREATE_INDEX_TEMPLATE, "a"));
+    }
+
+    private CompletableFuture<Void> holdImport(boolean failRowWrite) throws InterruptedException
+    {
+        failHeldRowWrite = failRowWrite;
+        holdNextRowWrite.set(true);
+        CompletableFuture<Void> load = CompletableFuture.runAsync(getCurrentColumnFamilyStore()::loadNewSSTables);
+        assertThat(rowWriteHeld.await(30, TimeUnit.SECONDS)).isTrue();
+        return load;
+    }
+
+    private void injectHolds() throws Throwable
+    {
+        heldBuild = null;
+        rowWriteHeld = new CountDownLatch(1);
+        rowWriteRelease = new CountDownLatch(1);
+        otherBuildWritten = new CountDownLatch(1);
+        initialBuildHeld = new CountDownLatch(1);
+        initialBuildRelease = new CountDownLatch(1);
+        waiterHeld = new CountDownLatch(1);
+        waiterRelease = new CountDownLatch(1);
+
+        Injections.inject(newHold("hold_initial_build",
+                                  InvokePointBuilder.newInvokePoint()
+                                                    .onClass(StorageAttachedIndex.class)
+                                                    .onMethod("findNonIndexedSSTables")
+                                                    .atEntry(),
+                                  "holdInitialBuild"),
+                          newHold("hold_first_row_write",
+                                  InvokePointBuilder.newInvokePoint()
+                                                    .onClass(SSTableIndexWriter.class)
+                                                    .onMethod("addRow")
+                                                    .atEntry(),
+                                  "holdRowWrite"),
+                          newHold("fail_held_build_index_complete",
+                                  InvokePointBuilder.newInvokePoint()
+                                                    .onClass(SSTableIndexWriter.class)
+                                                    .onMethod("complete")
+                                                    .atEntry(),
+                                  "failHeldBuildIndexComplete"),
+                          newHold("signal_per_index_components_written",
+                                  InvokePointBuilder.newInvokePoint()
+                                                    .onClass(StorageAttachedIndexBuilder.class)
+                                                    .onMethod("completeSSTable")
+                                                    .after("INVOKE " + StorageAttachedIndexWriter.class.getName() + ".complete"),
+                                  "otherBuildWritten"),
+                          newHold("hold_waiter_after_wait",
+                                  InvokePointBuilder.newInvokePoint()
+                                                    .onClass(StorageAttachedIndexBuilder.class)
+                                                    .onMethod("completeSSTable")
+                                                    .atInvoke("validateIndexes"),
+                                  "holdWaiter"));
+    }
+
+    private static Injection newHold(String name, InvokePointBuilder invokePoint, String method)
+    {
+        return Injections.newCustom(name)
+                         .add(invokePoint)
+                         .add(ActionBuilder.newActionBuilder()
+                                           .actions()
+                                           .doAction(Expression.expr(StorageAttachedIndexBuilderTest.class.getName())
+                                                               .method(method)
+                                                               .args()))
+                         .build();
+    }
+
+    private static void releaseHolds()
+    {
+        holdNextRowWrite.set(false);
+        holdNextInitialBuild.set(false);
+        holdNextWaiter.set(false);
+        failHeldBuildIndexComplete = false;
+        Injections.deleteAll();
+        if (rowWriteRelease != null)
+            rowWriteRelease.countDown();
+        if (initialBuildRelease != null)
+            initialBuildRelease.countDown();
+        if (waiterRelease != null)
+            waiterRelease.countDown();
+    }
+
+    // called by byteman
+    @SuppressWarnings("unused")
+    public static void holdInitialBuild() throws InterruptedException
+    {
+        if (!holdNextInitialBuild.compareAndSet(true, false))
+            return;
+
+        initialBuildHeld.countDown();
+        initialBuildRelease.await(60, TimeUnit.SECONDS);
+    }
+
+    // called by byteman
+    @SuppressWarnings("unused")
+    public static void holdRowWrite() throws InterruptedException
+    {
+        if (!holdNextRowWrite.compareAndSet(true, false))
+            return;
+
+        heldBuild = Thread.currentThread();
+        rowWriteHeld.countDown();
+        rowWriteRelease.await(60, TimeUnit.SECONDS);
+        if (failHeldRowWrite)
+            throw new RuntimeException("Injected failure");
+    }
+
+    // called by byteman
+    @SuppressWarnings("unused")
+    public static void failHeldBuildIndexComplete()
+    {
+        if (failHeldBuildIndexComplete && Thread.currentThread() == heldBuild)
+            throw new RuntimeException("Injected failure");
+    }
+
+    // called by byteman
+    @SuppressWarnings("unused")
+    public static void otherBuildWritten()
+    {
+        if (Thread.currentThread() != heldBuild)
+            otherBuildWritten.countDown();
+    }
+
+    // called by byteman
+    @SuppressWarnings("unused")
+    public static void holdWaiter() throws InterruptedException
+    {
+        if (Thread.currentThread() == heldBuild || !holdNextWaiter.compareAndSet(true, false))
+            return;
+
+        waiterHeld.countDown();
+        waiterRelease.await(60, TimeUnit.SECONDS);
     }
 
     private void assertCompleteComponents(StorageAttachedIndexGroup group, SSTableReader sstable)
