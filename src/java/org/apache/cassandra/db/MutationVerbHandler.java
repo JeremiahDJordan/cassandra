@@ -62,6 +62,14 @@ public class MutationVerbHandler implements IVerbHandler<Mutation>
         Tracing.trace("Payload application resulted in WriteTimeout, not replying");
     }
 
+    private void failed(Message<Mutation> message, Throwable t)
+    {
+        if (t instanceof WriteTimeoutException)
+            failed();
+        else
+            MessagingService.instance().inboundSink.fail(message.header, t);
+    }
+
     public void doVerb(Message<Mutation> message)
     {
         if (approxTime.now() > message.expiresAtNanos())
@@ -109,7 +117,15 @@ public class MutationVerbHandler implements IVerbHandler<Mutation>
             }
 
             long writeStartNanos = System.nanoTime();
-            message.payload.applyFuture(WriteOptions.DEFAULT).thenAccept(o -> {
+            // Mutation#applyFuture would also fail for an error in its sensor sync after the write is applied; the
+            // sensors are synced below
+            Keyspace keyspace = Keyspace.open(message.payload.getKeyspaceName());
+            keyspace.applyFuture(message.payload, WriteOptions.DEFAULT, true).whenComplete((o, t) -> {
+                if (t != null)
+                {
+                    failed(message, t);
+                    return;
+                }
                 long writeElapsedNanos = System.nanoTime() - writeStartNanos;
                 for (Context writeContext : writeContexts)
                 {
@@ -117,9 +133,6 @@ public class MutationVerbHandler implements IVerbHandler<Mutation>
                 }
                 requestSensors.syncAllSensors();
                 respond(requestSensors, message, respondToAddress);
-            }).exceptionally(wto -> {
-                failed();
-                return null;
             });
         }
         catch (WriteTimeoutException wto)
