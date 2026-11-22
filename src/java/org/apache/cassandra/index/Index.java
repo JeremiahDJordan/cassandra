@@ -262,6 +262,16 @@ public interface Index
     }
 
     /**
+     * Called by {@link SecondaryIndexManager} when this index is created on a table that already exists, before it is
+     * registered and before {@link #getInitializationTask()}; not when the index is added with its table or reloaded.
+     * Index data already on disk for the table's sstables predates the index, even if it is named after it (e.g. left
+     * by a dropped index of the same name). The default does nothing.
+     */
+    default void onAddedToExistingTable()
+    {
+    }
+
+    /**
      * Return a task to perform any initialization work when a new index instance is created.
      * This may involve costly operations such as (re)building the index, and is performed asynchronously
      * by SecondaryIndexManager

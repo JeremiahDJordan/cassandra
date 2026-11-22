@@ -133,7 +133,8 @@ public class IndexWriterAbortLoggingTest
         return new MemtableIndexWriter(mock(MemtableIndex.class),
                                        components(mock(IndexContext.class)),
                                        mock(PrimaryKey.Factory.class),
-                                       mock(RowMapping.class));
+                                       mock(RowMapping.class),
+                                       () -> false);
     }
 
     private static IndexComponents.ForWrite components(IndexContext context)

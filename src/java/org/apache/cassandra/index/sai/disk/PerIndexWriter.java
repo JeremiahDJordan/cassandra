@@ -59,5 +59,13 @@ public interface PerIndexWriter
      */
     void abort(Throwable cause);
 
+    /**
+     * Releases the ownership of the files of this writer ({@link PerIndexFilesOwner}), once the writer of the SSTable
+     * has completed or aborted every index.
+     */
+    default void releaseOwnership()
+    {
+    }
+
     IndexContext indexContext();
 }

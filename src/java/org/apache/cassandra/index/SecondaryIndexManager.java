@@ -288,6 +288,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private synchronized Future<?> createIndex(IndexMetadata indexDef, boolean isNewCF)
     {
         final Index index = createInstance(indexDef);
+        // before registering it, so that no write or read reaches the index before it has been told
+        if (!isNewCF)
+            index.onAddedToExistingTable();
         index.register(this);
         if (writableIndexes.put(index.getIndexMetadata().name, index) == null)
             logger.info("Index [{}] registered and writable.", index.getIndexMetadata().name);

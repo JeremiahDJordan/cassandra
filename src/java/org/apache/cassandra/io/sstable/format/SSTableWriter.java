@@ -63,6 +63,7 @@ import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Transactional;
 
 /**
@@ -378,31 +379,63 @@ public abstract class SSTableWriter extends SSTable implements Transactional
 
     public final Throwable abort(Throwable accumulate)
     {
+        Throwable cause = accumulate;
         try
         {
-            return txnProxy().abort(accumulate);
+            accumulate = txnProxy().abort(accumulate);
         }
         finally
         {
-            observers.forEach(observer -> observer.abort(accumulate));
+            accumulate = abortObservers(cause, accumulate);
         }
+        return accumulate;
     }
 
     public final void close()
     {
-        txnProxy().close();
+        // a writer closed before it is committed or aborted is aborted, observers included
+        switch (txnProxy().state())
+        {
+            case COMMITTED:
+            case ABORTED:
+                txnProxy().close();
+                break;
+            default:
+                abort();
+        }
     }
 
     public final void abort()
     {
+        Throwable accumulate = null;
         try
         {
             txnProxy().abort();
         }
-        finally
+        catch (Throwable t)
         {
-            observers.forEach(observer -> observer.abort(null));
+            accumulate = t;
         }
+        Throwables.maybeFail(abortObservers(null, accumulate));
+    }
+
+    // every observer is aborted, whatever another one throws
+    private Throwable abortObservers(Throwable cause, Throwable accumulate)
+    {
+        for (SSTableFlushObserver observer : observers)
+        {
+            try
+            {
+                observer.abort(cause);
+            }
+            catch (Throwable t)
+            {
+                // an observer may rethrow the cause, or what another observer threw: an error can't suppress itself
+                if (t != accumulate)
+                    accumulate = Throwables.merge(accumulate, t);
+            }
+        }
+        return accumulate;
     }
 
     protected final Map<MetadataType, MetadataComponent> finalizeMetadata()

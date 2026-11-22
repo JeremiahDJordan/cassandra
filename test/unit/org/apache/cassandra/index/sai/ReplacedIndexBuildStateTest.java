@@ -43,6 +43,7 @@ public class ReplacedIndexBuildStateTest extends SAITester
     public void cleanUp()
     {
         Injections.deleteAll();
+        Injections.Hold.releaseAll();
     }
 
     /**
@@ -58,33 +59,35 @@ public class ReplacedIndexBuildStateTest extends SAITester
         writeRows(0);
 
         // Hold the initial build of the first index once it has started building its SSTable, and drop the index...
-        Injections.Barrier holdDroppedBuild = barrier("hold_dropped_index_build",
-                                                      InvokePointBuilder.newInvokePoint()
-                                                                        .onClass(StorageAttachedIndexBuilder.class)
-                                                                        .onMethod("indexSSTable"));
-        Injections.Barrier holdNewBuild = barrier("hold_recreated_index_build",
-                                                  InvokePointBuilder.newInvokePoint()
-                                                                    .onClass(StorageAttachedIndexBuilder.class)
-                                                                    .onMethod("build"));
-        Injections.inject(holdDroppedBuild);
+        Injections.Hold droppedIndexBuildHold = Injections.newHold("dropped_index_build")
+                                                          .add(InvokePointBuilder.newInvokePoint()
+                                                                                 .onClass(StorageAttachedIndexBuilder.class)
+                                                                                 .onMethod("indexSSTable"))
+                                                          .build();
+        Injections.inject(droppedIndexBuildHold);
         try
         {
             String index = createIndexAsync("CREATE CUSTOM INDEX recreated_idx ON %s(v) USING 'StorageAttachedIndex'");
-            waitForAssert(() -> assertThat(holdDroppedBuild.getCount()).isEqualTo(1));
+            droppedIndexBuildHold.awaitHeld();
             dropIndex("DROP INDEX %s." + index);
 
             // ...recreate it (its initialization task queues behind the one of the dropped index)...
-            Injections.inject(holdNewBuild);
+            Injections.Hold recreatedIndexBuildHold = Injections.newHold("recreated_index_build")
+                                                                .add(InvokePointBuilder.newInvokePoint()
+                                                                                       .onClass(StorageAttachedIndexBuilder.class)
+                                                                                       .onMethod("build"))
+                                                                .build();
+            Injections.inject(recreatedIndexBuildHold);
             createIndexAsync("CREATE CUSTOM INDEX recreated_idx ON %s(v) USING 'StorageAttachedIndex'");
             assertThat(cfs.indexManager.isIndexBuilding(index)).isTrue();
 
             // ...let the build of the dropped index end, and hold the initial build of the new index once it has
             // selected its SSTables: the new index is still being built.
-            release(holdDroppedBuild);
-            waitForAssert(() -> assertThat(holdNewBuild.getCount()).isEqualTo(1), 60, TimeUnit.SECONDS);
+            droppedIndexBuildHold.release();
+            recreatedIndexBuildHold.awaitHeld();
             assertThat(cfs.indexManager.isIndexBuilding(index)).describedAs("new index building after the dropped index's build ended").isTrue();
 
-            release(holdNewBuild);
+            recreatedIndexBuildHold.release();
             waitForAssert(() -> assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse(), 60, TimeUnit.SECONDS);
 
             assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
@@ -92,8 +95,7 @@ public class ReplacedIndexBuildStateTest extends SAITester
         }
         finally
         {
-            release(holdDroppedBuild);
-            release(holdNewBuild);
+            Injections.Hold.releaseAll();
         }
     }
 
@@ -177,35 +179,38 @@ public class ReplacedIndexBuildStateTest extends SAITester
         waitForTableIndexesQueryable();
 
         // Hold a full rebuild of both indexes before it marks them as building...
-        Injections.Barrier holdRebuild = barrier("hold_rebuild_with_replacement",
-                                                 InvokePointBuilder.newInvokePoint()
-                                                                   .onClass(SecondaryIndexManager.class)
-                                                                   .onMethod("buildIndexesBlocking")
-                                                                   .atEntry());
         Injections.Counter builds = builderCounter("rebuild_with_replacement_builds");
-        Injections.Barrier holdNewBuild = barrier("hold_replacement_initial_build",
-                                                  InvokePointBuilder.newInvokePoint()
-                                                                    .onClass(StorageAttachedIndex.class)
-                                                                    .onMethod("findNonIndexedSSTables"));
-        Injections.inject(holdRebuild, builds);
+        Injections.inject(builds);
+        Injections.Hold rebuildHold = Injections.newHold("rebuild")
+                                                .add(InvokePointBuilder.newInvokePoint()
+                                                                       .onClass(SecondaryIndexManager.class)
+                                                                       .onMethod("buildIndexesBlocking")
+                                                                       .atEntry())
+                                                .build();
+        Injections.inject(rebuildHold);
         try
         {
             CompletableFuture<Void> rebuild = CompletableFuture.runAsync(() -> rebuildIndexes("recreated_idx", "other_idx"));
-            waitForAssert(() -> assertThat(holdRebuild.getCount()).isEqualTo(1));
+            rebuildHold.awaitHeld();
 
             // ...drop the first index and create it again, holding its initial build...
             dropIndex("DROP INDEX %s.recreated_idx");
-            Injections.inject(holdNewBuild);
+            Injections.Hold replacementInitialBuildHold = Injections.newHold("replacement_initial_build")
+                                                                    .add(InvokePointBuilder.newInvokePoint()
+                                                                                           .onClass(StorageAttachedIndex.class)
+                                                                                           .onMethod("findNonIndexedSSTables"))
+                                                                    .build();
+            Injections.inject(replacementInitialBuildHold);
             createIndexAsync("CREATE CUSTOM INDEX recreated_idx ON %s(v) USING 'StorageAttachedIndex'");
-            waitForAssert(() -> assertThat(holdNewBuild.getCount()).isEqualTo(1));
+            replacementInitialBuildHold.awaitHeld();
 
             // ...and let the rebuild go on, then the initial build.
             assertThat(rebuild.isDone()).isFalse();
-            release(holdRebuild);
+            rebuildHold.release();
             rebuild.get(60, TimeUnit.SECONDS);
             assertThat(builds.get()).isPositive();
             assertThat(cfs.indexManager.isIndexBuilding("recreated_idx")).isTrue();
-            release(holdNewBuild);
+            replacementInitialBuildHold.release();
             waitForAssert(() -> assertThat(cfs.indexManager.isIndexBuilding("recreated_idx")).isFalse(), 60, TimeUnit.SECONDS);
 
             for (String index : new String[]{ "recreated_idx", "other_idx" })
@@ -219,8 +224,7 @@ public class ReplacedIndexBuildStateTest extends SAITester
         }
         finally
         {
-            release(holdRebuild);
-            release(holdNewBuild);
+            Injections.Hold.releaseAll();
         }
     }
 
@@ -238,20 +242,22 @@ public class ReplacedIndexBuildStateTest extends SAITester
         createIndex("CREATE CUSTOM INDEX other_idx ON %s(w) USING 'StorageAttachedIndex'");
         waitForTableIndexesQueryable();
 
-        Injections.Barrier holdRebuild = barrier("hold_rebuild_without_replacement",
-                                                 InvokePointBuilder.newInvokePoint()
-                                                                   .onClass(SecondaryIndexManager.class)
-                                                                   .onMethod("buildIndexesBlocking")
-                                                                   .atEntry());
         Injections.Counter builds = builderCounter("rebuild_without_replacement_builds");
-        Injections.inject(holdRebuild, builds);
+        Injections.inject(builds);
+        Injections.Hold rebuildHold = Injections.newHold("rebuild")
+                                                .add(InvokePointBuilder.newInvokePoint()
+                                                                       .onClass(SecondaryIndexManager.class)
+                                                                       .onMethod("buildIndexesBlocking")
+                                                                       .atEntry())
+                                                .build();
+        Injections.inject(rebuildHold);
         try
         {
             CompletableFuture<Void> rebuild = CompletableFuture.runAsync(() -> rebuildIndexes("dropped_idx", "other_idx"));
-            waitForAssert(() -> assertThat(holdRebuild.getCount()).isEqualTo(1));
+            rebuildHold.awaitHeld();
             dropIndex("DROP INDEX %s.dropped_idx");
             assertThat(rebuild.isDone()).isFalse();
-            release(holdRebuild);
+            rebuildHold.release();
             rebuild.get(60, TimeUnit.SECONDS);
             assertThat(builds.get()).isPositive();
 
@@ -265,7 +271,7 @@ public class ReplacedIndexBuildStateTest extends SAITester
         }
         finally
         {
-            release(holdRebuild);
+            Injections.Hold.releaseAll();
         }
     }
 
@@ -281,21 +287,10 @@ public class ReplacedIndexBuildStateTest extends SAITester
         return execute("SELECT k FROM %s WHERE v = 0").size() + execute("SELECT k FROM %s WHERE v = 1").size();
     }
 
-    private static void release(Injections.Barrier barrier)
-    {
-        barrier.countDown();
-        barrier.disable();
-    }
-
     private static Injections.Counter builderCounter(String name)
     {
         return Injections.newCounter(name)
                          .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("build"))
                          .build();
-    }
-
-    private static Injections.Barrier barrier(String name, InvokePointBuilder at)
-    {
-        return Injections.newBarrier(name, 2, false).add(at).build();
     }
 }
