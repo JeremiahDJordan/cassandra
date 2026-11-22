@@ -25,6 +25,7 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.plan.Orderer;
 import org.apache.cassandra.io.sstable.SSTableId;
+import org.apache.cassandra.schema.ColumnMetadata;
 
 /**
  * A {@link PrimaryKey} that includes a score from a source index.
@@ -79,7 +80,11 @@ public class PrimaryKeyWithScore extends PrimaryKeyWithSortKey
     {
         if (!isScoreApproximate)
             return indexScore;
-        return orderer.score(row.getCell(context.getDefinition()).buffer());
+        ColumnMetadata column = context.getDefinition();
+        // a clustering column has no cell, its value is in the row's clustering
+        ByteBuffer value = column.isClusteringColumn() ? row.clustering().bufferAt(column.position())
+                                                       : row.getCell(column).buffer();
+        return orderer.score(value);
     }
 
     @Override

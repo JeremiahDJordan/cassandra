@@ -1154,10 +1154,12 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                       partition.isReverseOrder(),
                       partition.stats());
 
-                // The rows of a static vector don't get the synthetic score: the coordinator scores all the rows of
-                // the partition with the vector of its static row (see TopKProcessor#processScoredPartition).
+                // The rows of a static or partition key vector don't get the synthetic score: the coordinator scores
+                // all the rows of the partition with the vector of its static row or partition key (see
+                // TopKProcessor#processScoredPartition).
                 if (syntheticScoreColumn == null
                     || isOrderedColumnStatic
+                    || orderer.context.getDefinition().isPartitionKey()
                     || !(primaryKeyWithSortKey instanceof PrimaryKeyWithScore))
                 {
                     this.rows = content.iterator();
