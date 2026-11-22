@@ -163,7 +163,7 @@ public class EncryptionConfig
             }
             else
             {
-                className = "LocalFileSystemKeyProvider";
+                className = "LocalFileSystemKeyProviderFactory";
             }
 
             if (!className.contains("."))
