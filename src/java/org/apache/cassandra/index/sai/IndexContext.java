@@ -804,7 +804,8 @@ public class IndexContext
         if (op == Operator.BM25) return isAnalyzed && !isCollection();
 
         // If the column is analyzed and the operator is EQ, we need to check if the analyzer supports it.
-        if (op == Operator.EQ && isAnalyzed && !analyzerFactory.supportsEquals())
+        // IN is a disjunction of EQs.
+        if ((op == Operator.EQ || op == Operator.IN) && isAnalyzed && !analyzerFactory.supportsEquals())
             return false;
 
         // ANN is only supported against vectors.

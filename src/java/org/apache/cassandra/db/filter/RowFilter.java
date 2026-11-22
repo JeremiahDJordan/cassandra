@@ -490,8 +490,18 @@ public class RowFilter
                 {
                     // Optimization:
                     // if there is one child, we can just add it directly to the current FilterElement,
-                    // making the result tree flatter
-                    current.children.add(builder.current.children.get(0));
+                    // making the result tree flatter, and a disjunction (such as an IN of analyzer matches) adds
+                    // its expressions and children, as the equivalent OR would
+                    FilterElement child = builder.current.children.get(0);
+                    if (child.isDisjunction)
+                    {
+                        current.expressions.addAll(child.expressions);
+                        current.children.addAll(child.children);
+                    }
+                    else
+                    {
+                        current.children.add(child);
+                    }
                 }
                 else
                 {
@@ -527,6 +537,35 @@ public class RowFilter
         }
 
         /**
+         * Adds the disjunction of the simple filter expressions of the given values to this builder.
+         *
+         * @param def the filtered column
+         * @param op the filtering operator, shouldn't be {@link Operator#ANN}.
+         * @param values the filtered values, at least one
+         */
+        public void addDisjunction(ColumnMetadata def, Operator op, List<ByteBuffer> values)
+        {
+            assert !values.isEmpty() : "A disjunction of no expressions would match every row";
+
+            // a single value needs no disjunction
+            if (values.size() == 1)
+            {
+                add(def, op, values.get(0));
+                return;
+            }
+
+            assert op != Operator.ANN : "ANN expressions should be added with the addANNExpression method";
+            FilterElement.Builder builder = new FilterElement.Builder(true);
+            for (ByteBuffer value : values)
+            {
+                SimpleExpression expression = new SimpleExpression(def, op, value, analyzer(def, op, value), null);
+                expression.validate();
+                builder.expressions.add(expression);
+            }
+            current.children.add(builder.build());
+        }
+
+        /**
          * Adds the specified ANN expression to this builder.
          *
          * @param def the column for ANN ordering
@@ -546,6 +585,10 @@ public class RowFilter
         @Nullable
         private Index.Analyzer analyzer(ColumnMetadata def, Operator op, ByteBuffer value)
         {
+            // an IN on an analyzed index is sent as a disjunction of analyzer matches, so an IN compares raw values
+            if (op == Operator.IN)
+                return null;
+
             return indexRegistry == null ? null : indexRegistry.getAnalyzerFor(def, op, value, indexHints).orElse(null);
         }
 
@@ -1210,7 +1253,9 @@ public class RowFilter
                     case SIMPLE:
                         ByteBuffer value = ByteBufferUtil.readWithShortLength(in);
                         ANNOptions annOptions = operator == Operator.ANN ? ANNOptions.serializer.deserialize(in, version) : null;
-                        Index.Analyzer analyzer = indexRegistry.getAnalyzerFor(column, operator, value, indexHints).orElse(null);
+                        Index.Analyzer analyzer = operator == Operator.IN
+                                                  ? null
+                                                  : indexRegistry.getAnalyzerFor(column, operator, value, indexHints).orElse(null);
                         return new SimpleExpression(column, operator, value, analyzer, annOptions);
                     case MAP_COMPARISON:
                         ByteBuffer key = ByteBufferUtil.readWithShortLength(in);
