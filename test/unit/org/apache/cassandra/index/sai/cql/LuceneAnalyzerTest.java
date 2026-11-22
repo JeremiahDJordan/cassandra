@@ -446,6 +446,23 @@ public class LuceneAnalyzerTest extends SAITester
     }
 
     @Test
+    public void testFiltersWithoutTokenizer()
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, val text)");
+
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer':'{\n" +
+                    "\t\"filters\":[{\"name\":\"lowercase\"}]\n" +
+                    "}'}");
+
+        execute("INSERT INTO %s (id, val) VALUES ('1', 'Hello World')");
+
+        flush();
+
+        assertEquals(1, execute("SELECT * FROM %s WHERE val : 'HELLO WORLD'").size());
+        assertEquals(0, execute("SELECT * FROM %s WHERE val : 'hello'").size());
+    }
+
+    @Test
     public void testNGramfilter()
     {
         createTable("CREATE TABLE %s (id text PRIMARY KEY, val text)");
@@ -865,8 +882,12 @@ public class LuceneAnalyzerTest extends SAITester
         assertNoWarning("{'index_analyzer': 'whitespace'}");
 
         // custom non-ngram analyzer
+        assertNoWarning("{'index_analyzer': '{\"filters\":[{\"name\":\"lowercase\"}]}'}");
+        assertNoWarning("{'index_analyzer': '{\"charFilters\":[{\"name\":\"htmlstrip\"}]}'}");
 
         // ngram analyzer without query_analyzer
+        assertClientWarningOnNGram("{'index_analyzer': '{" +
+                                   "   \"filters\":[{\"name\":\"ngram\", \"args\":{\"minGramSize\":\"2\", \"maxGramSize\":\"3\"}}]}'}");
         assertClientWarningOnNGram("{'index_analyzer': '{" +
                                    "   \"tokenizer\":{\"name\":\"ngram\", \"args\":{\"minGramSize\":\"2\", \"maxGramSize\":\"3\"}}," +
                                    "   \"filters\":[{\"name\":\"lowercase\"}]}'}");
@@ -887,6 +908,9 @@ public class LuceneAnalyzerTest extends SAITester
                         "'query_analyzer': '{" +
                         "   \"tokenizer\":{\"name\":\"whitespace\"}," +
                         "   \"filters\":[{\"name\":\"porterstem\"}]}'}");
+        assertNoWarning("{'index_analyzer': '{" +
+                        "   \"tokenizer\":{\"name\":\"ngram\", \"args\":{\"minGramSize\":\"2\", \"maxGramSize\":\"3\"}}}'," +
+                        "'query_analyzer': '{\"filters\":[{\"name\":\"lowercase\"}]}'}");
     }
 
     @Test
