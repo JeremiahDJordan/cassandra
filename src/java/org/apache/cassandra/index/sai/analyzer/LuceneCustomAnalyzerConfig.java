@@ -57,7 +57,7 @@ public class LuceneCustomAnalyzerConfig
      */
     public boolean isNGram()
     {
-        if (getTokenizer().getName().equals("ngram"))
+        if (getTokenizer() != null && getTokenizer().getName().equals("ngram"))
             return true;
 
         for (LuceneClassNameAndArgs filter : getFilters())
