@@ -122,6 +122,8 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
         DeletionTime deletion = DeletionTime.merge(update.deletion, existing.deletion);
         if (deletion.deletes(livenessInfo))
             livenessInfo = LivenessInfo.EMPTY;
+        this.heapSize += (livenessInfo.unsharedHeapSize() + deletion.unsharedHeapSize())
+                         - (existing.livenessInfo.unsharedHeapSize() + existing.deletion.unsharedHeapSize());
 
         Object[] tree = BTreeRow.mergeRowBTrees(this,
                                                 existing.columnsBTree, update.columnsBTree,
