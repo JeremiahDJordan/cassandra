@@ -893,6 +893,11 @@ public class LuceneAnalyzerTest extends SAITester
         assertClientWarningOnNGram("{'index_analyzer': '{" +
                                    "   \"tokenizer\":{\"name\":\"whitespace\"}," +
                                    "   \"filters\":[{\"name\":\"ngram\", \"args\":{\"minGramSize\":\"2\", \"maxGramSize\":\"3\"}}]}'}");
+        assertClientWarningOnNGram("{'index_analyzer': '{" +
+                                   "   \"tokenizer\":{\"name\":\"nGram\", \"args\":{\"minGramSize\":\"2\", \"maxGramSize\":\"3\"}}}'}");
+        assertClientWarningOnNGram("{'index_analyzer': '{" +
+                                   "   \"tokenizer\":{\"name\":\"whitespace\"}," +
+                                   "   \"filters\":[{\"name\":\"NGram\", \"args\":{\"minGramSize\":\"2\", \"maxGramSize\":\"3\"}}]}'}");
 
         // ngram analyzer with ngram query_analyzer
         assertNoWarning("{'index_analyzer': '{" +
