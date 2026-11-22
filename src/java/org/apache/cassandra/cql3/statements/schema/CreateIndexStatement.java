@@ -222,7 +222,7 @@ public final class CreateIndexStatement extends AlterSchemaStatement
         IndexMetadata index = IndexMetadata.fromIndexTargets(indexTargets, name, kind, options);
 
         String className = index.getIndexClassName();
-        if (isUnknownCustomIndexCreateStatement() && INDEX_UNKNOWN_IGNORE.getBoolean())
+        if (INDEX_UNKNOWN_IGNORE.getBoolean() && isUnknownCustomIndexCreateStatement())
         {
             logger.error("Cannot find index type {}, but '{}' is true so ignoring index {} creation",
                          className, INDEX_UNKNOWN_IGNORE.getKey(), indexName);
@@ -270,7 +270,7 @@ public final class CreateIndexStatement extends AlterSchemaStatement
     {
         if (isDseIndexCreateStatement())
             return ImmutableSet.of(String.format(DSE_INDEX_WARNING, indexName, attrs.customClass));
-        if (isUnknownCustomIndexCreateStatement() && INDEX_UNKNOWN_IGNORE.getBoolean())
+        if (INDEX_UNKNOWN_IGNORE.getBoolean() && isUnknownCustomIndexCreateStatement())
             return ImmutableSet.of(String.format(UNKNOWN_INDEX_WARNING, indexName, attrs.customClass));
 
         return ImmutableSet.of();
@@ -293,9 +293,9 @@ public final class CreateIndexStatement extends AlterSchemaStatement
     {
         try
         {
-            // mimic what IndexMetadata.validate(..) does
+            // only a class that isn't found is unknown; IndexMetadata.validate(..) rejects a class that isn't an Index
             if (attrs.isCustom)
-                FBUtilities.classForName(IndexMetadata.expandAliases(attrs.customClass), "custom indexer");
+                FBUtilities.classForName(IndexMetadata.expandAliases(attrs.customClass), Object.class, "custom indexer");
             return false;
         }
         catch (ConfigurationException ex)
