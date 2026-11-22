@@ -24,7 +24,6 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -586,16 +585,6 @@ public class TypeUtil
             offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance);
         }
         return elements.iterator();
-    }
-
-    public static Comparator<ByteBuffer> comparator(AbstractType<?> type, Version version)
-    {
-        // Override the comparator for BigInteger, frozen collections (not including composite types) and
-        // composite types before DB version to maintain a consistent order between the in-memory index and the on-disk index.
-        if (useFastByteOperations(type, version))
-            return FastByteOperations::compareUnsigned;
-
-        return type;
     }
 
     private static boolean useFastByteOperations(AbstractType<?> type, Version version)
