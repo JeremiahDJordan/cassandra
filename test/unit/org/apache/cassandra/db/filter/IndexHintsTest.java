@@ -1215,6 +1215,37 @@ public class IndexHintsTest extends CQLTester
     }
 
     @Test
+    public void testMultipleIndexesPerColumnAndMatchInOnAnalyzer()
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        String literal = createIndex("CREATE CUSTOM INDEX literal ON %s(v) USING 'StorageAttachedIndex'");
+        String analyzed = createIndex("CREATE CUSTOM INDEX analyzed ON %s(v) USING 'StorageAttachedIndex' " +
+                                      "WITH OPTIONS = { 'equals_behaviour_when_analyzed': 'MATCH', 'index_analyzer': 'standard' }");
+
+        String insert = "INSERT INTO %s (k, v) VALUES (?, ?)";
+        Object[] row1 = new Object[]{ 1, "Richard Strauss" };
+        Object[] row2 = new Object[]{ 2, "Johann Strauss" };
+        Object[] row3 = new Object[]{ 3, "Strauss" };
+        execute(insert, row1);
+        execute(insert, row2);
+        execute(insert, row3);
+
+        // IN queries using the analyzed index should emit the same warning as equality queries
+        String warning = format(AnalyzerEqOperatorSupport.EQ_RESTRICTION_ON_ANALYZED_WARNING, 'v', analyzed);
+
+        // IN is a disjunction of equalities, so it is ambiguous as they are, and the hints disambiguate it the same way
+        for (String query : new String[]{ "SELECT * FROM %s WHERE v IN ('Strauss', 'Bach') ", "SELECT * FROM %s WHERE v IN ('Strauss') " })
+        {
+            assertEqualityPredicateIsAmbiguous(query);
+            assertEqualityPredicateIsAmbiguous(query + "WITH included_indexes={literal,analyzed}");
+            assertThatIndexQueryPlanFor(query + "WITH included_indexes={literal}", row3).selects(literal).doesntWarn();
+            assertThatIndexQueryPlanFor(query + "WITH included_indexes={analyzed}", row1, row2, row3).selects(analyzed).warns(warning);
+            assertThatIndexQueryPlanFor(query + "WITH excluded_indexes={analyzed}", row3).selects(literal).doesntWarn();
+            assertThatIndexQueryPlanFor(query + "WITH excluded_indexes={literal}", row1, row2, row3).selects(analyzed).warns(warning);
+        }
+    }
+
+    @Test
     public void testMultipleIndexesPerColumnAndContains()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v list<text>)");
