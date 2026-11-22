@@ -183,9 +183,7 @@ public final class IndexMetadata
             // Find any aliases to the fully qualified index class name:
             String className = expandAliases(options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME));
 
-            Class<Index> indexerClass = FBUtilities.classForName(className, "custom indexer");
-            if (!Index.class.isAssignableFrom(indexerClass))
-                throw new ConfigurationException(String.format("Specified Indexer class (%s) does not implement the Indexer interface", className));
+            Class<? extends Index> indexerClass = FBUtilities.classForName(className, Index.class, "custom indexer");
             validateCustomIndexOptions(table, indexerClass, options);
         }
     }

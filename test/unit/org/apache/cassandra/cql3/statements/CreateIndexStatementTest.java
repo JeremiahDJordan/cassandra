@@ -30,8 +30,13 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.schema.CreateIndexStatement;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.schema.KeyspaceParams;
+import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
+import org.apache.cassandra.utils.ClassLoadingTestSupport;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -84,6 +89,41 @@ public class CreateIndexStatementTest extends CQLTester
     {
         String indexClass = "org.apache.cassandra.index.sasi.SASIIndex";
         executeNet(String.format("CREATE CUSTOM INDEX index_name ON ks.tbl (v) USING '%s'", indexClass));
+    }
+
+    @Test
+    public void nonIndexCustomClassIsRejectedWithoutInitializing()
+    {
+        ClassLoadingTestSupport.assertNotInitialized(ClassLoadingTestNonAssignable.class);
+
+        String indexClass = ClassLoadingTestNonAssignable.class.getName();
+        assertThatThrownBy(() -> executeNet(String.format("CREATE CUSTOM INDEX ON ks.tbl (v) USING '%s'", indexClass)))
+        .isInstanceOf(InvalidConfigurationInQueryException.class)
+        .hasMessageContaining("is not a " + Index.class.getName());
+
+        assertFalse(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class));
+    }
+
+    @Test
+    public void nonIndexCustomClassIsRejectedWithUnknownIndexesIgnored()
+    {
+        Boolean previous = CassandraRelevantProperties.INDEX_UNKNOWN_IGNORE.setBoolean(true);
+        try
+        {
+            String indexClass = ClassLoadingTestNonAssignable.class.getName();
+            assertThatThrownBy(() -> executeNet(String.format("CREATE CUSTOM INDEX ON ks.tbl (v) USING '%s'", indexClass)))
+            .isInstanceOf(InvalidConfigurationInQueryException.class)
+            .hasMessageContaining("is not a " + Index.class.getName());
+
+            assertFalse(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class));
+        }
+        finally
+        {
+            if (null != previous)
+                CassandraRelevantProperties.INDEX_UNKNOWN_IGNORE.setBoolean((boolean)previous);
+            else
+                CassandraRelevantProperties.INDEX_UNKNOWN_IGNORE.reset();
+        }
     }
 
     @Test
