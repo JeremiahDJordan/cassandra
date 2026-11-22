@@ -412,9 +412,20 @@ public class StorageAttachedIndex implements Index
         /*
          * index files will be removed as part of base sstable lifecycle in {@link LogTransaction#delete(java.io.File)}
          * asynchronously, but we need to mark the index queryable because if the truncation is during the initial
-         * build of the index it won't get marked queryable by the build.
+         * build of the index it won't get marked queryable by the build. An SSTable kept by the truncation that the
+         * index doesn't cover leaves the index as it is.
          */
         return () -> {
+            View view = viewManager.view();
+            for (SSTableReader sstable : baseCfs.getLiveSSTables())
+            {
+                if (!isIndexed(view, sstable))
+                {
+                    logger.info(indexIdentifier.logMessage("Not making index queryable during table truncation, as the kept SSTable {} is not indexed"), sstable.descriptor);
+                    return null;
+                }
+            }
+
             logger.info(indexIdentifier.logMessage("Making index queryable during table truncation"));
             baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);
             return null;
@@ -959,18 +970,19 @@ public class StorageAttachedIndex implements Index
 
         for (SSTableReader sstable : sstables)
         {
-            // An SSTable is considered not indexed if:
-            //   1. The current view does not contain the SSTable
-            //   2. The SSTable is not marked compacted
-            //   3. The column index does not have a completion marker
-            if (!view.containsSSTable(sstable) && !sstable.isMarkedCompacted() &&
-                !IndexDescriptor.create(sstable).isPerColumnIndexBuildComplete(indexIdentifier))
-            {
+            if (!isIndexed(view, sstable))
                 nonIndexed.add(sstable);
-            }
         }
 
         return nonIndexed;
+    }
+
+    private boolean isIndexed(View view, SSTableReader sstable)
+    {
+        // An SSTable is considered indexed if the current view contains it, it is marked compacted, or the column
+        // index has a completion marker
+        return view.containsSSTable(sstable) || sstable.isMarkedCompacted() ||
+               IndexDescriptor.create(sstable).isPerColumnIndexBuildComplete(indexIdentifier);
     }
 
     private class UpdateIndexer implements Index.Indexer
