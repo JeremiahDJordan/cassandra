@@ -17,11 +17,16 @@
  */
 package org.apache.cassandra.index.sai.memory;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.math.MathContext;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.function.IntFunction;
@@ -36,6 +41,7 @@ import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.marshal.UTF8Type;
@@ -262,6 +268,110 @@ public class TrieMemoryIndexTest
         testLongFilterEstimate(context, index, values, Long.MAX_VALUE, Long.MAX_VALUE);
     }
 
+    @Test
+    public void testDecimalRangeEstimatesFarApartExponents()
+    {
+        // The exact difference of the smallest and largest values overflows a BigInteger.
+        List<BigDecimal> values = new ArrayList<>();
+        values.add(new BigDecimal("1E-300000000"));
+        for (int i = 1; i <= 1000; i++)
+            values.add(BigDecimal.valueOf(i));
+        values.add(new BigDecimal("1E+300000000"));
+        TrieMemoryIndex index = newDecimalIndex(values);
+
+        // The range covers half of the span of the values.
+        assertEquals(values.size() / 2, estimateDecimalRange(index, BigDecimal.valueOf(100), new BigDecimal("5E+299999999")), 10);
+    }
+
+    @Test
+    public void testDecimalRangeEstimatesLargestDouble()
+    {
+        // The differences of these values are finite doubles, but exceed Double.MAX_VALUE when rounded to 16 digits.
+        List<BigDecimal> values = new ArrayList<>();
+        for (int i = 1; i <= 1000; i++)
+            values.add(BigDecimal.valueOf(i));
+        values.add(BigDecimal.valueOf(Double.MAX_VALUE));
+        TrieMemoryIndex index = newDecimalIndex(values);
+
+        assertEquals(values.size(), estimateDecimalRange(index, BigDecimal.valueOf(100), BigDecimal.valueOf(Double.MAX_VALUE)));
+    }
+
+    @Test
+    public void testDecimalRangeEstimatesTinyBound()
+    {
+        // The fractions of the index range in these ranges are smaller than the smallest double.
+        List<BigDecimal> values = new ArrayList<>();
+        for (int i = 0; i < 5000; i++)
+            values.add(BigDecimal.ZERO);
+        for (int i = 1; i <= 1000; i++)
+            values.add(BigDecimal.valueOf(i));
+        values.add(new BigDecimal("1E+10"));
+        TrieMemoryIndex index = newDecimalIndex(values);
+        assertEquals(0, estimateDecimalRange(index, BigDecimal.ZERO, new BigDecimal("1E-2147483630")));
+
+        values = new ArrayList<>();
+        values.add(BigDecimal.ZERO);
+        for (int i = 1; i <= 300; i++)
+            values.add(BigDecimal.valueOf(i).scaleByPowerOfTen(-2147483600));
+        values.add(new BigDecimal("1E+100"));
+        index = newDecimalIndex(values);
+        assertEquals(0, estimateDecimalRange(index, BigDecimal.ZERO, BigDecimal.valueOf(300).scaleByPowerOfTen(-2147483600)));
+    }
+
+    @Test
+    public void testDecimalRangeEstimatesSmallestScale()
+    {
+        // The differences of these values have more than 16 digits at a scale close to Integer.MIN_VALUE.
+        List<BigDecimal> values = new ArrayList<>();
+        for (int i = 0; i <= 1000; i++)
+            values.add(atSmallestScale(i));
+        TrieMemoryIndex index = newDecimalIndex(values);
+        assertEquals(values.size() * 0.8, estimateDecimalRange(index, atSmallestScale(100), atSmallestScale(900)), 2);
+
+        // and from 0, whose scale is far from theirs
+        values.set(0, BigDecimal.ZERO);
+        index = newDecimalIndex(values);
+        double fraction = atSmallestScale(500).divide(atSmallestScale(1000), MathContext.DECIMAL64).doubleValue();
+        assertEquals(values.size() * fraction, estimateDecimalRange(index, BigDecimal.ZERO, atSmallestScale(500)), 2);
+    }
+
+    @Test
+    public void testDecimalRangeEstimatesZeroNearScaleLimits()
+    {
+        // The difference of 0 and 18 nines at the scale Integer.MIN_VALUE + 2 rounds up to the scale Integer.MIN_VALUE.
+        List<BigDecimal> values = new ArrayList<>();
+        values.add(BigDecimal.ZERO);
+        for (int i = 1; i <= 999; i++)
+            values.add(new BigDecimal(BigInteger.valueOf(i * 1000000000000000L), Integer.MIN_VALUE + 2));
+        values.add(new BigDecimal(new BigInteger("999999999999999999"), Integer.MIN_VALUE + 2));
+        TrieMemoryIndex index = newDecimalIndex(values);
+        assertEquals(values.size() * 0.5, estimateDecimalRange(index, BigDecimal.ZERO, values.get(500)), 2);
+
+        // and 0 with decimals at the scale Integer.MAX_VALUE
+        values = new ArrayList<>();
+        values.add(BigDecimal.ZERO);
+        for (int i = 0; i < 1000; i++)
+            values.add(new BigDecimal(BigInteger.valueOf(10 * i + 1), Integer.MAX_VALUE));
+        index = newDecimalIndex(values);
+        assertEquals(values.size() * 0.5, estimateDecimalRange(index, BigDecimal.ZERO, values.get(500)), 2);
+    }
+
+    private TrieMemoryIndex newDecimalIndex(List<BigDecimal> values)
+    {
+        TrieMemoryIndex index = new TrieMemoryIndex(newIndexContext(UTF8Type.instance, DecimalType.instance));
+        for (int i = 0; i < values.size(); i++)
+            index.add(makeKey(table, Integer.toString(i)), Clustering.EMPTY, DecimalType.instance.decompose(values.get(i)), allocatedBytes -> {}, allocatesBytes -> {});
+        return index;
+    }
+
+    private long estimateDecimalRange(TrieMemoryIndex index, BigDecimal lower, BigDecimal upper)
+    {
+        Expression expression = new Expression(index.indexContext);
+        expression.add(Operator.GTE, DecimalType.instance.decompose(lower));
+        expression.add(Operator.LTE, DecimalType.instance.decompose(upper));
+        return index.estimateMatchingRowsCount(expression);
+    }
+
     private void testLongFilterEstimate(IndexContext context, TrieMemoryIndex index, long[] allValues, long lower, long upper)
     {
         Expression expression = new Expression(context);
@@ -394,5 +504,14 @@ public class TrieMemoryIndexTest
         else
             key = table.partitionKeyType.fromString((String)partitionKeys[0]);
         return table.partitioner.decorateKey(key);
+    }
+
+    /**
+     * Returns {@code 100000000000000001 + i * 40000000000000001} at the scale {@code Integer.MIN_VALUE + 1}.
+     */
+    private static BigDecimal atSmallestScale(int i)
+    {
+        BigInteger unscaled = BigInteger.valueOf(40000000000000001L).multiply(BigInteger.valueOf(i)).add(BigInteger.valueOf(100000000000000001L));
+        return new BigDecimal(unscaled, Integer.MIN_VALUE + 1);
     }
 }
