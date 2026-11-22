@@ -17,6 +17,8 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.math.BigDecimal;
+
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -91,6 +93,22 @@ public class ClusteringKeyIndexTest extends SAITester
             int cnt = getRows(execute("SELECT ck FROM %s WHERE ck = ?", ck)).length;
             assertEquals("Missing row for ck=" + ck, 1, cnt);
         }
+    }
+
+    @Test
+    public void decimalClusteringAtScaleLimit()
+    {
+        createTable("CREATE TABLE %s (pk int, ck decimal, val int, PRIMARY KEY (pk, ck))");
+        createIndex("CREATE INDEX ON %s(val) USING 'sai'");
+
+        BigDecimal[] cks = { new BigDecimal("-5E-2147483647"), new BigDecimal("1E-2147483647"), new BigDecimal("1.5") };
+        for (int i = 0; i < cks.length; i++)
+            execute("INSERT INTO %s (pk, ck, val) VALUES (0, ?, ?)", cks[i], i);
+        flush();
+
+        for (int i = 0; i < cks.length; i++)
+            assertRows(execute("SELECT * FROM %s WHERE val = ?", i), row(0, cks[i], i));
+        assertRows(execute("SELECT * FROM %s WHERE val >= 0"), row(0, cks[0], 0), row(0, cks[1], 1), row(0, cks[2], 2));
     }
 
     private Object[] expectedRow(int index)
