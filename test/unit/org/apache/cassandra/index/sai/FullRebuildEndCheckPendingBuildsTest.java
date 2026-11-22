@@ -30,10 +30,12 @@ import java.util.stream.Collectors;
 import org.junit.After;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.internal.CollatedViewIndexBuilder;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
@@ -66,6 +68,8 @@ public class FullRebuildEndCheckPendingBuildsTest extends SAITester
     private static volatile boolean markedHeld;
     private static volatile boolean holdingLook;
     private static volatile boolean lookHeld;
+    private static volatile boolean holdingLegacy;
+    private static volatile boolean legacyHeld;
 
     /** called by the injected code at the start of StorageAttachedIndexBuilder#indexSSTable */
     public static void holdBuildOf(Object sstable) throws InterruptedException
@@ -98,6 +102,16 @@ public class FullRebuildEndCheckPendingBuildsTest extends SAITester
             Thread.sleep(20);
     }
 
+    /** called by the injected code at the start of CollatedViewIndexBuilder#build */
+    public static void holdLegacy() throws InterruptedException
+    {
+        if (!holdingLegacy)
+            return;
+        legacyHeld = true;
+        while (holdingLegacy)
+            Thread.sleep(20);
+    }
+
     /** called by the injected code at the end of SecondaryIndexManager#logAndMarkIndexesFailed: holds the first failure */
     public static void holdMarked() throws InterruptedException
     {
@@ -119,7 +133,10 @@ public class FullRebuildEndCheckPendingBuildsTest extends SAITester
         markedHeld = false;
         holdingLook = false;
         lookHeld = false;
+        holdingLegacy = false;
+        legacyHeld = false;
         Injections.deleteAll();
+        CompactionManager.instance.setConcurrentIndexBuilders(DatabaseDescriptor.getConcurrentIndexBuilders());
     }
 
     /**
@@ -155,6 +172,89 @@ public class FullRebuildEndCheckPendingBuildsTest extends SAITester
         Injections.deleteAll();
         assertTrue(cfs.indexManager.isIndexQueryable(v));
         assertThat(rowsThrough("v")).isEqualTo(SSTABLES * ROWS_PER_SSTABLE);
+    }
+
+    /**
+     * As above, but the asynchronous build of the reloaded copy also builds a legacy index, whose build fails while the
+     * SAI indexes are still building the copy: that failure must not fail the rebuild.
+     */
+    @Test
+    public void testFailedBuildOfALegacyIndexOfTheRemoteCopyDoesNotFailTheRebuild() throws Throwable
+    {
+        ColumnFamilyStore cfs = prepare();
+        String legacy = createIndex("CREATE INDEX ON %s(w) USING 'legacy_local_table'");
+        String v = indexOn(cfs, "v");
+        String w = indexOn(cfs, "w");
+        StorageAttachedIndex index = (StorageAttachedIndex) cfs.indexManager.getIndexByName(v);
+        SSTableReader built = firstSSTable(cfs);
+        // the check and the SAI build of the copy are held on two builder threads, the legacy build needs a third
+        CompactionManager.instance.setConcurrentIndexBuilders(DatabaseDescriptor.getConcurrentIndexBuilders() + 1);
+
+        Injections.inject(Injections.newCustom("fail_legacy_build_" + System.nanoTime())
+                                    .add(InvokePointBuilder.newInvokePoint().onClass(CollatedViewIndexBuilder.class).onMethod("build"))
+                                    .add(ActionBuilder.newActionBuilder().actions()
+                                                      .doThrow(RuntimeException.class, Expression.quote("Injected failure")))
+                                    .build());
+        CompletableFuture<Throwable> rebuild = rebuildHeldAtItsEndCheck(cfs, v);
+
+        // the copy has no index components, and its asynchronous build starts: the SAI part is held, the legacy part fails
+        removeIndexComponents(cfs, built, true, true);
+        hold.add(built.descriptor);
+        cfs.getTracker().notifySSTablesChanged(Collections.singleton(built), Collections.singleton(built), OperationType.REMOTE_RELOAD,
+                                               Optional.empty(), null);
+        waitForAssert(() -> assertTrue(held.contains(built.descriptor)), 120, TimeUnit.SECONDS);
+        waitForAssert(() -> assertFalse(cfs.indexManager.isIndexBuilding(legacy)), 120, TimeUnit.SECONDS);
+        assertThat(cfs.indexManager.sstablesOfBuildsInProgress(v)).contains(built.descriptor);
+        assertThat(cfs.indexManager.sstablesOfBuildsInProgress(legacy)).doesNotContain(built.descriptor);
+
+        holdingCheck = false;
+        assertThat(rebuild.get(180, TimeUnit.SECONDS)).isNull();
+        assertTrue(cfs.indexManager.isIndexQueryable(v));
+
+        hold.clear();
+        waitForAssert(() -> assertTrue(index.getIndexContext().getView().containsSSTableIndex(built.descriptor)), 120, TimeUnit.SECONDS);
+        Injections.deleteAll();
+        assertTrue(cfs.indexManager.isIndexQueryable(v));
+        assertThat(rowsThrough("v")).isEqualTo(SSTABLES * ROWS_PER_SSTABLE);
+        assertTrue(cfs.indexManager.isIndexQueryable(w));
+    }
+
+    /**
+     * The asynchronous build of an SSTable reloaded from remote storage builds the SAI indexes and a legacy index: once
+     * the SAI indexes are built, the SSTable is no longer listed for them while the legacy build is still running.
+     */
+    @Test
+    public void testSSTableOfAFinishedSAIBuildIsNotListedWhileALegacyBuildRuns() throws Throwable
+    {
+        ColumnFamilyStore cfs = prepare();
+        String legacy = createIndex("CREATE INDEX ON %s(w) USING 'legacy_local_table'");
+        String v = indexOn(cfs, "v");
+        StorageAttachedIndex index = (StorageAttachedIndex) cfs.indexManager.getIndexByName(v);
+        SSTableReader built = firstSSTable(cfs);
+
+        holdingLegacy = true;
+        Injections.inject(Injections.newCustom("hold_legacy_build_" + System.nanoTime())
+                                    .add(InvokePointBuilder.newInvokePoint().onClass(CollatedViewIndexBuilder.class).onMethod("build"))
+                                    .add(ActionBuilder.newActionBuilder().actions()
+                                                      .doAction(Expression.expr(FullRebuildEndCheckPendingBuildsTest.class.getName())
+                                                                          .method("holdLegacy").args()))
+                                    .build());
+
+        // the copy has no index components, and its asynchronous build starts: the legacy part is held
+        removeIndexComponents(cfs, built, true, true);
+        cfs.getTracker().notifySSTablesChanged(Collections.singleton(built), Collections.singleton(built), OperationType.REMOTE_RELOAD,
+                                               Optional.empty(), null);
+        waitForAssert(() -> assertTrue(legacyHeld), 120, TimeUnit.SECONDS);
+        waitForAssert(() -> assertTrue(index.getIndexContext().getView().containsSSTableIndex(built.descriptor)), 120, TimeUnit.SECONDS);
+        waitForAssert(() -> assertFalse(cfs.indexManager.isIndexBuilding(v)), 120, TimeUnit.SECONDS);
+        waitForAssert(() -> assertThat(cfs.indexManager.sstablesOfBuildsInProgress(v)).doesNotContain(built.descriptor), 10, TimeUnit.SECONDS);
+        assertThat(cfs.indexManager.sstablesOfBuildsInProgress(legacy)).contains(built.descriptor);
+
+        holdingLegacy = false;
+        waitForAssert(() -> assertThat(cfs.indexManager.sstablesOfBuildsInProgress(legacy)).isEmpty(), 120, TimeUnit.SECONDS);
+        Injections.deleteAll();
+        assertTrue(cfs.indexManager.isIndexQueryable(v));
+        assertTrue(cfs.indexManager.isIndexQueryable(legacy));
     }
 
     /**

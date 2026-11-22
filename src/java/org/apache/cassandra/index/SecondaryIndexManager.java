@@ -973,7 +973,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                // rejected because a zero-copy stream holds one of its sstables): mark these indexes
                                // failed, as a failed build would, so they don't stay counted as building forever.
                                if (sstableBuild != null)
-                                   sstableBuildsInProgress.remove(sstableBuild);
+                                   sstableBuild.removeIndexes(groupedIndexes);
                                logAndMarkIndexesFailed(groupedIndexes, t, false);
                                unbuiltIndexes.addAll(groupedIndexes);
                                SettableFuture<Object> failed = SettableFuture.create();
@@ -994,7 +994,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                // these indexes failed now; the builders already submitted run on, without a
                                // callback.
                                if (sstableBuild != null)
-                                   sstableBuildsInProgress.remove(sstableBuild);
+                                   sstableBuild.removeIndexes(groupedIndexes);
                                for (SecondaryIndexBuilder notSubmitted : builders.subList(builderFutures.size(), builders.size()))
                                {
                                    try
@@ -1025,11 +1025,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                {
                                    try
                                    {
-                                       // This build no longer adds its SSTables to the views: remove it first, so
-                                       // that the end check of a full rebuild doesn't leave them to it while its
-                                       // indexes are being marked failed.
+                                       // These indexes no longer add the SSTables to their views: remove them from
+                                       // the build first, so that the end check of a full rebuild doesn't leave the
+                                       // SSTables to it while they are being marked failed.
                                        if (sstableBuild != null)
-                                           sstableBuildsInProgress.remove(sstableBuild);
+                                           sstableBuild.removeIndexes(groupedIndexes);
                                        logAndMarkIndexesFailed(groupedIndexes, t, false);
                                    }
                                    finally
@@ -1049,12 +1049,17 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                            markIndexBuilt(index, isFullRebuild);
                                            builtIndexes.add(index);
                                        }
+                                       // the SSTables are in the views of these indexes now
+                                       if (sstableBuild != null)
+                                           sstableBuild.removeIndexes(groupedIndexes);
                                        logger.info("Index build of {} completed", Index.joinNames(groupedIndexes));
                                        build.set(o);
                                    }
                                    catch (Throwable t)
                                    {
                                        // the indexes that aren't marked built are marked failed once every group is done
+                                       if (sstableBuild != null)
+                                           sstableBuild.removeIndexes(groupedIndexes);
                                        build.setException(t);
                                    }
                                }
@@ -2113,8 +2118,15 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         SSTableBuild(Set<Index> indexes, Collection<SSTableReader> sstables)
         {
-            this.indexes = indexes.stream().map(index -> index.getIndexMetadata().name).collect(Collectors.toSet());
+            this.indexes = Sets.newConcurrentHashSet();
+            indexes.forEach(index -> this.indexes.add(index.getIndexMetadata().name));
             this.sstables = sstables.stream().map(sstable -> sstable.descriptor).collect(Collectors.toSet());
+        }
+
+        /** Removes the indexes of a building-support group whose build is done; the other groups may still be building. */
+        void removeIndexes(Set<Index> done)
+        {
+            done.forEach(index -> indexes.remove(index.getIndexMetadata().name));
         }
     }
 
