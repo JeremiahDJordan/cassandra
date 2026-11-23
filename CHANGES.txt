@@ -1,4 +1,5 @@
 5.0.10
+ * Fix GROUP BY queries with a limit or paging failing, or counting deleted rows, when the limits stop in a range tombstone (CASSANDRA-16431)
  * Fix short read protection losing GROUP BY groups and static rows of replicas that stop at the group limit (CASSANDRA-XXXXX)
  * Avoid needless short read protection requests in replica filtering protection when the rows that every replica returned fill the limit (CASSANDRA-XXXXX)
  * CONTAINS KEY restriction on a frozen map clustering column with descending order is rejected: "Cannot use CONTAINS KEY on non-map column" (CASSANDRA-21742)
