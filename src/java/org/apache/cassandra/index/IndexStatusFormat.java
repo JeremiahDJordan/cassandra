@@ -24,10 +24,8 @@ import javax.annotation.Nullable;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.TypeSizes;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.JsonUtils;
 import org.apache.cassandra.utils.NoSpamLogger;
 
@@ -39,6 +37,10 @@ import org.apache.cassandra.utils.NoSpamLogger;
  *     <li>The compact format groups the indexes by keyspace and uses the numeric status codes:
  *     {@code {"ks1": {"idx1": 3}}}.</li>
  * </ul>
+ * Nodes gossip the compact format, and the gossip serializer rewrites it in the legacy format for peers whose messaging
+ * version is older than {@link org.apache.cassandra.net.MessagingService#VERSION_DS_20}, see
+ * {@link #toLegacySerializedFormat(String)}.
+ * <p>
  * This class has no state, so the gossip serializer can use it without initializing {@link IndexStatusManager}.
  */
 public final class IndexStatusFormat
@@ -52,38 +54,6 @@ public final class IndexStatusFormat
     private static final int MAX_GOSSIP_VALUE_LENGTH = 0xFFFF;
 
     private IndexStatusFormat() {}
-
-    /**
-     * Serializes as a JSON string the status of the indexes in the provided map, in the format understood by all the
-     * nodes of a cluster whose minimum version is the given one.
-     * <p>
-     * Versions 5.0.0 through 5.0.2 use a much more bloated format that duplicates keyspace names and writes full
-     * status names instead of their numeric codes. If the minimum cluster version is unknown or one of those 3
-     * versions, the legacy format is used, unless the compact one is forced with
-     * {@link DatabaseDescriptor#getForceOptimizedIndexStatusFormat()}. Peers that need the legacy format whatever
-     * the minimum cluster version (HCD 1.2) get it from the gossip serializer, see
-     * {@link #toLegacySerializedFormat(String)}.
-     *
-     * @param minVersion the minimum version of the cluster, or {@code null} or {@link CassandraVersion#NULL_VERSION}
-     *                   if unknown
-     */
-    public static String toSerializedFormat(@Nullable CassandraVersion minVersion, Map<String, Index.Status> indexStatusMap)
-    {
-        return shouldWriteLegacyStatusFormat(minVersion) ? toLegacySerializedFormat(indexStatusMap)
-                                                         : toSerializedFormat(indexStatusMap);
-    }
-
-    private static boolean shouldWriteLegacyStatusFormat(@Nullable CassandraVersion minVersion)
-    {
-        if (DatabaseDescriptor.getForceOptimizedIndexStatusFormat())
-            return false;
-
-        // Gossiper.getMinVersion() returns NULL_VERSION while upgrading, until the versions of the peers are known
-        if (minVersion == null || CassandraVersion.NULL_VERSION.equals(minVersion))
-            return true;
-
-        return (minVersion.major == 5 && minVersion.minor == 0 && minVersion.patch < 3);
-    }
 
     /**
      * Serializes as a JSON string the status of the indexes in the provided map, using the compact format.
@@ -146,13 +116,17 @@ public final class IndexStatusFormat
 
     /**
      * Rewrites a gossiped index status value in the legacy format, for peers that cannot parse the compact one.
-     * A value already in the legacy format is returned unchanged, and so is a value that cannot be parsed: the peer
+     * A value already in the legacy format is returned unchanged, and so is a value that is not valid JSON: the peer
      * would not be able to read it in any format.
      * <p>
-     * The compact format exists because the legacy one may not fit in a gossiped value: if the legacy rewrite is longer
-     * than {@link #MAX_GOSSIP_VALUE_LENGTH} the value is also returned unchanged, so that gossip with the peer keeps
-     * working even if the peer cannot read the index status.
+     * The compact format exists because the legacy one may not fit in a gossiped value. A value in the compact format
+     * whose legacy rewrite is longer than {@link #MAX_GOSSIP_VALUE_LENGTH}, or that has a status code this node doesn't
+     * know, gives {@code null}: some of the peers that need the legacy format fail on a compact value without catching
+     * the failure (Apache Cassandra 5.0.0-5.0.2 casts each value to a string), so it must not be sent to them.
+     *
+     * @return the value in the legacy format, or {@code null} if it must not be sent to peers that need that format
      */
+    @Nullable
     public static String toLegacySerializedFormat(String serialized)
     {
         // Only the compact format nests JSON objects: keyspace and index names cannot contain '{', so anything else
@@ -160,27 +134,33 @@ public final class IndexStatusFormat
         if (serialized.indexOf('{', 1) < 0)
             return serialized;
 
+        Map<String, Object> parsed;
         try
         {
-            Map<String, Object> parsed = JsonUtils.fromJsonMap(serialized);
-            if (parsed.values().stream().noneMatch(v -> v instanceof Map))
-                return serialized;
+            parsed = JsonUtils.fromJsonMap(serialized);
+        }
+        catch (RuntimeException e)
+        {
+            noSpamLogger.debug("Unable to parse index status {}: {}", serialized, e.getMessage());
+            return serialized;
+        }
+        if (parsed.values().stream().noneMatch(v -> v instanceof Map))
+            return serialized;
 
+        try
+        {
             String legacy = toLegacySerializedFormat(fromParsedFormat(parsed));
-            if (TypeSizes.encodedUTF8Length(legacy) > MAX_GOSSIP_VALUE_LENGTH)
-            {
-                noSpamLogger.warn("The index status in the legacy format is too long to be gossiped ({} characters), " +
-                                  "peers older than HCD 2.0 will receive it in the compact format they cannot parse",
-                                  legacy.length());
-                return serialized;
-            }
-            return legacy;
+            if (TypeSizes.encodedUTF8Length(legacy) <= MAX_GOSSIP_VALUE_LENGTH)
+                return legacy;
+
+            noSpamLogger.warn("The index status in the legacy format is too long to be gossiped ({} characters), " +
+                              "it is not sent to peers that can only parse that format", legacy.length());
         }
         catch (RuntimeException e)
         {
             noSpamLogger.debug("Unable to convert index status {} to the legacy format: {}", serialized, e.getMessage());
-            return serialized;
         }
+        return null;
     }
 
     /**
