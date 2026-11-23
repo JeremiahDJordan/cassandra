@@ -46,8 +46,7 @@ public class SSTableExportLegacyTupleTest extends OfflineToolUtils
     public static Collection<Object[]> versions()
     {
         List<Object[]> versions = new ArrayList<>();
-        // mb and me are left out: they fail reading a complex column (EOFException), as they do on Apache Cassandra
-        for (String version : new String[]{ "ma", "mc", "md", "na", "nb" })
+        for (String version : new String[]{ "ma", "mb", "mc", "md", "me", "na", "nb" })
         {
             if (new File("test/data/legacy-sstables/" + version + "/legacy_tables/legacy_" + version + "_tuple").isDirectory())
                 versions.add(new Object[]{ version });
