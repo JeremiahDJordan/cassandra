@@ -102,6 +102,7 @@ import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.FutureCombiner;
@@ -701,9 +702,50 @@ public class StorageAttachedIndex implements Index
         /*
          * index files will be removed as part of base sstable lifecycle in {@link LogTransaction#delete(java.io.File)}
          * asynchronously, but we need to mark the index queryable because if the truncation is during the initial
-         * build of the index it won't get marked queryable by the build.
+         * build of the index it won't get marked queryable by the build. An SSTable kept by the truncation that the
+         * index doesn't cover leaves the index as it is.
          */
         return () -> {
+            // The index may be dropped while the table is truncated
+            StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
+            if (group == null || !group.containsIndex(this))
+                return null;
+
+            // Until the initialization task flushes them, the memtables can have rows written before the index was
+            // created, which its memtable index doesn't have. That task makes the index queryable once they're flushed.
+            if (!canFlushFromMemtableIndex)
+                return null;
+
+            List<SSTableReader> nonIndexed;
+            try
+            {
+                synchronized (this)
+                {
+                    // Checked again once the selection can start (findNonIndexedSSTables is synchronized on this index
+                    // too): the SSTables mustn't be loaded for an index that was dropped while this waited for it
+                    if (dropped || !group.containsIndex(this))
+                        return null;
+                    nonIndexed = findNonIndexedSSTables(baseCfs, group, false);
+                }
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                // Failing here would fail the truncation after its SSTables are discarded
+                logger.warn(indexContext.logMessage("Not making index queryable during table truncation"), t);
+                return null;
+            }
+
+            if (!nonIndexed.isEmpty())
+            {
+                logger.info(indexContext.logMessage("Not making index queryable during table truncation, as the kept SSTables {} are not indexed"),
+                            nonIndexed.stream().map(sstable -> sstable.descriptor).collect(Collectors.toList()));
+                return null;
+            }
+
+            if (dropped || !group.containsIndex(this))
+                return null;
+
             logger.info(indexContext.logMessage("Making index queryable during table truncation"));
             baseCfs.indexManager.makeIndexQueryable(this, Status.BUILD_SUCCEEDED);
             return null;
