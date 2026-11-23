@@ -23,7 +23,9 @@ import java.lang.invoke.MethodHandles;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.EnumSet;
+import java.util.List;
 import java.util.Set;
+import java.util.zip.CRC32;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -61,6 +63,8 @@ import org.apache.cassandra.metrics.DefaultNameFactory;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
+import org.apache.lucene.codecs.CodecUtil;
+import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.IndexInput;
 
 import static org.apache.cassandra.utils.FBUtilities.prettyPrintMemory;
@@ -228,15 +232,18 @@ public class V1OnDiskFormat implements OnDiskFormat
         if (component.isCompletionMarker())
             return true;
 
-        // We do not validate vector components until V7, so we skip for earlier versions
         IndexContext context = component.parent().context();
-        if (isVectorDataComponent(context, component.componentType()))
+        boolean isVectorData = isVectorDataComponent(context, component.componentType());
+        // The vector components only have headers and footers from version CA (jvector) on
+        if (isVectorData && !component.parent().version().onOrAfter(Version.JVECTOR_EARLIEST))
             return true;
 
         Version earliest = getExpectedEarliestVersion(context, component.componentType());
         try (IndexInput input = component.openInput())
         {
-            if (checksum)
+            if (checksum && isVectorData && component.componentType() == IndexComponentType.TERMS_DATA)
+                validateGraphChecksums(component, input, earliest);
+            else if (checksum)
                 SAICodecUtils.validateChecksum(input);
             else
                 SAICodecUtils.validate(input, earliest);
@@ -304,6 +311,80 @@ public class V1OnDiskFormat implements OnDiskFormat
         return TypeUtil.isLiteral(type)
                ? ByteBuffer.wrap(ByteSourceInverse.readBytes(value.asComparableBytes(ByteComparable.Version.OSS41)))
                : TypeUtil.fromComparableBytes(value, type, ByteComparable.Version.OSS41);
+    }
+
+    /**
+     * Validates each segment of the graph file (TERMS_DATA) of a vector index. The graph writer gives each segment its
+     * own header and footer, and the checksum of its footer covers only the graph of the segment, between them (see
+     * {@code CassandraOnHeapGraph#flush}). Before version EC, a footer may instead have the checksum of the file up to
+     * it, as the other components have, which the graph writers of earlier releases wrote.
+     */
+    private static void validateGraphChecksums(IndexComponent.ForRead component, IndexInput input, Version earliest) throws IOException
+    {
+        IndexComponents.ForRead parent = component.parent();
+        List<SegmentMetadata> segments = SegmentMetadata.loadWithoutFullResolutionBounds(MetadataSource.loadMetadata(parent),
+                                                                                       parent.context());
+        boolean acceptFileChecksum = !parent.version().onOrAfter(Version.EC);
+        long fileLength = input.length();
+        CRC32 fileChecksum = new CRC32();
+        byte[] buffer = new byte[64 * 1024];
+        long segmentStart = 0;
+        for (int i = 0; i < segments.size(); i++)
+        {
+            long graphStart = graphOffset(segments.get(i));
+            long segmentEnd = i + 1 < segments.size() ? graphOffset(segments.get(i + 1)) - SAICodecUtils.headerSize() : fileLength;
+            long footerStart = segmentEnd - CodecUtil.footerLength();
+            if (graphStart - SAICodecUtils.headerSize() != segmentStart || footerStart < graphStart || segmentEnd > fileLength)
+                throw new CorruptIndexException(String.format("Segment %d of the graph at [%d, %d) is inconsistent with the previous " +
+                                                              "segment, which ends at %d, or with the file length %d",
+                                                              i, graphStart, segmentEnd, segmentStart, fileLength),
+                                                input);
+
+            input.seek(segmentStart);
+            SAICodecUtils.checkHeader(input, earliest);
+            if (input.getFilePointer() != graphStart)
+                throw new CorruptIndexException("Unexpected header length " + (input.getFilePointer() - segmentStart) + " of segment " + i, input);
+
+            // the checksum of the graph, and the checksum of the file up to the footer's checksum
+            input.seek(segmentStart);
+            CRC32 graphChecksum = new CRC32();
+            long checksumStart = footerStart + 8;
+            for (long position = segmentStart; position < checksumStart; )
+            {
+                int length = (int) Math.min(buffer.length, checksumStart - position);
+                input.readBytes(buffer, 0, length);
+                fileChecksum.update(buffer, 0, length);
+                if (position + length > graphStart && position < footerStart)
+                {
+                    int from = (int) Math.max(0, graphStart - position);
+                    int to = (int) Math.min(length, footerStart - position);
+                    graphChecksum.update(buffer, from, to - from);
+                }
+                position += length;
+            }
+
+            input.seek(footerStart);
+            SAICodecUtils.validateFooter(input, true);
+            long expected = SAICodecUtils.readCRC(input);
+            if (expected != graphChecksum.getValue() && !(acceptFileChecksum && expected == fileChecksum.getValue()))
+                throw new CorruptIndexException(String.format("Checksum failed for segment %d of the graph: expected %x, actual %x",
+                                                              i, expected, graphChecksum.getValue()),
+                                                input);
+
+            // the checksum of the file up to the next segment's footer includes this footer's checksum
+            input.seek(checksumStart);
+            input.readBytes(buffer, 0, 8);
+            fileChecksum.update(buffer, 0, 8);
+            segmentStart = segmentEnd;
+        }
+
+        if (segmentStart != fileLength)
+            throw new CorruptIndexException("The segments of the graph end at " + segmentStart + ", before the end of the file at " + fileLength, input);
+    }
+
+    private static long graphOffset(SegmentMetadata segment)
+    {
+        return segment.componentMetadatas.get(IndexComponentType.TERMS_DATA).offset;
     }
 
     /** vector data components (that did not have checksums before v3) */
