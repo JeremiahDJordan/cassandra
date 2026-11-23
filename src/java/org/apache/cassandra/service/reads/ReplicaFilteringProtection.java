@@ -21,18 +21,28 @@ package org.apache.cassandra.service.reads;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Comparator;
+import java.util.EnumSet;
+import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.Queue;
+import java.util.Set;
 import java.util.function.Function;
+import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
 
 import javax.annotation.concurrent.NotThreadSafe;
 
+import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.Clusterable;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
@@ -40,6 +50,7 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadResponse;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
@@ -48,8 +59,10 @@ import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.Redaction;
 import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
@@ -110,12 +123,22 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                                                            "which is over the failure threshold of %d rows defined by " +
                                                            "'cached_replica_rows_fail_threshold' in cassandra.yaml.";
 
+    // The operators whose result on a static row the coordinator computes exactly: = also on an analyzed column, as
+    // RowFilter evaluates it with the analyzer of the index.
+    private static final Set<Operator> EXACT_OPERATORS = EnumSet.of(Operator.EQ, Operator.NEQ, Operator.LT, Operator.LTE,
+                                                                    Operator.GT, Operator.GTE, Operator.IN, Operator.NOT_IN,
+                                                                    Operator.CONTAINS, Operator.CONTAINS_KEY,
+                                                                    Operator.NOT_CONTAINS, Operator.NOT_CONTAINS_KEY);
+
     private final Keyspace keyspace;
     private final ReadCommand command;
     private final ConsistencyLevel consistency;
     private final Dispatcher.RequestTime requestTime;
     private final E sources;
     private final TableMetrics tableMetrics;
+
+    /** The filter that the coordinator applies to the merged, completed rows. */
+    private final UnaryOperator<PartitionIterator> coordinatorFilter;
 
     private final QueryMergeListener mergeListener;
 
@@ -139,11 +162,49 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /** Tracks the current partitions when not consuming entire partitions in {@link #queryProtectedPartitions}. */
     private RowIterator currentRowIterator = null;
 
+    private static boolean isEvaluatedExactly(RowFilter.Expression expression)
+    {
+        return (expression instanceof RowFilter.SimpleExpression || expression instanceof RowFilter.MapComparisonExpression)
+               && EXACT_OPERATORS.contains(expression.operator());
+    }
+
+    /**
+     * The given filter tree with its static expressions replaced by the given results: {@code TRUE}, {@code FALSE},
+     * or what remains of it, as the remaining expression or subtree, or as whether it is a disjunction and the list of
+     * those that remain. As the tree only has conjunctions and disjunctions, a tree that remains the same with fewer
+     * static expressions satisfied selects the same rows.
+     */
+    private static Object residual(RowFilter.FilterElement element, Predicate<RowFilter.Expression> staticResult)
+    {
+        Boolean decisive = element.isDisjunction();
+        List<Object> remaining = new ArrayList<>();
+        for (RowFilter.Expression expression : element.expressions())
+        {
+            Object operand = expression.column().isStatic() ? (Object) staticResult.test(expression) : expression;
+            if (decisive.equals(operand))
+                return decisive;
+            if (!(operand instanceof Boolean))
+                remaining.add(operand);
+        }
+        for (RowFilter.FilterElement child : element.children())
+        {
+            Object operand = residual(child, staticResult);
+            if (decisive.equals(operand))
+                return decisive;
+            if (!(operand instanceof Boolean))
+                remaining.add(operand);
+        }
+        if (remaining.isEmpty())
+            return !decisive;
+        return remaining.size() == 1 ? remaining.get(0) : Arrays.asList(decisive, remaining);
+    }
+
     ReplicaFilteringProtection(Keyspace keyspace,
                                ReadCommand command,
                                ConsistencyLevel consistency,
                                Dispatcher.RequestTime requestTime,
                                E sources,
+                               UnaryOperator<PartitionIterator> coordinatorFilter,
                                int cachedRowsWarnThreshold,
                                int cachedRowsFailThreshold)
     {
@@ -153,6 +214,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         this.consistency = consistency;
         this.requestTime = requestTime;
         this.sources = sources;
+        this.coordinatorFilter = coordinatorFilter;
         this.originalPartitions = new ArrayList<>(sources.size());
 
         for (int i = 0; i < sources.size(); i++)
@@ -168,7 +230,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         mergeListener = new QueryMergeListener();
     }
 
-    private UnfilteredPartitionIterator executeReadCommand(ReadCommand cmd, Replica source, ReplicaPlan.Shared<EndpointsForToken, ReplicaPlan.ForTokenRead> replicaPlan)
+    private ReadResponse executeReadCommand(ReadCommand cmd, Replica source, ReplicaPlan.Shared<EndpointsForToken, ReplicaPlan.ForTokenRead> replicaPlan)
     {
         @SuppressWarnings("unchecked")
         DataResolver<EndpointsForToken, ReplicaPlan.ForTokenRead> resolver =
@@ -194,7 +256,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         // We don't call handler.get() because we want to preserve tombstones since we're still in the middle of merging node results.
         handler.awaitResults();
         assert resolver.getMessages().size() == 1;
-        return resolver.getMessages().get(0).payload.makeIterator(command);
+        return resolver.getMessages().get(0).payload;
     }
 
     private class PartitionMergeListerner implements UnfilteredRowIterators.MergeListener
@@ -205,7 +267,8 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         final EncodingStats stats;
         final boolean[] silentRowAt;
         final boolean[] silentColumnAt;
-        
+        boolean populated;
+
         PartitionMergeListerner(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
         {
             key = partitionKey;
@@ -213,7 +276,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             stats = EncodingStats.merge(versions, NULL_TO_NO_STATS);
 
             for (int i = 0; i < sources.size(); i++)
-                builders.add(i, new PartitionBuilder(partitionKey, sources.get(i), columns, stats));
+                builders.add(i, new PartitionBuilder(partitionKey, sources.get(i), columns, stats, versions.get(i) != null));
 
             silentRowAt = new boolean[builders.size()];
             silentColumnAt = new boolean[builders.size()];
@@ -286,8 +349,103 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         public void populate()
         {
+            populated = true;
+            if (command.rowFilter().hasStaticExpression())
+            {
+                fetchWhereStaticRowIsStricter();
+                completeFetchedPartitions();
+            }
+
             for (int i = 0; i < sources.size(); i++)
                 originalPartitions.get(i).add(builders.get(i));
+        }
+
+        /**
+         * Fetches the entire partition from each replica whose static row is stricter than the static row of the
+         * partition (see isStricter): it can have left out rows that the static row of the partition selects. The
+         * static row of the partition merges the static rows and partition deletions of all the replicas.
+         */
+        private void fetchWhereStaticRowIsStricter()
+        {
+            List<UnfilteredRowIterator> known = new ArrayList<>(builders.size());
+            for (PartitionBuilder builder : builders)
+                known.add(builder.knownPartition());
+
+            Row staticRow;
+            try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(known))
+            {
+                staticRow = merged.staticRow();
+            }
+
+            for (PartitionBuilder builder : builders)
+                if (!builder.unresolvedStatic && isStricter(builder.knownStaticRow(), staticRow))
+                    builder.fetchEntirePartition();
+        }
+
+        /**
+         * Whether the replica's static row fails a static expression that the static row of the partition satisfies,
+         * in a way that changes what the filter selects. An expression that the coordinator can't evaluate exactly
+         * counts as failed unless both rows have the same data for its column.
+         */
+        private boolean isStricter(Row replicaStaticRow, Row staticRow)
+        {
+            Predicate<RowFilter.Expression> partition =
+                expression -> expression.isSatisfiedBy(command.metadata(), key, staticRow, command.nowInSec());
+            Predicate<RowFilter.Expression> replica =
+                expression -> expression.isSatisfiedBy(command.metadata(), key, replicaStaticRow, command.nowInSec());
+            boolean fails = false;
+            for (RowFilter.Expression expression : command.rowFilter().expressions())
+            {
+                if (!expression.column().isStatic())
+                    continue;
+
+                if (!isEvaluatedExactly(expression))
+                {
+                    if (!Objects.equals(replicaStaticRow.getColumnData(expression.column()), staticRow.getColumnData(expression.column())))
+                        return true;
+                }
+                else if (partition.test(expression) && !replica.test(expression))
+                {
+                    fails = true;
+                }
+            }
+
+            return fails && !residual(command.rowFilter().root(), partition).equals(residual(command.rowFilter().root(), partition.and(replica)));
+        }
+
+        /**
+         * The entire partitions fetched bring rows that no replica returned, and the other replicas left out of what
+         * they returned every row that doesn't satisfy the filter on their own data, deleted rows included. So the
+         * rows that the coordinator would select from what is known of the partition (the fetched partitions, and
+         * what the other replicas returned) are fetched from each other replica that didn't return them.
+         */
+        private void completeFetchedPartitions()
+        {
+            if (!Iterables.any(builders, builder -> builder.unresolvedStatic))
+                return;
+
+            List<UnfilteredRowIterator> known = new ArrayList<>(builders.size());
+            for (PartitionBuilder builder : builders)
+                known.add(builder.knownPartition());
+
+            List<Clustering<?>> selected = new ArrayList<>();
+            UnfilteredPartitionIterator merged = new SingletonUnfilteredPartitionIterator(UnfilteredRowIterators.merge(known));
+            try (PartitionIterator partitions = coordinatorFilter.apply(UnfilteredPartitionIterators.filter(merged, command.nowInSec())))
+            {
+                while (partitions.hasNext())
+                {
+                    // an index filter can return null for a partition that it rejects entirely
+                    try (RowIterator rows = partitions.next())
+                    {
+                        while (rows != null && rows.hasNext())
+                            selected.add(rows.next().clustering());
+                    }
+                }
+            }
+
+            for (PartitionBuilder builder : builders)
+                if (!builder.unresolvedStatic)
+                    builder.addToFetchUnlessReturned(selected);
         }
     }
 
@@ -326,7 +484,10 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
         {
             if (currentListener == null || !currentListener.key.equals(partitionKey))
+            {
+                populateDiscarded();
                 currentListener = new PartitionMergeListerner(partitionKey, versions);
+            }
 
             return currentListener;
         }
@@ -334,6 +495,16 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         public void populate()
         {
             if (currentListener != null)
+                currentListener.populate();
+        }
+
+        /**
+         * Populates the current partition if the first phase discarded it before populate was called: with an
+         * expression on a static column, a replica that didn't return it can have rows that its static row selects.
+         */
+        public void populateDiscarded()
+        {
+            if (currentListener != null && !currentListener.populated && command.rowFilter().hasStaticExpression())
                 currentListener.populate();
         }
     }
@@ -427,6 +598,10 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                                 mergeListener.populate();
                             }
                         }
+                        else
+                        {
+                            mergeListener.populateDiscarded();
+                        }
                     }
                     else
                     {
@@ -491,13 +666,16 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         private int partitionRowsCached;
 
         private boolean unresolvedStatic = false;
+        private ReadResponse fetched;
+        private final boolean returnedPartition;
 
-        private PartitionBuilder(DecoratedKey key, Replica source, RegularAndStaticColumns columns, EncodingStats stats)
+        private PartitionBuilder(DecoratedKey key, Replica source, RegularAndStaticColumns columns, EncodingStats stats, boolean returned)
         {
             this.key = key;
             this.source = source;
             this.columns = columns;
             this.stats = stats;
+            this.returnedPartition = returned;
         }
 
         private void setDeletionTime(DeletionTime deletionTime)
@@ -528,6 +706,75 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 contents.add(marker);
         }
 
+        /**
+         * Adds the given clusterings, in the order of the query, to the rows to fetch, except those that this replica
+         * returned: what it returned is already its version of the row.
+         */
+        private void addToFetchUnlessReturned(List<Clustering<?>> clusterings)
+        {
+            Comparator<Clusterable> comparator = command.isReversed() ? command.metadata().comparator.reversed()
+                                                                      : command.metadata().comparator;
+            Iterator<Unfiltered> returned = contents.iterator();
+            Unfiltered next = returned.hasNext() ? returned.next() : null;
+            for (Clustering<?> clustering : clusterings)
+            {
+                while (next != null && (!next.isRow() || comparator.compare(next, clustering) < 0))
+                    next = returned.hasNext() ? returned.next() : null;
+
+                if (next == null || comparator.compare(next, clustering) != 0)
+                {
+                    if (toFetch == null)
+                        toFetch = BTreeSet.builder(command.metadata().comparator);
+                    toFetch.add(clustering);
+                    fetched = null;
+                }
+            }
+        }
+
+        /**
+         * What is known of this replica's partition before the rows that the coordinator selects are fetched by name:
+         * what it returned, merged with the response of the fetch from it if its entire partition is fetched or if it
+         * didn't return the partition (the response has its static row and deletion). Unlike
+         * {@link #protectedPartition()}, this doesn't consume what the replica returned.
+         */
+        private UnfilteredRowIterator knownPartition()
+        {
+            Iterator<Unfiltered> returned = contents.iterator();
+            UnfilteredRowIterator original = new AbstractUnfilteredRowIterator(command.metadata(), key, deletionTime, columns,
+                                                                               staticRow, command.isReversed(), stats)
+            {
+                @Override
+                protected Unfiltered computeNext()
+                {
+                    return returned.hasNext() ? returned.next() : endOfData();
+                }
+            };
+
+            if (!unresolvedStatic && returnedPartition)
+                return original;
+
+            if (toFetch == null)
+                toFetch = BTreeSet.builder(command.metadata().comparator);
+            return mergeFetched(original);
+        }
+
+        /** The static row that this replica filtered its rows with. */
+        private Row knownStaticRow()
+        {
+            try (UnfilteredRowIterator known = knownPartition())
+            {
+                return known.staticRow();
+            }
+        }
+
+        private void fetchEntirePartition()
+        {
+            if (toFetch == null)
+                toFetch = BTreeSet.builder(command.metadata().comparator);
+            unresolvedStatic = true;
+            fetched = null;
+        }
+
         private void addToFetch(Row row)
         {
             if (toFetch == null)
@@ -541,6 +788,8 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 unresolvedStatic = command.rowFilter().hasStaticExpression();
             else
                 toFetch.add(row.clustering());
+
+            fetched = null;
         }
 
         private UnfilteredRowIterator originalPartition()
@@ -594,6 +843,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 {
                     releaseCachedRows(partitionRowsCached);
                     toFetch = null;
+                    fetched = null;
                     // TODO: the counters might not be accurate for the static row at this point?
                 }
 
@@ -614,17 +864,27 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         private UnfilteredRowIterator protectedPartition()
         {
             UnfilteredRowIterator original = originalPartition();
+            return toFetch == null ? original : mergeFetched(original);
+        }
 
-            if (toFetch != null)
+        /**
+         * Merges the given rows of this replica with the rows to fetch from it, which are only fetched again if rows
+         * were added to them: a partition read with a limit is populated at several checkpoints, and each of them can
+         * add rows to fetch.
+         */
+        private UnfilteredRowIterator mergeFetched(UnfilteredRowIterator original)
+        {
+            if (fetched == null)
+                fetched = fetchFromSource();
+            ReadResponse response = fetched;
+
+            try (UnfilteredPartitionIterator partitions = response.makeIterator(command))
             {
-                try (UnfilteredPartitionIterator partitions = fetchFromSource())
+                if (partitions.hasNext())
                 {
-                    if (partitions.hasNext())
+                    try (UnfilteredRowIterator fetchedRows = partitions.next())
                     {
-                        try (UnfilteredRowIterator fetchedRows = partitions.next())
-                        {
-                            return UnfilteredRowIterators.merge(Arrays.asList(original, fetchedRows));
-                        }
+                        return UnfilteredRowIterators.merge(Arrays.asList(original, fetchedRows));
                     }
                 }
             }
@@ -632,7 +892,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             return original;
         }
 
-        private UnfilteredPartitionIterator fetchFromSource()
+        private ReadResponse fetchFromSource()
         {
             assert toFetch != null;
 
