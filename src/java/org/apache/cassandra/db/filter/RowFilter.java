@@ -1266,6 +1266,7 @@ public class RowFilter
             switch (operator)
             {
                 case EQ:
+                case NEQ:
                 case IN:
                 case NOT_IN:
                 case LT:
@@ -1292,7 +1293,6 @@ public class RowFilter
                             return isSatisfiedBy(column.type, foundValue);
                         }
                     }
-                case NEQ:
                 case LIKE_PREFIX:
                 case LIKE_SUFFIX:
                 case LIKE_CONTAINS:
