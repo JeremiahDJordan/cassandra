@@ -53,7 +53,9 @@ import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.RegularAndStaticColumns;
+import org.apache.cassandra.db.RowUpdateBuilder;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.compaction.OperationType;
@@ -71,6 +73,7 @@ import org.apache.cassandra.notifications.SSTableListChangedNotification;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.serializers.SerializationUtils;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
 import org.apache.cassandra.utils.ClassLoadingTestSupport;
@@ -712,6 +715,32 @@ public class SecondaryIndexManagerTest extends CQLTester
             cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(indexName));
             assertEquals(context, 1, cfs.getLiveSSTables().size());
             assertEquals(context, 1, index.rowsInserted.size());
+        }
+    }
+
+    /**
+     * A rewrite of a value with the same timestamp keeps its entry in a legacy index, also when only the TTL changes and
+     * the rewrite is deserialized from a message.
+     */
+    @Test
+    public void rewriteWithSameTimestampKeepsTheIndexEntry() throws Throwable
+    {
+        for (String memtable : new String[]{ "trie", "skiplist" })
+        {
+            for (int ttl : new int[]{ 0, 1000 })
+            {
+                for (boolean deserialized : new boolean[]{ false, true })
+                {
+                    createTable("CREATE TABLE %s (k int PRIMARY KEY, v int) WITH memtable = '" + memtable + "'");
+                    createIndex("CREATE INDEX ON %s(v)");
+                    TableMetadata metadata = currentTableMetadata();
+                    new RowUpdateBuilder(metadata, 10, 0).add("v", 1).build().apply();
+
+                    Mutation rewrite = new RowUpdateBuilder(metadata, 10, ttl, 0).add("v", 1).build();
+                    (deserialized ? SerializationUtils.cycleSerialization(rewrite, Mutation.serializer) : rewrite).apply();
+                    beforeAndAfterFlush(() -> assertRows(execute("SELECT k FROM %s WHERE v = 1"), row(0)));
+                }
+            }
         }
     }
 
