@@ -186,6 +186,29 @@ Upgrading
       changes reach every node during the upgrade; without it, the earlier releases neither pull schema from 5.0.10
       nodes nor push schema to them. LIKE and blob indexes stay unavailable until the option is removed: a node
       started with it counts as a node that supports neither.
+    - The sstable versions without unsigned deletion times (BTI cc and earlier, BIG nb and earlier) can't represent a
+      local deletion time after 2038-01-19T03:14:06Z in their metadata, their partition deletions and the copies of
+      open range tombstones kept in their row indexes; the expiration times of cells and rows are encoded separately.
+      BTI cc is the default BTI version in every storage_compatibility_mode that allows BTI, including NONE, where
+      data can expire up to 2106, and UPGRADING, where it can once every node supports it (BIG writes oa in those
+      modes). This has two consequences. First, an sstable holding only data with a TTL, whose latest expiration is
+      after 2038, recorded 2038-01-19T03:14:06Z as its maximum local deletion time, so from that date plus
+      gc_grace_seconds compaction could drop it whole as fully expired, losing the data that is still live. Such a
+      maximum, or one equal to that time, is now recorded as unknown, and the 2038 value written by earlier releases
+      is read as unknown too, so no rewrite is needed while running this release. On this release, such sstables are
+      not dropped whole once their data expires: compaction purges the expired data when it rewrites them and the data
+      is purgeable, but TimeWindowCompactionStrategy, which runs no single-sstable tombstone compactions by default,
+      keeps them until something rewrites them, such as nodetool garbagecollect. After a downgrade, earlier releases
+      read the 2038 value as a real time again, in the sstables that weren't rewritten and in the ones they write, and
+      can drop them whole too early. Second, from 2038-01-19 on, a partition deletion written in these versions is
+      recorded as 2038-01-19T03:14:06Z, so once that date plus gc_grace_seconds has passed it can be purged as soon as
+      it is written, and a replica that missed the deletion can bring the deleted data back; reads that start inside a
+      range tombstone through the row index can likewise drop it too early. Every node must write sstables in a
+      version with unsigned deletion times before 2038, then rewrite its older sstables with nodetool
+      upgradesstables -a: BTI da (sstable.selected_format: bti and -Dcassandra.trie_index_format_version=da, set on
+      every node before any node writes or streams da sstables, and kept set while they exist, as a node on the
+      default cc version can't open them) or BIG oa (sstable.selected_format: big with storage_compatibility_mode NONE
+      or UPGRADING).
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
       return the same value as the address column. This avoids the risk of client connections overwhelming
       DNS. (CASSANDRA-21539)

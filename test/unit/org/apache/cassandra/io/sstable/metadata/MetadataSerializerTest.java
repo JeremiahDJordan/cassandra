@@ -22,14 +22,17 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.primitives.Bytes;
+import com.google.common.primitives.Ints;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -38,12 +41,14 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.commitlog.IntervalSet;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.rows.CellData;
 import org.apache.cassandra.dht.RandomPartitioner;
 import org.apache.cassandra.io.compress.CompressionMetadata;
 import org.apache.cassandra.io.compress.Encryptor;
@@ -55,7 +60,10 @@ import org.apache.cassandra.io.sstable.SequenceBasedSSTableId;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileInputStreamPlus;
@@ -365,6 +373,77 @@ public class MetadataSerializerTest
         }
     }
 
+    @Test
+    public void testLocalDeletionTimesPastLegacyCap() throws IOException
+    {
+        long cap = CellData.MAX_DELETION_TIME_2038_LEGACY_CAP;
+        long beforeCap = cap - TimeUnit.DAYS.toSeconds(1);
+        long afterCap = cap + TimeUnit.DAYS.toSeconds(365);
+        for (Version version : Arrays.asList(BigFormat.getInstance().getVersion("nb"),
+                                             BigFormat.getInstance().getVersion("oa"),
+                                             BtiFormat.getInstance().getVersion("cc"),
+                                             BtiFormat.getInstance().getVersion("da")))
+        {
+            // versions without unsigned deletion times clamp the min to the cap and hold a max at or past it as none
+            boolean legacy = !version.hasUIntDeletionTime();
+            assertLocalDeletionTimes(version, beforeCap, beforeCap + 1, beforeCap, beforeCap + 1);
+            assertLocalDeletionTimes(version, beforeCap, afterCap, beforeCap, legacy ? CellData.NO_DELETION_TIME : afterCap);
+            assertLocalDeletionTimes(version, afterCap, afterCap + 1, legacy ? cap : afterCap, legacy ? CellData.NO_DELETION_TIME : afterCap + 1);
+            assertLocalDeletionTimes(version, beforeCap, cap, beforeCap, legacy ? CellData.NO_DELETION_TIME : cap);
+        }
+    }
+
+    @Test
+    public void testLegacyMaxLocalDeletionTimePastCap() throws IOException
+    {
+        long min = 1_800_000_000L;
+        long afterCap = CellData.MAX_DELETION_TIME_2038_LEGACY_CAP + TimeUnit.DAYS.toSeconds(365);
+        for (Version version : Arrays.asList(BigFormat.getInstance().getVersion("nb"), BtiFormat.getInstance().getVersion("cc")))
+        {
+            // the max follows the min
+            byte[] bytes = serializeStats(version, statsWithLocalDeletionTimes(version, min, afterCap));
+            int minPosition = Bytes.indexOf(bytes, Ints.toByteArray((int) min));
+            assertTrue(version.toString(), minPosition >= 0);
+            int maxPosition = minPosition + Integer.BYTES;
+            assertEquals(version.toString(), Integer.MAX_VALUE, ByteBuffer.wrap(bytes).getInt(maxPosition));
+
+            // earlier releases wrote such a max as the cap
+            ByteBuffer.wrap(bytes).putInt(maxPosition, CellData.MAX_DELETION_TIME_2038_LEGACY_CAP);
+            StatsMetadata stats = deserializeStats(version, bytes);
+            assertEquals(version.toString(), min, stats.minLocalDeletionTime);
+            assertEquals(version.toString(), CellData.NO_DELETION_TIME, stats.maxLocalDeletionTime);
+        }
+    }
+
+    private void assertLocalDeletionTimes(Version version, long min, long max, long expectedMin, long expectedMax) throws IOException
+    {
+        StatsMetadata stats = deserializeStats(version, serializeStats(version, statsWithLocalDeletionTimes(version, min, max)));
+        assertEquals(version.toString(), expectedMin, stats.minLocalDeletionTime);
+        assertEquals(version.toString(), expectedMax, stats.maxLocalDeletionTime);
+    }
+
+    private StatsMetadata statsWithLocalDeletionTimes(Version version, long... localDeletionTimes)
+    {
+        return (StatsMetadata) constructMetadata(false, version, localDeletionTimes).get(MetadataType.STATS);
+    }
+
+    private static byte[] serializeStats(Version version, StatsMetadata stats) throws IOException
+    {
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            StatsMetadata.serializer.serialize(version, stats, out);
+            return out.toByteArray();
+        }
+    }
+
+    private static StatsMetadata deserializeStats(Version version, byte[] bytes) throws IOException
+    {
+        try (DataInputBuffer in = new DataInputBuffer(bytes))
+        {
+            return (StatsMetadata) StatsMetadata.serializer.deserialize(version, in);
+        }
+    }
+
     public File serialize(Map<MetadataType, MetadataComponent> metadata, MetadataSerializer serializer, Descriptor descriptor)
     throws IOException
     {
@@ -417,7 +496,7 @@ public class MetadataSerializerTest
         return constructMetadata(withNulls, format.getLatestVersion());
     }
 
-    public Map<MetadataType, MetadataComponent> constructMetadata(boolean withNulls, Version version)
+    public Map<MetadataType, MetadataComponent> constructMetadata(boolean withNulls, Version version, long... localDeletionTimes)
     {
         CommitLogPosition club = new CommitLogPosition(11L, 12);
         CommitLogPosition cllb = new CommitLogPosition(9L, 12);
@@ -438,6 +517,8 @@ public class MetadataSerializerTest
         collector.updateClusteringValues(Clustering.make(UTF8Type.instance.decompose("abc"), Int32Type.instance.decompose(123)));
         collector.updateClusteringValues(Clustering.make(UTF8Type.instance.decompose("cba"), withNulls ? null : Int32Type.instance.decompose(234)));
         collector.updateClusteringValues(Clustering.make(UTF8Type.instance.decompose(sensitiveKey)));
+        for (long localDeletionTime : localDeletionTimes)
+            collector.update(LivenessInfo.withExpirationTime(1L, 3600, localDeletionTime));
         ByteBuffer first = version.hasKeyRange() ? AsciiType.instance.decompose("a") : null;
         ByteBuffer last = version.hasKeyRange() ? AsciiType.instance.decompose("b") : null;
         return collector.finalizeMetadata(partitioner, bfFpChance, 0, null, false, SerializationHeader.make(cfm, Collections.emptyList()), first, last);
