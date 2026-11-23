@@ -61,15 +61,18 @@ import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.service.DataResurrectionCheck.Heartbeat;
 import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static java.util.Collections.singletonList;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_INVALID_LEGACY_SSTABLE_ROOT;
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_LEGACY_SSTABLE_ROOT;
 import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_TESTTAG;
 import static org.apache.cassandra.io.util.FileUtils.createTempFile;
 import static org.apache.cassandra.service.DataResurrectionCheck.HEARTBEAT_FILE_CONFIG_PROPERTY;
 import static org.apache.cassandra.service.StartupChecks.StartupCheckType.check_data_resurrection;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -153,6 +156,77 @@ public class StartupChecksTest
         Files.createDirectories(systemDir);
         copyInvalidLegacySSTables(systemDir);
         startupChecks.verify(options);
+    }
+
+    @Test
+    public void checkNewerSSTablesInStorageCompatibilityMode() throws Exception
+    {
+        startupChecks = startupChecks.withTest(StartupChecks.checkSSTablesFormat);
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        try
+        {
+            for (String version : new String[]{ "na", "oa", "da" })
+            {
+                new File(sstableDir).deleteRecursive();
+                Files.createDirectories(sstableDir);
+                copyLegacySSTables(version, sstableDir);
+
+                boolean newer = !version.equals("na");
+                DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_4);
+                // as in Apache Cassandra, CASSANDRA_4 refuses big oa but reads bti da
+                testAppender.list.clear();
+                if (version.equals("oa"))
+                    verifyFailure(startupChecks, "newer than storage_compatibility_mode CASSANDRA_4");
+                else
+                    startupChecks.verify(options);
+                assertTrue(testAppender.list.stream().noneMatch(event -> event.getFormattedMessage().contains("newer than a release of storage_compatibility_mode")));
+
+                for (StorageCompatibilityMode compatibilityMode : new StorageCompatibilityMode[]{ StorageCompatibilityMode.HCD_1, StorageCompatibilityMode.UPGRADING, StorageCompatibilityMode.NONE })
+                {
+                    DatabaseDescriptor.setStorageCompatibilityMode(compatibilityMode);
+                    testAppender.list.clear();
+                    startupChecks.verify(options);
+                    assertEquals(version + " in " + compatibilityMode,
+                                 newer && compatibilityMode == StorageCompatibilityMode.HCD_1,
+                                 testAppender.list.stream().anyMatch(event -> event.getFormattedMessage().contains("newer than a release of storage_compatibility_mode")));
+                }
+            }
+
+            new File(sstableDir).deleteRecursive();
+            Files.createDirectories(sstableDir);
+            copyLegacySSTables("oa", sstableDir);
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_4);
+            verifyFailure(startupChecks, "To use this mode, restart with storage_compatibility_mode HCD_1 and the big sstable format, rewrite these sstables " +
+                                         "with nodetool upgradesstables -a, which writes them as nb, then restart with storage_compatibility_mode CASSANDRA_4");
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.HCD_1);
+            testAppender.list.clear();
+            startupChecks.verify(options);
+            assertTrue(testAppender.list.stream().anyMatch(event -> Level.WARN == event.getLevel() &&
+                                                                    event.getFormattedMessage().contains("Found 1 sstables of versions newer than a release of storage_compatibility_mode HCD_1 " +
+                                                                                                         "reads (big nb, bti cc), in Keyspace1.Standard1. A downgrade to such a release " +
+                                                                                                         "isn't possible while they exist; see NEWS.txt for how to rewrite them")));
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
+    }
+
+    @Test
+    public void failStartupIfInvalidSSTableOfNewerVersionFound() throws Exception
+    {
+        startupChecks = startupChecks.withTest(StartupChecks.checkSSTablesFormat);
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        Files.write(sstableDir.resolve("oa-badid-big-Data.db"), new byte[0]);
+        try
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_4);
+            verifyFailure(startupChecks, "Detected unreadable sstables");
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
     }
 
     @Test
@@ -282,6 +356,16 @@ public class StartupChecksTest
         {
             fail("Failed startup check with error: " + e.getMessage());
         }
+    }
+
+    private void copyLegacySSTables(String version, Path targetDir) throws IOException
+    {
+        File legacySSTableDir = new File(Paths.get(TEST_LEGACY_SSTABLE_ROOT.getString(),
+                                                   version,
+                                                   "legacy_tables",
+                                                   String.format("legacy_%s_simple", version)));
+        for (File f : legacySSTableDir.tryList())
+            Files.copy(f.toPath(), targetDir.resolve(f.name()));
     }
 
     private void copyInvalidLegacySSTables(Path targetDir) throws IOException

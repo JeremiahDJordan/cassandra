@@ -119,6 +119,7 @@ public class LoaderOptions
     public final long interDcThrottleBytes;
     public final int entireSSTableThrottleMebibytes;
     public final int entireSSTableInterDcThrottleMebibytes;
+    public final boolean streamEntireSSTables;
     public final int storagePort;
     public final int sslStoragePort;
     public final EncryptionOptions clientEncOptions;
@@ -143,6 +144,7 @@ public class LoaderOptions
         interDcThrottleBytes = builder.interDcThrottleBytes;
         entireSSTableThrottleMebibytes = builder.entireSSTableThrottleMebibytes;
         entireSSTableInterDcThrottleMebibytes = builder.entireSSTableInterDcThrottleMebibytes;
+        streamEntireSSTables = builder.streamEntireSSTables;
         storagePort = builder.storagePort;
         sslStoragePort = builder.sslStoragePort;
         clientEncOptions = builder.clientEncOptions;
@@ -169,6 +171,7 @@ public class LoaderOptions
         long interDcThrottleBytes = 0;
         int entireSSTableThrottleMebibytes = 0;
         int entireSSTableInterDcThrottleMebibytes = 0;
+        boolean streamEntireSSTables = true;
 
         int storagePort;
         int sslStoragePort;
@@ -316,6 +319,12 @@ public class LoaderOptions
         public Builder entireSSTableInterDcThrottle(int entireSSTableInterDcThrottle)
         {
             this.entireSSTableInterDcThrottleMebibytes = entireSSTableInterDcThrottle;
+            return this;
+        }
+
+        public Builder streamEntireSSTables(boolean streamEntireSSTables)
+        {
+            this.streamEntireSSTables = streamEntireSSTables;
             return this;
         }
 
@@ -545,6 +554,7 @@ public class LoaderOptions
                 }
 
                 throttleBytes = config.stream_throughput_outbound.toBytesPerSecondAsInt();
+                streamEntireSSTables = config.stream_entire_sstables;
 
                 if (cmd.hasOption(SSL_STORAGE_PORT_OPTION))
                     System.out.println("ssl storage port is deprecated and not used, all communication goes through storage port " +
@@ -816,7 +826,7 @@ public class LoaderOptions
                 "you will need to have the files Standard1-g-1-Data.db and Standard1-g-1-Index.db into a directory /path/to/Keyspace1/Standard1/.";
         String footer = System.lineSeparator() +
                 "You can provide cassandra.yaml file with -f command line option to set up streaming throughput, client and server encryption options. " +
-                "Only stream_throughput_outbound, server_encryption_options and client_encryption_options are read from yaml. " +
+                "Only stream_throughput_outbound, stream_entire_sstables, server_encryption_options and client_encryption_options are read from yaml. " +
                 "You can override options read from cassandra.yaml with corresponding command line options.";
         new HelpFormatter().printHelp(usage, header, options, footer);
     }

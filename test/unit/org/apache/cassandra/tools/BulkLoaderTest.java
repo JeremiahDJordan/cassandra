@@ -18,14 +18,21 @@
 
 package org.apache.cassandra.tools;
 
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+
 import org.junit.Test;
 
 import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.tools.ToolRunner.ToolResult;
 import org.hamcrest.CoreMatchers;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertThat;
 
 public class BulkLoaderTest extends OfflineToolUtils
@@ -213,6 +220,26 @@ public class BulkLoaderTest extends OfflineToolUtils
         assertEquals(4 * 1024 * 1024, DatabaseDescriptor.getInterDCStreamThroughputOutboundBytesPerSec(), 0.0);
         assertEquals(5, DatabaseDescriptor.getEntireSSTableStreamThroughputOutboundMebibytesPerSec(), 0.0);
         assertEquals(6, DatabaseDescriptor.getEntireSSTableInterDCStreamThroughputOutboundMebibytesPerSec(), 0.0);
+        throw tool.getException().getCause().getCause().getCause();
+    }
+
+    @Test(expected = NoHostAvailableException.class)
+    public void testBulkLoader_StreamEntireSSTables() throws Throwable
+    {
+        File config = new File(Paths.get(".", "test", "conf", "cassandra.yaml").normalize());
+        Path noEntireSSTables = Files.createTempFile("cassandra", ".yaml");
+        noEntireSSTables.toFile().deleteOnExit();
+        Files.write(noEntireSSTables, (new String(Files.readAllBytes(config.toPath()), StandardCharsets.UTF_8) + "\nstream_entire_sstables: false\n")
+                                      .replace("stream_entire_sstables: true\n", "")
+                                      .getBytes(StandardCharsets.UTF_8));
+        ToolResult tool = ToolRunner.invokeClass(BulkLoader.class,
+                                                 "-d",
+                                                 "127.9.9.1:9041",
+                                                 "-f",
+                                                 noEntireSSTables.toString(),
+                                                 OfflineToolUtils.sstableDirName("legacy_sstables", "legacy_ma_simple"));
+        assertEquals(-1, tool.getExitCode());
+        assertFalse(DatabaseDescriptor.streamEntireSSTables());
         throw tool.getException().getCause().getCause().getCause();
     }
 }

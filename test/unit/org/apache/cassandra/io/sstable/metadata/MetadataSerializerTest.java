@@ -570,7 +570,7 @@ public class MetadataSerializerTest
 
     public void testOldReadsNew(String oldV, String newV) throws IOException
     {
-        Map<MetadataType, MetadataComponent> originalMetadata = constructMetadata(true);
+        Map<MetadataType, MetadataComponent> originalMetadata = constructMetadata(true, format.getVersion(newV));
 
         MetadataSerializer serializer = new MetadataSerializer();
         // Write metadata in two minor formats.

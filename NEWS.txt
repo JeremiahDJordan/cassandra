@@ -205,10 +205,8 @@ Upgrading
       it is written, and a replica that missed the deletion can bring the deleted data back; reads that start inside a
       range tombstone through the row index can likewise drop it too early. Every node must write sstables in a
       version with unsigned deletion times before 2038, then rewrite its older sstables with nodetool
-      upgradesstables -a: BTI da (sstable.selected_format: bti and -Dcassandra.trie_index_format_version=da, set on
-      every node before any node writes or streams da sstables, and kept set while they exist, as a node on the
-      default cc version can't open them) or BIG oa (sstable.selected_format: big with storage_compatibility_mode NONE
-      or UPGRADING).
+      upgradesstables -a: BTI da (sstable.selected_format: bti and -Dcassandra.trie_index_format_version=da) or BIG oa
+      (sstable.selected_format: big with storage_compatibility_mode NONE or UPGRADING).
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
       return the same value as the address column. This avoids the risk of client connections overwhelming
       DNS. (CASSANDRA-21539)
@@ -481,6 +479,29 @@ Upgrading
       their bytes, as filtering without an index does. Range restrictions on a column that holds both IPv4 and IPv6
       addresses used to miss rows. The index files don't change and need no rebuild. Until every replica runs this
       release, the replicas of an earlier release still select rows as before.
+    - A node reads the sstables of every version this release supports, up to big "o" ("oa") and bti "d" ("da", the
+      version of Apache Cassandra 5.0), whatever version it writes, except for big "oa" in storage_compatibility_mode
+      CASSANDRA_4: in CASSANDRA_4, UPGRADING and NONE, the modes of Apache Cassandra 5.0, a node reads what Apache
+      Cassandra 5.0 reads, so CASSANDRA_4 refuses big "oa" at startup and on import, and reads bti "da". A node
+      writing the default bti version "cc" no longer needs -Dcassandra.trie_index_format_version=da to start with,
+      import or load "da" sstables, and the offline tools read them too. Compaction rewrites them in the version
+      written; "cc" records the latest expiration time of an sstable capped at 2038, see the entry about expiration
+      times after 2038. An sstable of a version newer than the one written is streamed by partitions instead of as an
+      entire sstable, so that the receiver writes its data in its own version.
+      In HCD_1, the DataStax mode, a node reads the sstables of a major version later than the releases of that mode
+      read (big after "n", bti after "c"), such as those it imports or receives as entire sstables by streaming from
+      nodes in UPGRADING or NONE, but those releases can't, so the node logs a warning that a downgrade isn't possible
+      while they exist, at startup and when such sstables are added (at most once an hour per table). Before such a
+      downgrade, rewrite them with nodetool upgradesstables -a in HCD_1 without -Dcassandra.trie_index_format_version
+      set to a version later than "cc", so that they are written as big "nb" and bti "cc", and check that the node no
+      longer logs the warning when it starts.
+      To switch a node that has big "oa" sstables to CASSANDRA_4, restart it in HCD_1 with the big sstable format,
+      rewrite every sstable with nodetool upgradesstables -a, which writes them as "nb", the version Apache Cassandra
+      4.x reads, then restart it in CASSANDRA_4. Apache Cassandra 4.x doesn't read bti sstables, which a node in
+      CASSANDRA_4 writes when it streams a bti table by partitions, so they need that rewrite too.
+      -Dcassandra.trie_index_format_version must be a released bti version (aa, ac, ad, ba, bb, ca, cb, cc or da);
+      other values fail startup.
+      Snapshots and backups taken outside of the mode aren't rewritten.
 
 5.0.9
 =====

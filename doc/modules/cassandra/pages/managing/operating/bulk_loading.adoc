@@ -137,7 +137,7 @@ The following options are supported, with `-d,--nodes <initial hosts>` required:
 
 The `cassandra.yaml` file can be provided on the command-line with `-f` option to set up streaming throughput, client and server encryption
 options.
-Only `stream_throughput_outbound_megabits_per_sec`, `server_encryption_options` and `client_encryption_options` are read
+Only `stream_throughput_outbound_megabits_per_sec`, `stream_entire_sstables`, `server_encryption_options` and `client_encryption_options` are read
 from the `cassandra.yaml` file.
 You can override options read from `cassandra.yaml` with corresponding command line options.
 

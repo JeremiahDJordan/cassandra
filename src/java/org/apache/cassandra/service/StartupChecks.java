@@ -69,6 +69,7 @@ import org.apache.cassandra.exceptions.StartupException;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.UUIDBasedSSTableId;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
@@ -83,6 +84,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JavaUtils;
 import org.apache.cassandra.utils.INativeLibrary;
 import org.apache.cassandra.utils.SigarLibrary;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.CASSANDRA_JMX_LOCAL_PORT;
 import static org.apache.cassandra.config.CassandraRelevantProperties.COM_SUN_MANAGEMENT_JMXREMOTE_PORT;
@@ -554,6 +556,8 @@ public class StartupChecks
             if (options.isDisabled(getStartupCheckType()))
                 return;
             final Set<String> invalid = new HashSet<>();
+            final Set<String> refusedByCompatibilityMode = new HashSet<>();
+            final Set<Descriptor> newerThanCompatibilityMode = new HashSet<>();
             final Set<String> nonSSTablePaths = new HashSet<>();
             final List<String> withIllegalGenId = new ArrayList<>();
             nonSSTablePaths.add(FileUtils.getCanonicalPath(DatabaseDescriptor.getCommitLogLocation()));
@@ -573,13 +577,18 @@ public class StartupChecks
                         Descriptor desc = Descriptor.fromFileWithComponent(file, false).left;
                         if (!desc.isCompatible())
                             invalid.add(file.toString());
+                        else if (desc.version.isNewerThanStorageCompatibilityMode())
+                            newerThanCompatibilityMode.add(desc);
 
                         if (!DatabaseDescriptor.isUUIDSSTableIdentifiersEnabled() && desc.id instanceof UUIDBasedSSTableId)
                             withIllegalGenId.add(file.toString());
                     }
                     catch (Exception e)
                     {
-                        invalid.add(file.toString());
+                        if (Descriptor.isRefusedByStorageCompatibilityMode(file))
+                            refusedByCompatibilityMode.add(file.toString());
+                        else
+                            invalid.add(file.toString());
                     }
                     return FileVisitResult.CONTINUE;
                 }
@@ -648,6 +657,30 @@ public class StartupChecks
                                                          "all required intermediate versions, running " +
                                                          "upgradesstables",
                                                          Joiner.on(",").join(invalid)));
+
+            if (!refusedByCompatibilityMode.isEmpty())
+                throw new StartupException(StartupException.ERR_WRONG_DISK_STATE,
+                                           String.format("Detected sstables %s of versions newer than storage_compatibility_mode %s " +
+                                                         "reads. To use this mode, restart with storage_compatibility_mode %s and " +
+                                                         "the %s sstable format, rewrite these sstables with nodetool upgradesstables -a, " +
+                                                         "which writes them as %s, then restart with storage_compatibility_mode %s. " +
+                                                         "See NEWS.txt",
+                                                         Joiner.on(",").join(refusedByCompatibilityMode),
+                                                         DatabaseDescriptor.getStorageCompatibilityMode(),
+                                                         StorageCompatibilityMode.HCD_1,
+                                                         BigFormat.NAME,
+                                                         BigFormat.STORAGE_COMPATIBILITY_4_VERSION,
+                                                         DatabaseDescriptor.getStorageCompatibilityMode()));
+
+            if (!newerThanCompatibilityMode.isEmpty())
+                logger.warn("Found {} sstables of versions newer than a release of storage_compatibility_mode {} reads " +
+                            "(big {}, bti {}), in {}. A downgrade to such a release isn't possible while they exist; see " +
+                            "NEWS.txt for how to rewrite them",
+                            newerThanCompatibilityMode.size(),
+                            DatabaseDescriptor.getStorageCompatibilityMode(),
+                            BigFormat.STORAGE_COMPATIBILITY_4_VERSION,
+                            BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION,
+                            newerThanCompatibilityMode.stream().map(d -> d.ksname + '.' + d.cfname).distinct().sorted().collect(Collectors.joining(", ")));
 
             if (!withIllegalGenId.isEmpty())
                 throw new StartupException(StartupException.ERR_WRONG_CONFIG,
