@@ -392,19 +392,15 @@ public class VerifyTest extends SAITester
             file.setLength(3);
         }
 
-        // We didn't start validating these files until version EC
-        boolean verifyShouldFail = version.onOrAfter(Version.EC);
         // Verify should detect the corruption
         try (IVerifier verifier = sstable.getVerifier(cfs, new OutputHandler.LogOutput(), false, IVerifier.options().invokeDiskFailurePolicy(true).build()))
         {
             verifier.verify();
-            if (verifyShouldFail)
-                fail("Expected a CorruptSSTableException to be thrown");
+            fail("Expected a CorruptSSTableException to be thrown");
         }
         catch (CorruptSSTableException err)
         {
-            if (!verifyShouldFail)
-                fail("Unexpected CorruptSSTableException: " + err.getMessage());
+            // Expected
         }
     }
 
