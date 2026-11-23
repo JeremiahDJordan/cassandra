@@ -36,17 +36,30 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
+import org.apache.cassandra.db.marshal.ByteArrayAccessor;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.ArrayCell;
+import org.apache.cassandra.db.rows.BTreeRow;
+import org.apache.cassandra.db.rows.BufferCell;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.notifications.SSTableAddedNotification;
 import org.apache.cassandra.notifications.SSTableListChangedNotification;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMKiller;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.KillerForTests;
@@ -557,6 +570,35 @@ public class SecondaryIndexManagerTest extends CQLTester
             assertTrue(ex.getMessage().contains("configured to fail"));
         }
         assertNotMarkedAsBuilt(indexName);
+    }
+
+    /**
+     * A rewrite of a value with the same timestamp and a new TTL keeps its entry in a legacy index when the old and the
+     * new cell hold their values in different accessors, as a memtable cell and a deserialized cell can.
+     */
+    @Test
+    public void rewriteWithSameTimestampAndNewTtlKeepsTheIndexEntry() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+        createIndex("CREATE INDEX ON %s(v)");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        execute("INSERT INTO %s (k, v) VALUES (0, 1) USING TIMESTAMP 10");
+
+        ColumnMetadata v = cfs.metadata().getColumn(ByteBufferUtil.bytes("v"));
+        int nowInSec = FBUtilities.nowInSeconds();
+        Row existing = BTreeRow.singleCellRow(Clustering.EMPTY, BufferCell.live(v, 10, Int32Type.instance.decompose(1)));
+        Row rewritten = BTreeRow.singleCellRow(Clustering.EMPTY,
+                                               new ArrayCell(v, 10, 1000, nowInSec + 1000, ByteArrayAccessor.instance.valueOf(1), null));
+        PartitionUpdate update = PartitionUpdate.singleRowUpdate(cfs.metadata(), cfs.decorateKey(Int32Type.instance.decompose(0)), rewritten);
+        try (WriteContext ctx = cfs.keyspace.getWriteHandler().createContextForIndexing())
+        {
+            Memtable memtable = cfs.getTracker().getView().getCurrentMemtable();
+            UpdateTransaction transaction = cfs.indexManager.newUpdateTransaction(update, ctx, nowInSec, memtable);
+            transaction.start();
+            transaction.onUpdated(existing, rewritten);
+            transaction.commit();
+        }
+        beforeAndAfterFlush(() -> assertRows(execute("SELECT k FROM %s WHERE v = 1"), row(0)));
     }
 
     @Test
