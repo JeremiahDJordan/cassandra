@@ -349,7 +349,10 @@ public class StaleSameNameIndexComponentsStreamingTest extends SAITester
             received = sstablesNotLive(cfs);
             assertThat(received).hasSize(1);
             for (Descriptor descriptor : received)
+            {
                 assertThat(descriptor.directory.tryListNames()).noneMatch(n -> n.startsWith(descriptor.filenamePart() + '-') && n.contains('+' + INDEX + '+'));
+                assertThat(TOCComponent.loadTOC(descriptor, false)).noneMatch(c -> c.name.contains('+' + INDEX + '+'));
+            }
 
             createIndex("CREATE INDEX " + INDEX + " ON %s(a) USING 'sai'");
             waitForTableIndexesQueryable();
@@ -618,7 +621,7 @@ public class StaleSameNameIndexComponentsStreamingTest extends SAITester
     }
 
     /** Streams the partitions of the first half of the token range of the table's SSTable to this node. */
-    private static Future<StreamState> streamHalfToSelf(ColumnFamilyStore cfs) throws Exception
+    static Future<StreamState> streamHalfToSelf(ColumnFamilyStore cfs) throws Exception
     {
         SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
         List<Token> tokens = new ArrayList<>();
