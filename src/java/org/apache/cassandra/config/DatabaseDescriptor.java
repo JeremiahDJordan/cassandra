@@ -4260,7 +4260,6 @@ public class DatabaseDescriptor
         return conf.stream_entire_sstables;
     }
 
-    @VisibleForTesting
     public static boolean setStreamEntireSSTables(boolean value)
     {
         return conf.stream_entire_sstables = value;

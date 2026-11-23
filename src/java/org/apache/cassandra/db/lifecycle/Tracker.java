@@ -25,6 +25,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 import javax.annotation.Nullable;
 
@@ -45,6 +46,8 @@ import org.apache.cassandra.db.compaction.CompactionSSTable;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
+import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.metrics.StorageMetrics;
@@ -61,6 +64,7 @@ import org.apache.cassandra.notifications.SSTableListChangedNotification;
 import org.apache.cassandra.notifications.SSTableRepairStatusChanged;
 import org.apache.cassandra.notifications.TruncationNotification;
 import org.apache.cassandra.schema.TableMetadataRef;
+import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.TimeUUID;
@@ -284,6 +288,20 @@ public class Tracker
         addSSTablesInternal(sstables, operationType, false, true, true);
     }
 
+    // sstables added by streaming, import or refresh can be of a version that a downgrade can't read; warned at most
+    // hourly per table
+    private void warnIfNewerThanStorageCompatibilityMode(Collection<SSTableReader> sstables)
+    {
+        long newer = sstables.stream().filter(sstable -> sstable.descriptor.version.isNewerThanStorageCompatibilityMode()).count();
+        if (newer > 0)
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "newer sstables in " + cfstore.getKeyspaceName() + '.' + cfstore.name, 1, TimeUnit.HOURS,
+                             "Added {} sstables to {}.{} of versions newer than a release of storage_compatibility_mode {} reads " +
+                             "(big {}, bti {}). A downgrade to such a release isn't possible while they exist; see NEWS.txt for " +
+                             "how to rewrite them",
+                             newer, cfstore.getKeyspaceName(), cfstore.name, DatabaseDescriptor.getStorageCompatibilityMode(),
+                             BigFormat.STORAGE_COMPATIBILITY_4_VERSION, BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION);
+    }
+
     private void addSSTablesInternal(Collection<SSTableReader> sstables,
                                      OperationType operationType,
                                      boolean isInitialSSTables,
@@ -294,6 +312,8 @@ public class Tracker
         if (!isDummy())
             setupOnline(sstables);
         apply(updateLiveSet(emptySet(), sstables));
+        if (!isInitialSSTables && !isDummy())
+            warnIfNewerThanStorageCompatibilityMode(sstables);
         if(updateSize)
             maybeFail(updateSizeTracking(emptySet(), sstables, null));
         if (maybeIncrementallyBackup)

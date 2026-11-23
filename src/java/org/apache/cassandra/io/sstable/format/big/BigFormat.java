@@ -61,6 +61,7 @@ import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.OutputHandler;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
 import static org.apache.cassandra.io.sstable.format.SSTableFormat.Components.DATA;
@@ -73,6 +74,8 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
     private final static Logger logger = LoggerFactory.getLogger(BigFormat.class);
 
     public static final String NAME = "big";
+    // the version written in the 4.x storage compatibility modes
+    public static final String STORAGE_COMPATIBILITY_4_VERSION = "nb";
 
     private final Version latestVersion = new BigVersion(this, BigVersion.current_version);
     private final BigTableReaderFactory readerFactory = new BigTableReaderFactory();
@@ -353,8 +356,10 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
 
     static class BigVersion extends Version
     {
-        public static final String current_version = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5) ? "nb" : "oa";
+        public static final String current_version = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5) ? STORAGE_COMPATIBILITY_4_VERSION : "oa";
         public static final String earliest_supported_version = "ma";
+        // the newest version read except in storage compatibility mode CASSANDRA_4, whatever version is written
+        public static final String latest_supported_version = "oa";
 
         // ma (3.0.0): swap bf hash order
         //             store rows natively
@@ -371,6 +376,7 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
         //
         // NOTE: When adding a new version:
         //  - Please add it to LegacySSTableTest
+        //  - Please update latest_supported_version
         //  - Please maybe add it to hasOriginatingHostId's regexp
 
         private final boolean isLatestVersion;
@@ -555,7 +561,29 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
         @Override
         public boolean isCompatible()
         {
-            return version.compareTo(earliest_supported_version) >= 0 && version.charAt(0) <= current_version.charAt(0);
+            return isSupported() && !isRefusedByStorageCompatibilityMode();
+        }
+
+        @Override
+        public boolean isRefusedByStorageCompatibilityMode()
+        {
+            return isNewerThan4x() && DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_4;
+        }
+
+        @Override
+        public boolean isNewerThanStorageCompatibilityMode()
+        {
+            return isNewerThan4x() && DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1;
+        }
+
+        private boolean isNewerThan4x()
+        {
+            return isSupported() && version.charAt(0) > STORAGE_COMPATIBILITY_4_VERSION.charAt(0);
+        }
+
+        private boolean isSupported()
+        {
+            return version.compareTo(earliest_supported_version) >= 0 && version.charAt(0) <= latest_supported_version.charAt(0);
         }
 
         @Override

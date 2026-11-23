@@ -21,6 +21,9 @@ package org.apache.cassandra.tools;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.Permission;
 
@@ -31,6 +34,7 @@ import org.apache.cassandra.io.util.File;
 
 import static org.apache.cassandra.tools.OfflineToolUtils.sstableDirName;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 // LoaderOptionsTester for custom configuration
@@ -83,6 +87,26 @@ public class LoaderOptionsTest
                           sstableDirName("legacy_sstables", "legacy_ma_simple") };
         LoaderOptions options = LoaderOptions.builder().parseArgs(args).build();
         assertEquals("test.jks", options.clientEncOptions.keystore);
+    }
+
+    @Test
+    public void testStreamEntireSSTables() throws IOException
+    {
+        assertTrue(LoaderOptions.builder().build().streamEntireSSTables);
+        String[] noConfig = { "-d", "127.9.9.1", sstableDirName("legacy_sstables", "legacy_ma_simple") };
+        assertTrue(LoaderOptions.builder().parseArgs(noConfig).build().streamEntireSSTables);
+
+        File config = new File(Paths.get(".", "test", "conf", "cassandra.yaml").normalize());
+        String[] defaultConfig = { "-d", "127.9.9.1", "-f", config.absolutePath(), sstableDirName("legacy_sstables", "legacy_ma_simple") };
+        assertTrue(LoaderOptions.builder().parseArgs(defaultConfig).build().streamEntireSSTables);
+
+        Path noEntireSSTables = Files.createTempFile("cassandra", ".yaml");
+        noEntireSSTables.toFile().deleteOnExit();
+        Files.write(noEntireSSTables, (new String(Files.readAllBytes(config.toPath()), StandardCharsets.UTF_8) + "\nstream_entire_sstables: false\n")
+                                      .replace("stream_entire_sstables: true\n", "")
+                                      .getBytes(StandardCharsets.UTF_8));
+        String[] args = { "-d", "127.9.9.1", "-f", noEntireSSTables.toString(), sstableDirName("legacy_sstables", "legacy_ma_simple") };
+        assertFalse(LoaderOptions.builder().parseArgs(args).build().streamEntireSSTables);
     }
 
     @Test

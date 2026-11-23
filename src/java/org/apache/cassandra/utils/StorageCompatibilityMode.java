@@ -43,6 +43,8 @@ public enum StorageCompatibilityMode
      *       as {@code frozen<map<text, text>>} (CC4 format) instead of {@code text} (CC5 format).
      *       This ensures safe downgrades to CC4.</li>
      *   <li>SSTable format: Allows BTI format in {@link #validateSstableFormat}.</li>
+     *   <li>SSTable versions: Reads the versions newer than those its releases read, such as those written in
+     *       {@link #UPGRADING} or {@link #NONE}, and warns that a downgrade isn't possible while they exist.</li>
      * </ul>
      */
     HCD_1(4),
