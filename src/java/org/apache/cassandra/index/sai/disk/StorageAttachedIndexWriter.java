@@ -43,6 +43,7 @@ import org.apache.cassandra.index.sai.memory.RowMapping;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
+import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ApproximateTime;
@@ -64,6 +65,8 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
     private final RowMapping rowMapping;
     private final OperationType opType;
     private final TableMetrics tableMetrics;
+    // whether the expected components of every index were listed before they were written (see complete)
+    private final boolean componentsListedUpFront;
 
     private DecoratedKey currentKey;
     private boolean tokenOffsetWriterCompleted = false;
@@ -72,6 +75,10 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
     private long sstableRowId = 0;
     private long totalTimeSpent = 0;
 
+    /**
+     * Writer of the indexes of an SSTable written by {@link SSTableWriter}, which lists the components of every index
+     * before they are written.
+     */
     public StorageAttachedIndexWriter(IndexDescriptor indexDescriptor,
                                       TableMetadata tableMetadata,
                                       Collection<StorageAttachedIndex> indices,
@@ -79,9 +86,12 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                       long keyCount,
                                       TableMetrics tableMetrics) throws IOException
     {
-        this(indexDescriptor, tableMetadata, indices, lifecycleNewTracker, keyCount, false, tableMetrics);
+        this(indexDescriptor, tableMetadata, indices, lifecycleNewTracker, keyCount, false, true, tableMetrics);
     }
 
+    /**
+     * Writer of the indexes of an existing SSTable, which lists the components once they are written.
+     */
     public StorageAttachedIndexWriter(IndexDescriptor indexDescriptor,
                                       TableMetadata tableMetadata,
                                       Collection<StorageAttachedIndex> indices,
@@ -89,6 +99,18 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                       long keyCount,
                                       boolean perIndexComponentsOnly,
                                       TableMetrics tableMetrics) throws IOException
+    {
+        this(indexDescriptor, tableMetadata, indices, lifecycleNewTracker, keyCount, perIndexComponentsOnly, false, tableMetrics);
+    }
+
+    private StorageAttachedIndexWriter(IndexDescriptor indexDescriptor,
+                                       TableMetadata tableMetadata,
+                                       Collection<StorageAttachedIndex> indices,
+                                       LifecycleNewTracker lifecycleNewTracker,
+                                       long keyCount,
+                                       boolean perIndexComponentsOnly,
+                                       boolean componentsListedUpFront,
+                                       TableMetrics tableMetrics) throws IOException
     {
         // We always use the version of the existing per-sstable components, if any, or the configured current version
         // if there are no previously existing per-sstable components.
@@ -114,6 +136,7 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                 ? PerSSTableWriter.NONE
                                 : onDiskFormat.newPerSSTableWriter(indexDescriptor);
         this.tableMetrics = tableMetrics;
+        this.componentsListedUpFront = componentsListedUpFront;
     }
 
     @Override
@@ -247,20 +270,21 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                 {
                     perIndexWriter.complete(stopwatch);
 
-                    // The handling of components when we flush/compact is a tad backward: instead of registering the
+                    // The handling of components when we write an sstable is a tad backward: instead of registering the
                     // components as we write them, all the components are collected beforehand in `SSTableWriter#create`,
                     // which means this is a superset of possible components, but if any components are not written for
                     // those reason, this needs to be fixed afterward. One case for SAI component for instance is empty
                     // indexes: if a particular sstable has nothing indexed for a particular index, then only the completion
                     // marker for that index is kept on disk but no other components, so we need to remove the components
                     // that were "optimistically" added (and more generally, future index implementation may have some
-                    // components that are only optionally present based on specific conditions).
+                    // components that are only optionally present based on specific conditions). Another case is an index
+                    // dropped while the sstable is written, which writes none of its components.
                     // Note 1: for index build/rebuild on existing sstable, `SSTableWriter#create` is not used, and instead
                     //   we do only register components written (see `StorageAttachedIndexBuilder#completeSSTable`).
                     // Note 2: as hinted above, an alternative here would be to change the whole handling of components,
                     //   registering components only as they are effectively written. This is a larger refactor, with some
                     //   subtleties involved, so it is left as potential future work.
-                    if (opType == OperationType.FLUSH || opType == OperationType.COMPACTION)
+                    if (componentsListedUpFront)
                     {
                         var writtenComponents = perIndexWriter.writtenComponents().allAsCustomComponents();
                         var registeredComponents = IndexDescriptor.perIndexComponentsForNewlyFlushedSSTable(perIndexWriter.indexContext());
@@ -274,8 +298,8 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                              perIndexWriter.indexContext().getIndexName());
                             }
 
-                            // During flush, this happens as we finalize the sstable and before its size is tracked, so not
-                            // passing a tracker is correct and intended (there is nothing to update in the tracker).
+                            // This happens as we finalize the sstable and before its size is tracked, so not passing a
+                            // tracker is correct and intended (there is nothing to update in the tracker).
                             sstable.unregisterComponents(toRemove, null);
                         }
                     }
