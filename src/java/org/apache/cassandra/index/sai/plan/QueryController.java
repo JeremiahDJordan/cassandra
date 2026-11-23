@@ -528,7 +528,9 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      * If the column type is truncatable, e.g., BigInteger or BigDecimal,
      * then it returns a full index scan, since the ranges might result
      * in false negatives when a truncated value is equivalent to
-     * the value to exclude.
+     * the value to exclude. An inequality on a map entry or a frozen value searched
+     * in an index before {@link Version#DB} is planned as a full index scan too
+     * (see {@link #searchesByteOrderedTermsBeforeDB}).
      * @param predicate Inequality expression with indexContext
      * @return A plan on the index, which can also result false positives.
      */
@@ -536,7 +538,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     {
         assert predicate.getOp()== Expression.Op.NOT_EQ : "Only inequality predicate is expected";
 
-        if (TypeUtil.supportsRounding(predicate.validator))
+        if (TypeUtil.supportsRounding(predicate.validator) || searchesByteOrderedTermsBeforeDB(predicate))
             return planFactory.fullIndexScan(predicate.context);
         else
         {
@@ -544,6 +546,27 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             Plan.KeysIteration right = buildHalfRangeFromInequality(predicate, Operator.GT);
             return planFactory.union(new ArrayList<>(Arrays.asList(left, right)), true);
         }
+    }
+
+    /**
+     * Before {@link Version#DB}, the terms of a map entries index or of an index on a frozen value (tuple, UDT, frozen
+     * collection) are ordered by their serialized bytes, and a range search keeps the terms that satisfy the range in
+     * the type's order (for map entries, it only scans the entries around the key of its bound). The two half ranges
+     * of an inequality then lose the terms that sort differently by their bytes than by their type (a negative number,
+     * a decimal with another scale), so the whole index is scanned instead and post-filtering does the rest.
+     */
+    private boolean searchesByteOrderedTermsBeforeDB(Expression predicate)
+    {
+        if (!TypeUtil.isComposite(predicate.validator) && !TypeUtil.isFrozen(predicate.validator))
+            return false;
+        if (!predicate.context.version().onOrAfter(Version.DB))
+            return true;
+        for (SSTableIndex index : getQueryView(predicate.context).sstableIndexes)
+        {
+            if (!index.getVersion().onOrAfter(Version.DB))
+                return true;
+        }
+        return false;
     }
 
     /**
