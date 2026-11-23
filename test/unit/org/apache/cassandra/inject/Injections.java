@@ -30,6 +30,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -48,6 +51,7 @@ import static org.apache.cassandra.inject.ActionBuilder.newActionBuilder;
 import static org.apache.cassandra.inject.Expression.expr;
 import static org.apache.cassandra.inject.Expression.method;
 import static org.apache.cassandra.inject.Expression.quote;
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class Injections
 {
@@ -414,6 +418,159 @@ public class Injections
             public Barrier build()
             {
                 return new Barrier(id, name, parties, cyclic, doCountDown, doAwait, getRules());
+            }
+        }
+    }
+
+    /**
+     * Creates a new {@link Hold} injection, which gives up waiting after {@link Hold#DEFAULT_TIMEOUT_SECONDS}.
+     *
+     * @param name name of the hold, in its messages
+     */
+    public static Hold.HoldBuilder newHold(String name)
+    {
+        return newHold(name, Hold.DEFAULT_TIMEOUT_SECONDS);
+    }
+
+    /**
+     * Creates a new {@link Hold} injection.
+     *
+     * @param name name of the hold, in its messages
+     * @param timeoutSeconds how long the held call waits for the release at most
+     */
+    public static Hold.HoldBuilder newHold(String name, long timeoutSeconds)
+    {
+        return new Hold.HoldBuilder(name, timeoutSeconds);
+    }
+
+    /**
+     * Creates an injection that holds the first call to reach it until the test releases it. Later calls go on
+     * without waiting, and don't release it. The held call gives up waiting after a timeout, which makes the release
+     * fail, as does an interruption of the held call or a second release.
+     */
+    public static class Hold extends Injection
+    {
+        public static final long DEFAULT_TIMEOUT_SECONDS = 60;
+        // by injection id: holds of the same name are distinct
+        private static final Map<String, Hold> holds = new ConcurrentHashMap<>();
+        private final String name;
+        private final long timeoutSeconds;
+        private final AtomicBoolean taken = new AtomicBoolean();
+        private final AtomicBoolean releasing = new AtomicBoolean();
+        private final CountDownLatch reached = new CountDownLatch(1);
+        private final CountDownLatch released = new CountDownLatch(1);
+        private final CountDownLatch left = new CountDownLatch(1);
+        private volatile Thread thread;
+        private volatile boolean held;
+        private volatile boolean interrupted;
+        private volatile boolean expired;
+
+        private Hold(String id, String name, long timeoutSeconds, Rule[] rules)
+        {
+            super(id, rules);
+            this.name = name;
+            this.timeoutSeconds = timeoutSeconds;
+            holds.put(id, this);
+        }
+
+        /**
+         * Waits for a call to reach the hold, and checks it is still held.
+         */
+        public void awaitHeld() throws InterruptedException
+        {
+            assertThat(reached.await(60, TimeUnit.SECONDS)).as("hold %s reached", name).isTrue();
+            assertHeld();
+        }
+
+        /**
+         * Checks the call the hold took is still held: nothing has released it, and it hasn't given up waiting.
+         */
+        public void assertHeld()
+        {
+            assertThat(held && !interrupted && !expired && released.getCount() == 1).as("hold %s held", name).isTrue();
+        }
+
+        /**
+         * Releases the call the hold took, once, and waits for it to leave its wait released rather than given up.
+         */
+        public void release() throws InterruptedException
+        {
+            assertThat(releasing.compareAndSet(false, true)).as("hold %s released once", name).isTrue();
+            assertHeld();
+            released.countDown();
+            assertThat(left.await(60, TimeUnit.SECONDS)).as("hold %s left", name).isTrue();
+            assertThat(expired || interrupted).as("hold %s given up", name).isFalse();
+        }
+
+        /**
+         * The thread of the call the hold took, if any.
+         */
+        public Thread heldThread()
+        {
+            return thread;
+        }
+
+        /**
+         * Releases every hold, whether or not a call reached it, without checking or waiting (cleanup after a failure
+         * too), and forgets them.
+         */
+        public static void releaseAll()
+        {
+            holds.values().forEach(hold -> hold.released.countDown());
+            holds.clear();
+        }
+
+        /**
+         * Holds the calling thread until the release, if it is the first to arrive; returns at once otherwise.
+         */
+        public void arrive() throws InterruptedException
+        {
+            if (!taken.compareAndSet(false, true))
+                return;
+            thread = Thread.currentThread();
+            held = true;
+            reached.countDown();
+            try
+            {
+                expired = !released.await(timeoutSeconds, TimeUnit.SECONDS);
+            }
+            catch (InterruptedException e)
+            {
+                interrupted = true;
+                throw e;
+            }
+            finally
+            {
+                held = false;
+                left.countDown();
+            }
+        }
+
+        @CallMe
+        public static void doAction(String id) throws InterruptedException
+        {
+            Hold hold = holds.get(id);
+            if (hold != null)
+                hold.arrive();
+        }
+
+        public static class HoldBuilder extends CrossProductInjectionBuilder<Hold, HoldBuilder>
+        {
+            private final String name;
+            private final long timeoutSeconds;
+
+            private HoldBuilder(String name, long timeoutSeconds)
+            {
+                super(String.format("hold/%s/%s", name, UUID.randomUUID()));
+                this.name = name;
+                this.timeoutSeconds = timeoutSeconds;
+                add(newActionBuilder().actions().doAction(method(Hold.class, CallMe.class).args(quote(id))));
+            }
+
+            @Override
+            public Hold build()
+            {
+                return new Hold(id, name, timeoutSeconds, getRules());
             }
         }
     }
