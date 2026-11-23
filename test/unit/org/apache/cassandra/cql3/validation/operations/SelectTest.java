@@ -2674,7 +2674,22 @@ public class SelectTest extends CQLTester
                        row(21, 22, 23, 24L),
                        row(21, 25, 26, 27L),
                        row(41, 42, 43, 24L));
+            assertRowsIgnoringOrder(executeFilteringOnly("SELECT * FROM %s WHERE cnt != 24"),
+                                    row(11, 12, 13, 14L),
+                                    row(21, 25, 26, 27L),
+                                    row(31, 32, 33, 34L));
+            assertRows(executeFilteringOnly("SELECT * FROM %s WHERE a = 21 AND cnt != 24"),
+                       row(21, 25, 26, 27L));
+            assertRowsIgnoringOrder(executeFilteringOnly("SELECT * FROM %s WHERE cnt NOT IN (24, 34)"),
+                                    row(11, 12, 13, 14L),
+                                    row(21, 25, 26, 27L));
         });
+
+        // a row without the filtered counter doesn't satisfy !=
+        createTable("CREATE TABLE %s (a int PRIMARY KEY, c1 counter, c2 counter)");
+        execute("UPDATE %s SET c1 = c1 + 1 WHERE a = 1");
+        execute("UPDATE %s SET c1 = c1 + 1, c2 = c2 + 2 WHERE a = 2");
+        beforeAndAfterFlush(() -> assertRows(executeFilteringOnly("SELECT a FROM %s WHERE c2 != 3"), row(2)));
     }
 
     private UntypedResultSet executeFilteringOnly(String statement) throws Throwable
