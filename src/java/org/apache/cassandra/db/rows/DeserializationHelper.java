@@ -73,7 +73,18 @@ public class DeserializationHelper
 
     public boolean includes(ColumnMetadata column)
     {
-        return columnsToFetch == null || columnsToFetch.fetches(column);
+        if (columnsToFetch == null)
+            return true;
+
+        if (!columnsToFetch.fetches(column))
+            return false;
+
+        // A filter that fetches all columns accepts any column, including a dropped one, whose cells that are newer
+        // than the drop are kept. Such a column is not part of the fetched columns, which the result of a read must
+        // only contain (for instance to be serialized), so it is skipped.
+        return !hasDroppedColumns
+               || !columnsToFetch.fetchesAllColumns(column.isStatic())
+               || columnsToFetch.fetchedColumns().contains(column);
     }
 
     public boolean includes(Cell<?> cell, LivenessInfo rowLiveness)
