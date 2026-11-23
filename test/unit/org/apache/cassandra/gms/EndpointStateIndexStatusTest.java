@@ -20,11 +20,14 @@ import java.io.IOException;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
+import com.google.common.collect.Maps;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexStatusFormat;
 import org.apache.cassandra.index.IndexStatusManager;
@@ -33,8 +36,11 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JsonUtils;
 import org.json.simple.JSONValue;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -54,6 +60,7 @@ public class EndpointStateIndexStatusTest
     public static void setupDD()
     {
         DatabaseDescriptor.daemonInitialization();
+        CommitLog.instance.start();
     }
 
     @Test
@@ -81,36 +88,66 @@ public class EndpointStateIndexStatusTest
         String malformed = "{\"ks1\": {\"idx1\": 3}";
         assertSame(malformed, IndexStatusFormat.toLegacySerializedFormat(malformed));
 
-        // a code this version does not know: passed through, the peer will fail to parse it in any format
+        String nullWithTrailingObject = "null {\"ks1\": {\"idx1\": 3}}";
+        assertSame(nullWithTrailingObject, IndexStatusFormat.toLegacySerializedFormat(nullWithTrailingObject));
+
+        // a code this version does not know: not sent to peers that need the legacy format
         String unknownCode = "{\"ks1\": {\"idx1\": 99}}";
-        assertSame(unknownCode, IndexStatusFormat.toLegacySerializedFormat(unknownCode));
+        assertNull(IndexStatusFormat.toLegacySerializedFormat(unknownCode));
     }
 
     @Test
-    public void testFormatChosenByMinVersion()
+    public void testLocalIndexStatusGossipedInCompactFormat() throws Exception
     {
-        String legacy = IndexStatusFormat.toLegacySerializedFormat(STATUSES);
-        String compact = IndexStatusFormat.toSerializedFormat(STATUSES);
+        // enough indexes for the legacy format to exceed the 64KiB limit of a gossiped value, but not the compact one
+        Map<String, Index.Status> statuses = new HashMap<>();
+        for (int i = 0; i < 2000; i++)
+            statuses.put("a_rather_long_keyspace_name.idx" + i, Index.Status.BUILD_SUCCEEDED);
+        assertTrue(IndexStatusFormat.toLegacySerializedFormat(statuses).length() > 0xFFFF);
 
-        // Gossiper.getMinVersion() returns NULL_VERSION while upgrading, until the versions of the peers are known
-        assertEquals(legacy, IndexStatusFormat.toSerializedFormat(CassandraVersion.NULL_VERSION, STATUSES));
-        assertEquals(legacy, IndexStatusFormat.toSerializedFormat(null, STATUSES));
-        assertEquals(legacy, IndexStatusFormat.toSerializedFormat(new CassandraVersion("5.0.2"), STATUSES));
-        assertEquals(compact, IndexStatusFormat.toSerializedFormat(new CassandraVersion("5.0.3"), STATUSES));
-        assertEquals(compact, IndexStatusFormat.toSerializedFormat(new CassandraVersion("5.0.7.0"), STATUSES));
-        // HCD 1.2 gets the legacy format from the gossip serializer, whatever the minimum version
-        assertEquals(compact, IndexStatusFormat.toSerializedFormat(new CassandraVersion("4.0.11.0"), STATUSES));
-
-        boolean forced = DatabaseDescriptor.getForceOptimizedIndexStatusFormat();
+        InetAddressAndPort local = FBUtilities.getBroadcastAddressAndPort();
+        InetAddressAndPort peer = InetAddressAndPort.getByName("127.0.0.43");
         try
         {
-            DatabaseDescriptor.setForceOptimizedIndexStatusFormat(true);
-            assertEquals(compact, IndexStatusFormat.toSerializedFormat(CassandraVersion.NULL_VERSION, STATUSES));
-            assertEquals(compact, IndexStatusFormat.toSerializedFormat(new CassandraVersion("5.0.2"), STATUSES));
+            setLocalIndexStatus(statuses);
+            Gossiper.instance.start(0);
+
+            // a peer whose release version isn't known yet, as during an upgrade
+            Gossiper.instance.endpointStateMap.put(peer, new EndpointState(new HeartBeatState(1, 2)));
+            Gossiper.instance.clusterVersionProvider.reset();
+            assertEquals(CassandraVersion.NULL_VERSION, Gossiper.instance.getMinVersion());
+
+            IndexStatusManager.instance.propagateLocalIndexStatus("a_rather_long_keyspace_name", "idx0", Index.Status.BUILD_SUCCEEDED);
+            await().atMost(10, TimeUnit.SECONDS).until(() -> {
+                VersionedValue status = Gossiper.instance.getEndpointStateForEndpoint(local).getApplicationState(ApplicationState.INDEX_STATUS);
+                return status != null && statuses.equals(IndexStatusFormat.fromSerializedFormat(status.value));
+            });
+
+            EndpointState localState = Gossiper.instance.getEndpointStateForEndpoint(local);
+            String gossiped = localState.getApplicationState(ApplicationState.INDEX_STATUS).value;
+            assertEquals(gossiped, roundTrip(localState, MessagingService.current_version).getApplicationState(ApplicationState.INDEX_STATUS).value);
+            assertTrue(JsonUtils.fromJsonMap(gossiped).containsKey("a_rather_long_keyspace_name"));
+
+            // too long in the legacy format: left out for peers that need it, the other states are sent
+            EndpointState received = roundTrip(localState, MessagingService.VERSION_50);
+            assertNull(received.getApplicationState(ApplicationState.INDEX_STATUS));
+            assertEquals(localState.states().size() - 1, received.states().size());
         }
         finally
         {
-            DatabaseDescriptor.setForceOptimizedIndexStatusFormat(forced);
+            Gossiper.instance.stop();
+            Gossiper.instance.endpointStateMap.remove(peer);
+            Gossiper.instance.clusterVersionProvider.reset();
+            setLocalIndexStatus(Maps.transformValues(statuses, s -> Index.Status.DROPPED));
+        }
+    }
+
+    private static void setLocalIndexStatus(Map<String, Index.Status> statuses)
+    {
+        for (Map.Entry<String, Index.Status> e : statuses.entrySet())
+        {
+            String[] keyspaceAndIndex = e.getKey().split("\\.");
+            IndexStatusManager.instance.propagateLocalIndexStatus(keyspaceAndIndex[0], keyspaceAndIndex[1], e.getValue());
         }
     }
 
@@ -134,7 +171,7 @@ public class EndpointStateIndexStatusTest
     {
         String compact = IndexStatusFormat.toSerializedFormat(STATUSES);
 
-        // HCD 1.2 (up to VERSION_DS_12), and Apache Cassandra 5.0 which parses both formats
+        // HCD 1.2 (up to VERSION_DS_12), and Apache Cassandra 5.0, of which 5.0.0-5.0.2 only parse the legacy format
         for (int version : new int[]{ MessagingService.VERSION_40, MessagingService.VERSION_50,
                                       MessagingService.VERSION_DS_10, MessagingService.VERSION_DS_11,
                                       MessagingService.VERSION_DS_12 })
@@ -161,7 +198,7 @@ public class EndpointStateIndexStatusTest
     }
 
     @Test
-    public void testIndexStatusTooLongInLegacyFormatNotRewritten() throws Exception
+    public void testIndexStatusTooLongInLegacyFormatNotSentToLegacyPeers() throws Exception
     {
         // enough indexes for the legacy format to exceed the 64KiB limit of a gossiped value, but not the compact one
         Map<String, Index.Status> statuses = new HashMap<>();
@@ -171,12 +208,15 @@ public class EndpointStateIndexStatusTest
         assertTrue(IndexStatusFormat.toLegacySerializedFormat(statuses).length() > 0xFFFF);
         assertTrue(compact.length() <= 0xFFFF);
 
-        assertSame(compact, IndexStatusFormat.toLegacySerializedFormat(compact));
+        assertNull(IndexStatusFormat.toLegacySerializedFormat(compact));
 
-        // gossip with HCD 1.2 peers keeps working, even if they cannot parse the index status
-        EndpointState received = roundTrip(compact, MessagingService.VERSION_DS_12);
-        assertEquals(compact, received.getApplicationState(ApplicationState.INDEX_STATUS).value);
-        assertEquals("other", received.getApplicationState(ApplicationState.HOST_ID).value);
+        // gossip with HCD 1.2 and Apache Cassandra 5.0 peers keeps working, without the index status
+        for (int version : new int[]{ MessagingService.VERSION_50, MessagingService.VERSION_DS_12 })
+        {
+            EndpointState received = roundTrip(compact, version);
+            assertNull(received.getApplicationState(ApplicationState.INDEX_STATUS));
+            assertEquals("other", received.getApplicationState(ApplicationState.HOST_ID).value);
+        }
     }
 
     @Test
@@ -202,8 +242,11 @@ public class EndpointStateIndexStatusTest
         Map<ApplicationState, VersionedValue> states = new EnumMap<>(ApplicationState.class);
         states.put(ApplicationState.INDEX_STATUS, VersionedValue.unsafeMakeVersionedValue(indexStatus, 42));
         states.put(ApplicationState.HOST_ID, VersionedValue.unsafeMakeVersionedValue("other", 7));
-        EndpointState state = new EndpointState(new HeartBeatState(1, 2), states);
+        return roundTrip(new EndpointState(new HeartBeatState(1, 2), states), version);
+    }
 
+    private static EndpointState roundTrip(EndpointState state, int version) throws IOException
+    {
         try (DataOutputBuffer out = new DataOutputBuffer())
         {
             EndpointState.serializer.serialize(state, out, version);
