@@ -1335,6 +1335,7 @@ public interface StorageServiceMBean extends NotificationEmitter
     /** Reads that have started keep the setting they started with. */
     void setSAINonStrictReplicaFilteringEnabled(boolean value);
 
+    /** Has no effect, see {@link org.apache.cassandra.config.Config#force_optimized_index_status_format}. */
     boolean getForceOptimizedIndexStatusFormat();
     void setForceOptimizedIndexStatusFormat(boolean value);
 

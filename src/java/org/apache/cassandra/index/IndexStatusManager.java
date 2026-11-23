@@ -46,7 +46,6 @@ import org.apache.cassandra.locator.Endpoints;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.service.StorageService;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -202,8 +201,7 @@ public class IndexStatusManager
             // logged and this causes a number of dtests to fail.
             if (Gossiper.instance.isEnabled())
             {
-                CassandraVersion minVersion = Gossiper.instance.getMinVersion();
-                String newSerializedStatusMap = IndexStatusFormat.toSerializedFormat(minVersion, statusMap);
+                String newSerializedStatusMap = IndexStatusFormat.toSerializedFormat(statusMap);
 
                 statusPropagationExecutor.submit(() -> {
                     // schedule gossiper update asynchronously to avoid potential deadlock when another thread is holding

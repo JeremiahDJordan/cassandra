@@ -577,6 +577,9 @@ class EndpointStateSerializer implements IVersionedSerializer<EndpointState>
      * VERSION_41, which HCD 1.2 nodes use when their current messaging version is lowered with
      * {@code -Dds.current_messaging_version}. The legacy format is
      * understood by every version that knows INDEX_STATUS, so it is the safe choice when the peer is ambiguous.
+     * <p>
+     * A compact value that cannot be rewritten (see {@link IndexStatusFormat#toLegacySerializedFormat(String)}) is
+     * left out: the peer keeps the index status it had.
      */
     private static Set<Map.Entry<ApplicationState, VersionedValue>> withLegacyIndexStatus(Set<Map.Entry<ApplicationState, VersionedValue>> states)
     {
@@ -588,13 +591,14 @@ class EndpointStateSerializer implements IVersionedSerializer<EndpointState>
             // there is at most one INDEX_STATUS entry, so we are done whether or not it needs rewriting
             VersionedValue vv = state.getValue();
             String legacy = IndexStatusFormat.toLegacySerializedFormat(vv.value);
-            if (legacy.equals(vv.value))
+            if (vv.value.equals(legacy))
                 return states;
 
             Set<Map.Entry<ApplicationState, VersionedValue>> filteredStates = new HashSet<>(states);
             filteredStates.remove(state);
-            filteredStates.add(new AbstractMap.SimpleImmutableEntry<>(ApplicationState.INDEX_STATUS,
-                                                                      VersionedValue.unsafeMakeVersionedValue(legacy, vv.version)));
+            if (legacy != null)
+                filteredStates.add(new AbstractMap.SimpleImmutableEntry<>(ApplicationState.INDEX_STATUS,
+                                                                          VersionedValue.unsafeMakeVersionedValue(legacy, vv.version)));
             return filteredStates;
         }
         return states;
