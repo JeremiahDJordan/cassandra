@@ -932,9 +932,8 @@ public class Config
     public volatile boolean secondary_indexes_enabled = true;
 
     /**
-     * If we encounter a Gossip bug where {@link org.apache.cassandra.gms.Gossiper#getMinVersion} is
-     * unable to accurately report a minimum version for the cluster, optionally force the optimized
-     * index status format added in CASSANDRA-20058.
+     * Has no effect: the optimized index status format added in CASSANDRA-20058 is always gossiped, and it is rewritten
+     * in the legacy format for peers whose messaging version needs it.
      */
     public volatile boolean force_optimized_index_status_format = false;
 
