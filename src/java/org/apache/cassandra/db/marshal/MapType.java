@@ -373,7 +373,8 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             // map keys must be JSON strings, so convert non-string keys to strings
             ByteBuffer kv = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset);
             offset += CollectionSerializer.sizeOfValue(kv, ByteBufferAccessor.instance);
-            String key = keys.toJSONString(kv, protocolVersion);
+            // a map built by a selector, like {k: v}, has a null key for a null value
+            String key = kv == null ? "null" : keys.toJSONString(kv, protocolVersion);
             if (key.startsWith("\""))
                 sb.append(key);
             else
