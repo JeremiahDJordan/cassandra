@@ -34,6 +34,7 @@ import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.ColumnMetadata.Kind;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.index.sai.plan.Operation.OperationType;
@@ -106,7 +107,12 @@ public class FilterTree
             {
                 Expression filter = filterIterator.previous();
 
-                if (TypeUtil.isNonFrozenCollection(column.type))
+                if (filter.unindexed != null)
+                {
+                    TableMetadata metadata = filter.context.columnFamilyStore().metadata();
+                    result = op.apply(result, row != null && filter.unindexed.isSatisfiedBy(metadata, key, row, now));
+                }
+                else if (TypeUtil.isNonFrozenCollection(column.type))
                 {
                     Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
                     result = op.apply(result, filter.isSatisfiedBy(valueIterator));

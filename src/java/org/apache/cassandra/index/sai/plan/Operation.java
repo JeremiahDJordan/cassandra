@@ -86,6 +86,13 @@ public class Operation
             IndexContext indexContext = controller.getContext(e);
             List<Expression> perColumn = analyzed.get(e.column());
 
+            // filtered as it is (see FilterTree), with the analyzer of the = it negates, for a != that no index serves
+            if (e.operator() == Operator.NEQ && e.analyzer() != null)
+            {
+                perColumn.add(Expression.unindexed(indexContext, e));
+                continue;
+            }
+
             AbstractAnalyzer.AnalyzerFactory analyzerFactory = indexContext.getQueryAnalyzerFactory();
             AbstractAnalyzer analyzer = analyzerFactory.create();
             try
