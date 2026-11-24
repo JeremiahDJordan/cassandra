@@ -44,6 +44,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.metrics.TableMetrics;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ClientState;
@@ -191,6 +192,19 @@ public class MultiRangeReadCommand extends ReadCommand implements MultiPartition
                 .append(", ")
                 .append(dataRange.keyRange.right.getToken().toString())
                 .append(dataRange.keyRange.inclusiveRight() ? ']' : ')');
+    }
+
+    /**
+     * Nodes below DS 10, such as Apache Cassandra nodes, don't know {@link Verb#MULTI_RANGE_REQ} (see
+     * {@code EndpointGroupingRangeCommandIterator#canSendMultiRangeRead}).
+     */
+    @Override
+    protected void checkSerializable(int version)
+    {
+        if (version < MessagingService.VERSION_DS_10)
+            throw new IllegalStateException(String.format("Cannot serialize a multi-range read command for messaging version %d: " +
+                                                          "nodes on that version don't know %s",
+                                                          version, Verb.MULTI_RANGE_REQ));
     }
 
     @Override
