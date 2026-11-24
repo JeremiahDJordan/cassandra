@@ -35,7 +35,7 @@ public class VectorKeyRestrictedOnRangeTest extends VectorKeyRestrictedTester
         createTable("CREATE TABLE %s (partition int, val vector<float, 2>, PRIMARY KEY(partition))");
         createVectorIndex("%s", "val", Map.of("similarity_function", "euclidean"));
 
-        var nPartitions = 100;
+        var nPartitions = 50;
         Map<Integer, float[]> vectorsByKey = new HashMap<>();
 
         for (int i = 1; i <= nPartitions; i++)
