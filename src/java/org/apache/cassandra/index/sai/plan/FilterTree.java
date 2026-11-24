@@ -26,11 +26,13 @@ import java.util.ListIterator;
 import com.google.common.collect.ListMultimap;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.ColumnMetadata.Kind;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.index.sai.plan.Operation.OperationType;
@@ -103,7 +105,14 @@ public class FilterTree
             {
                 Expression filter = filterIterator.previous();
 
-                if (TypeUtil.isNonFrozenCollection(column.type))
+                if (filter.unindexed != null)
+                {
+                    // the row filter expression reads the cells of a purged row, as RowFilter#isSatisfiedBy gives it
+                    TableMetadata metadata = filter.context.columnFamilyStore().metadata();
+                    Row purged = row == null ? null : row.purge(DeletionPurger.PURGE_ALL, now, metadata.enforceStrictLiveness());
+                    result = op.apply(result, purged != null && filter.unindexed.isSatisfiedBy(metadata, key, purged));
+                }
+                else if (TypeUtil.isNonFrozenCollection(column.type))
                 {
                     Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
                     result = op.apply(result, filter.isSatisfiedBy(valueIterator));

@@ -62,7 +62,9 @@ public class LiteralRangeNotEqualTest extends SAITester.Versioned
         String indexed = createTable(schema);
         createIndex("CREATE CUSTOM INDEX ON %s(n) USING 'StorageAttachedIndex'");
         createIndex("CREATE CUSTOM INDEX ON %s(t) USING 'StorageAttachedIndex'");
-        createIndex("CREATE CUSTOM INDEX ON %s(ci) USING 'StorageAttachedIndex' WITH OPTIONS = { 'case_sensitive': false }");
+        // != and NOT IN compare raw values with equals_behaviour_when_analyzed: unsupported, as without the index
+        createIndex("CREATE CUSTOM INDEX ON %s(ci) USING 'StorageAttachedIndex' " +
+                    "WITH OPTIONS = { 'case_sensitive': false, 'equals_behaviour_when_analyzed': 'unsupported' }");
 
         for (int k = 0; k < 8; k++)
         {
