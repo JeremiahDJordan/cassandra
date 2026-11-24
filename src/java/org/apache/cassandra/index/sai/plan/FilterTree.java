@@ -106,7 +106,12 @@ public class FilterTree
             {
                 Expression filter = filterIterator.previous();
 
-                if (TypeUtil.isNonFrozenCollection(column.type))
+                // RowFilter would match a static row alone on any regular column
+                if (filter.unindexedMapEntry != null && row != null && row.isStatic() == column.isStatic())
+                {
+                    result = op.apply(result, filter.unindexedMapEntry.isSatisfiedBy(filter.context.columnFamilyStore().metadata(), key, row, now));
+                }
+                else if (TypeUtil.isNonFrozenCollection(column.type))
                 {
                     Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
                     result = op.apply(result, filter.isSatisfiedBy(valueIterator));
