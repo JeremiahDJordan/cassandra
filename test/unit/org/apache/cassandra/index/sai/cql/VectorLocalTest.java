@@ -225,16 +225,22 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
         assertThat(getCurrentColumnFamilyStore(keyspace()).getLiveSSTables()).hasSize(sstableCount);
 
         // query multiple on-disk indexes
-        int limit = Math.min(getRandom().nextIntBetween(30, 50), vectorCountPerSSTable);
-        float[] queryVector = allVectors.get(getRandom().nextIntBetween(0, allVectors.size() - 1));
-        UntypedResultSet resultSet = search(queryVector, limit);
+        int queries = 20;
+        double recall = 0;
+        for (int i = 0; i < queries; i++)
+        {
+            int limit = Math.min(getRandom().nextIntBetween(30, 50), vectorCountPerSSTable);
+            float[] queryVector = allVectors.get(getRandom().nextIntBetween(0, allVectors.size() - 1));
+            UntypedResultSet resultSet = search(queryVector, limit);
 
-        // expect recall to be at least 0.8
-        List<float[]> resultVectors = getVectorsFromResult(resultSet);
-        assertDescendingScore(queryVector, resultVectors);
+            List<float[]> resultVectors = getVectorsFromResult(resultSet);
+            assertDescendingScore(queryVector, resultVectors);
 
-        double recall = rawIndexedRecall(allVectors, queryVector, resultVectors, limit);
-        assertThat(recall).isGreaterThanOrEqualTo(0.8);
+            double queryRecall = bruteForceRecall(queryVector, resultVectors, allVectors, limit);
+            assertThat(queryRecall).isGreaterThanOrEqualTo(MIN_QUERY_RECALL);
+            recall += queryRecall;
+        }
+        assertThat(recall / queries).isGreaterThanOrEqualTo(0.95);
     }
 
     @Test
