@@ -16,6 +16,7 @@
 package org.apache.cassandra.db.filter;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -26,6 +27,11 @@ import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.ReadQuery;
+import org.apache.cassandra.db.SinglePartitionReadQuery;
+import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.io.util.DataInputBuffer;
@@ -133,6 +139,90 @@ public class RowFilterPeerCompatibilityTest extends SAITester
     }
 
     /**
+     * When SAI filters the read, a != or a NOT IN with a restriction that selects an index on nodes below DS 10 isn't
+     * sent to them, as their SAI ignores it, nor a != in a filter that needs reconciliation and intersects mutable
+     * columns, which they apply strictly without SAI, nor an IN in a filter that they relax, which their SAI refuses.
+     * Other filters with a !=, and filters that SAI doesn't serve, are sent.
+     */
+    @Test
+    public void testSAIFiltering() throws Throwable
+    {
+        // reads need reconciliation only with several replicas
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}");
+        createTable(keyspace, "CREATE TABLE %s (k int, c int, d int, x int, y int, z int, w int, s set<int>, st int static, PRIMARY KEY (k, c, d))");
+        createIndex(keyspace, "CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex(keyspace, "CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex(keyspace, "CREATE CUSTOM INDEX ON %s(st) USING 'StorageAttachedIndex'");
+        createIndex(keyspace, "CREATE INDEX ON %s(z) USING 'legacy_local_table'");
+
+        String nonStrictIn = String.format(RowFilter.SAI_NON_STRICT_OPERATOR, "IN");
+        Object[][] queries = {
+            { "SELECT * FROM %s WHERE x = 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.ONE, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE x > 0 AND x != 2", ConsistencyLevel.ONE, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE x = 1 AND y NOT IN (0, 2) ALLOW FILTERING", ConsistencyLevel.ONE, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE k = 0 AND x = 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.ONE, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE s CONTAINS 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.QUORUM, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE x != 1 AND s CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.ONE, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE x != 1", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x NOT IN (1, 2)", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x != 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x != 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.QUORUM, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE x NOT IN (1, 2)", ConsistencyLevel.ALL, null },
+            // z has a legacy index, w none
+            { "SELECT * FROM %s WHERE z = 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE w = 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE w != 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.ALL, null },
+            // their SAI serves no restriction of these
+            { "SELECT * FROM %s WHERE x != 1 AND w = 0 ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x != 1 AND z = 0 ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x != 1 AND y IN (0, 2) ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x != 1 AND st IN (1, 2) ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x != 1 AND w = 0 ALLOW FILTERING", ConsistencyLevel.QUORUM, RowFilter.SAI_EXCLUSION },
+            { "SELECT * FROM %s WHERE w = 1 AND y IN (0, 2) ALLOW FILTERING", ConsistencyLevel.ALL, null },
+            { "SELECT * FROM %s WHERE x = 1 AND y IN (0, 2) ALLOW FILTERING", ConsistencyLevel.QUORUM, nonStrictIn },
+            { "SELECT * FROM %s WHERE k = 0 AND x = 1 AND y IN (0, 2) ALLOW FILTERING", ConsistencyLevel.ALL, nonStrictIn },
+            { "SELECT * FROM %s WHERE x = 1 AND y IN (0, 2) ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE x IN (1, 2)", ConsistencyLevel.QUORUM, null },
+            { "SELECT * FROM %s WHERE x IN (1, 2) AND y = 0 ALLOW FILTERING", ConsistencyLevel.ALL, nonStrictIn },
+            { "SELECT * FROM %s WHERE x > 0 AND x < 5 AND d IN (1, 2) ALLOW FILTERING", ConsistencyLevel.QUORUM, nonStrictIn },
+            { "SELECT * FROM %s WHERE st = 1 AND d IN (1, 2) ALLOW FILTERING", ConsistencyLevel.ALL, nonStrictIn },
+            { "SELECT * FROM %s WHERE st = 1 AND d IN (1, 2) ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE d IN (1, 2) AND s CONTAINS 1 AND s CONTAINS 2 ALLOW FILTERING", ConsistencyLevel.QUORUM, nonStrictIn },
+            { "SELECT * FROM %s WHERE d IN (1, 2) AND s CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.QUORUM, null },
+            { "SELECT * FROM %s WHERE z = 1 AND y IN (0, 2) ALLOW FILTERING", ConsistencyLevel.QUORUM, null },
+        };
+
+        List<String> failures = new ArrayList<>();
+        for (Object[] query : queries)
+        {
+            String what = query[0] + " at " + query[1];
+            String feature = (String) query[2];
+            try
+            {
+                ReadCommand command = readCommand(formatQuery(keyspace, (String) query[0]), (ConsistencyLevel) query[1]);
+                assertThat(command.rowFilter().dataStaxOnlyFeature()).as(what).isNull();
+                assertThat(command.rowFilter().dataStaxOnlyFeature(command.isFilteredBySAI())).as(what).isEqualTo(feature);
+                serialize(command, MessagingService.VERSION_DS_20);
+                if (feature == null)
+                {
+                    serialize(command, APACHE_50);
+                }
+                else
+                {
+                    assertThatThrownBy(() -> serialize(command, APACHE_50)).as(what)
+                                                                           .isInstanceOf(IncompatibleMessagingVersionException.class)
+                                                                           .hasMessageContaining(feature);
+                }
+            }
+            catch (AssertionError e)
+            {
+                failures.add(e.getMessage());
+            }
+        }
+        assertThat(failures).isEmpty();
+    }
+
+    /**
      * Checks that the given filter is serialized for Apache Cassandra 5.0 nodes with only the expression kinds that it
      * reads as we mean them (simple, map equality, custom and user expressions) and the operators it knows.
      */
@@ -163,6 +253,25 @@ public class RowFilterPeerCompatibilityTest extends SAITester
         // the analyzer matches of a non-tokenizing index are sent as the analyzed equalities they are
         if (filter.expressions().stream().anyMatch(e -> e.operator() == Operator.ANALYZER_MATCHES))
             assertThat(deserialized.expressions().stream().map(RowFilter.Expression::operator)).as(query).contains(Operator.EQ);
+    }
+
+    private static ReadCommand readCommand(String query, ConsistencyLevel consistency)
+    {
+        SelectStatement statement = (SelectStatement) QueryProcessor.prepareInternal(query).statement;
+        QueryOptions options = QueryOptions.forInternalCalls(consistency, Collections.emptyList());
+        ReadQuery readQuery = statement.getQuery(options, FBUtilities.nowInSeconds());
+        return readQuery instanceof SinglePartitionReadQuery.Group
+               ? (ReadCommand) ((SinglePartitionReadQuery.Group<?>) readQuery).queries.get(0)
+               : (ReadCommand) readQuery;
+    }
+
+    private static void serialize(ReadCommand command, int version) throws Exception
+    {
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            ReadCommand.serializer.serializedSize(command, version);
+            ReadCommand.serializer.serialize(command, out, version);
+        }
     }
 
     private RowFilter rowFilter(String query)

@@ -84,6 +84,7 @@ import org.apache.cassandra.gms.IFailureDetector;
 import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.LuceneAnalyzer;
 import org.apache.cassandra.index.sai.utils.GeoUtil;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
@@ -131,6 +132,10 @@ public class RowFilter
     "%s is not supported while the query can contact nodes on a messaging version below DS 10, such as Apache " +
     "Cassandra nodes";
 
+    public static final String SAI_EXCLUSION = "A != or NOT IN that SAI filters";
+    public static final String SAI_NON_STRICT_OPERATOR =
+    "The %s operator in an intersection that SAI filters for a read that needs replica reconciliation";
+
     public final FilterElement root;
     public final IndexHints indexHints;
     public final OptimizerOptions optimizerOptions;
@@ -169,9 +174,10 @@ public class RowFilter
      * rejected here, but the serializers refuse it to such nodes. This doesn't know whether the query is sent to other
      * nodes, so queries that only run locally are rejected too.
      *
+     * @param filteredBySAI whether the replicas filter the read with SAI (see {@link #dataStaxOnlyFeature(boolean)})
      * @throws InvalidRequestException if this filter uses a DataStax-only feature and such a node may be contacted
      */
-    public void validateForPeers(String keyspace, ConsistencyLevel consistency)
+    public void validateForPeers(String keyspace, ConsistencyLevel consistency, boolean filteredBySAI)
     {
         if (root.isAlwaysTrue())
             return;
@@ -180,7 +186,7 @@ public class RowFilter
         if (!mayHavePeersBelowDS10(keyspace, consistency))
             return;
 
-        String feature = root.dataStaxOnlyFeature(false);
+        String feature = dataStaxOnlyFeature(false, filteredBySAI);
         if (feature != null)
             throw new InvalidRequestException(String.format(DATASTAX_ONLY_FEATURE_ERROR, feature));
     }
@@ -259,7 +265,116 @@ public class RowFilter
     @Nullable
     public String dataStaxOnlyFeature()
     {
-        return root.dataStaxOnlyFeature(true);
+        return dataStaxOnlyFeature(false);
+    }
+
+    /**
+     * Same as {@link #dataStaxOnlyFeature()}, plus, for a read that SAI filters, the restrictions that the SAI of
+     * Apache Cassandra 5.0 nodes drops or refuses: a != (which NOT IN is sent as) with a restriction that selects one of
+     * their indexes (see {@link #selectsIndexBelowDS10}), as their index query plan ignores it, and an IN in a filter
+     * that they relax (see {@link #isRelaxedBelowDS10()}). Without such a restriction, they apply the filter without
+     * SAI, strictly, so a filter with a != is refused too if it needs reconciliation and intersects mutable columns, as
+     * they would miss the rows whose columns only match once reconciled.
+     *
+     * @param filteredBySAI whether the replicas filter the read with SAI
+     */
+    @Nullable
+    public String dataStaxOnlyFeature(boolean filteredBySAI)
+    {
+        return dataStaxOnlyFeature(true, filteredBySAI);
+    }
+
+    @Nullable
+    private String dataStaxOnlyFeature(boolean includeLike, boolean filteredBySAI)
+    {
+        String feature = root.dataStaxOnlyFeature(includeLike);
+        if (feature != null || !filteredBySAI)
+            return feature;
+
+        boolean hasNotEquals = false;
+        boolean selectsIndex = false;
+        for (Expression expression : expressions())
+        {
+            if (expression.operator() == Operator.NEQ)
+                hasNotEquals = true;
+            else if (!selectsIndex)
+                selectsIndex = selectsIndexBelowDS10(expression);
+        }
+        if (hasNotEquals && (selectsIndex || (needsReconciliation && isMutableIntersection())))
+            return SAI_EXCLUSION;
+
+        if (isRelaxedBelowDS10())
+        {
+            for (Expression expression : expressions())
+            {
+                if (expression.operator() == Operator.IN)
+                    return String.format(SAI_NON_STRICT_OPERATOR, Operator.IN);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Whether the SAI of Apache Cassandra 5.0 nodes may select an index for the given expression: its operator is one
+     * that their SAI serves, and its column has an SAI index. The target of the index isn't checked, which errs on the
+     * side of refusing.
+     */
+    private static boolean selectsIndexBelowDS10(Expression expression)
+    {
+        Operator operator = expression.operator();
+        if (operator == null)
+            return false;
+
+        switch (operator)
+        {
+            case EQ:
+            case LT:
+            case LTE:
+            case GT:
+            case GTE:
+            case CONTAINS:
+            case CONTAINS_KEY:
+            case ANN:
+            case ANALYZER_MATCHES: // sent as = (see Expression.Serializer#wireOperator)
+                break;
+            default:
+                return false;
+        }
+
+        ColumnMetadata column = expression.column;
+        TableMetadata table = Schema.instance.getTableMetadata(column.ksName, column.cfName);
+        if (table == null)
+            return true;
+
+        for (Index index : IndexRegistry.obtain(table).listIndexes())
+        {
+            if (index instanceof StorageAttachedIndex && index.dependsOn(column))
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * Whether nodes below DS 10 may relax this filter, whatever the coordinator says: for a read that needs
+     * reconciliation, if it restricts a static column and something else, or has several restrictions on non-key
+     * columns. Apache Cassandra 5.0 releases count either as an intersection of mutable columns, some of them even
+     * when the restrictions are on the same column.
+     */
+    private boolean isRelaxedBelowDS10()
+    {
+        if (!needsReconciliation)
+            return false;
+
+        List<Expression> expressions = expressions();
+        int nonKeyRestrictions = 0;
+        for (Expression expression : expressions)
+        {
+            if (expression.column.isStatic() && expressions.size() > 1)
+                return true;
+            if (!expression.column.isPrimaryKeyColumn() && ++nonKeyRestrictions > 1)
+                return true;
+        }
+        return false;
     }
 
     /**
@@ -2410,6 +2525,22 @@ public class RowFilter
     {
         public void serialize(RowFilter filter, DataOutputPlus out, int version) throws IOException
         {
+            serialize(filter, out, version, false);
+        }
+
+        /**
+         * @param filteredBySAI whether the replicas filter the read with SAI, which nodes below DS 10 get wrong for
+         *                      some filters (see {@link RowFilter#dataStaxOnlyFeature(boolean)})
+         */
+        public void serialize(RowFilter filter, DataOutputPlus out, int version, boolean filteredBySAI) throws IOException
+        {
+            if (filteredBySAI && version < MessagingService.VERSION_DS_10)
+            {
+                String feature = filter.dataStaxOnlyFeature(true);
+                if (feature != null)
+                    throw incompatibleVersion(version, feature);
+            }
+
             out.writeBoolean(false); // Old "is for thrift" boolean
             IndexHints.serializer.serialize(filter.indexHints, out, version); // hints first because the expressions might need them
             FilterElement.serializer.serialize(filter.root, out, version);
