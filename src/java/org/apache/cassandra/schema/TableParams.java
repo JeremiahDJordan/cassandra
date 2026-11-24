@@ -678,7 +678,7 @@ public final class TableParams
                    .maxIndexInterval(in.readInt())
                    .speculativeRetry(SpeculativeRetryPolicy.fromString(in.readUTF()))
                    .additionalWritePolicy(SpeculativeRetryPolicy.fromString(in.readUTF()))
-                   .memtable(version.isAtLeast(Version.V2) ? MemtableParams.get(in.readUTF()) : MemtableParams.DEFAULT)
+                   .memtable(version.isAtLeast(Version.V2) ? MemtableParams.getWithFallback(in.readUTF()) : MemtableParams.DEFAULT)
                    .caching(CachingParams.fromMap(deserializeMap(in)))
                    .compaction(CompactionParams.fromMap(deserializeMap(in)))
                    .compression(CompressionParams.fromMap(deserializeMap(in)))

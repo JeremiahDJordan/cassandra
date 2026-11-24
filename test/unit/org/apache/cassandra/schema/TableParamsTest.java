@@ -22,10 +22,12 @@ import java.io.IOException;
 
 import com.google.common.collect.ImmutableMap;
 
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 import accord.utils.Gen;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.tcm.membership.NodeVersion;
@@ -36,10 +38,18 @@ import org.apache.cassandra.utils.Generators;
 
 import static accord.utils.Property.qt;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertSame;
 
 
 public class TableParamsTest
 {
+    @BeforeClass
+    public static void setUpClass()
+    {
+        DatabaseDescriptor.daemonInitialization();
+    }
+
     @Test
     public void serdeLatest()
     {
@@ -82,6 +92,20 @@ public class TableParamsTest
         TableParams read = TableParams.serializer.deserialize(in, Version.V10);
         assertThat(in.available()).isZero();
         assertThat(read).isEqualTo(params.unbuild().automatedRepair(AutoRepairParams.DEFAULT).build());
+    }
+
+    @Test
+    public void serdeUnknownMemtableConfiguration() throws IOException
+    {
+        TableParams params = TableParams.builder().memtable(MemtableParams.getWithFallback("unknown")).build();
+        DataOutputBuffer output = new DataOutputBuffer();
+        TableParams.serializer.serialize(params, output, NodeVersion.CURRENT_METADATA_VERSION);
+        try (DataInputBuffer input = new DataInputBuffer(output.buffer(), false))
+        {
+            MemtableParams memtable = TableParams.serializer.deserialize(input, NodeVersion.CURRENT_METADATA_VERSION).memtable;
+            assertEquals("unknown", memtable.configurationKey());
+            assertSame(MemtableParams.DEFAULT.factory(), memtable.factory());
+        }
     }
 
     private static Gen<TableParams> tableParams()
