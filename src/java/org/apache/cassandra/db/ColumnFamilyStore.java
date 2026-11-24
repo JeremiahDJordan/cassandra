@@ -309,6 +309,9 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
 
     private static final String SAMPLING_RESULTS_NAME = "SAMPLING_RESULTS";
 
+    /** The tables and names of the snapshots being taken, see {@link #snapshotWithoutMemtable} */
+    private static final Set<Pair<TableId, String>> snapshotsInProgress = new HashSet<>();
+
     public static final String SNAPSHOT_TRUNCATE_PREFIX = "truncated";
     public static final String SNAPSHOT_DROP_PREFIX = "dropped";
     static final String TOKEN_DELIMITER = ":";
@@ -2509,10 +2512,28 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
         return snapshotWithoutMemtable(snapshotName, null, false, null, null, creationTime);
     }
 
+    @Override
+    public boolean snapshotWithoutMemtableIfAbsent(String snapshotName, Instant creationTime)
+    {
+        return snapshotWithoutMemtable(snapshotName, null, false, null, null, creationTime, true) != null;
+    }
+
     /**
      * @param ephemeral If this flag is set to true, the snapshot will be cleaned during next startup
      */
     public TableSnapshot snapshotWithoutMemtable(String snapshotName, Predicate<SSTableReader> predicate, boolean ephemeral, DurationSpec.IntSecondsBound ttl, RateLimiter rateLimiter, Instant creationTime)
+    {
+        return snapshotWithoutMemtable(snapshotName, predicate, ephemeral, ttl, rateLimiter, creationTime, false);
+    }
+
+    /**
+     * A snapshot is registered while it is taken: another snapshot of the table with the same name would hard-link the
+     * same files into the same directories, so it fails before it links any.
+     *
+     * @param ifAbsent whether to take no snapshot, and return null, if a snapshot of the table with that name exists or
+     * is being taken
+     */
+    private TableSnapshot snapshotWithoutMemtable(String snapshotName, Predicate<SSTableReader> predicate, boolean ephemeral, DurationSpec.IntSecondsBound ttl, RateLimiter rateLimiter, Instant creationTime, boolean ifAbsent)
     {
         if (ephemeral && ttl != null)
         {
@@ -2524,6 +2545,29 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
         if (rateLimiter == null)
             rateLimiter = DatabaseDescriptor.getSnapshotRateLimiter();
 
+        Pair<TableId, String> inProgress = Pair.create(metadata().id, snapshotName);
+        synchronized (snapshotsInProgress)
+        {
+            if (ifAbsent && (snapshotsInProgress.contains(inProgress) || snapshotExists(snapshotName)))
+                return null;
+            if (!snapshotsInProgress.add(inProgress))
+                throw new RuntimeException(format("Snapshot %s for %s.%s is being taken.", snapshotName, getKeyspaceName(), getTableName()));
+        }
+        try
+        {
+            return linkSnapshot(snapshotName, predicate, ephemeral, ttl, rateLimiter, creationTime);
+        }
+        finally
+        {
+            synchronized (snapshotsInProgress)
+            {
+                snapshotsInProgress.remove(inProgress);
+            }
+        }
+    }
+
+    private TableSnapshot linkSnapshot(String snapshotName, Predicate<SSTableReader> predicate, boolean ephemeral, DurationSpec.IntSecondsBound ttl, RateLimiter rateLimiter, Instant creationTime)
+    {
         Set<SSTableReader> snapshottedSSTables = new LinkedHashSet<>();
         for (ColumnFamilyStore cfs : concatWithIndexes())
         {
