@@ -60,7 +60,7 @@ public abstract class ReadResponse
                                                         ReadCommand command,
                                                         int version)
     {
-        return new RemoteDataResponse(LocalDataResponse.build(data, command.columnFilter()),
+        return new RemoteDataResponse(LocalDataResponse.build(data, command.columnFilter(version)),
                                       repairedDataDigest,
                                       isRepairedDigestConclusive,
                                       version);
@@ -264,10 +264,14 @@ public abstract class ReadResponse
                 // Note that the command parameter shadows the 'command' field and this is intended because
                 // the later can be null (for RemoteDataResponse as those are created in the serializers and
                 // those don't have easy access to the command). This is also why we need the command as parameter here.
+                // A remote replica serialized the data with the column filter it was sent.
+                ColumnFilter columnFilter = flag == DeserializationHelper.Flag.FROM_REMOTE
+                                            ? command.columnFilter(dataSerializationVersion)
+                                            : command.columnFilter();
                 return UnfilteredPartitionIterators.serializerForIntraNode().deserialize(in,
                                                                                          dataSerializationVersion,
                                                                                          command.metadata(),
-                                                                                         command.columnFilter(),
+                                                                                         columnFilter,
                                                                                          flag);
             }
             catch (IOException e)
