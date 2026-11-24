@@ -15,10 +15,21 @@
  */
 
 package org.apache.cassandra.exceptions;
+import java.io.IOException;
+
 import org.junit.Test;
 
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.schema.TableId;
 
+import static org.apache.cassandra.net.MessagingService.VERSION_40;
+import static org.apache.cassandra.net.MessagingService.VERSION_50;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_10;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_11;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_12;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_20;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_21;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
@@ -78,6 +89,35 @@ public class RequestFailureReasonTest
         assertEquals(RequestFailureReason.UNKNOWN, RequestFailureReason.fromCode(9));
         assertEquals(RequestFailureReason.UNKNOWN, RequestFailureReason.fromCode(10));
         assertEquals(RequestFailureReason.UNKNOWN, RequestFailureReason.fromCode(11));
+    }
+
+    @Test
+    public void testSchemaReasonsForApache() throws IOException
+    {
+        for (int version : new int[]{ VERSION_40, VERSION_50 })
+        {
+            assertEquals(RequestFailureReason.INCOMPATIBLE_SCHEMA, roundTrip(RequestFailureReason.UNKNOWN_COLUMN, version));
+            assertEquals(RequestFailureReason.INCOMPATIBLE_SCHEMA, roundTrip(RequestFailureReason.UNKNOWN_TABLE, version));
+            assertEquals(RequestFailureReason.INDEX_BUILD_IN_PROGRESS, roundTrip(RequestFailureReason.INDEX_BUILD_IN_PROGRESS, version));
+        }
+        for (int version : new int[]{ VERSION_DS_10, VERSION_DS_11, VERSION_DS_12, VERSION_DS_20, VERSION_DS_21 })
+        {
+            assertEquals(RequestFailureReason.UNKNOWN_COLUMN, roundTrip(RequestFailureReason.UNKNOWN_COLUMN, version));
+            assertEquals(RequestFailureReason.UNKNOWN_TABLE, roundTrip(RequestFailureReason.UNKNOWN_TABLE, version));
+        }
+    }
+
+    private static RequestFailureReason roundTrip(RequestFailureReason reason, int version) throws IOException
+    {
+        try (DataOutputBuffer out = new DataOutputBuffer())
+        {
+            RequestFailureReason.serializer.serialize(reason, out, version);
+            assertEquals(out.getLength(), RequestFailureReason.serializer.serializedSize(reason, version));
+            try (DataInputBuffer in = new DataInputBuffer(out.getData()))
+            {
+                return RequestFailureReason.serializer.deserialize(in, version);
+            }
+        }
     }
 
     @Test
