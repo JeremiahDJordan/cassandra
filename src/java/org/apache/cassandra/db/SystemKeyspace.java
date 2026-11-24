@@ -925,10 +925,23 @@ public final class SystemKeyspace
      */
     public static synchronized void removeEndpoint(InetSocketAddress ep)
     {
-        String req = "DELETE FROM system.%s WHERE peer = ?";
-        executeInternal(String.format(req, LEGACY_PEERS), ep.getAddress());
-        req = String.format("DELETE FROM system.%s WHERE peer = ? AND peer_port = ?", PEERS_V2);
+        String req = String.format("DELETE FROM system.%s WHERE peer = ? AND peer_port = ?", PEERS_V2);
         executeInternal(req, ep.getAddress(), ep.getPort());
+        // system.peers has one row per address: a peer left at the address on another port keeps it, with its own values
+        UntypedResultSet remaining = executeInternal(String.format("SELECT * FROM system.%s WHERE peer = ? LIMIT 1", PEERS_V2), ep.getAddress());
+        if (remaining.isEmpty())
+        {
+            executeInternal(String.format("DELETE FROM system.%s WHERE peer = ?", LEGACY_PEERS), ep.getAddress());
+        }
+        else
+        {
+            UntypedResultSet.Row row = remaining.one();
+            req = "INSERT INTO system.%s (peer, data_center, host_id, preferred_ip, rack, release_version, rpc_address, schema_version, tokens) " +
+                  "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)";
+            executeInternal(String.format(req, LEGACY_PEERS), ep.getAddress(), row.getBytes("data_center"), row.getBytes("host_id"),
+                            row.getBytes("preferred_ip"), row.getBytes("rack"), row.getBytes("release_version"),
+                            row.getBytes("native_address"), row.getBytes("schema_version"), row.getBytes("tokens"));
+        }
         forceBlockingFlush(LEGACY_PEERS, PEERS_V2);
     }
 
