@@ -20,6 +20,7 @@ package org.apache.cassandra.index.sai.cql;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -32,6 +33,7 @@ import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.metrics.ColumnQueryMetrics;
@@ -69,23 +71,12 @@ public class VectorKeyRestrictedOnPartitionTest extends VectorKeyRestrictedTeste
             execute("INSERT INTO %s (pk, str_val, val) VALUES (?, 'A', " + vectorString(word2vec.vector(word2vec.word(pk))) + " )", pk);
 
         // query memtable index
-
-        for (int executionCount = 0; executionCount < 50; executionCount++)
-        {
-            int key = getRandom().nextIntBetween(1, vectorCount - 1);
-            float[] queryVector = word2vec.vector(word2vec.word(getRandom().nextIntBetween(0, vectorCount - 1)));
-            searchWithKey(queryVector, key, 1);
-        }
+        searchWithExistingKeys(vectorCount);
 
         flush();
 
         // query on-disk index with existing key:
-        for (int executionCount = 0; executionCount < 50; executionCount++)
-        {
-            int key = getRandom().nextIntBetween(1, vectorCount - 1);
-            float[] queryVector = word2vec.vector(word2vec.word(getRandom().nextIntBetween(0, vectorCount - 1)));
-            searchWithKey(queryVector, key, 1);
-        }
+        searchWithExistingKeys(vectorCount);
 
         // query on-disk index with non-existing key:
         for (int executionCount = 0; executionCount < 50; executionCount++)
@@ -94,6 +85,37 @@ public class VectorKeyRestrictedOnPartitionTest extends VectorKeyRestrictedTeste
             float[] queryVector = word2vec.vector(word2vec.word(getRandom().nextIntBetween(0, vectorCount - 1)));
             searchWithNonExistingKey(queryVector, nonExistingKey);
         }
+    }
+
+    private void searchWithExistingKeys(int vectorCount)
+    {
+        // brute force is exact, so it finds every key
+        setMaxBruteForceRows(Integer.MAX_VALUE);
+        for (int key : distinctRandomKeys(vectorCount))
+            assertThat(searchWithExistingKey(vectorCount, key)).isEqualTo(1);
+
+        // a graph search filtered to one row can't find it if the graph doesn't reach that node
+        setMaxBruteForceRows(0);
+        int found = 0;
+        for (int key : distinctRandomKeys(vectorCount))
+            found += searchWithExistingKey(vectorCount, key);
+        assertThat(found).isGreaterThanOrEqualTo(47);
+    }
+
+    private List<Integer> distinctRandomKeys(int vectorCount)
+    {
+        List<Integer> keys = IntStream.range(1, vectorCount).boxed().collect(Collectors.toList());
+        Collections.shuffle(keys, getRandom().getRandom());
+        return keys.subList(0, 50);
+    }
+
+    private int searchWithExistingKey(int vectorCount, int key)
+    {
+        float[] queryVector = word2vec.vector(word2vec.word(getRandom().nextIntBetween(0, vectorCount - 1)));
+        UntypedResultSet result = execute("SELECT pk FROM %s WHERE pk = ? ORDER BY val ann of ? LIMIT 1000", key, vector(queryVector));
+        assertThat(result.size()).isLessThanOrEqualTo(1);
+        result.forEach(row -> assertThat(row.getInt("pk")).isEqualTo(key));
+        return result.size();
     }
 
     @Test
