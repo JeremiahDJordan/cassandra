@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import org.apache.cassandra.cql3.AssignmentTestable;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.ColumnSpecification;
+import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.cql3.FunctionContext;
 import org.apache.cassandra.cql3.Operation;
 import org.apache.cassandra.cql3.RowUpdateBuilder;
@@ -437,7 +438,7 @@ public abstract class Constants
 
         public String getText()
         {
-            return type == Type.STRING ? String.format("'%s'", text) : text;
+            return type == Type.STRING ? new CqlBuilder().appendWithSingleQuotes(text).toString() : text;
         }
     }
 

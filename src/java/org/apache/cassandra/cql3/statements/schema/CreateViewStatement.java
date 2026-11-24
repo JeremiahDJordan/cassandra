@@ -52,6 +52,7 @@ import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableParams;
@@ -86,6 +87,8 @@ public final class CreateViewStatement extends AlterSchemaStatement
     private final boolean ifNotExists;
 
     private ClientState state;
+    private boolean hasIgnoredProperties;
+    private String expandedCql;
 
     public CreateViewStatement(String keyspaceName,
                                String tableName,
@@ -126,8 +129,34 @@ public final class CreateViewStatement extends AlterSchemaStatement
 
         super.validate(state);
 
-        // save the query state to use it for guardrails validation in #apply
+        // save the query state to use it for the restrictions in #apply
         this.state = state;
+
+        // apply refuses the statement, or ignores it with IF NOT EXISTS
+        KeyspaceMetadata keyspace = Schema.instance.getKeyspaceMetadata(keyspaceName);
+        TableMetadata table = keyspace == null ? null : keyspace.tables.getNullable(tableName);
+        if (table == null || keyspace.hasView(viewName))
+            return;
+
+        Guardrails.tableProperties.guard(attrs.updatedProperties(), property -> {
+            attrs.removeProperty(property);
+            hasIgnoredProperties = true;
+        }, state);
+
+        Guardrails.materializedViewsPerTable.guard(Iterables.size(keyspace.views.forTable(table.id)) + 1,
+                                                   String.format("%s on table %s", viewName, table.name),
+                                                   false,
+                                                   state);
+    }
+
+    /**
+     * Nodes replaying the statement from the metadata log don't run the guardrails, so if they ignored properties it
+     * is logged as the created view.
+     */
+    @Override
+    public String cql()
+    {
+        return expandedCql == null ? super.cql() : expandedCql;
     }
 
     @Override
@@ -174,16 +203,6 @@ public final class CreateViewStatement extends AlterSchemaStatement
 
         if (table.isView())
             throw ire("Materialized views cannot be created against other materialized views");
-
-        // Guardrails on table properties
-        Guardrails.tableProperties.guard(attrs.updatedProperties(), attrs::removeProperty, state);
-
-        // Guardrail to limit number of mvs per table
-        Iterable<ViewMetadata> tableViews = keyspace.views.forTable(table.id);
-        Guardrails.materializedViewsPerTable.guard(Iterables.size(tableViews) + 1,
-                                                   String.format("%s on table %s", viewName, table.name),
-                                                   false,
-                                                   state);
 
         if (table.params.gcGraceSeconds == 0)
         {
@@ -376,6 +395,12 @@ public final class CreateViewStatement extends AlterSchemaStatement
 
         ViewMetadata view = new ViewMetadata(table.id, table.name, rawColumns.isEmpty(), whereClause, builder.build());
         view.metadata.validate();
+
+        if (hasIgnoredProperties)
+        {
+            expandedCql = view.toCqlString(false, attrs.hasProperty(TableAttributes.ID), ifNotExists);
+            verifyExpandedCql(expandedCql);
+        }
 
         return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.views.with(view)));
     }

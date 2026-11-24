@@ -167,6 +167,10 @@ New features
     - SAI Memtable-attached indexes now support sharding via WITH OPTIONS. See CQL documentation for details.
 Upgrading
 ---------
+    - CREATE and ALTER MATERIALIZED VIEW no longer run the table_properties guardrail on the nodes that apply them
+      from the cluster metadata log. A node that replays an entry logged before upgrading applies every option in it,
+      including options that table_properties_ignored removed when the statement ran. Take a cluster metadata
+      snapshot with nodetool cms snapshot before upgrading, so that those entries aren't replayed. (CASSANDRA-XXXXX)
     - Do not set the UnifiedCompactionStrategy table option max_sstables_per_shard_factor until every node runs
       6.0-alpha3 or later, or 5.0.10 or later. Earlier versions, including 6.0-alpha1 and 6.0-alpha2, do not
       recognize the option. When one of them coordinates a schema change that validates the whole table definition,

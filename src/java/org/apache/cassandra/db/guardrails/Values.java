@@ -25,6 +25,7 @@ import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 
 import org.apache.cassandra.service.ClientState;
@@ -118,7 +119,8 @@ public class Values<T> extends Guardrail
         {
             warn(format("Ignoring provided values %s as they are not supported for %s (ignored values are: %s)",
                         toIgnore.stream().sorted().collect(Collectors.toList()), what, ignored));
-            toIgnore.forEach(ignoreAction);
+            // the action may remove the values from the set intersected with
+            ImmutableSet.copyOf(toIgnore).forEach(ignoreAction);
         }
 
         Set<T> warned = warnedValues.apply(state);

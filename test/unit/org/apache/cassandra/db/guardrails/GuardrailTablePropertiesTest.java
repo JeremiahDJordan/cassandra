@@ -32,9 +32,16 @@ import org.junit.Before;
 import org.junit.Test;
 
 import org.apache.cassandra.config.GuardrailsOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.statements.schema.AlterSchemaStatement;
 import org.apache.cassandra.cql3.statements.schema.TableAttributes;
+import org.apache.cassandra.schema.CachingParams;
+import org.apache.cassandra.schema.TableParams;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.tcm.ClusterMetadata;
 
 import static java.lang.String.format;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 
 /**
@@ -50,6 +57,7 @@ public class GuardrailTablePropertiesTest extends GuardrailTester
     private static final String WARNED_PROPERTY_NAME = "table_properties_warned";
     private static final String IGNORED_PROPERTY_NAME = "table_properties_ignored";
     private static final String DISALLOWED_PROPERTY_NAME = "table_properties_disallowed";
+    private static final CachingParams CACHING = new CachingParams(false, Integer.MAX_VALUE);
 
     public GuardrailTablePropertiesTest()
     {
@@ -194,6 +202,79 @@ public class GuardrailTablePropertiesTest extends GuardrailTester
     }
 
     @Test
+    public void testAlterTableReplay() throws Throwable
+    {
+        guardrails().setTablePropertiesDisallowed(Collections.emptySet());
+        String table = createTableWithProperties("");
+        String logged = submitted(format("ALTER TABLE %s.%s WITH comment = 'my table' AND caching = {'keys': 'NONE', 'rows_per_partition': 'ALL'}", keyspace(), table));
+        guardrails().setTablePropertiesIgnored(Collections.emptySet());
+        assertReplayed(logged, table, "", CACHING);
+    }
+
+    @Test
+    public void testAlterViewReplay() throws Throwable
+    {
+        guardrails().setTablePropertiesDisallowed(Collections.emptySet());
+        createTableWithProperties();
+        String view = createViewName();
+        schemaChange(format(CREATE_VIEW, keyspace(), view, keyspace(), currentTable(), ""));
+        String options = "comment = 'my view' AND caching = {'keys': 'NONE', 'rows_per_partition': 'ALL'}";
+
+        // comment ignored where the statement is submitted, not where it is replayed
+        String logged = submitted(format(ALTER_VIEW, keyspace(), view, options));
+        guardrails().setTablePropertiesIgnored(Collections.emptySet());
+        assertReplayed(logged, view, "", CACHING);
+
+        // comment ignored where the statement is replayed, not where it is submitted
+        logged = submitted(format(ALTER_VIEW, keyspace(), view, options));
+        guardrails().setTablePropertiesIgnored("comment");
+        assertReplayed(logged, view, "my view", CACHING);
+    }
+
+    @Test
+    public void testCreateViewReplay() throws Throwable
+    {
+        guardrails().setTablePropertiesDisallowed(Collections.emptySet());
+        createTableWithProperties();
+        String options = "WITH comment = 'my view' AND caching = {'keys': 'NONE', 'rows_per_partition': 'ALL'}";
+
+        // comment ignored where the statement is submitted, not where it is replayed
+        String view = createViewName();
+        String logged = submitted(format(CREATE_VIEW, keyspace(), view, keyspace(), currentTable(), options));
+        guardrails().setTablePropertiesIgnored(Collections.emptySet());
+        assertReplayed(logged, view, "", CACHING);
+
+        // comment ignored where the statement is replayed, not where it is submitted
+        view = createViewName();
+        logged = submitted(format(CREATE_VIEW, keyspace(), view, keyspace(), currentTable(), options));
+        guardrails().setTablePropertiesIgnored("comment");
+        assertReplayed(logged, view, "my view", CACHING);
+
+        // the view is logged as its CQL, with a quoted literal in the WHERE clause
+        String table = createTableName();
+        schemaChange(format("CREATE TABLE %s.%s (pk text, ck int, v int, PRIMARY KEY (pk, ck))", keyspace(), table));
+        view = createViewName();
+        logged = submitted(format("CREATE MATERIALIZED VIEW %s.%s AS SELECT * FROM %s.%s WHERE pk = 'O''Brien' AND ck IS NOT NULL PRIMARY KEY (ck, pk) %s",
+                                  keyspace(), view, keyspace(), table, options));
+        assertReplayed(logged, view, "", CACHING);
+    }
+
+    @Test
+    public void testAlterMissingViewIfExists() throws Throwable
+    {
+        assertValid(() -> execute(userClientState, format("ALTER MATERIALIZED VIEW IF EXISTS %s.missing WITH compaction = { 'class': 'SizeTieredCompactionStrategy' }", keyspace())));
+    }
+
+    @Test
+    public void testAlterViewInvalidIgnoredProperty() throws Throwable
+    {
+        createTableWithProperties();
+        createViewWithProperties("");
+        guardrails().setTablePropertiesIgnored("gc_grace_seconds");
+        assertThatThrownBy(() -> alterViewWithProperties("gc_grace_seconds = 'abc'")).hasMessageContaining("gc_grace_seconds");
+    }
+
+    @Test
     public void testInvalidTableProperties()
     {
         assertConfigFails(c -> c.setTablePropertiesDisallowed("ID1", "gc_grace_seconds"), "[id1]");
@@ -237,5 +318,32 @@ public class GuardrailTablePropertiesTest extends GuardrailTester
     private void alterViewWithProperties(String withClause)
     {
         execute(userClientState, format(ALTER_VIEW, keyspace(), currentView(), withClause));
+    }
+
+    /**
+     * Validates and applies the statement as the node it is submitted to does, and returns the text the metadata log
+     * gets.
+     */
+    private String submitted(String query)
+    {
+        AlterSchemaStatement statement = (AlterSchemaStatement) QueryProcessor.getStatement(query, userClientState);
+        statement.validate(userClientState);
+        statement.apply(ClusterMetadata.current());
+        return statement.cql();
+    }
+
+    private void assertReplayed(String logged, String table, String comment, CachingParams caching)
+    {
+        assertEquals(logged, comment, replayed(logged, table).comment);
+        assertEquals(logged, caching, replayed(logged, table).caching);
+    }
+
+    /**
+     * Applies the logged statement as a node replaying it from the metadata log does.
+     */
+    private TableParams replayed(String logged, String table)
+    {
+        AlterSchemaStatement statement = (AlterSchemaStatement) QueryProcessor.getStatement(logged, ClientState.forInternalCalls());
+        return statement.apply(ClusterMetadata.current()).getNullable(keyspace()).getTableOrViewNullable(table).params;
     }
 }

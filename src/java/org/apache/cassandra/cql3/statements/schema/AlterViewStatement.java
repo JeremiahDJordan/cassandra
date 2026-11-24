@@ -21,6 +21,7 @@ import org.apache.cassandra.audit.AuditLogContext;
 import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.cql3.CQLStatement;
+import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.cql3.QualifiedName;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.schema.KeyspaceMetadata;
@@ -40,8 +41,8 @@ public final class AlterViewStatement extends AlterSchemaStatement
 {
     private final String viewName;
     private final TableAttributes attrs;
-    private ClientState state;
     private final boolean ifExists;
+    private boolean hasIgnoredProperties;
 
     public AlterViewStatement(String keyspaceName, String viewName, TableAttributes attrs, boolean ifExists)
     {
@@ -56,8 +57,35 @@ public final class AlterViewStatement extends AlterSchemaStatement
     {
         super.validate(state);
 
-        // save the query state to use it for guardrails validation in #apply
-        this.state = state;
+        // apply refuses the statement, or ignores it with IF EXISTS
+        if (Schema.instance.getView(keyspaceName, viewName) == null)
+            return;
+
+        attrs.validate();
+        Guardrails.tableProperties.guard(attrs.updatedProperties(), property -> {
+            attrs.removeProperty(property);
+            hasIgnoredProperties = true;
+        }, state);
+    }
+
+    /**
+     * Nodes replaying the statement from the metadata log don't run the guardrails, so it is logged without the
+     * properties they ignored.
+     */
+    @Override
+    public String cql()
+    {
+        if (!hasIgnoredProperties)
+            return super.cql();
+
+        return new CqlBuilder().append("ALTER MATERIALIZED VIEW ")
+                               .append(ifExists ? "IF EXISTS " : "")
+                               .appendQuotingIfNeeded(keyspaceName)
+                               .append('.')
+                               .appendQuotingIfNeeded(viewName)
+                               .append(" WITH ")
+                               .append(attrs.toCqlString())
+                               .toString();
     }
 
     @Override
@@ -83,9 +111,6 @@ public final class AlterViewStatement extends AlterSchemaStatement
         }
 
         attrs.validate();
-
-        // Guardrails on table properties
-        Guardrails.tableProperties.guard(attrs.updatedProperties(), attrs::removeProperty, state);
 
         TableParams params = attrs.asAlteredTableParams(view.metadata.params);
 
