@@ -20,7 +20,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
-import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -32,13 +31,8 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.hints.HintsService;
-import org.apache.cassandra.index.sai.IndexContext;
-import org.apache.cassandra.index.sai.StorageAttachedIndex;
-import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
-import org.apache.cassandra.index.sai.disk.format.IndexComponents;
-import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
-import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.ApacheReadability;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
@@ -85,7 +79,7 @@ public final class RollbackEligibility
         {
             for (ColumnFamilyStore cfs : keyspace.getColumnFamilyStores())
             {
-                if (!hasCompleteAaGroups(cfs))
+                if (!cfs.getLiveSSTables().stream().allMatch(ApacheReadability::hasCompleteAaGroups))
                     tables.add(cfs.getKeyspaceName() + '.' + cfs.name);
             }
         }
@@ -102,32 +96,6 @@ public final class RollbackEligibility
                          "gc_grace_seconds, at least 3 hours with legacy, or after Paxos repair with repaired); check that it has cleared");
 
         return blockers;
-    }
-
-    private static boolean hasCompleteAaGroups(ColumnFamilyStore cfs)
-    {
-        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
-        if (group == null || group.getIndexes().isEmpty())
-            return true;
-
-        Set<IndexContext> contexts = group.getIndexes().stream().map(StorageAttachedIndex::getIndexContext).collect(Collectors.toSet());
-        for (SSTableReader sstable : cfs.getLiveSSTables())
-        {
-            IndexDescriptor descriptor = IndexDescriptor.load(sstable, contexts);
-            if (!isCompleteAa(descriptor.perSSTableComponents()))
-                return false;
-            for (IndexContext context : contexts)
-            {
-                if (!isCompleteAa(descriptor.perIndexComponents(context)))
-                    return false;
-            }
-        }
-        return true;
-    }
-
-    private static boolean isCompleteAa(IndexComponents.ForRead components)
-    {
-        return components.isComplete() && components.version().equals(Version.APACHE_AA);
     }
 
     private static boolean hasDataStaxVersion(String table, String column)

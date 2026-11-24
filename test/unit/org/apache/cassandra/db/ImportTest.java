@@ -43,6 +43,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cache.RowCacheKey;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.compaction.CompactionInterruptedException;
@@ -51,10 +52,15 @@ import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.dht.BootStrapper;
 import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
+import org.apache.cassandra.index.sai.disk.FileUtils;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.PathUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -64,6 +70,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tools.ToolRunner;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.assertj.core.api.AssertionsForClassTypes.assertThat;
@@ -97,6 +104,92 @@ public class ImportTest extends CQLTester
         importSSTables(SSTableImporter.Options.options(backupDir.toString()).copyData(false).build(), 10);
         // files were moved
         Assert.assertEquals(0, countFiles(backupDir));
+    }
+
+    @Test
+    public void testCassandra5ModeRefusesWhatApacheCantRead() throws Throwable
+    {
+        writeBigSSTables("CREATE TABLE %s (id int PRIMARY KEY, d int) WITH compression = {'class': 'AdaptiveCompressor'}", null);
+        getCurrentColumnFamilyStore().clearUnsafe();
+        assertThatThrownBy(this::loadNewSSTablesInCassandra5Mode).rootCause()
+                                                                 .hasMessageContaining("storage_compatibility_mode CASSANDRA_5 doesn't import")
+                                                                 .hasMessageContaining("compressor org.apache.cassandra.io.compress.AdaptiveCompressor");
+
+        // SAI files of an index the table doesn't have
+        writeBigSSTables("CREATE TABLE %s (id int PRIMARY KEY, d int)", "CREATE CUSTOM INDEX ON %s(d) USING 'StorageAttachedIndex'");
+        Set<SSTableReader> indexed = getCurrentColumnFamilyStore().getLiveSSTables();
+        createTable("CREATE TABLE %s (id int PRIMARY KEY, d int)");
+        File directory = getCurrentColumnFamilyStore().getDirectories().getDirectoryForNewSSTables();
+        for (SSTableReader sstable : indexed)
+        {
+            for (Component component : sstable.components())
+                Files.copy(sstable.descriptor.fileFor(component).toPath(), new File(directory, sstable.descriptor.fileFor(component).name()).toPath());
+        }
+        assertThatThrownBy(this::loadNewSSTablesInCassandra5Mode).rootCause()
+                                                                 .hasMessageContaining("SAI component SAI+" + Version.current(KEYSPACE) + "+GroupMeta.db");
+    }
+
+    @Test
+    public void testCassandra5ModeImportsWhatApacheReads() throws Throwable
+    {
+        // Apache's SAI files, used as they are
+        createTable("CREATE TABLE %s (pk int, ck int, st int static, s text, n bigint, PRIMARY KEY (pk, ck))");
+        for (String column : new String[]{ "s", "n", "st" })
+            createIndex("CREATE INDEX wide_" + column + " ON %s(" + column + ") USING 'sai'");
+        FileUtils.copySSTablesAndIndexes(getCurrentColumnFamilyStore().getDirectories().getDirectoryForNewSSTables().toJavaIOFile(), "apache-aa/wide");
+        loadNewSSTablesInCassandra5Mode();
+        assertEquals(2, getCurrentColumnFamilyStore().getLiveSSTables().size());
+        assertEquals(100, execute("SELECT pk, ck FROM %s WHERE s = 'w1'").size());
+
+        // no SAI files, so the index is built
+        writeBigSSTables("CREATE TABLE %s (id int PRIMARY KEY, d int)", null);
+        getCurrentColumnFamilyStore().clearUnsafe();
+        createIndex("CREATE CUSTOM INDEX ON %s(d) USING 'StorageAttachedIndex'");
+        loadNewSSTablesInCassandra5Mode();
+        assertEquals(1, execute("SELECT id FROM %s WHERE d = 3").size());
+    }
+
+    /**
+     * Creates a table, and an index if not null, and writes big sstables, compacted with the table's compressor.
+     */
+    private void writeBigSSTables(String table, String index) throws Throwable
+    {
+        // big sstables, which Apache Cassandra 5.0 reads whatever the bti version written in tests
+        SSTableFormat<?, ?> format = DatabaseDescriptor.getSelectedSSTableFormat();
+        DatabaseDescriptor.setSelectedSSTableFormat(DatabaseDescriptor.getSSTableFormats().get(BigFormat.NAME));
+        try
+        {
+            createTable(table);
+            if (index != null)
+                createIndex(index);
+            for (int i = 0; i < 10; i++)
+                execute("insert into %s (id, d) values (?, ?)", i, i);
+            // a flush writes with a fast compressor, a compaction with the table's
+            flush();
+            compact();
+        }
+        finally
+        {
+            DatabaseDescriptor.setSelectedSSTableFormat(format);
+        }
+    }
+
+    /**
+     * Loads the sstables in the table's directories, as nodetool refresh does, in storage_compatibility_mode
+     * CASSANDRA_5, which fails with the reason of a refusal.
+     */
+    private void loadNewSSTablesInCassandra5Mode()
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
+        try
+        {
+            getCurrentColumnFamilyStore().loadNewSSTables();
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
     }
 
     @Test

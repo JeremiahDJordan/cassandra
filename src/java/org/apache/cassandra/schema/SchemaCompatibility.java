@@ -250,6 +250,16 @@ public final class SchemaCompatibility
     }
 
     /**
+     * The reasons {@code target} doesn't accept {@code compression} as the compression of {@code element}; empty if none.
+     */
+    public static List<String> compressionIncompatibilities(Target target, String element, CompressionParams compression)
+    {
+        List<String> incompatibilities = new ArrayList<>();
+        checkCompression(element, compression, incompatibilities);
+        return incompatibilities;
+    }
+
+    /**
      * The reasons {@code target} doesn't accept {@code compressor}, a compressor class and its options, as the
      * compressor of {@code element}, a commit log or hints setting, whose files name their compressor: only its own
      * compressors; empty if none, or if the class is empty, which disables compression.

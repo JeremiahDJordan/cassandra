@@ -19,6 +19,7 @@
 package org.apache.cassandra.db.streaming;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -34,6 +35,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.io.compress.BufferType;
+import org.apache.cassandra.io.sstable.ApacheReadability;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.IOOptions;
@@ -52,6 +54,7 @@ import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.messages.StreamMessageHeader;
 import org.apache.cassandra.utils.ChecksumType;
 import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static java.lang.String.format;
 import static org.apache.cassandra.utils.FBUtilities.prettyPrintMemory;
@@ -111,6 +114,16 @@ public class CassandraEntireSSTableStreamReader implements IStreamReader
                      session.peer,
                      prettyPrintMemory(totalSize),
                      cfs.metadata());
+
+        if (DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_5)
+        {
+            List<String> unreadable = new ArrayList<>(ApacheReadability.unreadable(header.version, manifest.components(),
+                                                                                   header.compressionInfo == null ? null : header.compressionInfo.parameters()));
+            ApacheReadability.dataStaxSAIComponents(manifest.components()).forEach(name -> unreadable.add("SAI component " + name));
+            if (!unreadable.isEmpty())
+                throw new IOException(format("storage_compatibility_mode %s doesn't take from %s a whole sstable Apache Cassandra 5.0 can't read: %s",
+                                             StorageCompatibilityMode.CASSANDRA_5, session.peer, String.join("; ", unreadable)));
+        }
 
         SSTableZeroCopyWriter writer = null;
 

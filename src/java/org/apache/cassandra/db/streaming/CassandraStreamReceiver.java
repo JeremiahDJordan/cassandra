@@ -124,7 +124,8 @@ public class CassandraStreamReceiver implements StreamReceiver
         }
         txn.update(finished, false);
         sstables.addAll(finished);
-        receivedEntireSSTable = file.isEntireSSTable();
+        // the indexes of a session's entire sstables are validated even if its last sstable came by partitions
+        receivedEntireSSTable |= file.isEntireSSTable();
     }
 
     @Override

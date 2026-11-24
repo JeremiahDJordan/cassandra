@@ -140,4 +140,39 @@ public class Cassandra5ModeMixedClusterTest extends ApacheMixedClusterTestBase
             }
         }
     }
+
+    @Test
+    public void testApacheNodeBootstrapsFromModeNode() throws Throwable
+    {
+        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
+             UpgradeableCluster cluster = startCluster(3,
+                                                       config -> {
+                                                           if (config.num() == 2)
+                                                               config.set("storage_compatibility_mode", "CASSANDRA_5");
+                                                       },
+                                                       apacheVersion(), CURRENT_VERSION))
+        {
+            // with two replicas, the new node takes a range from each node, and that of the mode node from it
+            cluster.schemaChange(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}"), false, cluster.get(2));
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.indexed (pk int PRIMARY KEY, v text)"), false, cluster.get(2));
+            cluster.schemaChange(withKeyspace("CREATE INDEX indexed_v ON %s.indexed (v) USING 'sai'"), false, cluster.get(2));
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.plain (pk int PRIMARY KEY, v text)"), false, cluster.get(2));
+            assertSchemaAgreement(cluster);
+            for (int pk = 0; pk < 100; pk++)
+            {
+                cluster.coordinator(2).execute(withKeyspace("INSERT INTO %s.indexed (pk, v) VALUES (?, 'v')"), ALL, pk);
+                cluster.coordinator(2).execute(withKeyspace("INSERT INTO %s.plain (pk, v) VALUES (?, 'v')"), ALL, pk);
+            }
+            cluster.forEach(instance -> instance.flush(KEYSPACE));
+
+            IUpgradeableInstance apache = bootstrapNode(cluster, apacheVersion());
+            assertTrue(apache.executeInternal(withKeyspace("SELECT pk FROM %s.indexed")).length > 0);
+            assertTrue(apache.executeInternal(withKeyspace("SELECT pk FROM %s.plain")).length > 0);
+            for (int node = 1; node <= 3; node++)
+            {
+                assertEquals(100, cluster.coordinator(node).execute(withKeyspace("SELECT pk FROM %s.indexed WHERE v = 'v'"), ONE).length);
+                assertEquals(100, cluster.coordinator(node).execute(withKeyspace("SELECT pk FROM %s.plain"), ONE).length);
+            }
+        }
+    }
 }

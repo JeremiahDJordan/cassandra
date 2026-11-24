@@ -25,7 +25,9 @@ import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
 import org.apache.cassandra.distributed.shared.Versions.Version;
+import org.apache.cassandra.distributed.shared.WithProperties;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
@@ -46,7 +48,7 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
     @Test
     public void testUpgradeFromApache() throws Throwable
     {
-        try (UpgradeableCluster cluster = startCluster(1, ApacheNullComponentTest::configure, apacheVersion()))
+        try (UpgradeableCluster cluster = startCluster(1, config -> configure(config, "NONE"), apacheVersion()))
         {
             IUpgradeableInstance node = cluster.get(1);
             createSchema(cluster, 1);
@@ -62,18 +64,22 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
     @Test
     public void testEntireSSTableStreamingFromApache() throws Throwable
     {
-        testEntireSSTableStreaming(apacheVersion(), CURRENT_VERSION);
+        testEntireSSTableStreaming(apacheVersion(), CURRENT_VERSION, "NONE");
     }
 
     @Test
     public void testEntireSSTableStreamingToApache() throws Throwable
     {
-        testEntireSSTableStreaming(CURRENT_VERSION, apacheVersion());
+        // whole sstables go to an Apache node from a node with the same schema version, in CASSANDRA_5
+        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true))
+        {
+            testEntireSSTableStreaming(CURRENT_VERSION, apacheVersion(), "CASSANDRA_5");
+        }
     }
 
-    private static void testEntireSSTableStreaming(Version from, Version to) throws Throwable
+    private static void testEntireSSTableStreaming(Version from, Version to, String mode) throws Throwable
     {
-        try (UpgradeableCluster cluster = startCluster(2, ApacheNullComponentTest::configure, from, to))
+        try (UpgradeableCluster cluster = startCluster(2, config -> configure(config, mode), from, to))
         {
             createSchema(cluster, 2);
             write(cluster.get(1));
@@ -88,11 +94,11 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
         }
     }
 
-    private static void configure(IInstanceConfig config)
+    private static void configure(IInstanceConfig config, String mode)
     {
         config.set("column_index_size", "0KiB")
               .set("sstable", Map.of("selected_format", "bti"))
-              .set("storage_compatibility_mode", "NONE");
+              .set("storage_compatibility_mode", mode);
     }
 
     private static void createSchema(UpgradeableCluster cluster, int rf)

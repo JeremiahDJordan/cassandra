@@ -50,6 +50,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
@@ -104,11 +105,15 @@ public class CassandraOutgoingFileTest
         {
             assertSame(CassandraOutgoingFile.BtiDaReceiver.ENTIRE, CassandraOutgoingFile.BtiDaReceiver.of(FBUtilities.getBroadcastAddressAndPort()));
             assertNotNull(CassandraOutgoingFile.BtiDaReceiver.of(peer).refusal);
-            for (int version : new int[]{ MessagingService.VERSION_40, MessagingService.VERSION_50, MessagingService.VERSION_DS_21 })
+            for (int version : new int[]{ MessagingService.VERSION_40, MessagingService.VERSION_50 })
             {
                 versions.set(peer, version);
-                assertSame(String.valueOf(version), CassandraOutgoingFile.BtiDaReceiver.ENTIRE, CassandraOutgoingFile.BtiDaReceiver.of(peer));
+                CassandraOutgoingFile.BtiDaReceiver receiver = CassandraOutgoingFile.BtiDaReceiver.of(peer);
+                assertTrue(String.valueOf(version), receiver.entire && receiver.apache);
+                assertNull(String.valueOf(version), receiver.refusal);
             }
+            versions.set(peer, MessagingService.VERSION_DS_21);
+            assertSame(CassandraOutgoingFile.BtiDaReceiver.ENTIRE, CassandraOutgoingFile.BtiDaReceiver.of(peer));
             versions.set(peer, MessagingService.VERSION_DS_20);
             assertSame(CassandraOutgoingFile.BtiDaReceiver.PARTITIONS, CassandraOutgoingFile.BtiDaReceiver.of(peer));
             for (int version : new int[]{ MessagingService.VERSION_DS_10, MessagingService.VERSION_DS_12, MessagingService.VERSION_DSE_68 })

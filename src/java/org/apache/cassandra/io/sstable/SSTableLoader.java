@@ -32,7 +32,9 @@ import java.util.stream.Collectors;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Multimap;
+import com.google.common.collect.Sets;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Directories;
@@ -74,6 +76,8 @@ public class SSTableLoader implements StreamEventHandler
     private final int connectionsPerHost;
     private final OutputHandler outputHandler;
     private final Set<InetAddressAndPort> failedHosts = new HashSet<>();
+
+    private static final Set<Component> DIGESTS = ImmutableSet.of(Components.DIGEST, Components.DIGEST_CRC32C, Components.DIGEST_CRC64NVME);
 
     private final List<SSTableReader> sstables = new ArrayList<>();
 
@@ -144,7 +148,9 @@ public class SSTableLoader implements StreamEventHandler
                                               return false;
                                           }
 
-                                          Set<Component> components = desc.getComponents(desc.getFormat().primaryComponents(), desc.getFormat().uploadComponents());
+                                          // with the digest, which a node that reads only what Apache Cassandra 5.0 reads needs
+                                          Set<Component> components = desc.getComponents(desc.getFormat().primaryComponents(),
+                                                                                          Sets.union(desc.getFormat().uploadComponents(), DIGESTS));
 
                                           try
                                           {

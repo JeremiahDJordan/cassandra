@@ -35,6 +35,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
+import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
@@ -49,6 +50,7 @@ import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.schema.SchemaCompatibility.Target.APACHE_5_0;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Schema changes refused while the Apache upgrade path is active, because Apache Cassandra 5.0 doesn't read or
@@ -300,6 +302,17 @@ public class SchemaCompatibilityTest extends CQLTester
         }
         assertThat(logs.list).extracting(ILoggingEvent::getFormattedMessage)
                              .anyMatch(message -> message.contains("table " + KEYSPACE + ".received: compaction option 'log' of SizeTieredCompactionStrategy"));
+    }
+
+    @Test
+    public void testCompressionOverrideInCassandra5Mode()
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        inCassandra5Mode(() -> assertThatThrownBy(() -> cfs.setCompressionParameters(Map.of("class", "AdaptiveCompressor")))
+                               .hasMessageContaining("storage_compatibility_mode CASSANDRA_5 doesn't allow compression Apache Cassandra 5.0 can't read")
+                               .hasMessageContaining("compressor org.apache.cassandra.io.compress.AdaptiveCompressor"));
+        inCassandra5Mode(() -> cfs.setCompressionParameters(Map.of("class", "ZstdCompressor")));
     }
 
     private static void inCassandra5Mode(Runnable runnable)

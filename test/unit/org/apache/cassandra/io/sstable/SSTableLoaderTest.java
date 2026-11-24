@@ -32,6 +32,7 @@ import org.junit.runner.RunWith;
 
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
@@ -40,6 +41,8 @@ import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.partitions.FilteredPartition;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.schema.KeyspaceParams;
@@ -54,6 +57,7 @@ import org.apache.cassandra.streaming.StreamState;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.OutputHandler;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.concurrent.AsyncFuture;
 import org.awaitility.Awaitility;
 import org.jboss.byteman.contrib.bmunit.BMRule;
@@ -192,6 +196,44 @@ public class SSTableLoaderTest
         latch.await();
 
         checkAllRefsAreClosed(loader);
+    }
+
+    @Test
+    public void testLoadingSSTableInCassandra5Mode() throws Exception
+    {
+        File dataDir = dataDir(CF_STANDARD2);
+        // a big sstable, which Apache Cassandra 5.0 reads whatever the bti version written in tests
+        SSTableFormat<?, ?> format = DatabaseDescriptor.getSelectedSSTableFormat();
+        DatabaseDescriptor.setSelectedSSTableFormat(DatabaseDescriptor.getSSTableFormats().get(BigFormat.NAME));
+        try (CQLSSTableWriter writer = CQLSSTableWriter.builder()
+                                                       .inDirectory(dataDir)
+                                                       .forTable(String.format(schema, KEYSPACE1, CF_STANDARD2))
+                                                       .using(String.format(query, KEYSPACE1, CF_STANDARD2))
+                                                       .build())
+        {
+            writer.addRow("key1", "col1", "100");
+        }
+        finally
+        {
+            DatabaseDescriptor.setSelectedSSTableFormat(format);
+        }
+
+        // the sstable goes whole, with its digest, which the mode requires
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
+        try
+        {
+            CountDownLatch latch = new CountDownLatch(1);
+            SSTableLoader loader = new SSTableLoader(dataDir, new TestClient(), new OutputHandler.SystemOutput(false, false));
+            loader.stream(Collections.emptySet(), completionStreamListener(latch)).get();
+            assertEquals(1, Util.getAll(Util.cmd(Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD2)).build()).size());
+            latch.await();
+            checkAllRefsAreClosed(loader);
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
     }
 
     @Test

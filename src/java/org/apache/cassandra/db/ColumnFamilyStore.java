@@ -163,6 +163,7 @@ import org.apache.cassandra.schema.CompactionParams.TombstoneOption;
 import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaCompatibility;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
@@ -193,6 +194,7 @@ import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.OverlapIterator;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.WrappedRunnable;
 import org.apache.cassandra.utils.concurrent.CountDownLatch;
@@ -600,6 +602,13 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
         {
             CompressionParams params = CompressionParams.fromMap(opts);
             params.validate();
+            if (DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_5)
+            {
+                List<String> incompatibilities = SchemaCompatibility.compressionIncompatibilities(SchemaCompatibility.Target.APACHE_5_0, metadata().toString(), params);
+                if (!incompatibilities.isEmpty())
+                    throw new IllegalArgumentException(String.format("storage_compatibility_mode %s doesn't allow compression Apache Cassandra 5.0 can't read: %s",
+                                                                     StorageCompatibilityMode.CASSANDRA_5, String.join("; ", incompatibilities)));
+            }
             metadata.setLocalOverrides(metadata().unbuild().compression(params).build());
         }
         catch (ConfigurationException e)

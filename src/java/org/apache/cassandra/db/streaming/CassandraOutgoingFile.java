@@ -32,12 +32,19 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.EndpointState;
+import org.apache.cassandra.gms.Gossiper;
+import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.io.sstable.ApacheReadability;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.streaming.OutgoingStream;
 import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.streaming.StreamSession;
@@ -243,12 +250,28 @@ public class CassandraOutgoingFile implements OutgoingStream
         if (!receiver.entire && isBtiD(version))
             return false;
 
+        // an Apache Cassandra 5.0 node fails on an sstable without a complete group of its own for one of its indexes,
+        // and keeps SAI components it didn't write
+        if (receiver.apache && (!receiver.schemaAgrees
+                                || !ApacheReadability.hasCompleteAaGroups(ref.get())
+                                || !ApacheReadability.dataStaxSAIComponents(ref.get().components()).isEmpty()))
+            return false;
+
         return contained(sections, ref.get());
     }
 
     @Override
     public void checkCanSend()
     {
+        if (receiver.apache)
+        {
+            List<String> unreadable = ApacheReadability.unreadable(ref.get());
+            if (!unreadable.isEmpty())
+                throw new IllegalStateException(String.format("Cannot stream %s to %s, %s, which reads only what Apache Cassandra 5.0 reads: " +
+                                                              "%s. Rewrite it with nodetool upgradesstables -a with settings that write what " +
+                                                              "Apache Cassandra 5.0 reads",
+                                                              ref.get().descriptor, receiver.peer, receiver.description, String.join("; ", unreadable)));
+        }
         if (receiver.refusal != null && isBtiD(ref.get().descriptor.version))
             throw new IllegalStateException(String.format(BtiDaReceiver.REFUSAL, ref.get().descriptor, receiver.peer, receiver.refusal,
                                                           BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION,
@@ -317,15 +340,15 @@ public class CassandraOutgoingFile implements OutgoingStream
     }
 
     /**
-     * What a peer reads of bti sstables of major version "d", from one snapshot of its messaging version.
+     * What a peer reads of bti sstables of major version "d", and whether it takes only what Apache Cassandra 5.0 reads,
+     * from one snapshot of its messaging version.
      */
     public static final class BtiDaReceiver
     {
-        // a peer that reads them, entire: this node, an Apache Cassandra node or a DataStax node of this release's
-        // messaging version
-        public static final BtiDaReceiver ENTIRE = new BtiDaReceiver(true, null, null);
+        // a peer that reads them, entire: this node or a DataStax node of this release's messaging version
+        public static final BtiDaReceiver ENTIRE = new BtiDaReceiver(true, null, null, false, null, false);
         // a peer that may not read them entire, as for sstableloader, which doesn't know the versions of its targets
-        public static final BtiDaReceiver PARTITIONS = new BtiDaReceiver(false, null, null);
+        public static final BtiDaReceiver PARTITIONS = new BtiDaReceiver(false, null, null, false, null, false);
 
         private static final String REFUSAL = "Cannot stream %s to %s, %s: make the sending node write bti %s " +
                                               "(storage_compatibility_mode HCD_1 without a later -D%s, or -D%s=%s), " +
@@ -339,30 +362,55 @@ public class CassandraOutgoingFile implements OutgoingStream
         @VisibleForTesting
         @Nullable
         final String refusal;
+        // whether the peer is below DS 10 (an Apache Cassandra node or a node in storage_compatibility_mode CASSANDRA_5),
+        // or of an unknown version while an Apache Cassandra node may be in the ring, which takes only what Apache
+        // Cassandra 5.0 reads
+        @VisibleForTesting
+        final boolean apache;
+        // the peer's messaging version, as the refusals of an apache peer name it
+        @Nullable
+        private final String description;
+        // whether the peer had this node's schema version when the session was planned
+        private final boolean schemaAgrees;
 
-        private BtiDaReceiver(boolean entire, @Nullable InetAddressAndPort peer, @Nullable String refusal)
+        private BtiDaReceiver(boolean entire, @Nullable InetAddressAndPort peer, @Nullable String refusal, boolean apache, @Nullable String description, boolean schemaAgrees)
         {
             this.entire = entire;
             this.peer = peer;
             this.refusal = refusal;
+            this.apache = apache;
+            this.description = description;
+            this.schemaAgrees = schemaAgrees;
         }
 
         /**
          * The DataStax nodes of earlier 5.0 messaging versions accept an entire bti sstable of major version "d" but
          * don't read it, so they receive it by partitions. The DataStax nodes before 5.0 (DS 10 to DS 12, DSE 6.8) can't
-         * decode its partitions either, nor can a node whose version isn't known yet be shown not to be one of them.
+         * decode its partitions either, nor can a node whose version isn't known yet be shown not to be one of them,
+         * unless an Apache Cassandra node may be in the ring: then such a node takes only what Apache Cassandra 5.0 reads.
          */
         public static BtiDaReceiver of(InetAddressAndPort peer)
         {
             if (peer.equals(FBUtilities.getBroadcastAddressAndPort()))
                 return ENTIRE;
             Integer version = MessagingService.instance().versions.getRawIfKnown(peer);
-            if (version != null && (version < MessagingService.VERSION_DS_10 || MessagingService.isDataStax21OrLater(version)))
+            if (version != null && version < MessagingService.VERSION_DS_10)
+                return new BtiDaReceiver(true, peer, null, true, "a node at messaging version " + version, schemaAgrees(peer));
+            if (version == null && ApacheUpgradePath.checksSchemaChanges())
+                return new BtiDaReceiver(true, peer, null, true, "whose messaging version isn't known yet", schemaAgrees(peer));
+            if (version != null && MessagingService.isDataStax21OrLater(version))
                 return ENTIRE;
             if (version != null && MessagingService.isDataStax50OrLater(version))
                 return PARTITIONS;
             return new BtiDaReceiver(false, peer, version == null ? "whose messaging version isn't known yet"
-                                                                  : "whose messaging version " + version + " doesn't read it");
+                                                                  : "whose messaging version " + version + " doesn't read it", false, null, false);
+        }
+
+        private static boolean schemaAgrees(InetAddressAndPort peer)
+        {
+            EndpointState state = Gossiper.instance.getEndpointStateForEndpoint(peer);
+            VersionedValue schema = state == null ? null : state.getApplicationState(ApplicationState.SCHEMA);
+            return schema != null && schema.value.equals(Schema.instance.getVersion().toString());
         }
     }
 }

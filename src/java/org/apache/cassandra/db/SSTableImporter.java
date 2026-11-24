@@ -33,17 +33,21 @@ import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.io.compress.CompressionMetadataReaderType;
+import org.apache.cassandra.io.sstable.ApacheReadability;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.IVerifier;
 import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.io.sstable.SSTable;
+import org.apache.cassandra.io.sstable.format.CompressionInfoComponent;
 import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
@@ -51,6 +55,7 @@ import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.OutputHandler;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.concurrent.Refs;
 
 public class SSTableImporter
@@ -99,7 +104,8 @@ public class SSTableImporter
         List<String> failedDirectories = new ArrayList<>();
 
         // verify first to avoid starting to copy sstables to the data directories and then have to abort.
-        if (options.verifySSTables || options.verifyTokens || options.failOnMissingIndex)
+        boolean cassandra5Mode = DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_5;
+        if (options.verifySSTables || options.verifyTokens || options.failOnMissingIndex || cassandra5Mode)
         {
             for (Pair<Directories.SSTableLister, String> listerPair : listers)
             {
@@ -113,6 +119,9 @@ public class SSTableImporter
                         try
                         {
                             abortIfDraining();
+
+                            if (cassandra5Mode)
+                                checkApacheReadable(descriptor, entry.getValue());
 
                             if (options.failOnMissingIndex)
                             {
@@ -404,6 +413,20 @@ public class SSTableImporter
         {
             throw new RuntimeException("Failed to import sstable " + reader.getFilename(), ex);
         }
+    }
+
+    /**
+     * Throws if Apache Cassandra 5.0 can't read the sstable of {@code descriptor}, or the sstable has SAI components it
+     * didn't write, which storage_compatibility_mode CASSANDRA_5 doesn't keep.
+     */
+    private void checkApacheReadable(Descriptor descriptor, Set<Component> components)
+    {
+        List<String> unreadable = new ArrayList<>(ApacheReadability.unreadable(descriptor.version, components,
+                                                                               CompressionInfoComponent.readCompressionParamsIfExists(descriptor, CompressionMetadataReaderType.READ_TIME)));
+        ApacheReadability.dataStaxSAIComponents(components).forEach(name -> unreadable.add("SAI component " + name));
+        if (!unreadable.isEmpty())
+            throw new IllegalStateException(String.format("storage_compatibility_mode %s doesn't import %s, which Apache Cassandra 5.0 can't read: %s",
+                                                          StorageCompatibilityMode.CASSANDRA_5, descriptor, String.join("; ", unreadable)));
     }
 
     /**
