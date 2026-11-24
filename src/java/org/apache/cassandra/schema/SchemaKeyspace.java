@@ -65,9 +65,13 @@ import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.BytesType;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.MapType;
 import org.apache.cassandra.db.marshal.ReversedType;
+import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
@@ -846,6 +850,7 @@ public final class SchemaKeyspace
                .add("deterministic", false)
                .add("monotonic", false)
                .add("monotonic_on", Collections.emptyList());
+        addDropLegacyFunctionRowToSchemaMutation(Functions, function, builder);
     }
 
     private static String bbToString(ByteBuffer bb)
@@ -863,6 +868,7 @@ public final class SchemaKeyspace
     private static void addDropFunctionToSchemaMutation(UDFunction function, Mutation.SimpleBuilder builder)
     {
         builder.update(Functions).row(function.name().name, function.argumentsList()).delete();
+        addDropLegacyFunctionRowToSchemaMutation(Functions, function, builder);
     }
 
     private static void addAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
@@ -879,11 +885,57 @@ public final class SchemaKeyspace
                                 // must use the frozen state type here, as 'null' for unfrozen collections may mean 'empty'
                                 ? aggregate.stateType().freeze().asCQL3Type().toCQLLiteral(aggregate.initialCondition(), ProtocolVersion.CURRENT)
                                 : null);
+        addDropLegacyFunctionRowToSchemaMutation(Aggregates, aggregate, builder);
     }
 
     private static void addDropAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
     {
         builder.update(Aggregates).row(aggregate.name().name, aggregate.argumentsList()).delete();
+        addDropLegacyFunctionRowToSchemaMutation(Aggregates, aggregate, builder);
+    }
+
+    /**
+     * Earlier versions wrote the elements of vectors in schema type strings without their {@code frozen<>}, for example
+     * {@code vector<tuple<int, int>, 2>} for {@code vector<frozen<tuple<int, int>>, 2>}. Function and aggregate rows are
+     * keyed by their argument types, so the row such a version may have written for the function is deleted too.
+     */
+    private static void addDropLegacyFunctionRowToSchemaMutation(TableMetadata table,
+                                                                 UserFunction function,
+                                                                 Mutation.SimpleBuilder builder)
+    {
+        List<String> legacyArguments = function.argTypes().stream()
+                                               .map(SchemaKeyspace::legacySchemaString)
+                                               .collect(toList());
+        if (!legacyArguments.equals(function.argumentsList()))
+            builder.update(table).row(function.name().name, legacyArguments).delete();
+    }
+
+    private static String legacySchemaString(AbstractType<?> type)
+    {
+        if (type instanceof ReversedType)
+            return legacySchemaString(((ReversedType<?>) type).baseType);
+
+        if (type.isVector())
+        {
+            VectorType<?> vector = (VectorType<?>) type;
+            return "vector<" + vector.elementType.asCQL3Type() + ", " + vector.dimension + '>';
+        }
+
+        String body;
+        if (type instanceof ListType)
+            body = "list<" + legacySchemaString(((ListType<?>) type).getElementsType()) + '>';
+        else if (type instanceof SetType)
+            body = "set<" + legacySchemaString(((SetType<?>) type).getElementsType()) + '>';
+        else if (type instanceof MapType)
+            body = "map<" + legacySchemaString(((MapType<?, ?>) type).getKeysType()) + ", " +
+                   legacySchemaString(((MapType<?, ?>) type).getValuesType()) + '>';
+        else if (type.isTuple() && !type.isUDT())
+            body = type.subTypes().stream()
+                       .map(SchemaKeyspace::legacySchemaString)
+                       .collect(Collectors.joining(", ", "tuple<", ">"));
+        else
+            return type.asCQL3Type().toSchemaString();
+        return type.isMultiCell() ? body : "frozen<" + body + '>';
     }
 
     /*

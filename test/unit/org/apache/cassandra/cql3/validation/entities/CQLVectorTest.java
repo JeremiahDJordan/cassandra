@@ -36,6 +36,7 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 import org.assertj.core.api.Assertions;
 
 import static java.lang.String.format;
@@ -196,6 +197,104 @@ public class CQLVectorTest extends CQLTester
         execute("INSERT INTO %s (pk, value) VALUES (0, {z: [{y:1}, {y:2}]})");
         assertRows(execute("SELECT * FROM %s"),
                    row(0, userType("z", vector(userType("y", 1), userType("y", 2)))));
+    }
+
+    @Test
+    public void schemaTypes()
+    {
+        // the stored types are those of Apache Cassandra 5.0, which repeats frozen<> inside vectors
+        String udt = createType("CREATE TYPE %s (a int)");
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, " +
+                    "t vector<tuple<int, int>, 2>, " +
+                    "l vector<frozen<list<frozen<set<int>>>>, 2>, " +
+                    "m vector<frozen<map<frozen<" + udt + ">, frozen<list<int>>>>, 2>, " +
+                    "v vector<vector<tuple<int, int>, 2>, 2>, " +
+                    "c list<vector<tuple<int, frozen<" + udt + ">>, 2>>)");
+
+        assertRows(execute("SELECT column_name, type FROM system_schema.columns WHERE keyspace_name = ? AND table_name = ?",
+                           KEYSPACE, currentTable()),
+                   row("c", "list<vector<frozen<tuple<int, frozen<" + udt + ">>>, 2>>"),
+                   row("l", "vector<frozen<list<frozen<set<int>>>>, 2>"),
+                   row("m", "vector<frozen<map<frozen<" + udt + ">, frozen<list<int>>>>, 2>"),
+                   row("pk", "int"),
+                   row("t", "vector<frozen<tuple<int, int>>, 2>"),
+                   row("v", "vector<vector<frozen<tuple<int, int>>, 2>, 2>"));
+
+        String withVector = createType("CREATE TYPE %s (v vector<tuple<int, int>, 2>)");
+        assertRows(execute("SELECT field_types FROM system_schema.types WHERE keyspace_name = ? AND type_name = ?",
+                           KEYSPACE, withVector),
+                   row(list("vector<frozen<tuple<int, int>>, 2>")));
+
+        execute("ALTER TABLE %s DROP t");
+        assertRows(execute("SELECT type FROM system_schema.dropped_columns WHERE keyspace_name = ? AND table_name = ? AND column_name = 't'",
+                           KEYSPACE, currentTable()),
+                   row("vector<frozen<tuple<int, int>>, 2>"));
+    }
+
+    @Test
+    public void legacySchemaKeysOfFunctions() throws Throwable
+    {
+        // rows of functions and aggregates written by earlier versions are keyed without frozen<> inside vectors
+        String type = "vector<frozen<tuple<int, int>>, 2>";
+        String legacy = "vector<tuple<int, int>, 2>";
+        String body = " (x vector<tuple<int, int>, 2>) CALLED ON NULL INPUT RETURNS int LANGUAGE java AS ";
+        String f = createFunction(KEYSPACE, legacy, "CREATE FUNCTION %s" + body + "'return 1;'");
+        String tupleType = "frozen<tuple<int, vector<frozen<tuple<int, int>>, 2>>>";
+        String tupleLegacy = "frozen<tuple<int, vector<tuple<int, int>, 2>>>";
+        String state = createFunction(KEYSPACE, "int, tuple<int, vector<tuple<int, int>, 2>>",
+                                      "CREATE FUNCTION %s (s int, x tuple<int, vector<tuple<int, int>, 2>>) CALLED ON NULL INPUT RETURNS int LANGUAGE java AS 'return s;'");
+        String a = createAggregate(KEYSPACE, "tuple<int, vector<tuple<int, int>, 2>>",
+                                   "CREATE AGGREGATE %s (tuple<int, vector<tuple<int, int>, 2>>) SFUNC " + shortFunctionName(state) + " STYPE int INITCOND 0");
+
+        rekeySchemaRow("functions", "function_name", f, type, legacy);
+        schemaChange("CREATE OR REPLACE FUNCTION " + f + body + "'return 2;'");
+        assertRows(execute("SELECT argument_types FROM system_schema.functions WHERE keyspace_name = ? AND function_name = ?",
+                           KEYSPACE, shortFunctionName(f)),
+                   row(list(type)));
+        rekeySchemaRow("functions", "function_name", f, type, legacy);
+        schemaChange("CREATE OR REPLACE FUNCTION " + f +
+                     " (x 'ReversedType(VectorType(FrozenType(TupleType(Int32Type,Int32Type)),2))') CALLED ON NULL INPUT RETURNS int LANGUAGE java AS 'return 3;'");
+        assertRows(execute("SELECT argument_types FROM system_schema.functions WHERE keyspace_name = ? AND function_name = ?",
+                           KEYSPACE, shortFunctionName(f)),
+                   row(list(type)));
+        rekeySchemaRow("functions", "function_name", f, type, legacy);
+        schemaChange("DROP FUNCTION " + f);
+        assertEmpty(execute("SELECT argument_types FROM system_schema.functions WHERE keyspace_name = ? AND function_name = ?",
+                            KEYSPACE, shortFunctionName(f)));
+
+        rekeySchemaRow("aggregates", "aggregate_name", a, tupleType, tupleLegacy);
+        schemaChange("CREATE OR REPLACE AGGREGATE " + a + " (tuple<int, vector<tuple<int, int>, 2>>) SFUNC " + shortFunctionName(state) + " STYPE int INITCOND 1");
+        assertRows(execute("SELECT argument_types FROM system_schema.aggregates WHERE keyspace_name = ? AND aggregate_name = ?",
+                           KEYSPACE, shortFunctionName(a)),
+                   row(list(tupleType)));
+        rekeySchemaRow("aggregates", "aggregate_name", a, tupleType, tupleLegacy);
+        schemaChange("DROP AGGREGATE " + a);
+        assertEmpty(execute("SELECT argument_types FROM system_schema.aggregates WHERE keyspace_name = ? AND aggregate_name = ?",
+                            KEYSPACE, shortFunctionName(a)));
+    }
+
+    /**
+     * Moves the schema row of a function or aggregate taking a single argument from one argument type text to another.
+     */
+    private void rekeySchemaRow(String table, String nameColumn, String function, String from, String to) throws InterruptedException
+    {
+        String name = shortFunctionName(function);
+        String select = format("SELECT JSON * FROM system_schema.%s WHERE keyspace_name = ? AND %s = ? AND argument_types = ?", table, nameColumn);
+        String json = execute(select, KEYSPACE, name, list(from)).one().getString("[json]");
+        // schema changes are timestamped in milliseconds; keep the moved row clear of the changes before and after it
+        long timestamp = nextMillisecond();
+        execute(format("DELETE FROM system_schema.%s USING TIMESTAMP ? WHERE keyspace_name = ? AND %s = ? AND argument_types = ?", table, nameColumn),
+                timestamp, KEYSPACE, name, list(from));
+        execute(format("INSERT INTO system_schema.%s JSON ? USING TIMESTAMP ?", table), json.replace(from, to), timestamp);
+        nextMillisecond();
+    }
+
+    private static long nextMillisecond() throws InterruptedException
+    {
+        long start = FBUtilities.timestampMicros();
+        while (FBUtilities.timestampMicros() == start)
+            Thread.sleep(1);
+        return FBUtilities.timestampMicros();
     }
 
     @Test
