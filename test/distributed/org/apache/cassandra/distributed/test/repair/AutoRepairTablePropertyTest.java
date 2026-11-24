@@ -27,21 +27,27 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SimpleBuilders;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.distributed.Cluster;
+import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
 import org.apache.cassandra.repair.autorepair.AutoRepairConfig;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.schema.SchemaKeyspaceTables;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 
+import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
+import static org.apache.cassandra.distributed.shared.AssertUtils.row;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -167,5 +173,50 @@ public class AutoRepairTablePropertyTest extends TestBaseImpl
             assertTrue("auto_repair column should exist in views schema when AUTOREPAIR_ENABLE is true",
                        autoRepairColumn != null);
         });
+    }
+
+    @Test
+    public void testAutoRepairKeysStoredInLowerCase()
+    {
+        cluster.get(1).runOnInstance(() -> DatabaseDescriptor.getAutoRepairConfig().setAutoRepairSchedulingEnabled(true));
+        cluster.schemaChange(withKeyspace("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"));
+        cluster.schemaChange(withKeyspace("CREATE TABLE %s.upper_case_keys (k int PRIMARY KEY) WITH auto_repair = {'FULL_ENABLED': 'false', 'Priority': '7'}"));
+
+        assertRows(cluster.coordinator(1).execute("SELECT auto_repair FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
+                                                  ConsistencyLevel.ONE, KEYSPACE, "upper_case_keys"),
+                   row(ImmutableMap.of("full_enabled", "false",
+                                       "incremental_enabled", "true",
+                                       "preview_repaired_enabled", "true",
+                                       "priority", "7")));
+
+        Object[][] describe = cluster.coordinator(1).execute(withKeyspace("DESCRIBE TABLE %s.upper_case_keys"), ConsistencyLevel.ONE);
+        assertTrue((String) describe[0][3], ((String) describe[0][3]).contains("auto_repair = {'full_enabled': 'false', 'incremental_enabled': 'true', 'preview_repaired_enabled': 'true', 'priority': '7'}"));
+    }
+
+    @Test
+    public void testStoredAutoRepairKeysInSeveralCases()
+    {
+        cluster.get(1).runOnInstance(() -> DatabaseDescriptor.getAutoRepairConfig().setAutoRepairSchedulingEnabled(true));
+        cluster.schemaChange(withKeyspace("CREATE KEYSPACE IF NOT EXISTS %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"));
+        cluster.schemaChange(withKeyspace("CREATE TABLE %s.stored_keys (k int PRIMARY KEY)"));
+        cluster.get(1).runOnInstance(() -> {
+            QueryProcessor.executeInternal("UPDATE system_schema.tables SET auto_repair = {'FULL_ENABLED': 'false', 'Incremental_Enabled': 'maybe', 'Priority': '7', " +
+                                           "'full_enabled': 'true', 'incremental_enabled': 'true', 'preview_repaired_enabled': 'true', 'priority': '2'} " +
+                                           "WHERE keyspace_name = ? AND table_name = ?", KEYSPACE, "stored_keys");
+            Schema.instance.reloadSchemaAndAnnounceVersion();
+            assertEquals(ImmutableMap.of("full_enabled", "true",
+                                         "incremental_enabled", "true",
+                                         "preview_repaired_enabled", "true",
+                                         "priority", "2"),
+                         Keyspace.open(KEYSPACE).getColumnFamilyStore("stored_keys").metadata().params.autoRepair.options());
+        });
+
+        cluster.schemaChange(withKeyspace("ALTER TABLE %s.stored_keys WITH comment = 'rewritten'"));
+        assertRows(cluster.coordinator(1).execute("SELECT auto_repair FROM system_schema.tables WHERE keyspace_name = ? AND table_name = ?",
+                                                  ConsistencyLevel.ONE, KEYSPACE, "stored_keys"),
+                   row(ImmutableMap.of("full_enabled", "true",
+                                       "incremental_enabled", "true",
+                                       "preview_repaired_enabled", "true",
+                                       "priority", "2")));
     }
 }
