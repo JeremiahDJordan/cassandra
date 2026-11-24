@@ -28,6 +28,8 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.UnaryOperator;
+import java.util.stream.Collectors;
 
 import com.google.common.base.Objects;
 
@@ -65,6 +67,7 @@ import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
@@ -235,6 +238,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
         List<Expression> rowLevelExpressions = new ArrayList<>();
         for (Expression e: expressions)
         {
+            if (e instanceof SimpleExpression)
+                ((SimpleExpression) e).resolveAnalysis(metadata, indexHints);
+
             if (e.column.isStatic() || e.column.isPartitionKey())
                 partitionLevelExpressions.add(e);
             else
@@ -351,6 +357,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
         for (Expression e : expressions)
         {
+            if (e instanceof SimpleExpression)
+                ((SimpleExpression) e).resolveAnalysis(metadata, indexHints);
+
             if (!e.isSatisfiedBy(metadata, partitionKey, purged, nowInSec))
                 return false;
         }
@@ -786,6 +795,9 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public static class SimpleExpression extends Expression
     {
+        // set before filtering, see Index#getValueAnalysis
+        private volatile Analysis analysis;
+
         SimpleExpression(ColumnMetadata column, Operator operator, ByteBuffer value)
         {
             super(column, operator, value);
@@ -807,6 +819,12 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             // We support null conditions for LWT (in ColumnCondition) but not for RowFilter.
             // TODO: we should try to merge both code someday.
             assert value != null;
+
+            Analysis analysis = this.analysis;
+            if (analysis == null)
+                this.analysis = analysis = findAnalysis(metadata, IndexHints.NONE);
+            if (analysis != Analysis.NONE)
+                return isSatisfiedByAnalyzed(analysis, metadata, partitionKey, row, nowInSec);
 
             if (operator.appliesToColumnValues())
             {
@@ -846,6 +864,105 @@ public class RowFilter implements Iterable<RowFilter.Expression>
                 }
             }
             throw new AssertionError();
+        }
+
+        private void resolveAnalysis(TableMetadata metadata, IndexHints hints)
+        {
+            if (analysis == null)
+                analysis = findAnalysis(metadata, hints);
+        }
+
+        /**
+         * Returns the analysis of an index that serves {@code =}, {@code CONTAINS} or {@code CONTAINS KEY} on the
+         * column, for a restriction that the index leaves to filtering.
+         */
+        private Analysis findAnalysis(TableMetadata metadata, IndexHints hints)
+        {
+            Operator served;
+            switch (operator)
+            {
+                case NEQ:
+                case IN:
+                case NOT_IN:
+                    served = Operator.EQ;
+                    break;
+                case NOT_CONTAINS:
+                    served = Operator.CONTAINS;
+                    break;
+                case NOT_CONTAINS_KEY:
+                    served = Operator.CONTAINS_KEY;
+                    break;
+                default:
+                    return Analysis.NONE;
+            }
+
+            // the elements of a frozen collection are compared as they are
+            if (!operator.appliesToColumnValues() && !column.isComplex())
+                return Analysis.NONE;
+
+            for (Index index : IndexRegistry.obtain(metadata).listIndexes())
+            {
+                UnaryOperator<ByteBuffer> function = index.supportsExpression(column, served) && !hints.excludes(index)
+                                                     ? index.getValueAnalysis()
+                                                     : null;
+                if (function == null)
+                    continue;
+
+                if (operator == Operator.IN || operator == Operator.NOT_IN)
+                {
+                    ListType<?> type = ListType.getInstance(column.type, false);
+                    return new Analysis(function, type.pack(type.unpack(value).stream().map(function).collect(Collectors.toList())));
+                }
+                return new Analysis(function, function.apply(value));
+            }
+            return Analysis.NONE;
+        }
+
+        private boolean isSatisfiedByAnalyzed(Analysis analysis, TableMetadata metadata, DecoratedKey partitionKey, Row row, long nowInSec)
+        {
+            if (operator.appliesToColumnValues())
+            {
+                ByteBuffer foundValue = getValue(metadata, partitionKey, row, nowInSec);
+                return foundValue != null && operator.isSatisfiedBy(column.type, analysis.function.apply(foundValue), analysis.term);
+            }
+
+            // NOT CONTAINS and NOT CONTAINS KEY; the row may hold deleted elements if the read needs reconciliation
+            ComplexColumnData complexData = row.getComplexColumnData(column);
+            if (complexData == null)
+                return false;
+
+            CollectionType<?> type = (CollectionType<?>) column.type.unwrap();
+            boolean keys = operator == Operator.NOT_CONTAINS_KEY || type.kind == CollectionType.Kind.SET;
+            AbstractType<?> elementType = keys ? type.nameComparator() : type.valueComparator();
+            boolean hasLiveElement = false;
+            for (Cell<?> cell : complexData)
+            {
+                if (!cell.isLive(nowInSec))
+                    continue;
+
+                hasLiveElement = true;
+                ByteBuffer element = keys ? cell.path().get(0) : cell.buffer();
+                if (elementType.compare(analysis.function.apply(element), analysis.term) == 0)
+                    return false;
+            }
+            return hasLiveElement;
+        }
+
+        /**
+         * The analysis of the values and the analyzed term of a restriction.
+         */
+        private static final class Analysis
+        {
+            private static final Analysis NONE = new Analysis(null, null);
+
+            private final UnaryOperator<ByteBuffer> function;
+            private final ByteBuffer term;
+
+            private Analysis(UnaryOperator<ByteBuffer> function, ByteBuffer term)
+            {
+                this.function = function;
+                this.term = term;
+            }
         }
 
         @Override

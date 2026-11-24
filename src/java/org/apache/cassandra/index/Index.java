@@ -32,6 +32,7 @@ import java.util.concurrent.Callable;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -456,6 +457,18 @@ public interface Index
     default boolean supportsFilteringOnMapElementExpression()
     {
         return false;
+    }
+
+    /**
+     * Returns the analysis the index applies to the values of its column, and to the terms of the restrictions it
+     * serves, before comparing them, such as case folding, or {@code null} if it compares them as they are. Filtering
+     * applies it to the restrictions on the column the index leaves to filtering, such as {@code !=}, {@code IN} and
+     * {@code NOT CONTAINS}, so that they compare values the same way as {@code =} and {@code CONTAINS}.
+     */
+    @Nullable
+    default UnaryOperator<ByteBuffer> getValueAnalysis()
+    {
+        return null;
     }
 
     /**

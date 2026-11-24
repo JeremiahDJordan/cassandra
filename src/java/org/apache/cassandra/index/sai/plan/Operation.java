@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ArrayListMultimap;
@@ -36,6 +37,7 @@ import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
@@ -171,6 +173,19 @@ public class Operation
         IndexTermType indexTermType = IndexTermType.create(expression.column(),
                                                            queryController.metadata().partitionKeyColumns(),
                                                            determineIndexTargetType(expression));
+        if (expression.operator() == Operator.IN)
+        {
+            // an IN compares values with the analyzer of the index that serves = on the column, as = does
+            StorageAttachedIndex analyzing = queryController.indexFor(RowFilter.create(true).add(expression.column(), Operator.EQ, expression.getIndexValue()));
+            if (analyzing != null && analyzing.getValueAnalysis() != null)
+            {
+                ListType<?> type = ListType.getInstance(expression.column().type, false);
+                ByteBuffer values = type.pack(type.unpack(expression.getIndexValue()).stream().map(analyzing.getValueAnalysis()).collect(Collectors.toList()));
+                perColumn.add(Expression.create(indexTermType, analyzing).add(Operator.IN, values));
+                return;
+            }
+        }
+
         if (indexTermType.isMultiExpression(expression))
         {
             perColumn.add(Expression.create(indexTermType).add(expression.operator(), expression.getIndexValue().duplicate()));

@@ -22,6 +22,7 @@ import java.nio.ByteBuffer;
 import java.util.List;
 import java.util.Objects;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import org.apache.commons.lang3.builder.HashCodeBuilder;
@@ -73,7 +74,15 @@ public abstract class Expression
 
     public static Expression create(IndexTermType indexTermType)
     {
-        return new UnindexedExpression(indexTermType);
+        return new UnindexedExpression(indexTermType, null);
+    }
+
+    /**
+     * @param analyzing an index whose analyzer the expression applies to the values it compares
+     */
+    public static Expression create(IndexTermType indexTermType, StorageAttachedIndex analyzing)
+    {
+        return new UnindexedExpression(indexTermType, analyzing);
     }
 
     public static boolean supportsOperator(Operator operator)
@@ -521,9 +530,13 @@ public abstract class Expression
 
     public static class UnindexedExpression extends Expression
     {
-        private UnindexedExpression(IndexTermType indexTermType)
+        @Nullable
+        private final StorageAttachedIndex analyzing;
+
+        private UnindexedExpression(IndexTermType indexTermType, @Nullable StorageAttachedIndex analyzing)
         {
             super(indexTermType);
+            this.analyzing = analyzing;
         }
 
         @Override
@@ -541,13 +554,15 @@ public abstract class Expression
         @Override
         boolean hasAnalyzer()
         {
-            return false;
+            return analyzing != null;
         }
 
         @Override
         AbstractAnalyzer getAnalyzer()
         {
-            throw new UnsupportedOperationException();
+            if (analyzing == null)
+                throw new UnsupportedOperationException();
+            return analyzing.analyzer();
         }
     }
 
