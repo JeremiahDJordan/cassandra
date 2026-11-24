@@ -25,9 +25,13 @@ import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.FileChannel;
 import java.util.Arrays;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.FSWriteError;
@@ -142,6 +146,35 @@ public class NativeLibraryTest
         // non-existing FD
         INativeLibrary.instance.trySkipCache(-1, 0, 0L, "non-existing file");
         INativeLibrary.instance.trySkipCache(-1, 0, 0, "non-existing file");
+    }
+
+    @Test
+    public void testSkipCacheFileRemovedAfterExistsCheck()
+    {
+        File file = FileUtils.createDeletableTempFile("testSkipCache", "removed");
+        file.delete();
+        File removed = new File(file.path())
+        {
+            @Override
+            public boolean exists()
+            {
+                return true;
+            }
+        };
+
+        Logger logger = (Logger) LoggerFactory.getLogger(NativeLibrary.class);
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        logger.addAppender(appender);
+        try
+        {
+            INativeLibrary.instance.trySkipCache(removed, 0, 0);
+        }
+        finally
+        {
+            logger.detachAppender(appender);
+        }
+        Assert.assertTrue(appender.list.toString(), appender.list.isEmpty());
     }
 
     @Test
