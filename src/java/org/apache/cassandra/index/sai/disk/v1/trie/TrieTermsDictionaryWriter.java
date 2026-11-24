@@ -43,7 +43,7 @@ public class TrieTermsDictionaryWriter implements Closeable
     private final IndexOutputWriter termDictionaryOutput;
     private final long startOffset;
 
-    TrieTermsDictionaryWriter(IndexComponents.ForWrite components) throws IOException
+    public TrieTermsDictionaryWriter(IndexComponents.ForWrite components) throws IOException
     {
         termDictionaryOutput = components.addOrGet(IndexComponentType.TERMS_DATA).openOutput(true);
         startOffset = termDictionaryOutput.getFilePointer();

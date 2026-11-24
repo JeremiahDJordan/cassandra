@@ -276,13 +276,14 @@ public class IndexDescriptor
     }
 
     /**
-     * The set of per-index components _expected_ to be written for a newly flushed sstable for the provided index.
+     * The set of per-index components _expected_ to be written in the given version for a newly flushed sstable for the
+     * provided index.
      * <p>
      * This is a subset of {@link #componentsForNewlyFlushedSSTable(Collection, Version, boolean)} and has the same caveats.
      */
-    public static Set<Component> perIndexComponentsForNewlyFlushedSSTable(IndexContext context)
+    public static Set<Component> perIndexComponentsForNewlyFlushedSSTable(IndexContext context, Version version)
     {
-        return addPerIndexComponentsForNewlyFlushedSSTable(new HashSet<>(), ComponentsBuildId.forNewSSTable(context.version()), context);
+        return addPerIndexComponentsForNewlyFlushedSSTable(new HashSet<>(), ComponentsBuildId.forNewSSTable(version), context);
     }
 
     private static Set<Component> addPerIndexComponentsForNewlyFlushedSSTable(Set<Component> addTo, ComponentsBuildId buildId, IndexContext context)
@@ -359,12 +360,12 @@ public class IndexDescriptor
      * Returns the version that should be used for new components for the sstable of this descriptor.
      * It is the version of the per-sstable components, which is either the version of the existing per-sstable
      * components if any, or the current version if there is no existing components or if they were written by
-     * Apache Cassandra (whose format is read-only).
+     * Apache Cassandra (nothing selects its format for new components yet).
      */
     public Version versionForNewComponents()
     {
         Version version = perSSTableComponents().version();
-        // We never write Apache Cassandra's format: new components for an sstable that has some replace them.
+        // New components for an sstable with Apache Cassandra's replace them, in the current version.
         return version.isApache() ? Version.current(descriptor.ksname) : version;
     }
 
@@ -742,7 +743,13 @@ public class IndexDescriptor
         {
             IndexComponentImpl marker = (IndexComponentImpl) addOrGet(completionMarkerComponent());
             IndexMetadata index = isPerIndexGroup() ? context.getIndexMetadata() : null;
-            if (index == null)
+            if (isPerIndexGroup() && buildId.version().isApache())
+            {
+                // the marker is the only component of an empty index
+                marker.create(IndexDefinitionDigest.apacheMarkerContent(components.size() == 1));
+                builtForDefinition = true;
+            }
+            else if (index == null)
             {
                 marker.createEmpty();
             }

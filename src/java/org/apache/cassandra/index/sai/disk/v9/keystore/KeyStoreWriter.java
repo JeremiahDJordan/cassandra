@@ -29,7 +29,6 @@ import org.apache.cassandra.index.sai.disk.io.IndexOutput;
 import org.apache.cassandra.index.sai.disk.v1.MetadataWriter;
 import org.apache.cassandra.index.sai.disk.v1.bitpack.NumericValuesWriter;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
-import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.FastByteOperations;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
@@ -67,6 +66,7 @@ public class KeyStoreWriter implements Closeable
     private final String componentName;
     private final MetadataWriter metadataWriter;
     private final long bytesStartFP;
+    private final ByteComparable.Version byteComparableVersion;
     private BytesRefBuilder prevKey = new BytesRefBuilder();
     private BytesRefBuilder tempKey = new BytesRefBuilder();
     private boolean inPartition = false;
@@ -102,6 +102,7 @@ public class KeyStoreWriter implements Closeable
         this.keysOutput.writeByte((byte) (clustering ? 1 : 0));
         this.bytesStartFP = keysOutput.getFilePointer();
         this.offsetsWriter = keysBlockOffsets;
+        this.byteComparableVersion = keysDataComponent.parent().byteComparableVersionFor(keysDataComponent.componentType());
     }
 
     /**
@@ -209,7 +210,7 @@ public class KeyStoreWriter implements Closeable
      */
     private void copyBytes(ByteComparable source, BytesRefBuilder dest)
     {
-        ByteSource byteSource = source.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION);
+        ByteSource byteSource = source.asComparableBytes(byteComparableVersion);
         int val;
         while ((val = byteSource.next()) != ByteSource.END_OF_STREAM)
             dest.append((byte) val);

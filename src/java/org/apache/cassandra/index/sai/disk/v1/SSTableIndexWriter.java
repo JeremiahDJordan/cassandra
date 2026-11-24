@@ -40,6 +40,7 @@ import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.PerIndexFilesOwner;
 import org.apache.cassandra.index.sai.disk.PerIndexWriter;
+import org.apache.cassandra.index.sai.disk.apache.ApacheSegmentMetadata;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.v2.V2VectorIndexSearcher;
@@ -139,8 +140,7 @@ public class SSTableIndexWriter implements PerIndexWriter
                 while (valueIterator.hasNext())
                 {
                     ByteBuffer value = valueIterator.next();
-                    addedRow = addTerm(indexContext.asIndexTerm(value.duplicate()), key, sstableRowId,
-                                       indexContext.getValidator());
+                    addedRow = addTerm(indexTerm(value.duplicate()), key, sstableRowId, indexContext.getValidator());
                 }
             }
         }
@@ -149,13 +149,19 @@ public class SSTableIndexWriter implements PerIndexWriter
             ByteBuffer value = indexContext.getValueOf(key.partitionKey(), row, nowInSec);
             if (value != null)
             {
-                addedRow = addTerm(indexContext.asIndexTerm(value.duplicate()), key, sstableRowId,
-                                   indexContext.getValidator());
+                addedRow = addTerm(indexTerm(value.duplicate()), key, sstableRowId, indexContext.getValidator());
             }
         }
         if (addedRow)
             currentBuilder.incRowCount();
 
+    }
+
+    private ByteBuffer indexTerm(ByteBuffer value)
+    {
+        // Apache Cassandra indexes map entries and frozen values as written
+        return perIndexComponents.version().isApache() ? TypeUtil.asIndexBytesAsWritten(value, indexContext.getValidator())
+                                                       : indexContext.asIndexTerm(value);
     }
 
     @Override
@@ -432,7 +438,10 @@ public class SSTableIndexWriter implements PerIndexWriter
 
         try (MetadataWriter writer = new MetadataWriter(perIndexComponents))
         {
-            SegmentMetadata.write(writer, segments);
+            if (perIndexComponents.version().isApache())
+                ApacheSegmentMetadata.write(writer, segments, indexContext.comparator());
+            else
+                SegmentMetadata.write(writer, segments);
         }
         catch (IOException e)
         {

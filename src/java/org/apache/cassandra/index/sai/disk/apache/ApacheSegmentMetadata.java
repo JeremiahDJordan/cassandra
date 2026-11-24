@@ -25,6 +25,7 @@ import java.util.Map;
 import javax.annotation.Nullable;
 
 import org.apache.cassandra.db.BufferDecoratedKey;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.index.sai.IndexContext;
@@ -33,16 +34,20 @@ import org.apache.cassandra.index.sai.disk.PrimaryKeyMap;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.io.IndexInput;
+import org.apache.cassandra.index.sai.disk.io.IndexOutput;
 import org.apache.cassandra.index.sai.disk.v1.MetadataSource;
+import org.apache.cassandra.index.sai.disk.v1.MetadataWriter;
 import org.apache.cassandra.index.sai.disk.v1.SegmentMetadata;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
+import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 import org.apache.lucene.index.CorruptIndexException;
 
 /**
- * Reads the segment metadata of an index written by Apache Cassandra 5.0 (Apache's {@code SegmentMetadata#write}) into
- * our {@link SegmentMetadata}: int-prefixed keys and terms, OSS50 byte-comparable primary keys, no histograms.
+ * Reads and writes the segment metadata of Apache Cassandra 5.0 (Apache's {@code SegmentMetadata#write}) as our
+ * {@link SegmentMetadata}: int-prefixed keys and terms, OSS50 byte-comparable primary keys, no histograms.
  */
 public class ApacheSegmentMetadata
 {
@@ -73,6 +78,49 @@ public class ApacheSegmentMetadata
         for (int i = 0; i < segmentCount; i++)
             segments.add(read(input, context, sstableContext));
         return segments;
+    }
+
+    /**
+     * Writes the segment metadata the way Apache Cassandra 5.0 does.
+     */
+    public static void write(MetadataWriter writer, List<SegmentMetadata> segments, ClusteringComparator comparator) throws IOException
+    {
+        try (IndexOutput output = writer.builder(NAME))
+        {
+            output.writeVInt(segments.size());
+            for (SegmentMetadata metadata : segments)
+            {
+                output.writeLong(metadata.segmentRowIdOffset);
+                output.writeLong(metadata.numRows);
+                output.writeLong(metadata.minSSTableRowId);
+                output.writeLong(metadata.maxSSTableRowId);
+                writeBytes(keyBytes(metadata.minKey, comparator), output);
+                writeBytes(keyBytes(metadata.maxKey, comparator), output);
+                writeBytes(ByteBufferUtil.getArray(metadata.minTerm), output);
+                writeBytes(ByteBufferUtil.getArray(metadata.maxTerm), output);
+                metadata.componentMetadatas.write(output);
+            }
+        }
+    }
+
+    /**
+     * Apache's {@code PrimaryKey#asComparableBytes}: the partition key, and for a table with clustering columns the
+     * clustering too, null for a static row.
+     */
+    private static byte[] keyBytes(PrimaryKey key, ClusteringComparator comparator)
+    {
+        ByteSource partitionKey = ByteSource.of(key.partitionKey().getKey(), ByteComparable.Version.OSS50);
+        if (comparator.size() == 0)
+            return ByteSourceInverse.readBytes(partitionKey);
+
+        ByteSource clustering = key.isStaticRow() ? null : comparator.asByteComparable(key.clustering()).asComparableBytes(ByteComparable.Version.OSS50);
+        return ByteSourceInverse.readBytes(ByteSource.withTerminator(ByteComparable.Version.OSS50, ByteSource.TERMINATOR, partitionKey, clustering));
+    }
+
+    private static void writeBytes(byte[] bytes, IndexOutput output) throws IOException
+    {
+        output.writeInt(bytes.length);
+        output.writeBytes(bytes, 0, bytes.length);
     }
 
     private static SegmentMetadata read(IndexInput input, IndexContext context, @Nullable SSTableContext sstableContext) throws IOException

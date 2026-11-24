@@ -103,6 +103,14 @@ public final class IndexDefinitionDigest
     }
 
     /**
+     * @return the content of the completion marker Apache Cassandra writes for its per-index components
+     */
+    public static byte[] apacheMarkerContent(boolean emptyIndex)
+    {
+        return (emptyIndex ? APACHE_MARKER_OF_EMPTY_INDEX : APACHE_MARKER_OF_INDEX).clone();
+    }
+
+    /**
      * @return whether the provided content of a completion marker is one that Apache Cassandra writes for its per-index
      * components; anything else (e.g. a marker cut short by a crash) means they aren't complete
      */

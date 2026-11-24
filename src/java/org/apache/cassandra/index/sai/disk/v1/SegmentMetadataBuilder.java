@@ -28,6 +28,7 @@ import java.util.Objects;
 
 
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import com.google.common.base.Preconditions;
@@ -75,6 +76,7 @@ public class SegmentMetadataBuilder
     private long numRows;
     private long totalTermCount;
 
+    @Nullable
     private final TermsDistribution.Builder termsDistributionBuilder;
     private final Version version;
 
@@ -83,13 +85,15 @@ public class SegmentMetadataBuilder
     public SegmentMetadataBuilder(long segmentRowIdOffset, IndexComponents.ForWrite components)
     {
         IndexContext context = Objects.requireNonNull(components.context());
-        this.version = context.version();
+        this.version = components.version();
         this.segmentRowIdOffset = segmentRowIdOffset;
         this.byteComparableVersion = components.byteComparableVersionFor(IndexComponentType.TERMS_DATA);
 
         int histogramSize = context.getIntOption(HISTOGRAM_SIZE_OPTION, 128);
         int mostFrequentTermsCount = context.getIntOption(MFT_COUNT_OPTION, 128);
-        this.termsDistributionBuilder = new TermsDistribution.Builder(context.getValidator(), byteComparableVersion, histogramSize, mostFrequentTermsCount, version);
+        this.termsDistributionBuilder = version.onDiskFormat().indexFeatureSet().hasTermsHistogram()
+                                        ? new TermsDistribution.Builder(context.getValidator(), byteComparableVersion, histogramSize, mostFrequentTermsCount, version)
+                                        : null;
     }
 
     public void setNumRows(long numRows)
@@ -149,7 +153,8 @@ public class SegmentMetadataBuilder
         if (built)
             throw new IllegalStateException("Segment metadata already built, no more additions allowed");
 
-        termsDistributionBuilder.add(term, rowCount);
+        if (termsDistributionBuilder != null)
+            termsDistributionBuilder.add(term, rowCount);
     }
 
     public @Nonnull SegmentMetadata build()
@@ -172,7 +177,7 @@ public class SegmentMetadataBuilder
                                    maxKey,
                                    minTerm,
                                    maxTerm,
-                                   termsDistributionBuilder.build(),
+                                   termsDistributionBuilder == null ? null : termsDistributionBuilder.build(),
                                    metadataMap,
                                    totalTermCount,
                                    version);

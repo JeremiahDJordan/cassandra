@@ -196,7 +196,13 @@ public class IndexFileUtils
                 }
             }
 
-            if (append)
+            if (append && version.isApache())
+            {
+                // Apache Cassandra checksums each appended segment frame on its own
+                skipBytes(file.length());
+                checksum.reset();
+            }
+            else if (append)
             {
                 var fileLength = file.length();
                 skipBytes(fileLength);

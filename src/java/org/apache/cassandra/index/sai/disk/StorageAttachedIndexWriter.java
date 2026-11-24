@@ -38,6 +38,7 @@ import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.OnDiskFormat;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.memory.RowMapping;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.io.sstable.SSTableFlushObserver;
@@ -46,6 +47,7 @@ import org.apache.cassandra.io.sstable.format.SSTableWriter;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.Clock;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
 
 /**
@@ -67,6 +69,9 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
     private final Collection<StorageAttachedIndex> nonQueryableOnAbort;
     // whether the expected components of every index were listed before they were written (see complete)
     private final boolean componentsListedUpFront;
+    // Apache Cassandra's row ids leave out rows without live data
+    private final boolean skipRowsWithoutLiveData;
+    private final long nowInSeconds = FBUtilities.nowInSeconds();
 
     private DecoratedKey currentKey;
     private boolean tokenOffsetWriterCompleted = false;
@@ -134,7 +139,9 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         this.nonQueryableOnAbort = nonQueryableOnAbort;
         // We always use the version of the existing per-sstable components, if any, or the configured current version
         // if there are no previously existing per-sstable components.
-        OnDiskFormat onDiskFormat = indexDescriptor.versionForNewComponents().onDiskFormat();
+        Version version = indexDescriptor.versionForNewComponents();
+        OnDiskFormat onDiskFormat = version.onDiskFormat();
+        this.skipRowsWithoutLiveData = version.isApache();
         this.indexDescriptor = indexDescriptor;
         // Note: I think there is a silent assumption here. That is, the PK factory we use here must be for the current
         // format version, because that is what `IndexContext.keyFactory` always uses (see ctor)
@@ -200,9 +207,13 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         if (!unfiltered.isRow())
             return;
 
+        Row row = (Row) unfiltered;
+        if (skipRowsWithoutLiveData && !row.hasLiveData(nowInSeconds, false))
+            return;
+
         try
         {
-            addRow((Row) unfiltered);
+            addRow(row);
         }
         catch (Throwable t)
         {
@@ -306,7 +317,8 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                     if (componentsListedUpFront)
                     {
                         var writtenComponents = perIndexWriter.writtenComponents().allAsCustomComponents();
-                        var registeredComponents = IndexDescriptor.perIndexComponentsForNewlyFlushedSSTable(perIndexWriter.indexContext());
+                        var registeredComponents = IndexDescriptor.perIndexComponentsForNewlyFlushedSSTable(perIndexWriter.indexContext(),
+                                                                                                            perIndexWriter.writtenComponents().version());
                         var toRemove = Sets.difference(registeredComponents, writtenComponents);
                         if (!toRemove.isEmpty())
                         {

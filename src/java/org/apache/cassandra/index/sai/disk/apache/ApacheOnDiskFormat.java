@@ -39,7 +39,6 @@ import org.apache.cassandra.index.sai.SSTableContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.EmptyIndex;
 import org.apache.cassandra.index.sai.disk.PerIndexWriter;
-import org.apache.cassandra.index.sai.disk.PerSSTableWriter;
 import org.apache.cassandra.index.sai.disk.SearchableIndex;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
@@ -50,6 +49,7 @@ import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexSearcher;
 import org.apache.cassandra.index.sai.disk.v1.MetadataSource;
 import org.apache.cassandra.index.sai.disk.v1.PerIndexFiles;
+import org.apache.cassandra.index.sai.disk.v1.SSTableIndexWriter;
 import org.apache.cassandra.index.sai.disk.v1.SegmentMetadata;
 import org.apache.cassandra.index.sai.disk.v1.V1SearchableIndex;
 import org.apache.cassandra.index.sai.disk.v3.V3VectorIndexSearcher;
@@ -64,7 +64,7 @@ import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.IndexInput;
 
 /**
- * The SAI on-disk format of Apache Cassandra 5.0 (its version "aa", {@link Version#APACHE_AA}), read-only.
+ * The SAI on-disk format of Apache Cassandra 5.0 (its version "aa", {@link Version#APACHE_AA}).
  * The row ids of Apache's per-index components are only valid against Apache's per-SSTable components (Apache does
  * not index rows without live data), so the Apache components of an sstable are used, and replaced, as a unit:
  * see {@link IndexDescriptor} and {@code StorageAttachedIndexBuilder}.
@@ -231,16 +231,21 @@ public class ApacheOnDiskFormat extends V9OnDiskFormat
                : new ApacheNumericIndexSearcher(sstableContext, indexFiles, segmentMetadata, indexContext);
     }
 
-    @Override
-    public PerSSTableWriter newPerSSTableWriter(IndexDescriptor indexDescriptor)
-    {
-        throw new UnsupportedOperationException("The Apache Cassandra SAI format is read-only");
-    }
-
+    /**
+     * Apache's segments are built from the sstable rows, at flush too: the row ids of a memtable index count the rows
+     * without live data, which Apache's row ids leave out.
+     */
     @Override
     public PerIndexWriter newPerIndexWriter(StorageAttachedIndex index, IndexDescriptor indexDescriptor, LifecycleNewTracker tracker, RowMapping rowMapping, long keyCount)
     {
-        throw new UnsupportedOperationException("The Apache Cassandra SAI format is read-only");
+        IndexContext context = index.getIndexContext();
+        if (context.isVector() || !TypeUtil.isLiteral(context.getValidator()))
+            throw new UnsupportedOperationException("Only literal indexes are written in the Apache Cassandra SAI format, not " + context.getIndexName());
+        return new SSTableIndexWriter(indexDescriptor.newPerIndexComponentsForWrite(context),
+                                      SEGMENT_BUILD_MEMORY_LIMITER,
+                                      index.isDropped(),
+                                      index.isUnloaded(),
+                                      keyCount);
     }
 
     @Override

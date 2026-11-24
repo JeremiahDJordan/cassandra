@@ -47,6 +47,7 @@ import org.apache.cassandra.index.sai.analyzer.NoOpAnalyzer;
 import org.apache.cassandra.index.sai.disk.PostingList;
 import org.apache.cassandra.index.sai.disk.RAMStringIndexer;
 import org.apache.cassandra.index.sai.disk.TermsIterator;
+import org.apache.cassandra.index.sai.disk.apache.ApacheLiteralIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.Version;
@@ -230,6 +231,13 @@ public abstract class SegmentBuilder
         @Override
         protected void flushInternal(SegmentMetadataBuilder metadataBuilder) throws IOException
         {
+            if (components.version().isApache())
+            {
+                TermsIterator termsWithPostings = ramIndexer.getTermsWithPostings(minTerm, maxTerm, byteComparableVersion);
+                metadataBuilder.setComponentsMetadata(ApacheLiteralIndexWriter.writeCompleteSegment(components, metadataBuilder.intercept(termsWithPostings)));
+                return;
+            }
+
             try (InvertedIndexWriter writer = new InvertedIndexWriter(components, writeFrequencies()))
             {
                 TermsIterator termsWithPostings = ramIndexer.getTermsWithPostings(minTerm, maxTerm, byteComparableVersion);
@@ -469,7 +477,8 @@ public abstract class SegmentBuilder
         metadataBuilder.setKeyRange(minKey, maxKey);
         metadataBuilder.setRowIdRange(minSSTableRowId, maxSSTableRowId);
         metadataBuilder.setTermRange(minTerm, maxTerm);
-        metadataBuilder.setNumRows(getRowCount());
+        // Apache Cassandra counts the terms added to the segment
+        metadataBuilder.setNumRows(components.version().isApache() ? totalTermCount : getRowCount());
         metadataBuilder.setTotalTermCount(totalTermCount);
 
         flushInternal(metadataBuilder);

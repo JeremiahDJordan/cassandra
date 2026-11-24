@@ -87,7 +87,7 @@ public class Version implements Comparable<Version>
     public static final Version GA = new Version("ga", V9OnDiskFormat.instance, (c, i, g) -> stargazerFileNameFormat(c, i, g, "ga"));
 
     /**
-     * The format Apache Cassandra 5.0 writes, read-only. Not in {@link #ALL} ("aa" parses as DSE 6.8's {@link #AA}),
+     * The format Apache Cassandra 5.0 writes; nothing selects it for new components yet. Not in {@link #ALL} ("aa" parses as DSE 6.8's {@link #AA}),
      * and ordered before every DataStax version, so a DataStax build of a group of components is always preferred.
      */
     public static final Version APACHE_AA = new Version("aa", ApacheOnDiskFormat.instance, ApacheOnDiskFormat::fileNameFormat, true);
@@ -149,7 +149,7 @@ public class Version implements Comparable<Version>
         assert keyspace != null : "Keyspace name must not be null";
         Version version = SELECTOR.select(keyspace);
         if (version.isApache())
-            throw new IllegalStateException("The SAI version selector selected " + version + " for keyspace " + keyspace + ", which is read-only");
+            throw new IllegalStateException("The SAI version selector selected " + version + " for keyspace " + keyspace + ", which isn't selected for new components");
         return version;
     }
 
@@ -244,7 +244,7 @@ public class Version implements Comparable<Version>
         return compareTo(other) >= 0;
     }
 
-    /** @return whether this is {@link #APACHE_AA}, which is never used to write components */
+    /** @return whether this is {@link #APACHE_AA} */
     public boolean isApache()
     {
         return apache;
