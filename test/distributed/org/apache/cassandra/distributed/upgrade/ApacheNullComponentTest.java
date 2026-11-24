@@ -26,6 +26,7 @@ import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
 import org.apache.cassandra.distributed.shared.Versions.Version;
 
+import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 import static org.junit.Assert.assertEquals;
@@ -52,7 +53,7 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
             write(node);
             node.flush(KEYSPACE);
             node.shutdown().get();
-            node.setVersion(CURRENT);
+            node.setVersion(CURRENT_VERSION);
             node.startup();
             assertReads(node);
         }
@@ -61,13 +62,13 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
     @Test
     public void testEntireSSTableStreamingFromApache() throws Throwable
     {
-        testEntireSSTableStreaming(apacheVersion(), CURRENT);
+        testEntireSSTableStreaming(apacheVersion(), CURRENT_VERSION);
     }
 
     @Test
     public void testEntireSSTableStreamingToApache() throws Throwable
     {
-        testEntireSSTableStreaming(CURRENT, apacheVersion());
+        testEntireSSTableStreaming(CURRENT_VERSION, apacheVersion());
     }
 
     private static void testEntireSSTableStreaming(Version from, Version to) throws Throwable
