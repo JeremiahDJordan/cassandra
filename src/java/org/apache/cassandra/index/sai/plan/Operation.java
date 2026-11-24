@@ -31,17 +31,20 @@ import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.ListMultimap;
+import com.google.common.collect.Lists;
 
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.disk.v1.vector.PrimaryKeyWithScore;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
+import org.apache.cassandra.index.sai.iterators.KeyRangeUnionIterator;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.CloseableIterator;
@@ -357,7 +360,7 @@ public class Operation
     }
 
     /**
-     * Converts expressions into filter tree (which is currently just a single AND).
+     * Converts expressions into filter tree.
      * <p>
      * Filter tree allows us to do a couple of important optimizations
      * namely, group flattening for AND operations (query rewrite), expression bounds checks,
@@ -410,6 +413,22 @@ public class Operation
 
         static Node buildExpression(RowFilter.Expression expression)
         {
+            if (expression.operator().isIN())
+            {
+                RowFilter equalities = RowFilter.create(false);
+                ListType.getInstance(expression.column().type, false)
+                        .getSerializer()
+                        .forEach(expression.getIndexValue(), value -> {
+                            if (value != null)
+                                equalities.add(expression.column(), Operator.EQ, value);
+                        });
+
+                // An IN with no (non-null) values is an empty disjunction, which matches nothing.
+                OperatorNode node = new OrNode();
+                for (RowFilter.Expression equality : equalities)
+                    node.add(new ExpressionNode(equality));
+                return node;
+            }
             return new ExpressionNode(expression);
         }
 
@@ -424,7 +443,7 @@ public class Operation
 
         void doTreeAnalysis(Node node, List<RowFilter.Expression> expressions, QueryController controller)
         {
-            if (node.children().isEmpty())
+            if (node instanceof ExpressionNode)
                 expressions.add(node.expression());
             else
             {
@@ -481,11 +500,60 @@ public class Operation
         KeyRangeIterator rangeIterator(QueryController controller)
         {
             KeyRangeIterator.Builder builder = controller.getIndexQueryResults(expressions.all());
-            for (Node child : children)
+            try
             {
-                boolean canFilter = child.canFilter();
-                if (canFilter)
+                for (Node child : children)
+                {
+                    boolean canFilter = child.canFilter();
+                    if (canFilter)
+                        builder.add(child.rangeIterator(controller));
+                }
+            }
+            catch (Throwable t)
+            {
+                builder.cleanup();
+                throw t;
+            }
+            return builder.build();
+        }
+    }
+
+    static class OrNode extends OperatorNode
+    {
+        @Override
+        boolean canFilter()
+        {
+            return true;
+        }
+
+        @Override
+        public void analyze(List<RowFilter.Expression> expressionList, QueryController controller)
+        {
+            // The expressions of a disjunction are not combined into ranges, so each child is analyzed on its own.
+            expressions = new Expressions(ArrayListMultimap.create(), Collections.emptySet());
+            for (Node child : children)
+                child.analyze(Lists.newArrayList(child.expression()), controller);
+        }
+
+        @Override
+        FilterTree filterTree(boolean isStrict, QueryContext context)
+        {
+            return new FilterTree(BooleanOperator.OR, expressions, isStrict, context);
+        }
+
+        @Override
+        KeyRangeIterator rangeIterator(QueryController controller)
+        {
+            KeyRangeIterator.Builder builder = KeyRangeUnionIterator.builder(children.size());
+            try
+            {
+                for (Node child : children)
                     builder.add(child.rangeIterator(controller));
+            }
+            catch (Throwable t)
+            {
+                builder.cleanup();
+                throw t;
             }
             return builder.build();
         }

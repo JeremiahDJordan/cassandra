@@ -158,7 +158,7 @@ public class KeyRangeConcatIterator extends KeyRangeIterator
             if (rangeCount() == 1)
             {
                 KeyRangeIterator single = ranges.get(0);
-                single.setOnClose(onClose);
+                single.addOnClose(onClose);
                 return single;
             }
 

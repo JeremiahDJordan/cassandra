@@ -26,6 +26,7 @@ import javax.annotation.Nullable;
 import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.filter.RowFilter;
@@ -34,6 +35,7 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.metrics.TableQueryMetrics;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 
 public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
@@ -72,6 +74,9 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
 
         RowFilter preIndexFilter = filter;
         RowFilter postIndexFilter = filter;
+        boolean ordersMatchingRows = filter.getExpressions()
+                                           .stream()
+                                           .anyMatch(e -> e.operator() == Operator.ANN && !e.column().isStatic() && supports(indexes, e.column(), Operator.ANN));
 
         for (RowFilter.Expression expression : filter)
         {
@@ -80,17 +85,31 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
             // QueryPlan#postIndexQueryFilter(). If strict filtering is not allowed, we must reject the query until the
             // expression(s) in question are compatible with #isSatifiedBy.
             //
+            // The exception is IN on an indexed column in an ANN query. That query orders and limits the rows matching
+            // the index filter, so the IN is searched there, as the union of the equalities to its values. Neither
+            // column can be static: a static column index returns partition keys and a vector index has row keys, or
+            // the other way round.
+            //
             // Note: For both the pre- and post-filters we need to check that the expression exists before removing it
             // because the without method assert if the expression doesn't exist. This can be the case if we are given
             // a duplicate expression - a = 1 and a = 1. The without method removes all instances of the expression.
-            if (expression.operator().isIN() || expression.isUserDefined())
+            Operator operator = expression.operator();
+            if (operator.isIN() || expression.isUserDefined())
             {
                 if (!filter.isStrict())
                     throw new InvalidRequestException(String.format(UNSUPPORTED_NON_STRICT_OPERATOR, expression.operator()));
 
-                if (preIndexFilter.getExpressions().contains(expression))
-                    preIndexFilter = preIndexFilter.without(expression);
-                continue;
+                if (!ordersMatchingRows
+                    || expression.isUserDefined()
+                    || expression.column().isStatic()
+                    || expression.column().type.unwrap().isVector()
+                    || !supports(indexes, expression.column(), Operator.EQ))
+                {
+                    if (preIndexFilter.getExpressions().contains(expression))
+                        preIndexFilter = preIndexFilter.without(expression);
+                    continue;
+                }
+                operator = Operator.EQ;
             }
 
             if (postIndexFilter.getExpressions().contains(expression))
@@ -98,7 +117,7 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
 
             for (StorageAttachedIndex index : indexes)
             {
-                if (index.supportsExpression(expression.column(), expression.operator()))
+                if (index.supportsExpression(expression.column(), operator))
                 {
                     selectedIndexesBuilder.add(index);
                 }
@@ -110,6 +129,11 @@ public class StorageAttachedIndexQueryPlan implements Index.QueryPlan
             return null;
 
         return new StorageAttachedIndexQueryPlan(cfs, queryMetrics, postIndexFilter, preIndexFilter, selectedIndexes);
+    }
+
+    private static boolean supports(Set<StorageAttachedIndex> indexes, ColumnMetadata column, Operator operator)
+    {
+        return indexes.stream().anyMatch(index -> index.supportsExpression(column, operator));
     }
 
     @Override
