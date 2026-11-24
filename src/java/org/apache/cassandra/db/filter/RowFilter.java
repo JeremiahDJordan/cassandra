@@ -1882,6 +1882,10 @@ public class RowFilter
             if (operator == Operator.ANALYZER_MATCHES)
                 return isAnalyzedEquality(expression.column()) ? null : "The : operator (and = on an analyzed index)";
 
+            // nodes below DS 10 compare the raw values of !=
+            if (operator == Operator.NEQ && expression.analyzer() != null)
+                return "A != or NOT IN on an analyzed index";
+
             if (!operator.isDataStaxOnly())
                 return null;
 
@@ -2318,7 +2322,8 @@ public class RowFilter
                     case SIMPLE:
                         ByteBuffer value = ByteBufferUtil.readWithShortLength(in);
                         ANNOptions annOptions = operator == Operator.ANN ? ANNOptions.serializer.deserialize(in, version) : null;
-                        Index.Analyzer analyzer = operator == Operator.IN
+                        // nodes below DS 10 compare the raw values of !=
+                        Index.Analyzer analyzer = operator == Operator.IN || (operator == Operator.NEQ && version < MessagingService.VERSION_DS_10)
                                                   ? null
                                                   : indexRegistry.getAnalyzerFor(column, operator, value, indexHints).orElse(null);
                         return new SimpleExpression(column, operator, value, analyzer, annOptions);

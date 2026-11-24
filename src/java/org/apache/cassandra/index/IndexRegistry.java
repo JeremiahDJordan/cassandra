@@ -381,6 +381,15 @@ public interface IndexRegistry
 
     default Optional<Index.Analyzer> getAnalyzerFor(ColumnMetadata column, Operator operator, ByteBuffer value, IndexHints hints)
     {
+        // != is the negation of =: although no index serves it on an analyzed column, it uses the analyzer of the
+        // indexes that serve = as a match (see getEqBehavior), and compares raw values otherwise, also where = is
+        // ambiguous, and on primary key columns, as = does where it restricts the key
+        if (operator == Operator.NEQ)
+        {
+            if (column.isPrimaryKeyColumn() || getEqBehavior(column, hints).behavior != EqBehavior.MATCH)
+                return Optional.empty();
+            operator = Operator.EQ;
+        }
         return getBestIndexFor(column, operator, hints).flatMap(i -> i.getAnalyzer(value));
     }
 

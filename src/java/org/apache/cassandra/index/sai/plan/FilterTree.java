@@ -274,9 +274,9 @@ public class FilterTree
 
     private static boolean isSatisfiedBy(DecoratedKey key, Row row, ColumnMetadata column, Expression filter, long now)
     {
-        if (filter.unindexedMapEntry != null)
+        if (filter.unindexed != null)
         {
-            return row != null && filter.unindexedMapEntry.isSatisfiedBy(filter.context.columnFamilyStore().metadata(), key, row, now);
+            return row != null && filter.unindexed.isSatisfiedBy(filter.context.columnFamilyStore().metadata(), key, row, now);
         }
         else if (TypeUtil.isNonFrozenCollection(column.type))
         {

@@ -88,10 +88,12 @@ public class Operation
             IndexContext indexContext = controller.getContext(e);
             List<Expression> perColumn = analyzed.get(e.column());
 
-            // filtered as it is (see FilterTree), without the CompositeType terms of an entries index
-            if (e instanceof RowFilter.MapComparisonExpression && !controller.isIndexScanned(indexContext))
+            // filtered as it is (see FilterTree), without the CompositeType terms of an entries index, or with the
+            // analyzer of the = it negates for a != that no index serves
+            if ((e instanceof RowFilter.MapComparisonExpression && !controller.isIndexScanned(indexContext))
+                || (e.operator() == Operator.NEQ && e.analyzer() != null))
             {
-                perColumn.add(Expression.unindexedMapEntry(indexContext, (RowFilter.MapComparisonExpression) e));
+                perColumn.add(Expression.unindexed(indexContext, e));
                 continue;
             }
 

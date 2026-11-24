@@ -205,9 +205,10 @@ public class Expression
     // which the lower bound is one: an element or key holds the value if it holds all of them (see #addAllTerms)
     private List<ByteBuffer> allTerms;
 
-    // The map entry comparison this expression filters with when no index scan serves it, without bounds: its key or
-    // value can be too large for a CompositeType component
-    RowFilter.MapComparisonExpression unindexedMapEntry;
+    // The row filter expression this expression filters with, without bounds, when no index scan serves it: a map
+    // entry comparison, whose key or value can be too large for a CompositeType component, or an analyzed != (see
+    // Operation#analyzeGroup)
+    RowFilter.Expression unindexed;
 
     public Expression(IndexContext indexContext)
     {
@@ -220,14 +221,13 @@ public class Expression
     }
 
     /**
-     * @return an expression that filters the rows with the given map entry comparison, on a column that no index scan
-     * serves
+     * @return an expression that filters the rows with the given row filter expression, which no index scan serves
      */
-    static Expression unindexedMapEntry(IndexContext indexContext, RowFilter.MapComparisonExpression mapEntry)
+    static Expression unindexed(IndexContext indexContext, RowFilter.Expression unindexed)
     {
         Expression expression = new Expression(indexContext);
-        expression.operation = Op.valueOf(mapEntry.operator());
-        expression.unindexedMapEntry = mapEntry;
+        expression.operation = Op.valueOf(unindexed.operator());
+        expression.unindexed = unindexed;
         return expression;
     }
 
@@ -812,7 +812,7 @@ public class Expression
                                     .append(lower).append(upper)
                                     .append(exclusions)
                                     .append(allTerms)
-                                    .append(unindexedMapEntry).build();
+                                    .append(unindexed).build();
     }
 
     public boolean equals(Object other)
@@ -833,7 +833,7 @@ public class Expression
                 && Objects.equals(upper, o.upper)
                 && exclusions.equals(o.exclusions)
                 && Objects.equals(allTerms, o.allTerms)
-                && Objects.equals(unindexedMapEntry, o.unindexedMapEntry);
+                && Objects.equals(unindexed, o.unindexed);
     }
 
     /**

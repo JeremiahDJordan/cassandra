@@ -103,6 +103,10 @@ public class RowFilterPeerCompatibilityTest extends SAITester
         queries.put("SELECT * FROM %s WHERE b : 'x'", "The : operator (and = on an analyzed index)");
         // an index with equals_behaviour_when_analyzed: unsupported can't serve = in place of :
         queries.put("SELECT * FROM %s WHERE u : 'x'", "The : operator (and = on an analyzed index)");
+        queries.put("SELECT * FROM %s WHERE a != 'X' ALLOW FILTERING", "A != or NOT IN on an analyzed index");
+        queries.put("SELECT * FROM %s WHERE a NOT IN ('X', 'Y') ALLOW FILTERING", "A != or NOT IN on an analyzed index");
+        queries.put("SELECT * FROM %s WHERE b != 'x' ALLOW FILTERING", "A != or NOT IN on an analyzed index");
+        queries.put("SELECT * FROM %s WHERE u != 'X' ALLOW FILTERING", null); // compares raw values
         queries.put("SELECT * FROM %s WHERE s NOT CONTAINS 1", "The NOT CONTAINS operator");
         queries.put("SELECT * FROM %s WHERE n = 1 OR n = 2", "The OR operator");
         queries.put("SELECT * FROM %s ORDER BY n LIMIT 1", "ORDER BY on a non-clustering column");
@@ -286,6 +290,31 @@ public class RowFilterPeerCompatibilityTest extends SAITester
         finally
         {
             DatabaseDescriptor.setNewFeaturePeerVersionCheck(check);
+        }
+    }
+
+    /**
+     * A != from a node below DS 10 compares raw values, as on that node, also where an analyzed index serves = as a match.
+     */
+    @Test
+    public void testNotEqualsFromNodesBelowDS10() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        String query = "SELECT * FROM %s WHERE v != 'X' ALLOW FILTERING";
+        byte[] bytes = serialize(rowFilter(query), APACHE_50);
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'case_sensitive': 'false'}");
+
+        try (DataInputBuffer in = new DataInputBuffer(bytes))
+        {
+            RowFilter filter = RowFilter.serializer.deserialize(in, APACHE_50, currentTableMetadata(), false);
+            assertThat(filter.expressions().get(0).analyzer()).isNull();
+        }
+
+        bytes = serialize(rowFilter(query), MessagingService.current_version);
+        try (DataInputBuffer in = new DataInputBuffer(bytes))
+        {
+            RowFilter filter = RowFilter.serializer.deserialize(in, MessagingService.current_version, currentTableMetadata(), false);
+            assertThat(filter.expressions().get(0).analyzer()).isNotNull();
         }
     }
 

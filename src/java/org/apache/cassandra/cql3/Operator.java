@@ -166,6 +166,12 @@ public enum Operator
             return type.compareForCQL(leftOperand, rightOperand) != 0;
 
         }
+
+        @Override
+        public boolean isSatisfiedByAnalyzed(AbstractType<?> type, List<ByteBuffer> leftTokens, List<ByteBuffer> rightTokens)
+        {
+            return !EQ.isSatisfiedByAnalyzed(type, leftTokens, rightTokens);
+        }
     },
     IS_NOT(9)
     {
