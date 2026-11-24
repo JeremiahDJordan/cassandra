@@ -352,6 +352,11 @@ public class GuardrailsTest extends GuardrailTester
         assertEquals(set(4, 6), triggeredOn);
         triggeredOn.clear();
 
+        Set<Integer> values = set(4, 5, 6, 7);
+        assertWarns(() -> ignored.guard(values, values::remove, null),
+                    "Ignoring provided values [4, 6] as they are not supported for integer (ignored values are: [4, 6, 20])");
+        assertEquals(set(5, 7), values);
+
         assertThrows(() -> ignored.guard(set(4), userClientState),
                      AssertionError.class,
                      "There isn't an ignore action for integer, but value 4 is setup to be ignored");

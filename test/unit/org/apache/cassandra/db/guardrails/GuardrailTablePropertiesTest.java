@@ -177,6 +177,34 @@ public class GuardrailTablePropertiesTest extends GuardrailTester
     }
 
     @Test
+    public void testIgnoredPropertyWithOtherProperty() throws Throwable
+    {
+        // each of the two properties is ignored in turn, so one of them isn't the last one the guardrail iterates
+        for (String ignored : Arrays.asList("comment", "gc_grace_seconds"))
+        {
+            guardrails().setTablePropertiesIgnored(ignored);
+            String warning = "[" + ignored + "]";
+            String comment = ignored.equals("comment") ? "" : "my comment";
+            int gcGraceSeconds = ignored.equals("gc_grace_seconds") ? 864000 : 1000;
+            String withClause = "comment = 'my comment' AND gc_grace_seconds = 1000";
+
+            assertWarns(() -> createTableWithProperties("WITH " + withClause), warning);
+            assertProperties("tables", "table_name", currentTable(), comment, gcGraceSeconds);
+
+            createTableWithProperties();
+            assertWarns("ALTER TABLE %s WITH " + withClause, warning);
+            assertProperties("tables", "table_name", currentTable(), comment, gcGraceSeconds);
+
+            assertWarns(() -> createViewWithProperties("WITH " + withClause), warning);
+            assertProperties("views", "view_name", currentView(), comment, gcGraceSeconds);
+
+            createViewWithProperties("");
+            assertWarns(() -> alterViewWithProperties(withClause), warning);
+            assertProperties("views", "view_name", currentView(), comment, gcGraceSeconds);
+        }
+    }
+
+    @Test
     public void testInvalidTableProperties()
     {
         assertConfigFails(c -> c.setTablePropertiesDisallowed("ID1", "gc_grace_seconds"), "[id1]");
@@ -198,6 +226,13 @@ public class GuardrailTablePropertiesTest extends GuardrailTester
         () -> format(ALTER_VIEW, keyspace(), currentView(), "gc_grace_seconds = 1000"),
         () -> format(ALTER_VIEW, keyspace(), currentView(), "gc_grace_seconds = 1000 and crc_check_chance = 1"),
         () -> format(ALTER_VIEW, keyspace(), currentView(), "compaction = { 'class': 'SizeTieredCompactionStrategy' }"));
+    }
+
+    private void assertProperties(String schemaTable, String nameColumn, String name, String comment, int gcGraceSeconds)
+    {
+        assertRowsNet(executeNet(format("SELECT comment, gc_grace_seconds FROM system_schema.%s WHERE keyspace_name = ? AND %s = ?", schemaTable, nameColumn),
+                                 keyspace(), name),
+                      row(comment, gcGraceSeconds));
     }
 
     private void createTableWithProperties()
