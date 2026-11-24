@@ -687,7 +687,8 @@ public class MessagingService extends MessagingServiceMBeanImpl
     /**
      * Returns the endpoints for the given keyspace that are known to be alive and have a connection whose
      * messaging version is older than the given version. To be used for example when we want to be sure a message
-     * can be serialized to all endpoints, according to their negotiated version at connection time.
+     * can be serialized to all endpoints, according to the version their connections negotiated or, for those that
+     * aren't connected, the version they announced.
      *
      * @param keyspace a keyspace
      * @param version a messaging version
@@ -701,7 +702,18 @@ public class MessagingService extends MessagingServiceMBeanImpl
             ConnectionType.MESSAGING_TYPES.forEach(type -> {
                 OutboundConnections connections = getOutbound(node, false);
                 OutboundConnection connection = connections != null ? connections.connectionFor(type) : null;
-                if (connection != null && connection.messagingVersion() < version)
+                if (connection == null)
+                    return;
+
+                // a connection that isn't connected keeps the version of its last connection, or the one known when it
+                // was created, until it connects again and negotiates its version: count it with the version the node
+                // announced, capped to ours, unless that isn't known or is a DSE 6.x one, which connects on an older
+                // version
+                Integer announced = versions.getRawIfKnown(node);
+                int connectionVersion = connection.isConnected() || announced == null || announced >= VERSION_DSE_68
+                                        ? connection.messagingVersion()
+                                        : Math.min(announced, current_version);
+                if (connectionVersion < version)
                     nodes.add(node);
             });
         }
