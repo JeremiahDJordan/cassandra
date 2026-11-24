@@ -48,6 +48,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.ReadCommand.PotentialTxnConflicts;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -312,8 +313,9 @@ public class CommitLogReplayer implements CommitLogReadHandler
                         // if it is the last known segment, if we are after the commit log segment position
                         if (commitLogReplayer.shouldReplay(update.metadata().id, new CommitLogPosition(segmentId, entryLocation)))
                         {
+                            // The mutation was accepted when it was logged, even if its range has since started migrating to Accord
                             if (newPUCollector == null)
-                                newPUCollector = new Mutation.PartitionUpdateCollector(mutation.getKeyspaceName(), mutation.key());
+                                newPUCollector = new Mutation.PartitionUpdateCollector(mutation.getKeyspaceName(), mutation.key(), PotentialTxnConflicts.ALLOW);
                             newPUCollector.add(update);
                             commitLogReplayer.replayedCount.incrementAndGet();
                         }

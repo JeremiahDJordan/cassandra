@@ -26,6 +26,7 @@ import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.service.consensus.migration.ConsensusMigrationMutationHelper;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
@@ -45,6 +46,9 @@ public class CassandraKeyspaceWriteHandler implements KeyspaceWriteHandler
         try
         {
             group = Keyspace.writeOrder.start();
+
+            // checked before the commit log write, as replay applies every logged mutation
+            ConsensusMigrationMutationHelper.validateSafeToExecuteNonTransactionally(mutation);
 
             // write the mutation to the commitlog and memtables
             CommitLogPosition position = null;
