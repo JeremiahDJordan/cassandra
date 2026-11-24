@@ -205,7 +205,7 @@ public final class CopyTableStatement extends AlterSchemaStatement
 
         // withInternals can be set to false as it is only used for source table id, which is not need for target table and the table
         // id can be set through create table like cql using WITH ID
-        String sourceCQLString = sourceTableMeta.toCqlString(false, false, false, false);
+        String sourceCQLString = sourceTableMeta.toCqlStringWithAutoRepair(false, false, false);
 
         TableMetadata.Builder targetBuilder = CreateTableStatement.parse(sourceCQLString,
                                                                          targetKeyspace,

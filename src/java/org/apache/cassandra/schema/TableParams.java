@@ -368,7 +368,10 @@ public final class TableParams
                           .toString();
     }
 
-    public void appendCqlTo(CqlBuilder builder, boolean isView)
+    /**
+     * @param withAutoRepair whether to write auto_repair whatever this node's auto-repair scheduling setting
+     */
+    public void appendCqlTo(CqlBuilder builder, boolean isView, boolean withAutoRepair)
     {
         // option names should be in alphabetical order
         builder.append("additional_write_policy = ").appendWithSingleQuotes(additionalWritePolicy.toString())
@@ -428,8 +431,8 @@ public final class TableParams
         }
 
         builder.append("AND speculative_retry = ").appendWithSingleQuotes(speculativeRetry.toString());
-        if (DatabaseDescriptor.getRawConfig() != null
-            && DatabaseDescriptor.getAutoRepairConfig().isAutoRepairSchedulingEnabled())
+        if (withAutoRepair
+            || (DatabaseDescriptor.getRawConfig() != null && DatabaseDescriptor.getAutoRepairConfig().isAutoRepairSchedulingEnabled()))
         {
             builder.newLine()
                 .append("AND auto_repair = ").append(autoRepair.asMap());
