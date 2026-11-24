@@ -52,6 +52,7 @@ import org.apache.cassandra.index.sai.utils.NamedMemoryLimiter;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.io.storage.StorageProvider;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
 
@@ -113,8 +114,12 @@ public class SSTableIndexWriter implements PerIndexWriter
 
         // This is to avoid duplicates (and also reduce space taken by indexes on static columns).
         // An index on a static column indexes static rows only.
-        // An index on a non-static column indexes regular rows only.
-        if (indexContext.getDefinition().isStatic() != row.isStatic())
+        // An index on a clustering or regular column indexes regular rows only.
+        // An index on a partition key column indexes both: a partition can consist of a static row alone, and it
+        // would be missed if its static row wasn't indexed. This matches what the memtable index and memtable flush
+        // write, and what Apache Cassandra writes.
+        ColumnMetadata column = indexContext.getDefinition();
+        if (!column.isPartitionKey() && column.isStatic() != row.isStatic())
             return;
 
         boolean addedRow = false;

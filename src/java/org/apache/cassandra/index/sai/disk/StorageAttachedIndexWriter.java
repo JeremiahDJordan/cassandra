@@ -115,6 +115,11 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         this.tableMetrics = tableMetrics;
     }
 
+    public long rowCount()
+    {
+        return sstableRowId;
+    }
+
     @Override
     public void begin()
     {
