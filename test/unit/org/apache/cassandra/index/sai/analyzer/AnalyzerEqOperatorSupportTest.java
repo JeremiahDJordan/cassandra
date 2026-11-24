@@ -16,10 +16,18 @@
 
 package org.apache.cassandra.index.sai.analyzer;
 
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
+
 import org.junit.Before;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.conditions.ColumnCondition;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
@@ -154,6 +162,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertNonTokenizedIndexSupportsEquality();
             assertNonTokenizedIndexSupportsMatches();
             assertNonTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertNonTokenizedIndexSupportsNotEquals();
         });
     }
 
@@ -164,6 +173,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertNonTokenizedIndexSupportsEquality();
             assertNonTokenizedIndexSupportsMatches();
             assertNonTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertNonTokenizedIndexSupportsNotEquals();
         });
     }
 
@@ -201,6 +211,19 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         // LWT
         assertRowsWithLWTWarning("UPDATE %s SET v = 'Quick fox' WHERE k = 1 IF v = 'Quick fox'", row(true));
         assertRowsWithLWTWarning("UPDATE %s SET v = 'Quick fox' WHERE k = 1 IF v = 'fox'", row(false, "Quick fox"));
+    }
+
+    private void assertNonTokenizedIndexSupportsNotEquals()
+    {
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v != 'quick fox' ALLOW FILTERING", row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v != 'fox' ALLOW FILTERING", row(1), row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v NOT IN ('quick fox', 'lazy') ALLOW FILTERING", row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v NOT IN ('quick fox', 'LAZY FOX') ALLOW FILTERING");
+        assertRows(execute("SELECT k FROM %s WHERE v NOT IN ? ALLOW FILTERING", list("QUICK FOX")), row(2));
+        assertRows(executeInternal("SELECT k FROM %s WHERE v != 'quick fox' ALLOW FILTERING"), row(2));
+
+        // LWT
+        assertRowsWithLWTWarning("UPDATE %s SET v = 'Quick fox' WHERE k = 1 IF v != 'quick fox'", row(true));
     }
 
     private void assertNonTokenizedIndexSupportsMatches()
@@ -259,6 +282,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertTokenizedIndexSupportsEquality();
             assertTokenizedIndexSupportsMatches();
             assertTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertTokenizedIndexSupportsNotEquals();
         });
     }
 
@@ -269,6 +293,7 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             assertTokenizedIndexSupportsEquality();
             assertTokenizedIndexSupportsMatches();
             assertTokenizedIndexSupportsMixedEqualityAndMatches();
+            assertTokenizedIndexSupportsNotEquals();
         });
     }
 
@@ -311,6 +336,20 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         assertRowsWithSelectWarning("SELECT k FROM %s WHERE v = 'quick' AND v = 'lazy'");
         assertRowsWithSelectWarning("SELECT k FROM %s WHERE (v = 'quick' AND v = 'fox') OR v = 'dog'", row(1));
         assertRowsWithSelectWarning("SELECT k FROM %s WHERE (v = 'quick' AND v = 'fox') OR v = 'Lazy'", row(1), row(2));
+    }
+
+    private void assertTokenizedIndexSupportsNotEquals()
+    {
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v != 'quick' ALLOW FILTERING", row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v != 'quick fox' ALLOW FILTERING", row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v != 'fox' ALLOW FILTERING");
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v != 'quick dog' ALLOW FILTERING", row(1), row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v NOT IN ('quick', 'lazy') ALLOW FILTERING");
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v NOT IN ('quick dog', 'lazy') ALLOW FILTERING", row(1));
+        assertRows(executeInternal("SELECT k FROM %s WHERE v != 'quick' ALLOW FILTERING"), row(2));
+
+        // LWT
+        assertRowsWithLWTWarning("UPDATE %s SET v = 'Quick fox' WHERE k = 1 IF v != 'quick'", row(true));
     }
 
     private void assertTokenizedIndexSupportsMatches()
@@ -437,6 +476,10 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
 
             // EQ gets interpreted as a match query here
             assertRows(execute("SELECT x FROM %s WHERE x = 'a'"), row("A"), row("a"));
+
+            // != compares raw values on primary key columns
+            assertRows(execute("SELECT x FROM %s WHERE x != 'a' ALLOW FILTERING"), row("A"));
+            assertRows(execute("SELECT x FROM %s WHERE z != 'c' ALLOW FILTERING"), row("A"));
             // This only gets 1 row instead of 2 because the index is on a clustering column and that applies post
             // filtering in surprising and problematic way.
             assertRows(execute("SELECT x FROM %s WHERE z = 'c'"), row("a"));
@@ -451,6 +494,94 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
             .isInstanceOf(InvalidRequestException.class)
             .hasMessageContaining(String.format(SingleColumnRestriction.AnalyzerMatchesRestriction.CANNOT_BE_RESTRICTED_BY_CLUSTERING_ERROR, "z"));
         });
+    }
+
+    @Test
+    public void testNotEqualsAndNotIn() throws Throwable
+    {
+        String[] values = { "Quick fox", "quick fox", "fox quick", "Lazy dog", "", null };
+        Set<Integer> withValue = new TreeSet<>();
+        for (int k = 0; k < values.length; k++)
+        {
+            if (values[k] != null)
+                withValue.add(k);
+        }
+
+        for (String analyzer : List.of("'case_sensitive': 'false'", "'index_analyzer': 'standard'"))
+        {
+            for (AnalyzerEqOperatorSupport.Value eqBehaviour : AnalyzerEqOperatorSupport.Value.values())
+            {
+                createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, raw text, i int)");
+                createIndex(format("CREATE CUSTOM INDEX ON %%s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {%s, '%s': '%s'}",
+                                   analyzer, AnalyzerEqOperatorSupport.OPTION, eqBehaviour));
+                createIndex("CREATE CUSTOM INDEX ON %s(i) USING 'StorageAttachedIndex'");
+                for (int k = 0; k < values.length; k++)
+                    execute("INSERT INTO %s (k, v, raw, i) VALUES (?, ?, ?, 1)", k, values[k], values[k]);
+
+                // != and NOT IN match the rows with a value that = doesn't match, which compare raw values as the
+                // unindexed column does with equals_behaviour_when_analyzed: unsupported, with or without the index
+                // of i, next to a range, and on the replica
+                beforeAndAfterFlush(() -> {
+                    List<Integer> inRange = keys(false, "SELECT k FROM %s WHERE v < 'q' ALLOW FILTERING");
+                    for (List<String> excluded : List.of(List.of("quick fox"), List.of("Quick fox"), List.of("QUICK"), List.of("dog"),
+                                                         List.of("quick fox", "dog"), List.of("QUICK", "Lazy dog")))
+                    {
+                        String quoted = excluded.stream().map(e -> '\'' + e + '\'').collect(Collectors.joining(", "));
+                        String restriction = excluded.size() == 1 ? "%1$s != " + quoted : "%1$s NOT IN (" + quoted + ')';
+                        for (String other : List.of("", " AND i = 1", " AND %1$s < 'q' AND i = 1"))
+                        {
+                            String where = "SELECT k FROM %%s WHERE " + restriction + other + " ALLOW FILTERING";
+                            String negative = format(where, "v");
+                            String rawNegative = format(where, "raw");
+                            for (boolean internal : new boolean[]{ false, true })
+                            {
+                                Set<Integer> expected = new TreeSet<>(withValue);
+                                for (String value : excluded)
+                                    expected.removeAll(keys(internal, "SELECT k FROM %s WHERE v = '" + value + "' ALLOW FILTERING"));
+                                if (other.contains("<"))
+                                    expected.retainAll(inRange);
+                                Assertions.assertThat(keys(internal, negative))
+                                          .as("%s %s %s", analyzer, eqBehaviour, negative)
+                                          .containsExactlyElementsOf(expected);
+                                if (eqBehaviour == AnalyzerEqOperatorSupport.Value.UNSUPPORTED)
+                                    Assertions.assertThat(keys(internal, negative))
+                                              .as("%s %s %s", analyzer, eqBehaviour, negative)
+                                              .isEqualTo(keys(internal, rawNegative));
+                            }
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    @Test
+    public void testNotEqualsOnStaticColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, s text STATIC, i int, PRIMARY KEY (k, c))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex' WITH OPTIONS = {'case_sensitive': 'false'}");
+        createIndex("CREATE CUSTOM INDEX ON %s(i) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (k, c, s, i) VALUES (1, 1, 'Quick', 1)");
+        execute("INSERT INTO %s (k, c, i) VALUES (1, 2, 1)");
+        execute("INSERT INTO %s (k, c, s, i) VALUES (2, 1, 'quick', 1)");
+        execute("INSERT INTO %s (k, c, s, i) VALUES (3, 1, 'dog', 1)");
+        execute("INSERT INTO %s (k, s) VALUES (4, 'cat')");
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT k, c FROM %s WHERE s != 'QUICK' ALLOW FILTERING"), row(3, 1), row(4, null));
+            assertRowsIgnoringOrder(executeInternal("SELECT k, c FROM %s WHERE s != 'QUICK' ALLOW FILTERING"), row(3, 1), row(4, null));
+            assertRows(execute("SELECT k, c FROM %s WHERE s NOT IN ('QUICK', 'cat') AND i = 1 ALLOW FILTERING"), row(3, 1));
+            assertRows(executeInternal("SELECT k, c FROM %s WHERE s NOT IN ('QUICK', 'cat') AND i = 1 ALLOW FILTERING"), row(3, 1));
+        });
+    }
+
+    private List<Integer> keys(boolean internal, String query)
+    {
+        List<Integer> keys = new ArrayList<>();
+        for (UntypedResultSet.Row row : internal ? executeInternal(query) : execute(query))
+            keys.add(row.getInt("k"));
+        Collections.sort(keys);
+        return keys;
     }
 
     private String createCaseInsensitiveIndexString(String column, AnalyzerEqOperatorSupport.Value eqBehaviour)
@@ -472,6 +603,11 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         // the EQ query should not use any kind of transformation when filtered without index intervention
         assertRowsWithoutWarning("SELECT k FROM %s WHERE v = 'quick fox' ALLOW FILTERING");
         assertRowsWithoutWarning("SELECT k FROM %s WHERE v = 'fox' ALLOW FILTERING");
+
+        // nor != and NOT IN, their negations
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v != 'quick fox' ALLOW FILTERING", row(1), row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v NOT IN ('Quick fox', 'lazy fox') ALLOW FILTERING", row(2));
+        assertRowsWithoutWarning("UPDATE %s SET v = 'Quick fox' WHERE k = 1 IF v != 'quick fox'", row(true));
     }
 
     private void assertIndexDoesNotSupportMatches()

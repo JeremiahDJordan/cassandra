@@ -63,6 +63,11 @@ public class GuardrailQueryFiltersTest extends ThresholdTester
         assertFails("SELECT * FROM %s WHERE x : '1 2 3 4 5'", 5);
         assertFails("SELECT * FROM %s WHERE x : '1 2 3 4 5 6'", 6);
 
+        // single column, != and NOT IN (analyzed)
+        assertValid("SELECT * FROM %s WHERE x != '1 2' ALLOW FILTERING");
+        assertWarns("SELECT * FROM %s WHERE x != '1 2 3' ALLOW FILTERING", 3);
+        assertFails("SELECT * FROM %s WHERE x NOT IN ('1', '2 3 4 5') ALLOW FILTERING", 5);
+
         // single column, single expression (not analyzed)
         assertValid("SELECT * FROM %s WHERE z = '1'");
         assertValid("SELECT * FROM %s WHERE z = '1 2'");
