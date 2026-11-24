@@ -69,6 +69,7 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.SinglePartitionSliceCommandTest;
 import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.repair.PendingAntiCompaction;
@@ -550,6 +551,8 @@ public class LegacySSTableTest
             if (Schema.instance.getTableMetadata(LEGACY_TABLES_KEYSPACE, table) != null)
                 Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore(table).truncateBlocking();
         }
+        // loading from the data directory must not list the truncated sstables while they are deleted
+        LifecycleTransaction.waitForDeletions();
         CacheService.instance.invalidateKeyCache();
     }
 
@@ -1317,6 +1320,7 @@ public class LegacySSTableTest
         Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore(String.format("legacy_%s_clust_counter", legacyVersion)).truncateBlocking();
         Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore(String.format("legacy_%s_tuple", legacyVersion)).truncateBlocking();
         Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore(String.format("legacy_%s_clust_be_index_summary", legacyVersion)).truncateBlocking();
+        LifecycleTransaction.waitForDeletions();
         CacheService.instance.invalidateCounterCache();
         CacheService.instance.invalidateKeyCache();
     }
