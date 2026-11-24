@@ -23,6 +23,7 @@ import java.lang.reflect.Field;
 import java.nio.MappedByteBuffer;
 import java.nio.channels.AsynchronousFileChannel;
 import java.nio.channels.FileChannel;
+import java.nio.file.NoSuchFileException;
 import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
@@ -205,6 +206,10 @@ public class NativeLibrary implements INativeLibrary
         try (FileInputStreamPlus fis = new FileInputStreamPlus(f))
         {
             trySkipCache(getfd(fis.getChannel()), offset, len, f.path());
+        }
+        catch (NoSuchFileException e)
+        {
+            // deleted or moved since the exists() check
         }
         catch (IOException e)
         {
