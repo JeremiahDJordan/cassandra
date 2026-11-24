@@ -16,6 +16,10 @@
 
 package org.apache.cassandra.distributed.test.sai;
 
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.util.concurrent.TimeUnit;
+
 import org.junit.Test;
 
 import net.bytebuddy.ByteBuddy;
@@ -25,7 +29,11 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.ICoordinator;
+import org.apache.cassandra.distributed.api.IInvokableInstance;
+import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
+import org.apache.cassandra.gms.FailureDetector;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
 import org.assertj.core.api.Assertions;
 
@@ -33,6 +41,7 @@ import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Distributed tests for ANN options.
@@ -48,9 +57,9 @@ public class ANNOptionsDistributedTest extends TestBaseImpl
     @Test
     public void testANNOptionsWithAllDS11() throws Throwable
     {
-        CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION.setInt(MessagingService.VERSION_DS_11);
-
-        try (Cluster cluster = init(Cluster.build(NUM_REPLICAS)
+        try (WithProperties properties = new WithProperties().set(CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION,
+                                                                  MessagingService.VERSION_DS_11);
+             Cluster cluster = init(Cluster.build(NUM_REPLICAS)
                                            .withConfig(config -> config.with(GOSSIP).with(NETWORK))
                                            .start(), RF))
         {
@@ -65,9 +74,9 @@ public class ANNOptionsDistributedTest extends TestBaseImpl
     @Test
     public void testANNOptionsWithAllDS10() throws Throwable
     {
-        CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION.setInt(MessagingService.VERSION_DS_10);
-
-        try (Cluster cluster = init(Cluster.build(NUM_REPLICAS)
+        try (WithProperties properties = new WithProperties().set(CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION,
+                                                                  MessagingService.VERSION_DS_10);
+             Cluster cluster = init(Cluster.build(NUM_REPLICAS)
                                            .withConfig(config -> config.with(GOSSIP).with(NETWORK))
                                            .start(), RF))
         {
@@ -92,13 +101,79 @@ public class ANNOptionsDistributedTest extends TestBaseImpl
         }
     }
 
+    /**
+     * Test that ANN options are accepted after a rolling upgrade from DS 10, without waiting for the connections between
+     * the nodes to connect again on the new version.
+     */
+    @Test
+    public void testANNOptionsAfterRollingUpgradeFromDS10() throws Throwable
+    {
+        assert CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION.getInt() >= MessagingService.VERSION_DS_11;
+
+        try (Cluster cluster = init(Cluster.build(NUM_REPLICAS)
+                                           .withInstanceInitializer((classLoader, threadGroup, node, generation) -> {
+                                               if (generation == 0)
+                                                   BB.pin(classLoader);
+                                           })
+                                           .withConfig(config -> config.with(GOSSIP).with(NETWORK))
+                                           .start(), RF))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.large (k int PRIMARY KEY, b blob)"));
+            testSelectWithAnnOptions(cluster, "ANN options are not supported in clusters below DS 11.");
+
+            restart(cluster, 1);
+            // a write large enough for the large message connection, which connects on DS 10
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.large (k, b) VALUES (0, ?)"),
+                                           ConsistencyLevel.ALL, ByteBuffer.allocate(100_000));
+
+            restart(cluster, 2);
+            assertSelectWithAnnOptions(cluster, null);
+        }
+    }
+
+    /**
+     * Restarts the given node, without its pinned messaging version, and waits until it and the other nodes see each
+     * other alive with their versions, and the indexes are queryable.
+     */
+    private static void restart(Cluster cluster, int node) throws Exception
+    {
+        cluster.get(node).shutdown().get();
+        cluster.get(node).startup();
+        for (IInvokableInstance other : cluster)
+        {
+            if (other.config().num() != node)
+            {
+                awaitKnown(other, cluster.get(node));
+                awaitKnown(cluster.get(node), other);
+            }
+        }
+        SAIUtil.waitForIndexQueryableOnAllNodes(cluster, KEYSPACE);
+    }
+
+    /** Waits until the given observer sees the given node alive, with its messaging version capped to the observer's. */
+    private static void awaitKnown(IInvokableInstance observer, IInvokableInstance node)
+    {
+        InetSocketAddress address = node.broadcastAddress();
+        int version = node.callOnInstance(() -> MessagingService.current_version);
+        await().atMost(1, TimeUnit.MINUTES).until(() -> observer.callOnInstance(() -> {
+            InetAddressAndPort endpoint = InetAddressAndPort.getByAddressOverrideDefaults(address.getAddress(), address.getPort());
+            return MessagingService.instance().versions.knows(endpoint)
+                   && MessagingService.instance().versions.get(endpoint) == Math.min(version, MessagingService.current_version)
+                   && FailureDetector.instance.isAlive(endpoint);
+        }));
+    }
+
     private static void testSelectWithAnnOptions(Cluster cluster, String expectedErrorMessage)
     {
         cluster.schemaChange(withKeyspace("CREATE TABLE %s.t (k int PRIMARY KEY, n int, v vector<float, 2>)"));
         cluster.schemaChange(withKeyspace("CREATE CUSTOM INDEX ON %s.t(v) USING 'StorageAttachedIndex'"));
         // Wait for index to be queryable on all nodes since test queries from all coordinators
         SAIUtil.waitForIndexQueryableOnAllNodes(cluster, KEYSPACE);
+        assertSelectWithAnnOptions(cluster, expectedErrorMessage);
+    }
 
+    private static void assertSelectWithAnnOptions(Cluster cluster, String expectedErrorMessage)
+    {
         String selectRerankk = withKeyspace("SELECT * FROM %s.t ORDER BY v ANN OF [1, 1] LIMIT 10 WITH ann_options = {'rerank_k': 10}");
         String selectUsePruning = withKeyspace("SELECT * FROM %s.t ORDER BY v ANN OF [1, 1] LIMIT 10 WITH ann_options = {'use_pruning': false}");
 
@@ -121,20 +196,23 @@ public class ANNOptionsDistributedTest extends TestBaseImpl
     }
 
     /**
-     * Injection to set the current version of the first cluster node to DS 10.
+     * Injection to set the current version of the first cluster node, or of the node of a given class loader, to DS 10.
      */
     public static class BB
     {
         public static void install(ClassLoader classLoader, int node)
         {
             if (node == 1)
-            {
-                new ByteBuddy().rebase(MessagingService.class)
-                               .method(named("currentVersion"))
-                               .intercept(MethodDelegation.to(BB.class))
-                               .make()
-                               .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
-            }
+                pin(classLoader);
+        }
+
+        static void pin(ClassLoader classLoader)
+        {
+            new ByteBuddy().rebase(MessagingService.class)
+                           .method(named("currentVersion"))
+                           .intercept(MethodDelegation.to(BB.class))
+                           .make()
+                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
         }
 
         @SuppressWarnings("unused")
