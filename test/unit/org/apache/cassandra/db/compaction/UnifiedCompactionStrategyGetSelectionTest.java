@@ -123,9 +123,12 @@ public class UnifiedCompactionStrategyGetSelectionTest extends BaseCompactionStr
         double growth = Math.pow(2, 1 - sizeModifier);
         List<CompactionAggregate.UnifiedAggregate> list = new ArrayList<>();
         List<List<CompactionSSTable>> sets = prepareSSTablesSets(levels, perLevel);
+        UnifiedCompactionStrategy.Arena arena = Mockito.mock(UnifiedCompactionStrategy.Arena.class);
+        List<UnifiedCompactionStrategy.Level> buckets = new ArrayList<>();
         long size = startSize;
         for (int i = 0; i < levels; ++i)
         {
+            buckets.add(new UnifiedCompactionStrategy.Level(i, 0, 0, 0, 1.0, 0, 0));
             for (int j = 0; j < perLevel; ++j)
             {
                 int overlap = (int) Math.max(0, random.nextGaussian() * 5 + 15);
@@ -137,13 +140,16 @@ public class UnifiedCompactionStrategyGetSelectionTest extends BaseCompactionStr
                                                             size,
                                                             size,
                                                             size);
-                CompactionAggregate.UnifiedAggregate aggregate = Mockito.mock(CompactionAggregate.UnifiedAggregate.class, Mockito.withSettings().stubOnly());
-                when(aggregate.getSelected()).thenReturn(pick);
-                when(aggregate.maxOverlap()).thenReturn(overlap);
-                when(aggregate.toString()).thenAnswer(inv -> toString((CompactionAggregate) inv.getMock()));
-                Mockito.doCallRealMethod().when(aggregate).setPermittedParallelism(anyInt());
-                Mockito.doCallRealMethod().when(aggregate).getPermittedParallelism();
-                list.add(aggregate);
+                // the selected sstables can be of a higher level than the aggregate's bucket
+                UnifiedCompactionStrategy.Level bucket = buckets.get(random.nextInt(i + 1));
+                list.add(new CompactionAggregate.UnifiedAggregate(pick.sstables(), overlap, pick, Collections.emptyList(), arena, bucket)
+                {
+                    @Override
+                    public String toString()
+                    {
+                        return UnifiedCompactionStrategyGetSelectionTest.toString(this);
+                    }
+                });
             }
             size *= growth;
         }
@@ -292,7 +298,7 @@ public class UnifiedCompactionStrategyGetSelectionTest extends BaseCompactionStr
                     final CompactionAggregate.UnifiedAggregate unifiedAggregate = (CompactionAggregate.UnifiedAggregate) c;
                     Assert.assertThat(other.maxOverlap(), Matchers.lessThanOrEqualTo(unifiedAggregate.maxOverlap()));
                     if (other.maxOverlap() == unifiedAggregate.maxOverlap())
-                        Assert.assertThat(other.bucketIndex(), Matchers.lessThanOrEqualTo(unifiedAggregate.bucketIndex()));
+                        Assert.assertThat(other.bucketIndex(), Matchers.greaterThanOrEqualTo(unifiedAggregate.bucketIndex()));
                 }
             }
 
