@@ -44,6 +44,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.cql3.QualifiedName;
 import org.apache.cassandra.cql3.constraints.ColumnConstraints;
 import org.apache.cassandra.cql3.functions.masking.ColumnMask;
@@ -96,7 +97,7 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
     public static final String ACCORD_COUNTER_COLUMN_UNSUPPORTED = "Cannot add a counter column to Accord table %s.%s with transactional mode %s and transactional migration from %s";
 
     protected final String tableName;
-    private final boolean ifExists;
+    protected final boolean ifExists;
     protected ClientState state;
 
     public AlterTableStatement(String keyspaceName, String tableName, boolean ifExists)
@@ -615,6 +616,7 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
     private static class AlterOptions extends AlterTableStatement
     {
         private final TableAttributes attrs;
+        private boolean hasIgnoredProperties;
 
         private AlterOptions(String keyspaceName, String tableName, TableAttributes attrs, boolean ifTableExists)
         {
@@ -629,12 +631,35 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
             // If a memtable configuration is specified, validate it against config
             if (attrs.hasOption(TableParams.Option.MEMTABLE))
                 MemtableParams.get(attrs.getString(TableParams.Option.MEMTABLE.toString()));
-            Guardrails.tableProperties.guard(attrs.updatedProperties(), attrs::removeProperty, state);
+            Guardrails.tableProperties.guard(attrs.updatedProperties(), property -> {
+                attrs.removeProperty(property);
+                hasIgnoredProperties = true;
+            }, state);
 
             TableParams paramsForValidation = attrs.asNewTableParams(keyspaceName);
             validateDefaultTimeToLive(paramsForValidation);
             validateZstdCompressionLevel(paramsForValidation);
             validateMinimumTrainingFrequencyForDictionaryCompressor(paramsForValidation);
+        }
+
+        /**
+         * Nodes replaying the statement from the metadata log don't run the guardrails, so it is logged without the
+         * properties they ignored.
+         */
+        @Override
+        public String cql()
+        {
+            if (!hasIgnoredProperties)
+                return super.cql();
+
+            return new CqlBuilder().append("ALTER TABLE ")
+                                   .append(ifExists ? "IF EXISTS " : "")
+                                   .appendQuotingIfNeeded(keyspaceName)
+                                   .append('.')
+                                   .appendQuotingIfNeeded(tableName)
+                                   .append(" WITH ")
+                                   .append(attrs.toCqlString())
+                                   .toString();
         }
 
         private TableParams validateAndUpdateTransactionalMigration(boolean isCounter, TableParams prev, TableParams next)

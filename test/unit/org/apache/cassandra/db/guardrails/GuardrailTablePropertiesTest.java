@@ -202,6 +202,16 @@ public class GuardrailTablePropertiesTest extends GuardrailTester
     }
 
     @Test
+    public void testAlterTableReplay() throws Throwable
+    {
+        guardrails().setTablePropertiesDisallowed(Collections.emptySet());
+        String table = createTableWithProperties("");
+        String logged = submitted(format("ALTER TABLE %s.%s WITH comment = 'my table' AND caching = {'keys': 'NONE', 'rows_per_partition': 'ALL'}", keyspace(), table));
+        guardrails().setTablePropertiesIgnored(Collections.emptySet());
+        assertReplayed(logged, table, "", CACHING);
+    }
+
+    @Test
     public void testAlterViewReplay() throws Throwable
     {
         guardrails().setTablePropertiesDisallowed(Collections.emptySet());
