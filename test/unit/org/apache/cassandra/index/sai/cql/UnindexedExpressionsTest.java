@@ -19,13 +19,26 @@
 package org.apache.cassandra.index.sai.cql;
 
 import java.math.BigInteger;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 import com.datastax.driver.core.ResultSet;
 
 import org.junit.Test;
 
+import org.apache.cassandra.Util;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
@@ -282,6 +295,102 @@ public class UnindexedExpressionsTest extends SAITester
         createIndex("CREATE INDEX ON %s(t) USING 'sai' WITH OPTIONS = {'case_sensitive': 'false'}");
         execute("INSERT INTO %s (k, c, x, t) VALUES (7, 0, 7, 'a')");
         beforeAndAfterFlush(() -> assertEmpty(execute("SELECT k FROM %s WHERE t = 'A' AND x BETWEEN 5 AND 2 ALLOW FILTERING")));
+    }
+
+    @Test
+    public void restrictionsLeftToFilteringOnAnalyzedColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, t text, s set<text>, m map<text, int>)");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(t) USING 'sai' WITH OPTIONS = {'case_sensitive': false}");
+        createIndex("CREATE INDEX ON %s(s) USING 'sai' WITH OPTIONS = {'case_sensitive': false}");
+        createIndex("CREATE INDEX ON %s(KEYS(m)) USING 'sai' WITH OPTIONS = {'case_sensitive': false}");
+        execute("INSERT INTO %s (k, v, t, s, m) VALUES (1, 0, 'Foo', {'Foo'}, {'Foo': 1})");
+        execute("INSERT INTO %s (k, v, t, s, m) VALUES (2, 0, 'bar', {'bar'}, {'bar': 1})");
+        execute("INSERT INTO %s (k, v, t, s, m) VALUES (3, 0, 'FOO', {'x', 'FOO'}, {'x': 1, 'FOO': 1})");
+        execute("INSERT INTO %s (k, v, t, s, m) VALUES (4, 1, 'foo', {'foo'}, {'foo': 1})");
+
+        beforeAndAfterFlush(() -> {
+            // with and without a restriction that an index serves
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE t IN ('foo', 'x') ALLOW FILTERING"), row(1), row(3), row(4));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE v = 0 AND t IN ('foo', 'x') ALLOW FILTERING"), row(1), row(3));
+
+            for (String restriction : new String[]{ "t != 'foo'", "t NOT IN ('foo', 'x')", "s NOT CONTAINS 'foo'", "m NOT CONTAINS KEY 'foo'" })
+            {
+                assertRows(execute("SELECT k FROM %s WHERE " + restriction + " ALLOW FILTERING"), row(2));
+                assertRows(execute("SELECT k FROM %s WHERE v = 0 AND " + restriction + " ALLOW FILTERING"), row(2));
+            }
+
+            assertRowCount(execute("SELECT k FROM %s WHERE t IN ('foo', 'x') LIMIT 2 ALLOW FILTERING"), 2);
+            assertRowCount(execute("SELECT k FROM %s WHERE v = 0 AND t IN ('foo', 'x') LIMIT 1 ALLOW FILTERING"), 1);
+            assertEquals(Set.of(1, 3, 4), keys(executeNetWithPaging("SELECT k FROM %s WHERE t IN ('foo', 'x') ALLOW FILTERING", 1)));
+            assertEquals(Set.of(1, 3), keys(executeNetWithPaging("SELECT k FROM %s WHERE v = 0 AND t IN ('foo', 'x') ALLOW FILTERING", 1)));
+            assertEquals(Set.of(2), keys(executeNetWithPaging("SELECT k FROM %s WHERE t NOT IN ('foo', 'x') ALLOW FILTERING", 1)));
+            assertEquals(Set.of(2), keys(executeNetWithPaging("SELECT k FROM %s WHERE v = 0 AND s NOT CONTAINS 'foo' ALLOW FILTERING", 1)));
+        });
+    }
+
+    @Test
+    public void restrictionsLeftToFilteringWithExcludedAnalyzedIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, t text)");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        createIndex("CREATE INDEX t_idx ON %s(t) USING 'sai' WITH OPTIONS = {'case_sensitive': false}");
+        execute("INSERT INTO %s (k, v, t) VALUES (1, 0, 'Foo')");
+        execute("INSERT INTO %s (k, v, t) VALUES (2, 0, 'foo')");
+
+        // without the analyzed index, values are compared as they are
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT k FROM %s WHERE t IN ('foo', 'x') ALLOW FILTERING WITH excluded_indexes = {t_idx}"), row(2));
+            assertRows(execute("SELECT k FROM %s WHERE v = 0 AND t IN ('foo', 'x') ALLOW FILTERING WITH excluded_indexes = {t_idx}"), row(2));
+            assertRows(execute("SELECT k FROM %s WHERE t != 'foo' ALLOW FILTERING WITH excluded_indexes = {t_idx}"), row(1));
+        });
+    }
+
+    @Test
+    public void negatedContainsOnAnalyzedCollectionsWithReconciliation() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, s set<text>, m map<text, int>)");
+        createIndex("CREATE INDEX ON %s(s) USING 'sai' WITH OPTIONS = {'case_sensitive': false}");
+        createIndex("CREATE INDEX ON %s(KEYS(m)) USING 'sai' WITH OPTIONS = {'case_sensitive': false}");
+
+        // a deleted element, an expired element, and a deleted collection
+        execute("INSERT INTO %s (k, s, m) VALUES (1, {'Foo', 'bar'}, {'Foo': 1, 'bar': 1})");
+        execute("UPDATE %s SET s = s - {'Foo'} WHERE k = 1");
+        execute("DELETE m['Foo'] FROM %s WHERE k = 1");
+        execute("INSERT INTO %s (k, s, m) VALUES (2, {'bar'}, {'bar': 1})");
+        execute("UPDATE %s USING TTL 1 SET s = s + {'Foo'}, m = m + {'Foo': 1} WHERE k = 2");
+        execute("INSERT INTO %s (k, s, m) VALUES (3, {'Foo'}, {'Foo': 1})");
+        execute("DELETE s, m FROM %s WHERE k = 3");
+        Thread.sleep(2000);
+
+        beforeAndAfterFlush(() -> {
+            for (String restriction : new String[]{ "s NOT CONTAINS 'foo'", "m NOT CONTAINS KEY 'foo'" })
+            {
+                String query = "SELECT k FROM %s WHERE " + restriction + " ALLOW FILTERING";
+                assertRowsIgnoringOrder(execute(query), row(1), row(2));
+                assertEquals(Set.of(1, 2), new HashSet<>(readNeedingReconciliation(query)));
+            }
+        });
+    }
+
+    /**
+     * Returns the partition keys this node returns for the query as a replica of a read that needs reconciliation.
+     */
+    private List<Integer> readNeedingReconciliation(String query)
+    {
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(query), ClientState.forInternalCalls());
+        PartitionRangeReadCommand command = (PartitionRangeReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+        RowFilter filter = RowFilter.create(true);
+        command.rowFilter().forEach(filter::add);
+        PartitionRangeReadCommand reconciled = PartitionRangeReadCommand.create(command.metadata(), command.nowInSec(), command.columnFilter(),
+                                                                                filter, command.limits(), command.dataRange());
+        return Util.getAll(reconciled).stream().map(p -> Int32Type.instance.compose(p.partitionKey().getKey())).collect(Collectors.toList());
+    }
+
+    private static Set<Integer> keys(ResultSet rows)
+    {
+        return rows.all().stream().map(row -> row.getInt("k")).collect(Collectors.toSet());
     }
 
     @Test
