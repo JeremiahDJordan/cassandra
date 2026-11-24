@@ -17,9 +17,9 @@
  */
 package org.apache.cassandra.hints;
 
+import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.BitSet;
 import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -34,6 +34,7 @@ import java.util.function.Function;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.RateLimiter;
 
 import org.slf4j.Logger;
@@ -42,10 +43,14 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.DebuggableTask.RunnableDebuggableTask;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.exceptions.CoordinatorBehindException;
 import org.apache.cassandra.exceptions.RequestExecutionException;
 import org.apache.cassandra.exceptions.RequestFailure;
 import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.exceptions.RetryOnDifferentSystemException;
+import org.apache.cassandra.exceptions.UnknownTableException;
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
@@ -189,9 +194,15 @@ final class HintsDispatcher implements AutoCloseable
         }
     }
 
-    private Action doSendHintsAndAwait(HintsReader.Page page, @Nullable BitSet hintsFilter)
+    /**
+     * @param retriedHints the hints of the page to send again, or null to send the whole page
+     */
+    private Action doSendHintsAndAwait(HintsReader.Page page, @Nullable List<Hint> retriedHints)
     {
         List<Callback> callbacks = new ArrayList<>();
+        // the hint each callback is for, encoded or not
+        List<ByteBuffer> sentBuffers = new ArrayList<>();
+        List<Hint> sentHints = new ArrayList<>();
 
         /*
          * If hints file messaging version matches the version of the target host, we'll use the optimised path -
@@ -203,22 +214,20 @@ final class HintsDispatcher implements AutoCloseable
          * If these hints are from the batchlog and were originally attempted on Accord then
          * we also need to decode so we can route the Hint contents appropriately.
          *
-         * If filtering of hints is requested, because this is retrying a page that had some retry on different system
-         * errors, then also don't go down the sendEncodedHints path since it won't re-route the mutation and will trigger
-         * the same retry on different system error.
+         * Hints that are retried because they got retry on different system errors are sent decoded, since the
+         * sendEncodedHints path won't re-route the mutation and will trigger the same retry on different system error.
          */
         boolean isBatchLogHints = hostId.equals(RETRY_ON_DIFFERENT_SYSTEM_UUID);
-        boolean sendEncodedHints = reader.descriptor().messagingVersion() == messagingVersion && !isBatchLogHints && hintsFilter == null;
-        // If the hints filter is set then splitting the hints is needed and encoded hints can't do that
-        checkState(!sendEncodedHints || hintsFilter == null, "Should not send encoded hints if hints filter is set");
+        boolean sendEncodedHints = reader.descriptor().messagingVersion() == messagingVersion && !isBatchLogHints && retriedHints == null;
         Action action = sendEncodedHints
-                      ? sendHints(page.buffersIterator(), null, callbacks, this::sendEncodedHint)
-                      : sendHints(page.hintsIterator(), hintsFilter, callbacks, this::sendHint);
+                      ? sendHints(page.buffersIterator(), callbacks, sentBuffers, this::sendEncodedHint)
+                      : sendHints(retriedHints == null ? page.hintsIterator() : retriedHints.iterator(), callbacks, sentHints, this::sendHint);
 
         if (action == Action.ABORT)
             return action;
 
-        BitSet retryDifferentSystemHints = new BitSet(callbacks.size());
+        List<ByteBuffer> retryDifferentSystemBuffers = new ArrayList<>();
+        List<Hint> retryDifferentSystemHints = new ArrayList<>();
         long success = 0, failures = 0, timeouts = 0, retryDifferentSystem = 0;
         for (int i = 0; i < callbacks.size(); i++)
         {
@@ -229,7 +238,10 @@ final class HintsDispatcher implements AutoCloseable
             else if (outcome == Callback.Outcome.TIMEOUT) timeouts++;
             else if (outcome == RETRY_DIFFERENT_SYSTEM)
             {
-                retryDifferentSystemHints.set(i);
+                if (sendEncodedHints)
+                    retryDifferentSystemBuffers.add(sentBuffers.get(i));
+                else
+                    retryDifferentSystemHints.add(sentHints.get(i));
                 retryDifferentSystem++;
             }
             else throw new IllegalStateException("Unhandled outcome: " + outcome);
@@ -242,17 +254,26 @@ final class HintsDispatcher implements AutoCloseable
         // Hints for the batch log can hit RETRY_DIFFERENT_SYSTEM but don't need to be retried here and it could result
         // in the same hint ending up in hintsNeedingRehinting twice
         boolean failedRetryDifferentSystem = false;
-        if (retryDifferentSystem > 0 && failures < 1 && timeouts < 1 && hintsFilter == null && !isBatchLogHints)
+        if (retryDifferentSystem > 0 && failures < 1 && timeouts < 1 && retriedHints == null && !isBatchLogHints)
         {
-            reader.seek(currentPagePosition);
-            Action retryResult = doSendHintsAndAwait(page, retryDifferentSystemHints);
+            if (sendEncodedHints)
+                retryDifferentSystemHints = decode(retryDifferentSystemBuffers);
+
+            Action retryResult = Action.ABORT;
+            if (retryDifferentSystemHints != null)
+            {
+                // as the reader does, leave out the hints that have expired since they were read
+                retryDifferentSystemHints.removeIf(hint -> !hint.isLive());
+                retryResult = doSendHintsAndAwait(page, retryDifferentSystemHints);
+            }
             if (retryResult != Action.CONTINUE)
                 failedRetryDifferentSystem = true;
         }
 
         // The batchlog Accord hints need to return abort if any hint needs to be retried and retry the whole page
-        // since we don't want hints to ping pong back and forth via hintsNeedingRehinting
-        if (failures > 0 || timeouts > 0 || failedRetryDifferentSystem || (isBatchLogHints && retryDifferentSystem > 0))
+        // since we don't want hints to ping pong back and forth via hintsNeedingRehinting. A retried hint that is
+        // rejected again is not delivered either.
+        if (failures > 0 || timeouts > 0 || failedRetryDifferentSystem || ((isBatchLogHints || retriedHints != null) && retryDifferentSystem > 0))
         {
             HintDiagnostics.pageFailureResult(this, success, failures, timeouts, retryDifferentSystem);
             return Action.ABORT;
@@ -324,12 +345,42 @@ final class HintsDispatcher implements AutoCloseable
         HintsServiceMetrics.hintsRetryDifferentSystem.mark(retryDifferentSystem);
     }
 
+    /**
+     * Decodes encoded hints of this file, leaving out those for tables that have been dropped.
+     *
+     * @return the hints, or null if one of them is for a table this node doesn't know
+     */
+    @Nullable
+    private List<Hint> decode(List<ByteBuffer> buffers)
+    {
+        List<Hint> hints = new ArrayList<>(buffers.size());
+        for (ByteBuffer buffer : buffers)
+        {
+            try (DataInputBuffer in = new DataInputBuffer(buffer, true))
+            {
+                hints.add(Hint.serializer.deserialize(in, reader.descriptor().messagingVersion()));
+            }
+            catch (CoordinatorBehindException e)
+            {
+                // the table has been dropped
+            }
+            catch (UnknownTableException e)
+            {
+                return null;
+            }
+            catch (IOException e)
+            {
+                throw new FSReadError(e, reader.descriptor().fileName());
+            }
+        }
+        return hints;
+    }
+
     /*
      * Sending hints in compatibility mode.
      */
-    private <T> Action sendHints(Iterator<T> hints, @Nullable BitSet hintsFilter, Collection<Callback> callbacks, Function<T, Callback> sendFunction)
+    private <T> Action sendHints(Iterator<T> hints, Collection<Callback> callbacks, List<T> sent, Function<T, Callback> sendFunction)
     {
-        int hintIndex = -1;
         while (hints.hasNext())
         {
             if (abortRequested.getAsBoolean())
@@ -339,11 +390,8 @@ final class HintsDispatcher implements AutoCloseable
             }
 
             T hint = hints.next();
-            hintIndex++;
-            if (hintsFilter != null && !hintsFilter.get(hintIndex))
-                continue;
-
             callbacks.add(sendFunction.apply(hint));
+            sent.add(hint);
         }
         return Action.CONTINUE;
     }
@@ -455,7 +503,8 @@ final class HintsDispatcher implements AutoCloseable
             this(to, hintCreationTimeMillisSinceEpoch, null);
         }
 
-        private Callback(@Nullable InetAddressAndPort to, long hintCreationTimeMillisSinceEpoch, @Nullable IAccordResult<TxnResult> accordTxnResult)
+        @VisibleForTesting
+        Callback(@Nullable InetAddressAndPort to, long hintCreationTimeMillisSinceEpoch, @Nullable IAccordResult<TxnResult> accordTxnResult)
         {
             this.to = to != null ? to : ACCORD_HINT_ENDPOINT;
             this.hintCreationNanoTime = approxTime.translate().fromMillisSinceEpoch(hintCreationTimeMillisSinceEpoch);
@@ -485,12 +534,12 @@ final class HintsDispatcher implements AutoCloseable
         private Outcome outcome()
         {
             checkState((normalOutcome != null && accordOutcome != null) || (normalOutcome != SUCCESS || accordOutcome != SUCCESS), "Outcome for both normal and accord hint delivery should be known");
-            if (normalOutcome == RETRY_DIFFERENT_SYSTEM || accordOutcome == RETRY_DIFFERENT_SYSTEM)
-                return RETRY_DIFFERENT_SYSTEM;
             if (normalOutcome == TIMEOUT || accordOutcome == TIMEOUT)
                 return TIMEOUT;
             if (normalOutcome == FAILURE || accordOutcome == FAILURE)
                 return FAILURE;
+            if (normalOutcome == RETRY_DIFFERENT_SYSTEM || accordOutcome == RETRY_DIFFERENT_SYSTEM)
+                return RETRY_DIFFERENT_SYSTEM;
             checkState(normalOutcome == SUCCESS && accordOutcome == SUCCESS, "Hint delivery should have been successful");
             return SUCCESS;
         }
