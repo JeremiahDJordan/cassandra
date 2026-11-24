@@ -22,11 +22,14 @@ import java.util.Collections;
 import java.util.concurrent.TimeUnit;
 
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.EmptyIterators;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.MultiRangeReadCommand;
 import org.apache.cassandra.db.MultiRangeReadResponse;
 import org.apache.cassandra.db.PartitionPosition;
@@ -42,6 +45,7 @@ import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
+import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.locator.EndpointsForToken;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.ReplicaPlan;
@@ -49,6 +53,7 @@ import org.apache.cassandra.metrics.ReplicaResponseSizeMetrics;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.QueryInfoTracker;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -62,9 +67,19 @@ import static org.junit.Assert.*;
  */
 public class ReadCallbackTest extends AbstractReadResponseTest
 {
+    private static final String KEYSPACE_RF3 = "ReadCallbackTestRF3";
+    private static final String KEYSPACE_RF5 = "ReadCallbackTestRF5";
+
     private SinglePartitionReadCommand command;
     private EndpointsForToken targetReplicas;
     
+    @BeforeClass
+    public static void defineKeyspaces()
+    {
+        SchemaLoader.createKeyspace(KEYSPACE_RF3, KeyspaceParams.simple(3), SchemaLoader.standardCFMD(KEYSPACE_RF3, CF_STANDARD));
+        SchemaLoader.createKeyspace(KEYSPACE_RF5, KeyspaceParams.simple(5), SchemaLoader.standardCFMD(KEYSPACE_RF5, CF_STANDARD));
+    }
+
     @Before
     public void setUp()
     {
@@ -228,6 +243,79 @@ public class ReadCallbackTest extends AbstractReadResponseTest
                    ReplicaResponseSizeMetrics.readResponseBytesReceived.getCount() > initialReadBytes);
     }
     
+    /**
+     * A caller that doesn't speculate fails the read as soon as the replicas it contacted can't meet the consistency
+     * level, even with an uncontacted candidate.
+     */
+    @Test
+    public void testFailureWithoutSpeculation()
+    {
+        ReplicaPlan.SharedForTokenRead plan = plan(Keyspace.open(KEYSPACE_RF3), ConsistencyLevel.QUORUM, targetReplicas, targetReplicas.subList(0, 2));
+        ReadCallback<EndpointsForToken, ReplicaPlan.ForTokenRead> callback =
+            new ReadCallback<>(new DigestResolver<>(command, plan, queryStartNanoTime(), noopReadTracker()), command, plan, queryStartNanoTime());
+
+        callback.onFailure(EP1, RequestFailureReason.READ_TOO_MANY_TOMBSTONES);
+        assertTrue(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+    }
+
+    /**
+     * A caller that may speculate gets the time to send its request to the uncontacted candidate.
+     */
+    @Test
+    public void testFailureWithSpeculation()
+    {
+        ReplicaPlan.SharedForTokenRead plan = plan(Keyspace.open(KEYSPACE_RF3), ConsistencyLevel.QUORUM, targetReplicas, targetReplicas.subList(0, 2));
+        ReadCallback<EndpointsForToken, ReplicaPlan.ForTokenRead> callback =
+            new ReadCallback<>(new DigestResolver<>(command, plan, queryStartNanoTime(), noopReadTracker()), command, plan, queryStartNanoTime(), true);
+
+        callback.onFailure(EP1, RequestFailureReason.READ_TOO_MANY_TOMBSTONES);
+        assertFalse(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+        callback.onFailure(EP2, RequestFailureReason.READ_TOO_MANY_TOMBSTONES);
+        assertTrue(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+    }
+
+    /**
+     * A caller that decides not to speculate fails the read, whether a replica failed before or after.
+     */
+    @Test
+    public void testNoSpeculativeRetry()
+    {
+        ReplicaPlan.SharedForTokenRead plan = plan(Keyspace.open(KEYSPACE_RF3), ConsistencyLevel.QUORUM, targetReplicas, targetReplicas.subList(0, 2));
+        ReadCallback<EndpointsForToken, ReplicaPlan.ForTokenRead> callback =
+            new ReadCallback<>(new DigestResolver<>(command, plan, queryStartNanoTime(), noopReadTracker()), command, plan, queryStartNanoTime(), true);
+        callback.onFailure(EP1, RequestFailureReason.READ_TOO_MANY_TOMBSTONES);
+        assertFalse(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+        callback.onNoSpeculativeRetry();
+        assertTrue(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+
+        callback = new ReadCallback<>(new DigestResolver<>(command, plan, queryStartNanoTime(), noopReadTracker()), command, plan, queryStartNanoTime(), true);
+        callback.onNoSpeculativeRetry();
+        assertFalse(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+        callback.onFailure(EP1, RequestFailureReason.READ_TOO_MANY_TOMBSTONES);
+        assertTrue(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+    }
+
+    /**
+     * A caller that has speculated doesn't send another request, even with more uncontacted candidates: with RF 5,
+     * QUORUM (3) contacts 3 replicas, and speculates on a fourth.
+     */
+    @Test
+    public void testFailureAfterSpeculation() throws Throwable
+    {
+        EndpointsForToken candidates = EndpointsForToken.of(dk.getToken(), full(EP1), full(EP2), full(EP3),
+                                                             full(InetAddressAndPort.getByName("127.0.0.4")),
+                                                             full(InetAddressAndPort.getByName("127.0.0.5")));
+        ReplicaPlan.SharedForTokenRead plan = plan(Keyspace.open(KEYSPACE_RF5), ConsistencyLevel.QUORUM, candidates, candidates.subList(0, 3));
+        ReadCallback<EndpointsForToken, ReplicaPlan.ForTokenRead> callback =
+            new ReadCallback<>(new DigestResolver<>(command, plan, queryStartNanoTime(), noopReadTracker()), command, plan, queryStartNanoTime(), true);
+        plan.addToContacts(candidates.get(3));
+
+        callback.onFailure(EP1, RequestFailureReason.READ_TOO_MANY_TOMBSTONES);
+        assertFalse(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+        callback.onFailure(EP2, RequestFailureReason.READ_TOO_MANY_TOMBSTONES);
+        assertTrue(callback.awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+    }
+
     // Helper methods
     
     private Message<ReadResponse> createReadResponseMessage(ReadResponse response, InetAddressAndPort from)
@@ -251,7 +339,12 @@ public class ReadCallbackTest extends AbstractReadResponseTest
     
     private ReplicaPlan.SharedForTokenRead plan(ConsistencyLevel consistencyLevel, EndpointsForToken replicas)
     {
-        return ReplicaPlan.shared(new ReplicaPlan.ForTokenRead(ks, ks.getReplicationStrategy(), consistencyLevel, replicas, replicas));
+        return plan(ks, consistencyLevel, replicas, replicas);
+    }
+
+    private ReplicaPlan.SharedForTokenRead plan(Keyspace keyspace, ConsistencyLevel consistencyLevel, EndpointsForToken candidates, EndpointsForToken contacts)
+    {
+        return ReplicaPlan.shared(new ReplicaPlan.ForTokenRead(keyspace, keyspace.getReplicationStrategy(), consistencyLevel, candidates, contacts));
     }
     
     // Test implementation that doesn't support response size tracking

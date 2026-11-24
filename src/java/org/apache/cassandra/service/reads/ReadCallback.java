@@ -67,11 +67,21 @@ public class ReadCallback<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
             = AtomicIntegerFieldUpdater.newUpdater(ReadCallback.class, "failures");
     private volatile int failures = 0;
     private final Map<InetAddressAndPort, RequestFailureReason> failureReasonByEndpoint;
-    private final boolean couldSpeculate;
+    private volatile boolean couldSpeculate;
+    private final int initialContacts;
     private final RequestSensors requestSensors;
     private final ExecutionTimeSensorAccumulator execTimeAccumulator;
 
     public ReadCallback(ResponseResolver<E, P> resolver, ReadCommand command, ReplicaPlan.Shared<E, P> replicaPlan, long queryStartNanoTime)
+    {
+        this(resolver, command, replicaPlan, queryStartNanoTime, false);
+    }
+
+    /**
+     * @param couldSpeculate whether the caller may send one more request, to a read candidate it hasn't contacted, for
+     * a speculative retry (see {@link #onFailure})
+     */
+    public ReadCallback(ResponseResolver<E, P> resolver, ReadCommand command, ReplicaPlan.Shared<E, P> replicaPlan, long queryStartNanoTime, boolean couldSpeculate)
     {
         this.command = command;
         this.resolver = resolver;
@@ -81,12 +91,8 @@ public class ReadCallback<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         this.failureReasonByEndpoint = new ConcurrentHashMap<>();
         // we don't support read repair (or rapid read protection) for range scans yet (CASSANDRA-6897)
         assert !(command instanceof PartitionRangeReadCommand) || blockFor >= replicaPlan().contacts().size();
-        SpeculativeRetryPolicy retry = replicaPlan()
-                .keyspace()
-                .getColumnFamilyStore(command.metadata().id)
-                .metadata()
-                .params.speculativeRetry;
-        this.couldSpeculate = !NeverSpeculativeRetryPolicy.INSTANCE.equals(retry);
+        this.couldSpeculate = couldSpeculate;
+        this.initialContacts = replicaPlan().contacts().size();
 
         if (logger.isTraceEnabled())
             logger.trace("Blockfor is {}; setting up requests to {}", blockFor, this.replicaPlan);
@@ -236,12 +242,25 @@ public class ReadCallback<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                 
         failureReasonByEndpoint.put(from, failureReason);
 
+        // counted before couldSpeculate is read, so that either this or onNoSpeculativeRetry sees both changes
+        int failed = failuresUpdater.incrementAndGet(this);
         int numContacts = replicaPlan().contacts().size();
         int numCandidates = replicaPlan().candidates().size();
-        // If potentially there is a replica which could be requested as part of the speculative read path
-        // then increase the number of nodes we wait for in case of failures.
-        int failFastPoint = (numContacts < numCandidates && couldSpeculate) ? numContacts + 1 : numContacts;
-        if (blockFor + failuresUpdater.incrementAndGet(this) > failFastPoint)
+        // If the caller may still request a replica as part of the speculative read path, then increase the number of
+        // nodes we wait for in case of failures. It requests at most one more than the replicas it contacted first.
+        int failFastPoint = (initialContacts < numCandidates && couldSpeculate) ? Math.max(numContacts, initialContacts + 1) : numContacts;
+        if (blockFor + failed > failFastPoint)
+            condition.signalAll();
+    }
+
+    /**
+     * Called by a caller that may speculate once it has decided not to send its speculative retry: from then on, the
+     * read fails as soon as the replicas it contacted can't give enough responses.
+     */
+    public void onNoSpeculativeRetry()
+    {
+        couldSpeculate = false;
+        if (blockFor + failures > replicaPlan().contacts().size())
             condition.signalAll();
     }
 
