@@ -26,14 +26,18 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.NoSpamLogger;
+
+import static org.apache.cassandra.exceptions.RequestFailureReason.INCOMPATIBLE_SCHEMA;
 
 /**
  * Verb handler used both for hint dispatch and streaming.
@@ -54,12 +58,29 @@ public final class HintVerbHandler implements IVerbHandler<HintMessage>
         Hint hint = message.payload.hint;
         InetAddressAndPort address = StorageService.instance.getEndpointForHostId(hostId);
 
-        // If we see an unknown table id, it means the table, or one of the tables in the mutation, had been dropped.
-        // In that case there is nothing we can really do, or should do, other than log it go on.
-        // This will *not* happen due to a not-yet-seen table, because we don't transfer hints unless there
-        // is schema agreement between the sender and the receiver.
+        // If we see an unknown table id, either the table, or one of the tables in the mutation, had been dropped, or
+        // this node hadn't caught up with its creation yet. The sender knew the table when it stored the hint, so if
+        // this node has the schema version the sender gossips and still doesn't know the table, the table is taken as
+        // dropped, and there is nothing we can really do, or should do, other than log it and go on. Otherwise the hint
+        // fails, so that the sender can send it again later. The version goes first, as a schema change makes its
+        // tables visible before its version.
         if (hint == null)
         {
+            if (!Schema.instance.isSameVersion(Gossiper.instance.getSchemaVersion(message.from()))
+                || Schema.instance.getTableMetadata(message.payload.unknownTableID) != null)
+            {
+                NoSpamLogger.log(logger,
+                                 NoSpamLogger.Level.INFO,
+                                 1,
+                                 TimeUnit.SECONDS,
+                                 "Rejected a hint from {} for table {}, unknown when decoded (local schema version {})",
+                                 message.from(),
+                                 message.payload.unknownTableID,
+                                 Schema.instance.getVersion());
+                MessagingService.instance().send(message.failureResponse(INCOMPATIBLE_SCHEMA), message.from());
+                return;
+            }
+
             logger.trace("Failed to decode and apply a hint for {}: {} - table with id {} is unknown",
                          address,
                          hostId,
