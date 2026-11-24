@@ -206,6 +206,54 @@ public class CQLVectorTest extends CQLTester.InMemory
     }
 
     @Test
+    public void userTypesInVectors() throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int)");
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v vector<frozen<" + udt + ">, 2>, d vector<frozen<" + udt + ">, 2>, " +
+                    "n frozen<list<vector<frozen<" + udt + ">, 2>>>)");
+
+        assertInvalidThrowMessage("Cannot drop user type '" + KEYSPACE + '.' + udt + "' as it is still used by tables " + currentTable(),
+                                  InvalidRequestException.class,
+                                  "DROP TYPE " + KEYSPACE + '.' + udt);
+
+        schemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " RENAME a TO b");
+        execute("INSERT INTO %s (pk, v, d) VALUES (0, [{b: 1}, {b: 2}], [{b: 1}, {b: 2}])");
+        assertRows(execute("SELECT v FROM %s WHERE pk = 0"), row(vector(userType("b", 1), userType("b", 2))));
+        flush();
+        schemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " ADD c text");
+        execute("INSERT INTO %s (pk, v) VALUES (1, [{b: 3, c: 'x'}, {b: 4}])");
+        assertRows(execute("SELECT v FROM %s WHERE pk = 0"), row(vector(userType("b", 1), userType("b", 2))));
+        assertRows(execute("SELECT v FROM %s WHERE pk = 1"), row(vector(userType("b", 3, "c", "x"), userType("b", 4, "c", null))));
+
+        // dropped column types are stored without user types, so that the schema loads after the type is dropped
+        execute("ALTER TABLE %s DROP d");
+        assertRows(execute("SELECT type FROM system_schema.dropped_columns WHERE keyspace_name = ? AND table_name = ? AND column_name = 'd'",
+                           KEYSPACE, currentTable()),
+                   row("vector<frozen<tuple<int, text>>, 2>"));
+        execute("ALTER TABLE %s DROP n");
+        assertRows(execute("SELECT type FROM system_schema.dropped_columns WHERE keyspace_name = ? AND table_name = ? AND column_name = 'n'",
+                           KEYSPACE, currentTable()),
+                   row("frozen<list<vector<frozen<tuple<int, text>>, 2>>>"));
+        SchemaKeyspace.fetchNonSystemKeyspaces();
+
+        // a column added back with the recorded type is read together with the sstable written before the drop
+        execute("ALTER TABLE %s ADD d vector<frozen<tuple<int, text>>, 2>");
+        execute("INSERT INTO %s (pk, d) VALUES (0, [(5, 'y'), (6, null)])");
+        flush();
+        assertRowCount(execute("SELECT * FROM %s"), 2);
+        compact();
+        assertRows(execute("SELECT toJson(d) FROM %s WHERE pk = 0"), row("[[5, \"y\"], [6, null]]"));
+    }
+
+    @Test
+    public void durationsInVectors() throws Throwable
+    {
+        assertInvalidThrowMessage("duration type is not supported for PRIMARY KEY column 'pk'",
+                                  InvalidRequestException.class,
+                                  "CREATE TABLE " + KEYSPACE + '.' + createTableName() + " (pk vector<duration, 2> PRIMARY KEY)");
+    }
+
+    @Test
     public void invalidElementTypeFixedWidth() throws Throwable
     {
         createTable("CREATE TABLE %s (pk int primary key, value vector<int, 2>)");
