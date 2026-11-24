@@ -33,6 +33,7 @@ import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.MethodDelegation;
 import net.bytebuddy.implementation.bind.annotation.SuperCall;
+import net.bytebuddy.implementation.bind.annotation.This;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ReadCommand;
@@ -46,6 +47,7 @@ import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ICoordinator;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
+import org.apache.cassandra.distributed.test.sai.SAIUtil;
 import org.apache.cassandra.distributed.test.sai.SlowSAIQueryLoggerTest;
 import org.apache.cassandra.exceptions.ReadTimeoutException;
 import org.apache.cassandra.utils.FBUtilities;
@@ -156,6 +158,10 @@ public class AbortedQueryLoggerTest extends TestBaseImpl
         cluster.schemaChange(format("CREATE TABLE %s.%s (k int, c int, v int, l int, s int, PRIMARY KEY (k, c))"));
         cluster.schemaChange(format("CREATE INDEX legacy_idx ON %s.%s (l)"));
         cluster.schemaChange(format("CREATE CUSTOM INDEX sai_idx ON %s.%s (s) USING 'StorageAttachedIndex'"));
+        // the initial index builds flush the table, so they must finish before the writes to keep them in one flush
+        cluster.forEach(i -> Awaitility.waitAtMost(30, TimeUnit.SECONDS)
+                                       .until(() -> SAIUtil.isIndexQueryable(i, KEYSPACE, table, "legacy_idx") &&
+                                                    SAIUtil.isIndexQueryable(i, KEYSPACE, table, "sai_idx")));
         int numPartitions = 10;
         int numClusterings = 10;
         int numRows = 0;
@@ -369,8 +375,16 @@ public class AbortedQueryLoggerTest extends TestBaseImpl
 
         @SuppressWarnings("unused")
         public static UnfilteredPartitionIterator executeLocally(ReadExecutionController executionController,
+                                                                 @This ReadCommand command,
                                                                  @SuperCall Callable<UnfilteredPartitionIterator> zuperCall)
         {
+            // A slow start must not time the read out before the delay, so the timeout is lifted until the delay, which
+            // restores the original timeout at the selected row.
+            boolean delayed = readRowsBeforeDelay.get() >= 0 && executionController.metadata().keyspace.equals(KEYSPACE);
+            long timeoutNanos = command.timeoutNanos();
+            if (delayed)
+                command.setMonitoringTime(command.creationTimeNanos(), command.isCrossNode(), Long.MAX_VALUE, command.slowTimeoutNanos());
+
             UnfilteredPartitionIterator result;
             try
             {
@@ -381,12 +395,12 @@ public class AbortedQueryLoggerTest extends TestBaseImpl
                 throw Throwables.unchecked(e);
             }
 
-            if (!executionController.metadata().keyspace.equals(KEYSPACE))
+            if (!delayed)
                 return result;
 
             if (readRowsBeforeDelay.get() == 0)
             {
-                delay();
+                delay(command, timeoutNanos);
                 return result;
             }
 
@@ -404,7 +418,7 @@ public class AbortedQueryLoggerTest extends TestBaseImpl
                         protected Row applyToRow(Row row)
                         {
                             if (row.hasLiveData(nowInSec, false) && ++liveRows >= readRowsBeforeDelay.get() && readRowsBeforeDelay.get() > 0)
-                                delay();
+                                delay(command, timeoutNanos);
 
                             return row;
                         }
@@ -413,8 +427,9 @@ public class AbortedQueryLoggerTest extends TestBaseImpl
             });
         }
 
-        private static void delay()
+        private static void delay(ReadCommand command, long timeoutNanos)
         {
+            command.setMonitoringTime(command.creationTimeNanos(), command.isCrossNode(), timeoutNanos, command.slowTimeoutNanos());
             Uninterruptibles.sleepUninterruptibly(QUERY_TIMEOUT_MS * 2, TimeUnit.MILLISECONDS);
         }
     }
