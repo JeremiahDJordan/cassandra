@@ -695,6 +695,45 @@ public class VectorTypeTest extends VectorTester
     }
 
     @Test
+    public void testStaticVectorColumnWithPredicate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, x int, sv vector<float, 2> static, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(sv) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        for (int pk = 0; pk < 5; pk++)
+        {
+            // partition 4 has no vector
+            if (pk < 4)
+                execute("INSERT INTO %s (pk, sv) VALUES (?, ?)", pk, vector((float) pk, (float) pk));
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, x) VALUES (?, ?, ?)", pk, ck, ck % 2);
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 1 ORDER BY sv ANN OF [0, 0] LIMIT 2"),
+                       row(0, 1), row(1, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"),
+                       row(0, 0), row(0, 2), row(1, 0));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 1 ORDER BY sv ANN OF [0, 0] LIMIT 10"),
+                       row(0, 1), row(1, 1), row(2, 1), row(3, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 2 AND ck > 0 AND x = 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"),
+                       row(2, 2));
+        });
+
+        // the vectors and the restricted values are then in different memtables or sstables
+        execute("UPDATE %s SET sv = [9, 9] WHERE pk = 0");
+        flush();
+        execute("UPDATE %s SET x = 2 WHERE pk = 3 AND ck = 0");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 1 ORDER BY sv ANN OF [0, 0] LIMIT 10"),
+                       row(1, 1), row(2, 1), row(3, 1), row(0, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 2 ORDER BY sv ANN OF [0, 0] LIMIT 10"),
+                       row(3, 0));
+        });
+    }
+
+    @Test
     public void testTooManyMaterializedKeys() throws Throwable
     {
         int originalValue = QueryController.MAX_MATERIALIZED_KEYS;

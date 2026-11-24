@@ -407,11 +407,29 @@ public class QueryController
     public CloseableIterator<PrimaryKeyWithScore> getTopKRows(KeyRangeIterator source, QueryViewBuilder.QueryExpressionView queryExpressionView)
     {
         List<PrimaryKey> primaryKeys = materializeKeysAndCloseSource(source);
+        if (primaryKeys != null && queryExpressionView.expression.getIndexTermType().columnMetadata().isStatic())
+            primaryKeys = replaceRowKeysByStaticKeys(primaryKeys);
         if (primaryKeys == null)
             return getTopKRows(queryExpressionView);
         if (primaryKeys.isEmpty())
             return CloseableIterator.empty();
         return getTopKRows(primaryKeys, queryExpressionView);
+    }
+
+    /**
+     * An index on a static vector column only orders the keys of static rows, and the key of a static row stands for
+     * every row of its partition.
+     */
+    private static List<PrimaryKey> replaceRowKeysByStaticKeys(List<PrimaryKey> keys)
+    {
+        List<PrimaryKey> staticKeys = new ArrayList<>(keys.size());
+        for (PrimaryKey key : keys)
+        {
+            PrimaryKey staticKey = key.toStatic();
+            if (staticKeys.isEmpty() || !staticKeys.get(staticKeys.size() - 1).equals(staticKey))
+                staticKeys.add(staticKey);
+        }
+        return staticKeys;
     }
 
     private CloseableIterator<PrimaryKeyWithScore> getTopKRows(List<PrimaryKey> sourceKeys, QueryViewBuilder.QueryExpressionView queryExpressionView)
