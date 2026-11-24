@@ -371,7 +371,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             ByteBuffer value = keyValidator instanceof CompositeType
                              ? ((CompositeType) keyValidator).split(key.getKey())[e.column.position()]
                              : key.getKey();
-            if (!e.operator().isSatisfiedBy(e.column.type, value, e.value))
+            if (!e.isSatisfiedByPartitionKeyValue(value))
                 return false;
         }
         return true;
@@ -617,6 +617,14 @@ public class RowFilter implements Iterable<RowFilter.Expression>
          * @return whether the row is satisfied by this expression.
          */
         public abstract boolean isSatisfiedBy(TableMetadata metadata, DecoratedKey partitionKey, Row row, long nowInSec);
+
+        /**
+         * Returns whether the provided value of the partition key column of this expression satisfies it.
+         */
+        protected boolean isSatisfiedByPartitionKeyValue(ByteBuffer keyValue)
+        {
+            return operator.isSatisfiedBy(column.type, keyValue, value);
+        }
 
         protected ByteBuffer getValue(TableMetadata metadata, DecoratedKey partitionKey, Row row, long nowInSec)
         {
@@ -944,7 +952,8 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             // TODO: we should try to merge both code someday.
             assert value != null;
 
-            if (row.isStatic() != column.isStatic())
+            // a partition key map is read from the key, whatever the row
+            if (!column.isPartitionKey() && row.isStatic() != column.isStatic())
                 return true;
 
             MapType<?, ?> mt = (MapType<?, ?>) column.type;
@@ -956,12 +965,21 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             else
             {
                 ByteBuffer serializedMap = getValue(metadata, partitionKey, row, nowInSec);
-                if (serializedMap == null)
-                    return false;
-
-                ByteBuffer foundValue = mt.getSerializer().getSerializedValue(serializedMap, key, mt.getKeysType());
-                return foundValue != null && operator.isSatisfiedBy(mt.getValuesType(), foundValue, value);
+                return serializedMap != null && isSatisfiedByMap(serializedMap);
             }
+        }
+
+        @Override
+        protected boolean isSatisfiedByPartitionKeyValue(ByteBuffer keyValue)
+        {
+            return isSatisfiedByMap(keyValue);
+        }
+
+        private boolean isSatisfiedByMap(ByteBuffer serializedMap)
+        {
+            MapType<?, ?> mt = (MapType<?, ?>) column.type;
+            ByteBuffer foundValue = mt.getSerializer().getSerializedValue(serializedMap, key, mt.getKeysType());
+            return foundValue != null && operator.isSatisfiedBy(mt.getValuesType(), foundValue, value);
         }
 
         @Override

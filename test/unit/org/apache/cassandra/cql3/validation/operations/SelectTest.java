@@ -2496,6 +2496,34 @@ public class SelectTest extends CQLTester
     }
 
     @Test
+    public void testMapEntryOnPartitionKey() throws Throwable
+    {
+        testMapEntryOnPartitionKey("CREATE TABLE %s (k frozen<map<int, int>>, c int, v int, PRIMARY KEY (k, c))");
+        testMapEntryOnPartitionKey("CREATE TABLE %s (k frozen<map<int, int>>, c int, v int, PRIMARY KEY ((k, c)))");
+    }
+
+    private void testMapEntryOnPartitionKey(String schema) throws Throwable
+    {
+        createTable(schema);
+
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", map(1, 2), 1, 1);
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", map(1, 3), 2, 1);
+        execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", map(2, 2), 3, 1);
+
+        CheckedFunction assertions = () -> {
+            assertRows(execute("SELECT k FROM %s WHERE k[1] = 2 ALLOW FILTERING"), row(map(1, 2)));
+            assertRows(execute("SELECT k FROM %s WHERE k[1] != 2 ALLOW FILTERING"), row(map(1, 3)));
+            assertRows(execute("SELECT k FROM %s WHERE v = 1 AND k[1] = 2 ALLOW FILTERING"), row(map(1, 2)));
+            assertRows(execute("SELECT k FROM %s WHERE v = 1 AND k[1] != 2 ALLOW FILTERING"), row(map(1, 3)));
+        };
+        beforeAndAfterFlush(assertions);
+
+        // read through an index on another column
+        createIndex("CREATE INDEX ON %s(v) USING 'legacy_local_table'");
+        beforeAndAfterFlush(assertions);
+    }
+
+    @Test
     public void filteringWithOrderClause() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d list<int>, PRIMARY KEY (a, b, c))");

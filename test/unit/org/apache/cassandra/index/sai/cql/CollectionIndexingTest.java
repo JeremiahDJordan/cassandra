@@ -329,6 +329,22 @@ public class CollectionIndexingTest extends SAITester
     }
 
     @Test
+    public void testMapEntryOnFrozenMapPartitionKey() throws Throwable
+    {
+        createTable("CREATE TABLE %s (fm frozen<map<int, int>> PRIMARY KEY, v int)");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+
+        execute("INSERT INTO %s (fm, v) VALUES (?, 0)", map(1, 2));
+        execute("INSERT INTO %s (fm, v) VALUES (?, 0)", map(1, 3));
+        execute("INSERT INTO %s (fm, v) VALUES (?, 0)", map(2, 2));
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT fm FROM %s WHERE v = 0 AND fm[1] = 2 ALLOW FILTERING"), row(map(1, 2)));
+            assertRows(execute("SELECT fm FROM %s WHERE v = 0 AND fm[1] != 2 ALLOW FILTERING"), row(map(1, 3)));
+        });
+    }
+
+    @Test
     public void testFrozenMapEntriesIndexMapEntry() throws Throwable
     {
         createTable("CREATE TABLE %s (pk int PRIMARY KEY, frozen_map frozen<map<int, text>>)");
