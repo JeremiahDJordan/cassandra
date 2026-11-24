@@ -26,6 +26,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiPredicate;
 import javax.annotation.Nullable;
 
 import com.google.common.base.Preconditions;
@@ -138,6 +139,39 @@ public final class VectorType<T> extends AbstractType<List<T>>
             return this;
 
         return getInstance((AbstractType<T>) subTypes.get(0), dimension);
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> previous)
+    {
+        return isElementCompatibleWith(previous, AbstractType::isCompatibleWith);
+    }
+
+    @Override
+    protected boolean isValueCompatibleWithInternal(AbstractType<?> previous)
+    {
+        return isElementCompatibleWith(previous, AbstractType::isSerializationCompatibleWith);
+    }
+
+    /**
+     * Vectors of the same dimension whose elements hold user types, on either side, follow the compatibility of their
+     * elements, so that {@code ALTER TYPE} reaches vector columns and a dropped column (whose user types are recorded as
+     * tuples) can be added back. Other vectors are only compatible with themselves.
+     */
+    private boolean isElementCompatibleWith(AbstractType<?> previous,
+                                            BiPredicate<AbstractType<?>, AbstractType<?>> elementsCompatible)
+    {
+        if (equals(previous))
+            return true;
+
+        if (!(previous instanceof VectorType))
+            return false;
+
+        VectorType<?> prev = (VectorType<?>) previous;
+        return dimension == prev.dimension &&
+               (elementType.referencesUserTypes() || prev.elementType.referencesUserTypes()) &&
+               elementType.valueLengthIfFixed() == prev.elementType.valueLengthIfFixed() &&
+               elementsCompatible.test(elementType, prev.elementType);
     }
 
     @Override

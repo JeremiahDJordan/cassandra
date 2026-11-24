@@ -36,6 +36,7 @@ import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.schema.CQLTypeParser;
 import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -320,6 +321,45 @@ public class CQLVectorTest extends CQLTester.InMemory
         while (FBUtilities.timestampMicros() == start)
             Thread.sleep(1);
         return FBUtilities.timestampMicros();
+    }
+
+    @Test
+    public void userTypesInVectors() throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int)");
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v vector<frozen<" + udt + ">, 2>, d vector<frozen<" + udt + ">, 2>, " +
+                    "n frozen<list<vector<frozen<" + udt + ">, 2>>>)");
+
+        assertInvalidThrowMessage("Cannot drop user type '" + KEYSPACE + '.' + udt + "' as it is still used by tables " + currentTable(),
+                                  InvalidRequestException.class,
+                                  "DROP TYPE " + KEYSPACE + '.' + udt);
+
+        schemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " RENAME a TO b");
+        execute("INSERT INTO %s (pk, v, d) VALUES (0, [{b: 1}, {b: 2}], [{b: 1}, {b: 2}])");
+        assertRows(execute("SELECT v FROM %s WHERE pk = 0"), row(vector(userType("b", 1), userType("b", 2))));
+        flush();
+        schemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " ADD c text");
+        execute("INSERT INTO %s (pk, v) VALUES (1, [{b: 3, c: 'x'}, {b: 4}])");
+        assertRows(execute("SELECT v FROM %s WHERE pk = 0"), row(vector(userType("b", 1), userType("b", 2))));
+        assertRows(execute("SELECT v FROM %s WHERE pk = 1"), row(vector(userType("b", 3, "c", "x"), userType("b", 4, "c", null))));
+
+        // dropped column types are stored without user types, so that the schema loads after the type is dropped
+        execute("ALTER TABLE %s DROP d");
+        String dropped = execute("SELECT type FROM system_schema.dropped_columns WHERE keyspace_name = ? AND table_name = ? AND column_name = 'd'",
+                                 KEYSPACE, currentTable()).one().getString("type");
+        Assertions.assertThat(CQLTypeParser.parseDroppedType(KEYSPACE, dropped).asCQL3Type().toString()).isEqualTo("vector<tuple<int, text>, 2>");
+        execute("ALTER TABLE %s DROP n");
+        String nested = execute("SELECT type FROM system_schema.dropped_columns WHERE keyspace_name = ? AND table_name = ? AND column_name = 'n'",
+                                KEYSPACE, currentTable()).one().getString("type");
+        Assertions.assertThat(nested).doesNotContain(udt);
+        CQLTypeParser.parseDroppedType(KEYSPACE, nested);
+
+        // the dropped column can be added back with its type, and is read together with the sstable written before
+        execute("ALTER TABLE %s ADD d vector<frozen<" + udt + ">, 2>");
+        execute("INSERT INTO %s (pk, d) VALUES (0, [{b: 5, c: 'y'}, {b: 6}])");
+        flush();
+        compact();
+        assertRows(execute("SELECT toJson(d) FROM %s WHERE pk = 0"), row("[{\"b\": 5, \"c\": \"y\"}, {\"b\": 6, \"c\": null}]"));
     }
 
     @Test
