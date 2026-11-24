@@ -25,6 +25,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiPredicate;
 
 import javax.annotation.Nullable;
 
@@ -110,6 +111,73 @@ public final class VectorType<T> extends AbstractType<List<T>>
     {
         TypeParser.Vector v = parser.getVectorParameters();
         return getInstance(v.type.freeze(), v.dimension);
+    }
+
+    @Override
+    public <V> boolean referencesUserType(V name, ValueAccessor<V> accessor)
+    {
+        return elementType.referencesUserType(name, accessor);
+    }
+
+    @Override
+    public VectorType<?> withUpdatedUserType(UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        instances.remove(new Key(elementType, dimension));
+
+        return getInstance(elementType.withUpdatedUserType(udt), dimension);
+    }
+
+    @Override
+    public AbstractType<?> expandUserTypes()
+    {
+        return getInstance(elementType.expandUserTypes(), dimension);
+    }
+
+    @Override
+    public boolean referencesDuration()
+    {
+        return elementType.referencesDuration();
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> previous)
+    {
+        return isElementCompatibleWith(previous, AbstractType::isCompatibleWith);
+    }
+
+    @Override
+    protected boolean isValueCompatibleWithInternal(AbstractType<?> previous)
+    {
+        return isElementCompatibleWith(previous, AbstractType::isSerializationCompatibleWith);
+    }
+
+    /**
+     * Vectors of the same dimension whose elements hold user types follow the compatibility of their elements, so that
+     * {@code ALTER TYPE} reaches vector columns. Other vectors are only compatible with themselves.
+     */
+    private boolean isElementCompatibleWith(AbstractType<?> previous,
+                                            BiPredicate<AbstractType<?>, AbstractType<?>> elementsCompatible)
+    {
+        if (equals(previous))
+            return true;
+
+        if (!(previous instanceof VectorType))
+            return false;
+
+        VectorType<?> prev = (VectorType<?>) previous;
+        return dimension == prev.dimension &&
+               referencesUserTypes(elementType) &&
+               referencesUserTypes(prev.elementType) &&
+               elementType.valueLengthIfFixed() == prev.elementType.valueLengthIfFixed() &&
+               elementsCompatible.test(elementType, prev.elementType);
+    }
+
+    private static boolean referencesUserTypes(AbstractType<?> type)
+    {
+        return type.isUDT() || type.subTypes().stream().anyMatch(VectorType::referencesUserTypes);
     }
 
     @Override
