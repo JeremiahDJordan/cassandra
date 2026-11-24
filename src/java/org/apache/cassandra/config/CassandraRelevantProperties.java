@@ -979,6 +979,9 @@ public enum CassandraRelevantProperties
     /** Whether to validate terms that will be SAI indexed at the coordinator */
     SAI_VALIDATE_TERMS_AT_COORDINATOR("cassandra.sai.validate_terms_at_coordinator", "true"),
 
+    /** Apache Cassandra 5.0's setting that allows custom vector index graph options, read by the schema compatibility checks. */
+    SAI_VECTOR_ALLOW_CUSTOM_PARAMETERS("cassandra.sai.vector.allow_custom_parameters", "false"),
+
     /**
      * Whether compaction should build vector indexes using a fused graph, i.e. a graph where the quantized vectors
      * are stored inline with the graph nodes (FusedPQ). This is an experimental feature that significantly increases

@@ -486,7 +486,7 @@ public class StorageAttachedIndex implements Index
      * Whether an index on values of the given type has blob terms, i.e. the type is blob or a composite (map entries)
      * with a blob component.
      */
-    private static boolean indexesBlobTerms(AbstractType<?> type)
+    public static boolean indexesBlobTerms(AbstractType<?> type)
     {
         if (TypeUtil.isBytes(type))
             return true;

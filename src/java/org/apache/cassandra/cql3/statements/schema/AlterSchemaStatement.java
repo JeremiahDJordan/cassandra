@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3.statements.schema;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Function;
@@ -33,6 +34,7 @@ import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.QueryState;
@@ -130,7 +132,8 @@ public abstract class AlterSchemaStatement implements CQLStatement.SingleKeyspac
 
         validateKeyspaceName(keyspaceName, AlterSchemaStatement::ire);
 
-        SchemaTransformationResult result = Schema.instance.transform(this, locally);
+        SchemaTransformation transformation = ApacheUpgradePath.isActive() ? compatibleWith(SchemaCompatibility.Target.APACHE_5_0) : this;
+        SchemaTransformationResult result = Schema.instance.transform(transformation, locally);
 
         clientWarnings(result.diff).forEach(ClientWarn.instance::warn);
 
@@ -149,6 +152,21 @@ public abstract class AlterSchemaStatement implements CQLStatement.SingleKeyspac
             createdResources(result.diff).forEach(r -> grantPermissionsOnResource(r, user));
 
         return new ResultMessage.SchemaChange(schemaChangeEvent(result.diff));
+    }
+
+    /**
+     * This statement's transformation, refused when its result has elements {@code target} doesn't read or accept.
+     */
+    private SchemaTransformation compatibleWith(SchemaCompatibility.Target target)
+    {
+        return schema -> {
+            Keyspaces after = apply(schema);
+            List<String> incompatibilities = SchemaCompatibility.incompatibilities(target, schema, after);
+            if (!incompatibilities.isEmpty())
+                throw ire("Refused while the Apache upgrade path is active, as %s doesn't support: %s",
+                          target, String.join("; ", incompatibilities));
+            return after;
+        };
     }
 
     protected void validateDefaultTimeToLive(TableParams params)

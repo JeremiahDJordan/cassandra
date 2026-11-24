@@ -154,6 +154,17 @@ public final class MemtableParams
         return CONFIGURATION_DEFINITIONS.keySet();
     }
 
+    /**
+     * The fully qualified class of the memtable configuration {@code configurationKey}, or null if it isn't defined.
+     */
+    public static String configurationClassName(String configurationKey)
+    {
+        ParameterizedClass definition = CONFIGURATION_DEFINITIONS.get(configurationKey);
+        if (definition == null || definition.class_name == null)
+            return null;
+        return definition.class_name.contains(".") ? definition.class_name : "org.apache.cassandra.db.memtable." + definition.class_name;
+    }
+
     public static MemtableParams get(String key)
     {
         if (key == null)
