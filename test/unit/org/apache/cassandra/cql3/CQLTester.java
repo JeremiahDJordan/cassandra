@@ -47,7 +47,6 @@ import java.util.Set;
 import java.util.TreeSet;
 import java.util.UUID;
 import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -270,7 +269,7 @@ public abstract class CQLTester
     protected static MBeanServerConnection jmxConnection;
 
     protected static int nativePort;
-    private static Randomization random;
+    private static volatile Randomization random;
 
     protected static final InetAddress nativeAddr;
     protected static final Set<InetAddressAndPort> remoteAddrs = new HashSet<>();
@@ -443,7 +442,7 @@ public abstract class CQLTester
         return new JMXServiceURL(String.format("service:jmx:rmi:///jndi/rmi://%s:%d/jmxrmi", jmxHost, jmxPort));
     }
 
-    public static Randomization getRandom()
+    public static synchronized Randomization getRandom()
     {
         if (random == null)
             random = new Randomization();
@@ -3096,8 +3095,7 @@ public abstract class CQLTester
     /** @return a normalized vector with the given dimension */
     public static float[] randomVector(int dimension)
     {
-        // this can be called from concurrent threads so don't use getRandom()
-        ThreadLocalRandom R = ThreadLocalRandom.current();
+        Random R = getRandom().getRandom();
 
         float[] vector = new float[dimension];
         for (int i = 0; i < dimension; i++)
