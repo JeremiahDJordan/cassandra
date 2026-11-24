@@ -86,6 +86,13 @@ public class Operation
             IndexContext indexContext = controller.getContext(e);
             List<Expression> perColumn = analyzed.get(e.column());
 
+            // filtered as it is (see FilterTree), without the CompositeType terms of an entries index
+            if (e instanceof RowFilter.MapComparisonExpression && !indexContext.isIndexed())
+            {
+                perColumn.add(Expression.unindexedMapEntry(indexContext, (RowFilter.MapComparisonExpression) e));
+                continue;
+            }
+
             AbstractAnalyzer.AnalyzerFactory analyzerFactory = indexContext.getQueryAnalyzerFactory();
             AbstractAnalyzer analyzer = analyzerFactory.create();
             try
