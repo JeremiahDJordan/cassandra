@@ -410,7 +410,6 @@ public class ByteSourceConversionTest extends ByteSourceTestBase
                                               Object o1, Object o2,
                                               BiFunction<AbstractType, Object, ByteBuffer> decompose)
     {
-        boolean checkEquals = t1 != DecimalType.instance && t2 != DecimalType.instance;
         EnumSet<ClusteringPrefix.Kind> skippedKinds = EnumSet.of(ClusteringPrefix.Kind.SSTABLE_LOWER_BOUND, ClusteringPrefix.Kind.SSTABLE_UPPER_BOUND);
         for (ClusteringPrefix.Kind k1 : EnumSet.complementOf(skippedKinds))
             {
@@ -422,6 +421,7 @@ public class ByteSourceConversionTest extends ByteSourceTestBase
                 final ByteComparable bsc = comp.asByteComparable(c);
                 logger.info("Clustering {} bytesource {}", c.clusteringString(comp.subtypes()), bsc.byteComparableAsString(version));
                 ClusteringPrefix<?> converted = getClusteringPrefix(accessor, k1, comp, bsc);
+                boolean checkEquals = comp.decodesComparableBytesExactly(c);
                 assertEquals(String.format("Failed compare(%s, converted %s ByteSource %s) == 0\ntype %s",
                                            safeStr(c.clusteringString(comp.subtypes())),
                                            safeStr(converted.clusteringString(comp.subtypes())),
@@ -735,6 +735,13 @@ public class ByteSourceConversionTest extends ByteSourceTestBase
                                    bs1.byteComparableAsString(version)),
                      0,
                      type.compare(b1, actual));
+        if (type.decodesComparableBytesExactly(b1, ByteBufferAccessor.instance))
+            assertEquals(String.format("Failed equals(%s, converted %s (bytesource %s))",
+                                       ByteBufferUtil.bytesToHex(b1),
+                                       ByteBufferUtil.bytesToHex(actual),
+                                       bs1.byteComparableAsString(version)),
+                         b1,
+                         actual);
     }
 
     public void testDecoratedKeys(IPartitioner type, List<ByteBuffer> values)
@@ -814,6 +821,14 @@ public class ByteSourceConversionTest extends ByteSourceTestBase
         final ByteComparable bc1 = typeToComparable(type, b1);
         ByteBuffer convertedBuffer = type.fromComparableBytes(source(bc1), version);
         T actual = type.compose(convertedBuffer);
+        if (type.decodesComparableBytesExactly(b1, ByteBufferAccessor.instance))
+            assertEquals(String.format("Failed exact decoding %s(%s bs %s), got %s",
+                                       safeStr(v1),
+                                       ByteBufferUtil.bytesToHex(b1),
+                                       safeStr(bc1.byteComparableAsString(version)),
+                                       ByteBufferUtil.bytesToHex(convertedBuffer)),
+                         b1,
+                         convertedBuffer);
 
         assertEquals(String.format("Failed equals %s(%s bs %s), got %s",
                                    safeStr(v1),

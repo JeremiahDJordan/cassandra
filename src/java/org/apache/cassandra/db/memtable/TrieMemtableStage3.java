@@ -33,6 +33,7 @@ import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.partitions.OriginalClusterings;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.TrieBackedPartitionStage3;
@@ -45,6 +46,8 @@ import org.apache.cassandra.db.tries.DeletionAwareTrie;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryBaseTrie;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
+import org.apache.cassandra.db.tries.InMemoryTrie;
+import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.db.tries.TrieEntriesWalker;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.db.tries.TrieTailsIterator;
@@ -104,11 +107,15 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
     /// [org.apache.cassandra.db.tries.InMemoryTrie] methods.
     private final DeletionAwareTrie<Object, TrieTombstoneMarker> mergedTrie;
 
+    /// A merged view of the shards' [MemtableShard#originalClusterings], null if the table has none.
+    private final Trie<byte[][]> mergedOriginalClusterings;
+
     TrieMemtableStage3(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadataRef, Owner owner, Integer shardCountOption)
     {
         super(commitLogLowerBound, metadataRef, owner, shardCountOption);
         this.shards = generatePartitionShards(boundaries.shardCount(), metadataRef, metrics, owner.readOrdering());
         this.mergedTrie = makeMergedTrie(shards);
+        this.mergedOriginalClusterings = makeMergedOriginalClusterings(shards);
         logger.trace("Created memtable with {} shards", this.shards.length);
     }
 
@@ -141,6 +148,16 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
         return DeletionAwareTrie.mergeDistinct(tries);
     }
 
+    private static Trie<byte[][]> makeMergedOriginalClusterings(MemtableShard[] shards)
+    {
+        if (shards[0].originalClusterings == null)
+            return null;
+        List<Trie<byte[][]>> tries = new ArrayList<>(shards.length);
+        for (MemtableShard shard : shards)
+            tries.add(shard.originalClusterings);
+        return Trie.mergeDistinct(tries);
+    }
+
     @Override
     public UnfilteredPartitionIterator partitionIterator(final ColumnFilter columnFilter,
                                                          final DataRange dataRange,
@@ -158,7 +175,7 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
 
         TableMetadata metadata = metadata();
         return new MemtableUnfilteredPartitionIterator(metadata,
-                                                       new PartitionIterator(subMap, metadata, allocator.ensureOnHeap()),
+                                                       new PartitionIterator(subMap, mergedOriginalClusterings, metadata, allocator.ensureOnHeap()),
                                                        columnFilter,
                                                        dataRange,
                                                        getMinLocalDeletionTime());
@@ -171,12 +188,12 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
 
     public Partition getPartition(DecoratedKey key)
     {
-        int shardIndex = boundaries.getShardForKey(key);
-        DeletionAwareTrie<Object, TrieTombstoneMarker> trie = shards[shardIndex].data.tailTrie(key);
-        return createPartition(metadata(), allocator.ensureOnHeap(), key, trie);
+        MemtableShard shard = shards[boundaries.getShardForKey(key)];
+        DeletionAwareTrie<Object, TrieTombstoneMarker> trie = shard.data.tailTrie(key);
+        return createPartition(metadata(), allocator.ensureOnHeap(), key, trie, shard.originalClusterings);
     }
 
-    private static TrieBackedPartitionStage3 createPartition(TableMetadata metadata, EnsureOnHeap ensureOnHeap, DecoratedKey key, DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
+    private static TrieBackedPartitionStage3 createPartition(TableMetadata metadata, EnsureOnHeap ensureOnHeap, DecoratedKey key, DeletionAwareTrie<Object, TrieTombstoneMarker> trie, Trie<byte[][]> originalClusterings)
     {
         if (trie == null)
             return null;
@@ -192,6 +209,7 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
                                                 holder.rowCountIncludingStatic(),
                                                 holder.tombstoneCount(),
                                                 trie,
+                                                originalClusterings != null ? originalClusterings.tailTrie(key) : null,
                                                 metadata,
                                                 ensureOnHeap);
     }
@@ -325,7 +343,7 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
 
             public Iterator<TrieBackedPartitionStage3> iterator()
             {
-                return new PartitionIterator(toFlush, metadata(), EnsureOnHeap.NOOP);
+                return new PartitionIterator(toFlush, mergedOriginalClusterings, metadata(), EnsureOnHeap.NOOP);
             }
 
             public long partitionKeysSize()
@@ -337,6 +355,12 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
 
     public static class MemtableShard extends AbstractMemtableShard<InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>, TriePartitionUpdaterStage3>
     {
+        /// The [OriginalClusterings] values of the deleted rows and range tombstone bounds in [#data], by the same
+        /// paths. Null if the table's clustering comparator decodes them exactly.
+        final InMemoryTrie<byte[][]> originalClusterings;
+        /// The on-heap space [#originalClusterings] took in the last update, to be charged whether it succeeded or not.
+        private long originalClusteringsSizeToCharge;
+
         MemtableShard(TableMetadataRef metadata, TrieMemtableMetricsView metrics, OpOrder opOrder)
         {
             this(metadata, AbstractAllocatorMemtable.MEMORY_POOL.newAllocator(metadata.toString()), metrics, opOrder);
@@ -346,6 +370,9 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
         {
             super(metadata, allocator, metrics,
                   InMemoryDeletionAwareTrie.longLived(TrieBackedPartitionStage3.BYTE_COMPARABLE_VERSION, BUFFER_TYPE, opOrder));
+            this.originalClusterings = metadata.get().comparator.decodesComparableBytesExactly()
+                                       ? null
+                                       : InMemoryTrie.shortLived(TrieBackedPartitionStage3.BYTE_COMPARABLE_VERSION);
         }
 
         @Override
@@ -355,9 +382,46 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
         }
 
         @Override
+        protected boolean reachedAllocatedSizeThreshold()
+        {
+            return super.reachedAllocatedSizeThreshold() || originalClusterings != null && originalClusterings.reachedAllocatedSizeThreshold();
+        }
+
+        @Override
+        protected long takeAuxiliaryOnHeapSize()
+        {
+            long size = originalClusteringsSizeToCharge;
+            originalClusteringsSizeToCharge = 0;
+            return size;
+        }
+
+        @Override
         protected void applyUpdate(TriePartitionUpdaterStage3 updater, PartitionUpdate update) throws TrieSpaceExhaustedException
         {
-            updater.apply(TriePartitionUpdateStage3.asMergableTrie(update));
+            TriePartitionUpdateStage3 trieUpdate = TriePartitionUpdateStage3.asTrieUpdate(update);
+            if (originalClusterings == null || trieUpdate.originalClusterings() == null)
+            {
+                updater.apply(TriePartitionUpdateStage3.asMergableTrie(trieUpdate));
+                return;
+            }
+
+            OriginalClusterings.Staging staging = new OriginalClusterings.Staging(originalClusterings);
+            updater.setOriginalClusterings(trieUpdate.originalClusterings());
+            try
+            {
+                staging.addAll(update.partitionKey(), trieUpdate.originalClusterings());
+                updater.apply(TriePartitionUpdateStage3.asMergableTrie(trieUpdate));
+            }
+            catch (Throwable t)
+            {
+                staging.rollback(t);
+                throw t;
+            }
+            finally
+            {
+                // The trie keeps the space of the entries a failed update removes.
+                originalClusteringsSizeToCharge = staging.size();
+            }
         }
 
         @Override
@@ -381,11 +445,13 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
 
     static class PartitionIterator extends TrieTailsIterator.DeletionAwareWithoutCoveringDeletions<Object, TrieTombstoneMarker, TrieBackedPartitionStage3>
     {
+        final Trie<byte[][]> originalClusterings;
         final TableMetadata metadata;
         final EnsureOnHeap ensureOnHeap;
-        PartitionIterator(DeletionAwareTrie<Object, TrieTombstoneMarker> source, TableMetadata metadata, EnsureOnHeap ensureOnHeap)
+        PartitionIterator(DeletionAwareTrie<Object, TrieTombstoneMarker> source, Trie<byte[][]> originalClusterings, TableMetadata metadata, EnsureOnHeap ensureOnHeap)
         {
             super(source, Direction.FORWARD, PartitionData.class::isInstance);
+            this.originalClusterings = originalClusterings;
             this.metadata = metadata;
             this.ensureOnHeap = ensureOnHeap;
         }
@@ -404,6 +470,7 @@ public class TrieMemtableStage3 extends AbstractTrieMemtable
                                                     pd.rowCountIncludingStatic(),
                                                     pd.tombstoneCount(),
                                                     tailTrie,
+                                                    originalClusterings != null ? originalClusterings.tailTrie(key) : null,
                                                     metadata,
                                                     ensureOnHeap);
         }

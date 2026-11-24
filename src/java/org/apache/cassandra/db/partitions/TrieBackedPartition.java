@@ -22,6 +22,7 @@ import java.util.Iterator;
 import java.util.NavigableSet;
 import java.util.function.BiFunction;
 import java.util.function.Predicate;
+import javax.annotation.Nullable;
 
 import com.google.common.base.Predicates;
 import com.google.common.primitives.Ints;
@@ -51,6 +52,7 @@ import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryBaseTrie;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.db.tries.RangeTrie;
+import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.db.tries.TrieSet;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.db.tries.TrieTailsIterator;
@@ -112,6 +114,10 @@ public class TrieBackedPartition implements Partition
     /// Number of tombstone boundary pairs on the row-level or above: partition, range and row tombstones.
     protected final int tombstoneCount;
     protected final DeletionAwareTrie<Object, TrieTombstoneMarker> staticRowTrie;
+    /// The [OriginalClusterings] values of the clusterings and range tombstone bounds of the partition, by path, or
+    /// null if there are none.
+    @Nullable
+    protected final Trie<byte[][]> originalClusterings;
 
     public TrieBackedPartition(DecoratedKey partitionKey,
                                RegularAndStaticColumns columns,
@@ -121,6 +127,19 @@ public class TrieBackedPartition implements Partition
                                DeletionAwareTrie<Object, TrieTombstoneMarker> trie,
                                TableMetadata metadata)
     {
+        this(partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, null, metadata);
+    }
+
+    public TrieBackedPartition(DecoratedKey partitionKey,
+                               RegularAndStaticColumns columns,
+                               EncodingStats stats,
+                               int rowCountIncludingStatic,
+                               int tombstoneCount,
+                               DeletionAwareTrie<Object, TrieTombstoneMarker> trie,
+                               @Nullable Trie<byte[][]> originalClusterings,
+                               TableMetadata metadata)
+    {
+        this.originalClusterings = originalClusterings;
         this.partitionKey = partitionKey;
         this.trie = trie;
         this.metadata = metadata;
@@ -157,6 +176,7 @@ public class TrieBackedPartition implements Partition
                                        builder.rowCountIncludingStatic(),
                                        builder.tombstoneCount(),
                                        builder.trie(),
+                                       builder.originalClusterings(),
                                        iterator.metadata());
     }
 
@@ -180,13 +200,14 @@ public class TrieBackedPartition implements Partition
                                              int rowCountIncludingStatic,
                                              int tombstoneCount,
                                              DeletionAwareTrie<Object, TrieTombstoneMarker> trie,
+                                             @Nullable Trie<byte[][]> originalClusterings,
                                              TableMetadata metadata,
                                              TableMetadata droppedColumnsSource,
                                              boolean copyToHeap)
     {
         return copyToHeap
-               ? new WithCopyingToHeap(partitionKey, columnMetadata, encodingStats, rowCountIncludingStatic, tombstoneCount, trie, metadata, droppedColumnsSource)
-               : new WithDroppedColumnsSource(partitionKey, columnMetadata, encodingStats, rowCountIncludingStatic, tombstoneCount, trie, metadata, droppedColumnsSource);
+               ? new WithCopyingToHeap(partitionKey, columnMetadata, encodingStats, rowCountIncludingStatic, tombstoneCount, trie, originalClusterings, metadata, droppedColumnsSource)
+               : new WithDroppedColumnsSource(partitionKey, columnMetadata, encodingStats, rowCountIncludingStatic, tombstoneCount, trie, originalClusterings, metadata, droppedColumnsSource);
     }
 
     /// Implementation of an iterator over rows. Note that because the legacy containers store deleted rows as [Row]s
@@ -436,7 +457,12 @@ public class TrieBackedPartition implements Partition
     public Row getRow(Clustering<?> clustering)
     {
         // getRow must return range and partition deletion applicable to the row
-        return toRow(trie.tailTrie(path(clustering), true), clustering);
+        ByteComparable path = path(clustering);
+        DeletionAwareTrie<Object, TrieTombstoneMarker> rowTrie = trie.tailTrie(path, true);
+        if (rowTrie == null)
+            return null;
+        Clustering<?> written = OriginalClusterings.written(originalClusterings, metadata.comparator, ByteBufferAccessor.instance, path);
+        return toRow(rowTrie, written != null ? written : clustering);
     }
 
     @Override
@@ -447,10 +473,10 @@ public class TrieBackedPartition implements Partition
 
     private Clustering<?> getClustering(byte[] bytes, int byteLength)
     {
-        return metadata.comparator.clusteringFromByteComparable(ByteBufferAccessor.instance,
-                                                                ByteComparable.preencoded(BYTE_COMPARABLE_VERSION,
-                                                                                          bytes, 0, byteLength),
-                                                                BYTE_COMPARABLE_VERSION);
+        return OriginalClusterings.clustering(originalClusterings,
+                                              metadata.comparator,
+                                              ByteBufferAccessor.instance,
+                                              ByteComparable.preencoded(BYTE_COMPARABLE_VERSION, bytes, 0, byteLength));
     }
 
     /// Combine live and deletion branch markers to identify row roots in the trie. Must return non-null when a row
@@ -485,6 +511,13 @@ public class TrieBackedPartition implements Partition
     protected TableMetadata droppedColumnsSource()
     {
         return metadata;
+    }
+
+    /// The [OriginalClusterings] values of this partition, by path, or null if there are none.
+    @Nullable
+    public Trie<byte[][]> originalClusterings()
+    {
+        return originalClusterings;
     }
 
     /// Implementation of [UnfilteredRowIterator] for this partition.
@@ -536,10 +569,11 @@ public class TrieBackedPartition implements Partition
             {
                 // Range or partition deletion marker.
                 // The method below will present only range tombstones, identified by their marker kind.
-                return ((TrieTombstoneMarker) content).toRangeTombstoneMarker(
-                    ByteComparable.preencoded(BYTE_COMPARABLE_VERSION, bytes, 0, byteLength),
-                    BYTE_COMPARABLE_VERSION,
-                    metadata.comparator);
+                ByteComparable path = ByteComparable.preencoded(BYTE_COMPARABLE_VERSION, bytes, 0, byteLength);
+                RangeTombstoneMarker marker = ((TrieTombstoneMarker) content).toRangeTombstoneMarker(path,
+                                                                                                    BYTE_COMPARABLE_VERSION,
+                                                                                                    metadata.comparator);
+                return OriginalClusterings.withOriginalValues(marker, originalClusterings, path);
             }
         }
 
@@ -649,9 +683,9 @@ public class TrieBackedPartition implements Partition
     {
         final TableMetadata droppedColumnsSource;
 
-        public WithDroppedColumnsSource(DecoratedKey partitionKey, RegularAndStaticColumns columns, EncodingStats stats, int rowCountIncludingStatic, int tombstoneCount, DeletionAwareTrie<Object, TrieTombstoneMarker> trie, TableMetadata metadata, TableMetadata droppedColumnsSource)
+        public WithDroppedColumnsSource(DecoratedKey partitionKey, RegularAndStaticColumns columns, EncodingStats stats, int rowCountIncludingStatic, int tombstoneCount, DeletionAwareTrie<Object, TrieTombstoneMarker> trie, Trie<byte[][]> originalClusterings, TableMetadata metadata, TableMetadata droppedColumnsSource)
         {
-            super(partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, metadata);
+            super(partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, originalClusterings, metadata);
             this.droppedColumnsSource = droppedColumnsSource;
         }
 
@@ -671,10 +705,11 @@ public class TrieBackedPartition implements Partition
                                  int rowCountIncludingStatic,
                                  int tombstoneCount,
                                  DeletionAwareTrie<Object, TrieTombstoneMarker> trie,
+                                 Trie<byte[][]> originalClusterings,
                                  TableMetadata metadata,
                                  TableMetadata droppedColumnsSource)
         {
-            super(partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, metadata, droppedColumnsSource);
+            super(partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, originalClusterings, metadata, droppedColumnsSource);
         }
 
         /// Copies the row to the heap as a `BTreeRow`, built directly from the trie cells. Readers of memtable data
@@ -751,6 +786,7 @@ public class TrieBackedPartition implements Partition
 
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie;
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Object, TrieTombstoneMarker> mutator;
+        private final OriginalClusterings.Builder originalClusterings;
 
         private final boolean collectDataSize;
 
@@ -768,6 +804,7 @@ public class TrieBackedPartition implements Partition
 
             this.trie = newTrieWithPartitionMarker();
             this.mutator = makeNoConflictMutator(this.trie);
+            this.originalClusterings = OriginalClusterings.builder(comparator);
 
             this.collectDataSize = collectDataSize;
 
@@ -797,6 +834,8 @@ public class TrieBackedPartition implements Partition
             // constructor relies on this to decide whether to exclude the static row from the row count.
             if (putInTrie(mutator, metadata, comparator, row))
                 ++rowCountIncludingStatic;
+            if (originalClusterings != null)
+                originalClusterings.add(row.clustering());
             if (collectDataSize)
                 dataSize += row.dataSize();
             if (!row.deletion().isLive())
@@ -806,6 +845,8 @@ public class TrieBackedPartition implements Partition
 
         public ContentBuilder addRangeTombstoneMarker(RangeTombstoneMarker unfiltered)
         {
+            if (originalClusterings != null)
+                originalClusterings.add(unfiltered.clustering());
             if (openMarker != null)
             {
                 // This will check that unfiltered closes openMarker
@@ -844,6 +885,12 @@ public class TrieBackedPartition implements Partition
         public InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie()
         {
             return trie;
+        }
+
+        @Nullable
+        public Trie<byte[][]> originalClusterings()
+        {
+            return originalClusterings != null ? originalClusterings.build() : null;
         }
 
         public int rowCountIncludingStatic()

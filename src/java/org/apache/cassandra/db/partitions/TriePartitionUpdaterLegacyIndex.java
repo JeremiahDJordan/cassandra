@@ -36,6 +36,7 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.TrieBackedRow;
 import org.apache.cassandra.db.rows.TrieTombstoneMarker;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
+import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.index.transactions.UpdateTransaction;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -67,6 +68,10 @@ public final class TriePartitionUpdaterLegacyIndex extends TriePartitionUpdater
     /// Set when we pass through a row marker ([LivenessInfo] or [TrieTombstoneMarker.LevelMarker.ROW]), which always
     /// happens before seeing any of the columns and cells of the update.
     private Columns currentColumns;
+    /// The [OriginalClusterings] values of the partition being updated, by path, or null if there are none.
+    private Trie<byte[][]> originalClusterings;
+    /// The [OriginalClusterings] values of the update, by path, or null if there are none.
+    private Trie<byte[][]> updateOriginalClusterings;
 
     public TriePartitionUpdaterLegacyIndex(TrieMemtable.MemtableShard owner,
                                            InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> data,
@@ -82,6 +87,22 @@ public final class TriePartitionUpdaterLegacyIndex extends TriePartitionUpdater
         this.indexer = indexer;
         this.rangeTombstoneOpenPosition = null;
         assert indexer != UpdateTransaction.NO_OP;
+    }
+
+    /// Set the [OriginalClusterings] values of the partition to update and of the update, by path. Rows are reported
+    /// with the clusterings of the partition, range tombstones with the bounds of the update.
+    public void setOriginalClusterings(Trie<byte[][]> originalClusterings, Trie<byte[][]> updateOriginalClusterings)
+    {
+        this.originalClusterings = originalClusterings;
+        this.updateOriginalClusterings = updateOriginalClusterings;
+    }
+
+    /// Release the references to the last update kept by this updater, which the memtable keeps for later updates.
+    public void clearOriginalClusterings()
+    {
+        this.originalClusterings = null;
+        this.updateOriginalClusterings = null;
+        this.rangeTombstoneOpenPosition = null;
     }
 
     @Override
@@ -101,9 +122,10 @@ public final class TriePartitionUpdaterLegacyIndex extends TriePartitionUpdater
 
     private void processRowDeletionUpdate(DeletionTime existing, DeletionTime updated)
     {
-        Clustering<?> clustering = metadata.comparator.clusteringFromByteComparable(
-            ByteArrayAccessor.instance,
-            byteComparableForCurrentDeletionBranchKey());
+        Clustering<?> clustering = OriginalClusterings.clustering(originalClusterings,
+                                                                  metadata.comparator,
+                                                                  ByteArrayAccessor.instance,
+                                                                  byteComparableForCurrentDeletionBranchKey());
 
         Row.Deletion updatedDeletion = updated != null ? Row.Deletion.regular(updated) : Row.Deletion.LIVE;
         if (existing == null)
@@ -157,10 +179,7 @@ public final class TriePartitionUpdaterLegacyIndex extends TriePartitionUpdater
             // We have an active range. The incoming marker's left side must close it. Combine with the start
             // position to form the tombstone range we report to the indexer.
             assert leftSide != null; // open markers are always closed
-            ClusteringBound<?> bound = metadata.comparator.boundFromByteComparable(
-                ByteArrayAccessor.instance,
-                deletionBranchKey,
-                true);
+            ClusteringBound<?> bound = OriginalClusterings.bound(updateOriginalClusterings, metadata.comparator, deletionBranchKey, true);
             indexer.onRangeTombstone(new RangeTombstone(Slice.make(rangeTombstoneOpenPosition,
                                                                    bound),
                                                         leftSide));
@@ -173,10 +192,7 @@ public final class TriePartitionUpdaterLegacyIndex extends TriePartitionUpdater
             // The right side of the marker tells us if this boundary opens a new deletion. If so, store the
             // position to report the range when it closes.
             // Note: we don't need to save the deletion time as the closing side will repeat it.
-            rangeTombstoneOpenPosition = metadata.comparator.boundFromByteComparable(
-                ByteArrayAccessor.instance,
-                deletionBranchKey,
-                false);
+            rangeTombstoneOpenPosition = OriginalClusterings.bound(updateOriginalClusterings, metadata.comparator, deletionBranchKey, false);
         }
         else
             rangeTombstoneOpenPosition = null;
@@ -261,7 +277,8 @@ public final class TriePartitionUpdaterLegacyIndex extends TriePartitionUpdater
         {
             mergedAsCell = TrieBackedRow.cellFromCellData(mergedCellData, cellPath, cellPath.length, currentColumns);
             if (existing != null)
-                existingAsCell = existing.toCell(mergedAsCell.column(), mergedAsCell.path());
+                existingAsCell = existing.toCell(mergedAsCell.column(),
+                                                 mergedAsCell.path() != null ? TrieBackedRow.foundCellPath(mergedAsCell.column(), existing, mergedAsCell.path()) : null);
         }
         else
         {
@@ -281,9 +298,10 @@ public final class TriePartitionUpdaterLegacyIndex extends TriePartitionUpdater
 
     private Clustering<?> clusteringForCurrentKey()
     {
-        return metadata.comparator.clusteringFromByteComparable(
-            ByteArrayAccessor.instance,
-            ByteComparable.preencoded(mutator.byteComparableVersion(),
-                                      mutator.getCurrentKeyBytes(currentPartitionDepth)));
+        return OriginalClusterings.clustering(originalClusterings,
+                                              metadata.comparator,
+                                              ByteArrayAccessor.instance,
+                                              ByteComparable.preencoded(mutator.byteComparableVersion(),
+                                                                        mutator.getCurrentKeyBytes(currentPartitionDepth)));
     }
 }
