@@ -1673,11 +1673,32 @@ public class TableMetadata implements SchemaElement
         return builder.toString();
     }
 
+    /**
+     * Returns the statement creating this table for other nodes to apply, such as the statement written to the
+     * metadata log: unlike {@link #toCqlString}, it has auto_repair whatever this node's auto-repair scheduling setting.
+     */
+    public String toCqlStringWithAutoRepair(boolean withDroppedColumns, boolean withInternals, boolean ifNotExists)
+    {
+        CqlBuilder builder = new CqlBuilder(2048);
+        appendCqlTo(builder, false, withDroppedColumns, withInternals, ifNotExists, true);
+        return builder.toString();
+    }
+
     public void appendCqlTo(CqlBuilder builder,
                             boolean withWarnings,
                             boolean includeDroppedColumns,
                             boolean withInternals,
                             boolean ifNotExists)
+    {
+        appendCqlTo(builder, withWarnings, includeDroppedColumns, withInternals, ifNotExists, false);
+    }
+
+    void appendCqlTo(CqlBuilder builder,
+                     boolean withWarnings,
+                     boolean includeDroppedColumns,
+                     boolean withInternals,
+                     boolean ifNotExists,
+                     boolean withAutoRepair)
     {
         assert !isView();
 
@@ -1714,7 +1735,7 @@ public class TableMetadata implements SchemaElement
         builder.append(" WITH ")
                .increaseIndent();
 
-        appendTableOptions(builder, withInternals);
+        appendTableOptions(builder, withInternals, withAutoRepair);
 
         builder.decreaseIndent();
 
@@ -1796,7 +1817,7 @@ public class TableMetadata implements SchemaElement
         builder.append(')').newLine();
     }
 
-    void appendTableOptions(CqlBuilder builder, boolean withInternals)
+    void appendTableOptions(CqlBuilder builder, boolean withInternals, boolean withAutoRepair)
     {
         if (withInternals)
             builder.append("ID = ")
@@ -1819,7 +1840,7 @@ public class TableMetadata implements SchemaElement
         }
         else
         {
-            params.appendCqlTo(builder, isView());
+            params.appendCqlTo(builder, isView(), withAutoRepair);
         }
         builder.append(";");
     }
@@ -2053,11 +2074,12 @@ public class TableMetadata implements SchemaElement
         }
 
         @Override
-        public void appendCqlTo(CqlBuilder builder,
-                                boolean withWarnings,
-                                boolean includeDroppedColumns,
-                                boolean internals,
-                                boolean ifNotExists)
+        void appendCqlTo(CqlBuilder builder,
+                         boolean withWarnings,
+                         boolean includeDroppedColumns,
+                         boolean internals,
+                         boolean ifNotExists,
+                         boolean withAutoRepair)
         {
             if (withWarnings)
             {
@@ -2074,7 +2096,7 @@ public class TableMetadata implements SchemaElement
                        .newLine();
             }
 
-            super.appendCqlTo(builder, withWarnings, includeDroppedColumns, internals, ifNotExists);
+            super.appendCqlTo(builder, withWarnings, includeDroppedColumns, internals, ifNotExists, withAutoRepair);
 
             if (withWarnings)
             {
@@ -2084,7 +2106,7 @@ public class TableMetadata implements SchemaElement
         }
 
         @Override
-        void appendTableOptions(CqlBuilder builder, boolean withInternals)
+        void appendTableOptions(CqlBuilder builder, boolean withInternals, boolean withAutoRepair)
         {
             builder.append("COMPACT STORAGE")
                    .newLine()
@@ -2118,7 +2140,7 @@ public class TableMetadata implements SchemaElement
             }
             else
             {
-                params.appendCqlTo(builder, isView());
+                params.appendCqlTo(builder, isView(), withAutoRepair);
             }
             builder.append(";");
         }

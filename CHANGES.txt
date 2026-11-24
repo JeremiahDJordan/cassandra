@@ -1,4 +1,5 @@
 6.0-alpha3
+ * Write auto_repair into the CQL other nodes apply for CREATE TABLE and CREATE TABLE LIKE whatever the auto-repair scheduling setting (CASSANDRA-XXXXX)
  * Load cluster metadata snapshots with a memtable configuration the node does not define (CASSANDRA-XXXXX)
  * Serialize the auto_repair table parameters in cluster metadata (CASSANDRA-XXXXX)
  * Fix equals and hashCode of column constraints and document removal of custom constraint providers with TCM (CASSANDRA-21879)
