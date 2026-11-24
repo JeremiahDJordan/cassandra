@@ -31,15 +31,19 @@ import java.util.Map;
 import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
 
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 import com.google.common.primitives.Bytes;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.After;
+import org.junit.AfterClass;
 import org.junit.Assert;
 import org.junit.Assume;
 import org.junit.BeforeClass;
@@ -62,6 +66,7 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.SinglePartitionSliceCommandTest;
 import org.apache.cassandra.db.compaction.CompactionManager;
+import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.repair.PendingAntiCompaction;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
@@ -92,9 +97,12 @@ import org.apache.cassandra.streaming.OutgoingStream;
 import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.streaming.StreamPlan;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.OutputHandler;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.TimeUUID;
 import org.assertj.core.api.SoftAssertions;
 
@@ -105,6 +113,7 @@ import static org.apache.cassandra.service.ActiveRepairService.NO_PENDING_REPAIR
 import static org.apache.cassandra.service.ActiveRepairService.UNREPAIRED_SSTABLE;
 import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -138,14 +147,36 @@ public class LegacySSTableTest
      * Sequence numbers represent the C* version used when creating the SSTable, i.e. with #testGenerateSstables()
      */
     public static String[] legacyVersions = null;
+    private static int noSpamLoggerIntervalsSkipped;
 
-    // Get all versions up to the current one. Useful for testing in compatibility mode C18301
+    // Get all versions the node reads, which depends on the storage compatibility mode (C18301)
     private static String[] getValidLegacyVersions()
     {
+        return getShippedLegacyVersions().stream()
+                                         .filter(v -> getLegacyFormat(v).getVersion(v).isCompatible())
+                                         .toArray(String[]::new);
+    }
+
+    private static List<String> getShippedLegacyVersions()
+    {
         return ALL_VERSIONS.stream()
-                           .filter(v -> DatabaseDescriptor.getSelectedSSTableFormat().getVersion(v).isCompatible())
                            .filter(v -> new File(LEGACY_SSTABLE_ROOT, v + "/" + LEGACY_TABLES_KEYSPACE).isDirectory())
-                           .toArray(String[]::new);
+                           .collect(Collectors.toList());
+    }
+
+    // the shipped versions of a later major version than the releases of storage compatibility mode HCD_1 read in
+    // their format: big nb, bti cc
+    private static List<String> getNewerLegacyVersions()
+    {
+        return getShippedLegacyVersions().stream()
+                                         .filter(v -> v.charAt(0) > (BigFormat.is(getLegacyFormat(v)) ? BigFormat.STORAGE_COMPATIBILITY_4_VERSION : BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION).charAt(0))
+                                         .collect(Collectors.toList());
+    }
+
+    // the legacy sstables of versions aa to da are bti sstables, those of versions ma to oa big sstables
+    private static SSTableFormat<?, ?> getLegacyFormat(String legacyVersion)
+    {
+        return legacyVersion.compareTo("m") < 0 ? BtiFormat.getInstance() : BigFormat.getInstance();
     }
 
     // 1200 chars
@@ -330,7 +361,8 @@ public class LegacySSTableTest
     {
         for (String legacyVersion : legacyVersions)
         {
-            if ('m' <= legacyVersion.charAt(0))
+            // the versions before cc have no clust_be_index_summary table
+            if (legacyVersion.compareTo("cc") >= 0)
             {
                 logger.info("Loading legacy version: {}", legacyVersion);
                 truncateLegacyTables(legacyVersion);
@@ -341,6 +373,7 @@ public class LegacySSTableTest
                 if (Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore(String.format("legacy_%s_simple", legacyVersion)).getLiveSSTables().stream().anyMatch(sstr -> BigFormat.is(sstr.descriptor.getFormat())))
                     verifyCache(legacyVersion, startCount);
                 compactLegacyTables(legacyVersion);
+                verifyReads(legacyVersion);
             }
         }
     }
@@ -796,6 +829,197 @@ public class LegacySSTableTest
     }
 
     @Test
+    public void testReadableVersions()
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        Assume.assumeFalse("CASSANDRA_4 doesn't read big oa", mode == StorageCompatibilityMode.CASSANDRA_4);
+        assertThat(legacyVersions).containsExactlyElementsOf(getShippedLegacyVersions());
+
+        try
+        {
+            for (String legacyVersion : getNewerLegacyVersions())
+            {
+                File file = getTestDataTableDir(legacyVersion, String.format("legacy_%s_simple", legacyVersion)).tryList()[0];
+                DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_4);
+                if (BigFormat.is(getLegacyFormat(legacyVersion)))
+                    assertThatThrownBy(() -> Descriptor.fromFilename(file))
+                    .isInstanceOf(IllegalArgumentException.class)
+                    .hasMessageContaining("is newer than storage_compatibility_mode CASSANDRA_4");
+                else
+                    assertThat(Descriptor.fromFilename(file).version.isNewerThanStorageCompatibilityMode()).describedAs(legacyVersion).isFalse();
+                DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.HCD_1);
+                assertThat(Descriptor.fromFilename(file).version.isNewerThanStorageCompatibilityMode()).describedAs(legacyVersion).isTrue();
+                DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.UPGRADING);
+                assertThat(Descriptor.fromFilename(file).version.isNewerThanStorageCompatibilityMode()).describedAs(legacyVersion).isFalse();
+            }
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
+    }
+
+    /**
+     * HCD_1 reads the {@code oa} and {@code da} sstables, warns that a downgrade isn't possible while they exist when
+     * they are added, and {@code nodetool upgradesstables -a} rewrites them in versions it writes.
+     */
+    @Test
+    public void testRewriteNewerVersionsForStorageCompatibilityMode() throws Exception
+    {
+        Assume.assumeTrue("HCD_1 reads the versions newer than those it writes", DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1);
+
+        skipNoSpamLoggerInterval();
+        ListAppender<ILoggingEvent> warnings = new ListAppender<>();
+        warnings.start();
+        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(Tracker.class)).addAppender(warnings);
+        List<String> newerVersions = getNewerLegacyVersions();
+        try
+        {
+            for (String legacyVersion : newerVersions)
+                loadLegacyTables(legacyVersion);
+        }
+        finally
+        {
+            ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(Tracker.class)).detachAppender(warnings);
+            warnings.stop();
+        }
+        List<ColumnFamilyStore> tables = Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStores().stream()
+                                                 .filter(cfs -> !cfs.getLiveSSTables().isEmpty())
+                                                 .collect(Collectors.toList());
+        assertThat(tables).isNotEmpty();
+        for (ColumnFamilyStore cfs : tables)
+        {
+            for (SSTableReader sstable : cfs.getLiveSSTables())
+                assertThat(sstable.descriptor.version.isNewerThanStorageCompatibilityMode()).describedAs(sstable.toString()).isTrue();
+            assertThat(warnings.list).describedAs(cfs.name)
+                                     .filteredOn(e -> isNewerVersionsWarning(e, cfs.name))
+                                     .hasSize(1);
+        }
+
+        for (ColumnFamilyStore cfs : tables)
+        {
+            assertEquals(CompactionManager.AllSSTableOpStatus.SUCCESSFUL, cfs.sstablesRewrite(false, Long.MAX_VALUE, false, 1));
+            for (SSTableReader sstable : cfs.getLiveSSTables())
+            {
+                assertThat(sstable.descriptor.version).describedAs(sstable.toString()).isEqualTo(DatabaseDescriptor.getSelectedSSTableFormat().getLatestVersion());
+                assertThat(sstable.descriptor.version.isNewerThanStorageCompatibilityMode()).describedAs(sstable.toString()).isFalse();
+            }
+        }
+        for (String legacyVersion : newerVersions)
+            verifyReads(legacyVersion);
+    }
+
+    /**
+     * HCD_1 warns about the newer sstables added to a table at most once an hour.
+     */
+    @Test
+    public void testNewerVersionsWarningInterval()
+    {
+        Assume.assumeTrue("HCD_1 reads the versions newer than those it writes", DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1);
+
+        String table = "legacy_oa_simple";
+        skipNoSpamLoggerInterval();
+        ListAppender<ILoggingEvent> warnings = new ListAppender<>();
+        warnings.start();
+        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(Tracker.class)).addAppender(warnings);
+        try
+        {
+            Predicate<ILoggingEvent> warning = e -> isNewerVersionsWarning(e, table);
+            loadLegacyTable("oa", "simple");
+            truncateLegacyTables("oa");
+            loadLegacyTable("oa", "simple");
+            assertThat(warnings.list).filteredOn(warning).hasSize(1);
+
+            skipNoSpamLoggerInterval();
+            truncateLegacyTables("oa");
+            loadLegacyTable("oa", "simple");
+            assertThat(warnings.list).filteredOn(warning).hasSize(2);
+        }
+        finally
+        {
+            ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(Tracker.class)).detachAppender(warnings);
+            warnings.stop();
+        }
+    }
+
+    /**
+     * An entire sstable of a version newer than the releases of HCD_1 read is received in HCD_1 with a warning.
+     */
+    @Test
+    public void testEntireSSTableStreamOfNewerVersion() throws Exception
+    {
+        int streamed = 0;
+        for (String legacyVersion : getNewerLegacyVersions())
+        {
+            // a version newer than the one written is streamed by partitions
+            if (legacyVersion.compareTo(getLegacyFormat(legacyVersion).getLatestVersion().version) <= 0)
+            {
+                streamEntireSSTableOfNewerVersion(legacyVersion);
+                streamed++;
+            }
+        }
+        Assume.assumeTrue("every newer version is streamed by partitions", streamed > 0);
+    }
+
+    private void streamEntireSSTableOfNewerVersion(String legacyVersion) throws Exception
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        String table = String.format("legacy_%s_simple", legacyVersion);
+        File testDataDir = new File(tempFolder.newFolder("streamed-" + legacyVersion, LEGACY_TABLES_KEYSPACE, table));
+        copySstablesToTestData(legacyVersion, table, testDataDir);
+        SSTableReader sstable = SSTableReader.open(null, getDescriptor(testDataDir));
+        skipNoSpamLoggerInterval();
+        ListAppender<ILoggingEvent> warnings = new ListAppender<>();
+        warnings.start();
+        ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(Tracker.class)).addAppender(warnings);
+        try
+        {
+            IPartitioner p = sstable.getPartitioner();
+            List<Range<Token>> ranges = Collections.singletonList(new Range<>(p.getMinimumToken(), p.getMinimumToken()));
+            CassandraOutgoingFile stream = new CassandraOutgoingFile(StreamOperation.OTHER,
+                                                                     sstable.ref(),
+                                                                     sstable.getPositionsForRanges(ranges),
+                                                                     ranges,
+                                                                     sstable.estimatedKeysForRanges(ranges));
+            assertThat(stream.computeShouldStreamEntireSSTables()).isTrue();
+
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.HCD_1);
+            new StreamPlan(StreamOperation.OTHER).transferStreams(FBUtilities.getBroadcastAddressAndPort(), Collections.singletonList(stream))
+                                                 .execute()
+                                                 .get();
+            ColumnFamilyStore cfs = Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore(table);
+            assertThat(cfs.getLiveSSTables()).isNotEmpty().allMatch(s -> s.descriptor.version.version.equals(legacyVersion));
+            assertThat(warnings.list).filteredOn(e -> isNewerVersionsWarning(e, table))
+                                     .hasSize(1);
+        }
+        finally
+        {
+            ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(Tracker.class)).detachAppender(warnings);
+            warnings.stop();
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+            sstable.selfRef().release();
+        }
+    }
+
+    private static boolean isNewerVersionsWarning(ILoggingEvent event, String table)
+    {
+        return event.getFormattedMessage().contains(LEGACY_TABLES_KEYSPACE + '.' + table + " of versions newer than a release of storage_compatibility_mode HCD_1");
+    }
+
+    // moves the clock of NoSpamLogger past the interval of the warnings logged earlier for the same tables
+    private static void skipNoSpamLoggerInterval()
+    {
+        long offset = TimeUnit.HOURS.toNanos(2) * ++noSpamLoggerIntervalsSkipped;
+        NoSpamLogger.unsafeSetClock(() -> Clock.Global.nanoTime() + offset);
+    }
+
+    @AfterClass
+    public static void resetNoSpamLoggerClock()
+    {
+        NoSpamLogger.unsafeSetClock(Clock.Global::nanoTime);
+    }
+
+    @Test
     public void testInaccurateSSTableMinMax()
     {
         QueryProcessor.executeInternal("CREATE TABLE legacy_tables.legacy_mc_inaccurate_min_max (k int, c1 int, c2 int, c3 int, v int, primary key (k, c1, c2, c3))");
@@ -978,18 +1202,31 @@ public class LegacySSTableTest
         if (null != descriptor)
         {
             SSTableReader sstable = SSTableReader.open(null, descriptor);
-            IPartitioner p = sstable.getPartitioner();
-            List<Range<Token>> ranges = new ArrayList<>();
-            ranges.add(new Range<>(p.getMinimumToken(), p.getToken(ByteBufferUtil.bytes("100"))));
-            ranges.add(new Range<>(p.getToken(ByteBufferUtil.bytes("100")), p.getMinimumToken()));
+            try
+            {
+                IPartitioner p = sstable.getPartitioner();
+                List<Range<Token>> ranges = new ArrayList<>();
+                ranges.add(new Range<>(p.getMinimumToken(), p.getToken(ByteBufferUtil.bytes("100"))));
+                ranges.add(new Range<>(p.getToken(ByteBufferUtil.bytes("100")), p.getMinimumToken()));
 
-            List<OutgoingStream> streams = Lists.newArrayList(new CassandraOutgoingFile(StreamOperation.OTHER,
-                    sstable.ref(),
-                    sstable.getPositionsForRanges(ranges),
-                    ranges,
-                    sstable.estimatedKeysForRanges(ranges)));
+                List<OutgoingStream> streams = Lists.newArrayList(new CassandraOutgoingFile(StreamOperation.OTHER,
+                        sstable.ref(),
+                        sstable.getPositionsForRanges(ranges),
+                        ranges,
+                        sstable.estimatedKeysForRanges(ranges)));
 
-            new StreamPlan(StreamOperation.OTHER).transferStreams(FBUtilities.getBroadcastAddressAndPort(), streams).execute().get();
+                new StreamPlan(StreamOperation.OTHER).transferStreams(FBUtilities.getBroadcastAddressAndPort(), streams).execute().get();
+
+                // an sstable of a version newer than the one written is received in the version written
+                if (descriptor.version.version.compareTo(descriptor.getFormat().getLatestVersion().version) > 0)
+                    assertThat(Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore(table).getLiveSSTables())
+                    .isNotEmpty()
+                    .allMatch(s -> s.descriptor.version.isLatestVersion());
+            }
+            finally
+            {
+                sstable.selfRef().release();
+            }
         }
     }
 
@@ -1074,7 +1311,9 @@ public class LegacySSTableTest
                 }
 
                 readClusteringTable("legacy_%s_clust", legacyVersion, ck, ckValue, pkValue);
-                readClusteringTable("legacy_%s_clust_be_index_summary", legacyVersion, ck, ckValue, pkValue);
+                // the versions before cc have no clust_be_index_summary table
+                if (!legacyVersion.equals("ca") && !legacyVersion.equals("cb") && !legacyVersion.startsWith("a") && !legacyVersion.startsWith("b"))
+                    readClusteringTable("legacy_%s_clust_be_index_summary", legacyVersion, ck, ckValue, pkValue);
                 readClusteringCounterTable(legacyVersion, ckValue, pkValue);
             }
         }

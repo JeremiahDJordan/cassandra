@@ -133,6 +133,23 @@ public abstract class Version
 
     abstract public boolean isCompatible();
 
+    /**
+     * @return true if the code reads this version, but the storage compatibility mode doesn't
+     */
+    public boolean isRefusedByStorageCompatibilityMode()
+    {
+        return false;
+    }
+
+    /**
+     * @return true if the code reads this version in storage compatibility mode HCD_1, but the releases of that mode
+     * don't, so that a downgrade to them isn't possible while it exists
+     */
+    public boolean isNewerThanStorageCompatibilityMode()
+    {
+        return false;
+    }
+
     abstract public boolean isCompatibleForStreaming();
 
     @Override

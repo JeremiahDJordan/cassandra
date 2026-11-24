@@ -486,6 +486,18 @@ public class Descriptor
 
     private static SSTableInfo validateAndExtractInfo(String name)
     {
+        SSTableInfo info = extractInfo(name);
+        if (info.version.isRefusedByStorageCompatibilityMode())
+            throw invalidSSTable(name, "sstable version (%s) is newer than storage_compatibility_mode %s reads; see NEWS.txt",
+                                 info.version, DatabaseDescriptor.getStorageCompatibilityMode());
+        if (!info.version.isCompatible())
+            throw invalidSSTable(name, "incompatible sstable version (%s); you should have run upgradesstables before upgrading", info.version);
+
+        return info;
+    }
+
+    private static SSTableInfo extractInfo(String name)
+    {
         List<String> tokens = filenameTokens(name);
 
         String versionString = tokens.get(0);
@@ -505,11 +517,7 @@ public class Descriptor
         SSTableFormat<?, ?> format = formatFromName(name, tokens);
         Component component = Component.parse(tokens.get(3), format);
 
-        Version version = format.getVersion(versionString);
-        if (!version.isCompatible())
-            throw invalidSSTable(name, "incompatible sstable version (%s); you should have run upgradesstables before upgrading", versionString);
-
-        return new SSTableInfo(version, id, component);
+        return new SSTableInfo(format.getVersion(versionString), id, component);
     }
 
     private static class SSTableInfo
@@ -542,6 +550,22 @@ public class Descriptor
     public IMetadataSerializer getMetadataSerializer()
     {
         return new MetadataSerializer();
+    }
+
+    /**
+     * @return true if the file is a component of an sstable of a version that the code reads, but the storage
+     * compatibility mode doesn't
+     */
+    public static boolean isRefusedByStorageCompatibilityMode(File file)
+    {
+        try
+        {
+            return extractInfo(file.name()).version.isRefusedByStorageCompatibilityMode();
+        }
+        catch (IllegalArgumentException e)
+        {
+            return false;
+        }
     }
 
     /**

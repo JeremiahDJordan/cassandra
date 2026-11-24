@@ -37,6 +37,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.GaugeProvider;
@@ -58,6 +59,7 @@ import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.OutputHandler;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
 /**
@@ -68,6 +70,8 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
     private final static Logger logger = LoggerFactory.getLogger(BtiFormat.class);
 
     public static final String NAME = "bti";
+    // the newest version that the releases of storage compatibility mode HCD_1 read
+    public static final String STORAGE_COMPATIBILITY_HCD_1_VERSION = "cc";
 
     private final Version latestVersion = new BtiVersion(this, BtiVersion.current_version);
     static final BtiTableReaderFactory readerFactory = new BtiTableReaderFactory();
@@ -325,7 +329,10 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
     {
         private static final Logger logger = LoggerFactory.getLogger(BtiVersion.class);
 
-        public static final String current_version = CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getString();
+        // the versions that can be written: the released ones
+        private static final Set<String> WRITABLE_VERSIONS = ImmutableSet.of("aa", "ac", "ad", "ba", "bb", "ca", "cb", "cc", "da");
+
+        public static final String current_version = checkWritable(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getString());
 
         static
         {
@@ -333,6 +340,8 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
         }
 
         public static final String earliest_supported_version = "aa";
+        // the newest version read, whatever version is written
+        public static final String latest_supported_version = "da";
 
         // aa (DSE 6.0): trie index format
         // ab (DSE pre-6.8): ILLEGAL - handled as 'ba' (it was renamed to 'ba'). Pre-GA "LABS" releases of DSE 6.8
@@ -352,7 +361,7 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
 
         // versions aa-cz are not supported in OSS
         // da (5.0): initial version of the BIT format
-        // NOTE: when adding a new version, please add that to LegacySSTableTest, too.
+        // NOTE: when adding a new version, please add that to LegacySSTableTest and update latest_supported_version, too.
 
         private final boolean isLatestVersion;
 
@@ -556,7 +565,31 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
         @Override
         public boolean isCompatible()
         {
-            return version.compareTo(earliest_supported_version) >= 0 && version.charAt(0) <= current_version.charAt(0);
+            return isSupported(version);
+        }
+
+        @Override
+        public boolean isNewerThanStorageCompatibilityMode()
+        {
+            return isSupported(version)
+                   && DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
+                   && version.charAt(0) > STORAGE_COMPATIBILITY_HCD_1_VERSION.charAt(0);
+        }
+
+        private static boolean isSupported(String version)
+        {
+            return version.compareTo(earliest_supported_version) >= 0 && version.charAt(0) <= latest_supported_version.charAt(0);
+        }
+
+        // the version written must be a released one: "ab" and "b" were pre-release versions
+        private static String checkWritable(String version)
+        {
+            if (!WRITABLE_VERSIONS.contains(version))
+                throw new ConfigurationException(String.format("Unsupported %s %s: the bti versions written are %s",
+                                                               CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getKey(),
+                                                               version,
+                                                               String.join(", ", WRITABLE_VERSIONS)));
+            return version;
         }
 
         @Override

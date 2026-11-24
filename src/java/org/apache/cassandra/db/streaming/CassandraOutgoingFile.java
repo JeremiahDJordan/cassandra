@@ -29,6 +29,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.streaming.OutgoingStream;
 import org.apache.cassandra.streaming.StreamOperation;
@@ -191,6 +192,12 @@ public class CassandraOutgoingFile implements OutgoingStream
         if (!DatabaseDescriptor.streamEntireSSTables() ||
             ref.get().getSSTableMetadata().hasLegacyCounterShards ||
             ref.get().descriptor.version.hasOldBfFormat())
+            return false;
+
+        // an sstable of a version newer than the one written is streamed by partitions, so the receiver writes the
+        // data in its own version
+        Version version = ref.get().descriptor.version;
+        if (version.version.compareTo(version.format.getLatestVersion().version) > 0)
             return false;
 
         return contained(sections, ref.get());
