@@ -19,6 +19,7 @@
 package org.apache.cassandra.schema;
 
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
@@ -44,14 +45,19 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.functions.FunctionName;
+import org.apache.cassandra.cql3.functions.UDAggregate;
+import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
@@ -100,7 +106,8 @@ public class SchemaKeyspaceTest
         StorageCompatibilityMode[] modes = {
             StorageCompatibilityMode.NONE,      // CC5 mode
             StorageCompatibilityMode.HCD_1,      // CC4 compatibility mode
-            StorageCompatibilityMode.CASSANDRA_4 // Cassandra 4 compatibility mode
+            StorageCompatibilityMode.CASSANDRA_4, // Cassandra 4 compatibility mode
+            StorageCompatibilityMode.UPGRADING
         };
 
         for (StorageCompatibilityMode mode : modes)
@@ -154,6 +161,14 @@ public class SchemaKeyspaceTest
         assertEquals("View memtable column type should match mode " + mode,
                     expectedType,
                     viewMemtableColumn.type.asCQL3Type().toString());
+
+        // Cassandra 4.1 and 5.0 have no deterministic and monotonic columns
+        boolean hasDeterminismColumns = mode != StorageCompatibilityMode.CASSANDRA_4;
+        TableMetadata functionsTable = ksm.tables.getNullable(SchemaKeyspaceTables.FUNCTIONS);
+        TableMetadata aggregatesTable = ksm.tables.getNullable(SchemaKeyspaceTables.AGGREGATES);
+        for (String column : new String[]{ "deterministic", "monotonic", "monotonic_on" })
+            assertEquals("Functions " + column + " column in mode " + mode, hasDeterminismColumns, functionsTable.getColumn(new ColumnIdentifier(column, true)) != null);
+        assertEquals("Aggregates deterministic column in mode " + mode, hasDeterminismColumns, aggregatesTable.getColumn(new ColumnIdentifier("deterministic", true)) != null);
     }
 
     @FunctionalInterface
@@ -234,6 +249,52 @@ public class SchemaKeyspaceTest
                 }
             }
         }, true); // Validate metadata for each mode
+    }
+
+    @Test
+    public void testFunctionMutation() throws Exception
+    {
+        FunctionName stateFunction = new FunctionName(KEYSPACE1, "state");
+        UDFunction function = UDFunction.createBrokenFunction(stateFunction,
+                                                              Arrays.asList(ColumnIdentifier.getInterned("s", false), ColumnIdentifier.getInterned("v", false)),
+                                                              Arrays.asList(Int32Type.instance, Int32Type.instance),
+                                                              Int32Type.instance,
+                                                              true,
+                                                              "java",
+                                                              "return s;",
+                                                              true,
+                                                              true,
+                                                              Collections.emptyList(),
+                                                              new InvalidRequestException("not compiled"));
+        UDAggregate aggregate = UDAggregate.create(Collections.singleton(function),
+                                                   new FunctionName(KEYSPACE1, "aggregate"),
+                                                   Collections.singletonList(Int32Type.instance),
+                                                   Int32Type.instance,
+                                                   stateFunction,
+                                                   null,
+                                                   Int32Type.instance,
+                                                   null,
+                                                   true);
+        KeyspaceMetadata keyspace = Schema.instance.getKeyspaceMetadata(KEYSPACE1)
+                                                   .withSwapped(UserFunctions.builder().add(function, aggregate).build());
+        runWithAllCompatibilityModes(mode -> {
+            Mutation mutation = SchemaKeyspace.makeCreateKeyspaceMutation(keyspace, FBUtilities.timestampMicros()).build();
+            boolean hasDeterminism = mode != StorageCompatibilityMode.CASSANDRA_4;
+            for (String column : new String[]{ "deterministic", "monotonic", "monotonic_on" })
+                assertEquals("functions " + column + " in mode " + mode, hasDeterminism, writesColumn(mutation, SchemaKeyspaceTables.FUNCTIONS, column));
+            assertEquals("aggregates in mode " + mode, hasDeterminism, writesColumn(mutation, SchemaKeyspaceTables.AGGREGATES, "deterministic"));
+        }, true);
+    }
+
+    private static boolean writesColumn(Mutation mutation, String schemaTable, String column)
+    {
+        PartitionUpdate update = mutation.getPartitionUpdate(SchemaKeyspace.metadata().tables.getNullable(schemaTable));
+        for (ColumnMetadata written : update.columns().regulars)
+        {
+            if (written.name.toString().equals(column))
+                return true;
+        }
+        return false;
     }
 
     @Test

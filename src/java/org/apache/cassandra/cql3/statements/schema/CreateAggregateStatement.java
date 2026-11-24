@@ -31,6 +31,7 @@ import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.FunctionResource;
 import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.Term;
@@ -46,6 +47,7 @@ import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.schema.UserFunctions.FunctionsDiff;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.service.ClientState;
@@ -112,6 +114,10 @@ public final class CreateAggregateStatement extends AlterSchemaStatement
 
         if (!rawStateType.isImplicitlyFrozen() && rawStateType.isFrozen())
             throw ire("State type '%s' cannot be frozen; remove frozen<> modifier from '%s'", rawStateType, rawStateType);
+
+        if (deterministic && !SchemaKeyspace.hasDeterminismColumns())
+            throw ire("DETERMINISTIC aggregates are not supported while storage_compatibility_mode is %s; " +
+                      "set storage_compatibility_mode to UPGRADING or NONE", DatabaseDescriptor.getStorageCompatibilityMode());
 
         KeyspaceMetadata keyspace = schema.getNullable(keyspaceName);
         if (null == keyspace)

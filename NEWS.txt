@@ -65,6 +65,22 @@ restore snapshots created with the previous major version using the
 'sstableloader' tool. You can upgrade the file format of your snapshots
 using the provided 'sstableupgrade' tool.
 
+USER FUNCTIONS IN STORAGE COMPATIBILITY MODE CASSANDRA_4
+========================================================
+
+With storage_compatibility_mode CASSANDRA_4, system_schema.functions and system_schema.aggregates have the columns
+of Cassandra 4.x and 5.0, without the deterministic, monotonic and monotonic_on columns of the other modes:
+    - CREATE FUNCTION with DETERMINISTIC or MONOTONIC, and CREATE AGGREGATE with DETERMINISTIC, are refused.
+    - Functions and aggregates created in another mode, or by an earlier release, are neither deterministic nor
+      monotonic, so GROUP BY on a monotonic user function fails.
+    - Nodes that use different definitions of the two tables report different schema versions as soon as a function
+      or aggregate exists: during a rolling upgrade in CASSANDRA_4 from an earlier release, which uses the other
+      definitions, and while some nodes are in CASSANDRA_4 and others in another mode. Avoid schema changes until
+      every node runs the same release in the same mode.
+    - Earlier releases wrote the three columns in CASSANDRA_4 too, and Cassandra 4.x can't read sstables that have
+      them. Before a rollback to Cassandra 4.x, run `nodetool upgradesstables -a system_schema functions aggregates`
+      on every node in CASSANDRA_4, then drain it.
+
 UPGRADING FROM HCD 1.2 (HCD-632)
 ================================
 
