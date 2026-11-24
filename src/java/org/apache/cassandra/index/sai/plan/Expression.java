@@ -39,6 +39,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.LikePatterns;
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Redaction;
 import org.apache.cassandra.db.marshal.CompositeType;
@@ -204,6 +205,10 @@ public class Expression
     // which the lower bound is one: an element or key holds the value if it holds all of them (see #addAllTerms)
     private List<ByteBuffer> allTerms;
 
+    // The map entry comparison this expression filters with when no index scan serves it, without bounds: its key or
+    // value can be too large for a CompositeType component
+    RowFilter.MapComparisonExpression unindexedMapEntry;
+
     public Expression(IndexContext indexContext)
     {
         this.context = indexContext;
@@ -212,6 +217,18 @@ public class Expression
         this.reversed = indexContext.getDefinition() != null
                         && indexContext.getDefinition().isReversedType()
                         && !TypeUtil.isIndexedUnreversed(validator);
+    }
+
+    /**
+     * @return an expression that filters the rows with the given map entry comparison, on a column that no index scan
+     * serves
+     */
+    static Expression unindexedMapEntry(IndexContext indexContext, RowFilter.MapComparisonExpression mapEntry)
+    {
+        Expression expression = new Expression(indexContext);
+        expression.operation = Op.valueOf(mapEntry.operator());
+        expression.unindexedMapEntry = mapEntry;
+        return expression;
     }
 
     public boolean isLiteral()
@@ -794,7 +811,8 @@ public class Expression
                                     .append(validator)
                                     .append(lower).append(upper)
                                     .append(exclusions)
-                                    .append(allTerms).build();
+                                    .append(allTerms)
+                                    .append(unindexedMapEntry).build();
     }
 
     public boolean equals(Object other)
@@ -814,7 +832,8 @@ public class Expression
                 && Objects.equals(lower, o.lower)
                 && Objects.equals(upper, o.upper)
                 && exclusions.equals(o.exclusions)
-                && Objects.equals(allTerms, o.allTerms);
+                && Objects.equals(allTerms, o.allTerms)
+                && Objects.equals(unindexedMapEntry, o.unindexedMapEntry);
     }
 
     /**

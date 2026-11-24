@@ -905,7 +905,12 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      */
     boolean isIndexScanned(Expression expression)
     {
-        return expression.context.isIndexed() && !command.rowFilter().indexHints.excludes(expression.context.getIndexName());
+        return isIndexScanned(expression.context);
+    }
+
+    boolean isIndexScanned(IndexContext context)
+    {
+        return context.isIndexed() && !command.rowFilter().indexHints.excludes(context.getIndexName());
     }
 
     private void addIndexScans(Plan.Builder builder, Collection<Expression> expressions, Plan.DataScope scope)

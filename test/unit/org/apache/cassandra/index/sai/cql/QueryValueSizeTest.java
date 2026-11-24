@@ -31,8 +31,9 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Tests that the coordinator of an SAI range query rejects the values that can't be serialized in the read command sent
- * to the replicas, rather than timing out, that a single-partition query served locally isn't affected, and that SAI
- * rejects the map entry keys and values that its composite values and entries index terms can't encode.
+ * to the replicas, rather than timing out, that a single-partition query served locally isn't affected, that SAI
+ * rejects the map entry keys and values that its composite values and entries index terms can't encode, and that it
+ * filters the unindexed map entries that those can't hold.
  */
 public class QueryValueSizeTest extends SAITester
 {
@@ -120,8 +121,8 @@ public class QueryValueSizeTest extends SAITester
             assertTooLarge("Map key", "e", MAX + 1, "SELECT k FROM %s WHERE e[?] = 'b'", huge);
             assertTooLarge("Map value", "e", MAX + 1, "SELECT k FROM %s WHERE e['a'] = ?", huge);
 
-            // a single-partition read isn't serialized, but SAI builds a composite of the key and value of every map
-            // entry comparison it plans, which can't hold more than 65535 bytes for either, indexed or not
+            // a single-partition read isn't serialized, but SAI rejects the map entry comparisons that an entry term
+            // can't hold, with a key or value of more than 65535 bytes, indexed or not
             assertRows(execute("SELECT c FROM %s WHERE k = 0 AND n = 0 AND m[?] = ? ALLOW FILTERING", max, max));
             assertMapEntryTooLarge("Map key", "m", "SELECT c FROM %s WHERE k = 0 AND n = 0 AND m[?] = 'b' ALLOW FILTERING", huge);
             assertMapEntryTooLarge("Map value", "m", "SELECT c FROM %s WHERE k = 0 AND n = 0 AND m['a'] = ? ALLOW FILTERING", huge);
@@ -141,6 +142,53 @@ public class QueryValueSizeTest extends SAITester
                 assertSameAsFiltering(String.format(restriction, 'e'), String.format(restriction, 'm'), max);
             assertRows(execute("SELECT c FROM %s WHERE e['a'] = 'b'"), row(0));
         });
+    }
+
+    @Test
+    public void testFilteredMapEntryLargerThanEntryTerm() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, m map<text, text>, s map<text, text> static, n int, PRIMARY KEY (k, c))");
+        createIndex("CREATE INDEX ON %s(n) USING 'sai'");
+        // the largest key (its first byte over 0x7F), a key over 32767 bytes, and a value too large for an entry term
+        String maxKey = "\u00e9" + "a".repeat(MAX - 2);
+        String longKey = "a".repeat(40000);
+        String hugeValue = "x".repeat(MAX + 1);
+        execute("INSERT INTO %s (k, c, m, s, n) VALUES (0, 0, ?, {'a': 'b'}, 0)", map("a", hugeValue));
+        execute("INSERT INTO %s (k, c, m, n) VALUES (0, 1, ?, 0)", map(maxKey, "b"));
+        execute("INSERT INTO %s (k, c, m, n) VALUES (0, 2, {'a': 'b'}, 0)");
+        execute("INSERT INTO %s (k, c, m, n) VALUES (0, 3, {'a': 'b'}, 0)");
+        execute("DELETE m['a'] FROM %s WHERE k = 0 AND c = 3");
+        execute("INSERT INTO %s (k, c, n) VALUES (0, 4, 0)");
+        execute("UPDATE %s USING TTL 1 SET m['a'] = 'b' WHERE k = 0 AND c = 4");
+        Thread.sleep(2000);
+        execute("INSERT INTO %s (k, c, m, n) VALUES (0, 5, ?, 0)", map(longKey, "b"));
+        execute("INSERT INTO %s (k, c, m, s, n) VALUES (1, 0, ?, ?, 0)", map("a", hugeValue, "b", "b"), map("a", hugeValue));
+
+        beforeAndAfterFlush(() -> {
+            assertFilteredMapEntry("m['a'] > 'a'", null, row(0, 0), row(0, 2), row(1, 0));
+            assertFilteredMapEntry("m['a'] >= 'x'", null, row(0, 0), row(1, 0));
+            assertFilteredMapEntry("m['a'] < 'y'", null, row(0, 0), row(0, 2), row(1, 0));
+            assertFilteredMapEntry("m['a'] != 'b'", null, row(0, 0), row(0, 1), row(0, 3), row(0, 4), row(0, 5), row(1, 0));
+            assertFilteredMapEntry("m[?] = 'b'", maxKey, row(0, 1));
+            assertFilteredMapEntry("m[?] > 'a'", maxKey, row(0, 1));
+            assertFilteredMapEntry("m[?] = 'b'", longKey, row(0, 5));
+            assertFilteredMapEntry("m[?] > 'a'", longKey, row(0, 5));
+            assertFilteredMapEntry("m CONTAINS KEY ?", maxKey, row(0, 1));
+            assertFilteredMapEntry("(m['a'] = 'b' OR m[?] = 'b')", maxKey, row(0, 1), row(0, 2));
+            assertFilteredMapEntry("m['a'] > 'a' AND m['a'] < 'y'", null, row(0, 0), row(0, 2), row(1, 0));
+            assertFilteredMapEntry("m['a'] = 'b' AND m['b'] != 'c'", null, row(0, 2));
+            assertFilteredMapEntry("s['a'] > 'a'", null, row(0, 0), row(0, 1), row(0, 2), row(0, 3), row(0, 4), row(0, 5), row(1, 0));
+        });
+    }
+
+    private void assertFilteredMapEntry(String restriction, Object value, Object[]... expected)
+    {
+        Object[] values = value == null ? new Object[0] : new Object[]{ value };
+        // without a restriction on an indexed column, the query isn't served by SAI
+        assertRowsIgnoringOrder(execute("SELECT k, c FROM %s WHERE " + restriction + " ALLOW FILTERING", values), expected);
+        assertRowsIgnoringOrder(execute("SELECT k, c FROM %s WHERE n = 0 AND " + restriction + " ALLOW FILTERING", values), expected);
+        Object[][] inPartition = Arrays.stream(expected).filter(r -> r[0].equals(0)).toArray(Object[][]::new);
+        assertRowsIgnoringOrder(execute("SELECT k, c FROM %s WHERE k = 0 AND n = 0 AND " + restriction + " ALLOW FILTERING", values), inPartition);
     }
 
     private void assertTooLarge(String what, String column, int size, String query, Object... values)

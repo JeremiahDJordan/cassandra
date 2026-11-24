@@ -1684,9 +1684,10 @@ public class StorageAttachedIndex implements Index
 
     /**
      * Rejects, in any read that SAI plans, the map entry comparisons whose key or value can't be encoded in a
-     * {@link CompositeType} value, which SAI builds for each of them, on any map column, indexed or not: a component
-     * length is an unsigned short, so the key and value can have at most 65535 bytes. On an entries index the key is
-     * limited to 65534 bytes, as {@code 0xFFFF} is reserved for the length of the first component of a composite.
+     * {@link CompositeType} entry term, on any map column, indexed or not, as range reads can't send them either: a
+     * component length is an unsigned short, so the key and value can have at most 65535 bytes. On an entries index
+     * the key is limited to 65534 bytes, as {@code 0xFFFF} is reserved for the length of the first component of a
+     * composite.
      */
     private void validateMapEntrySizes(RowFilter.FilterElement element)
     {

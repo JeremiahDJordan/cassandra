@@ -274,7 +274,11 @@ public class FilterTree
 
     private static boolean isSatisfiedBy(DecoratedKey key, Row row, ColumnMetadata column, Expression filter, long now)
     {
-        if (TypeUtil.isNonFrozenCollection(column.type))
+        if (filter.unindexedMapEntry != null)
+        {
+            return row != null && filter.unindexedMapEntry.isSatisfiedBy(filter.context.columnFamilyStore().metadata(), key, row, now);
+        }
+        else if (TypeUtil.isNonFrozenCollection(column.type))
         {
             Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
             return filter.isSatisfiedBy(valueIterator);
