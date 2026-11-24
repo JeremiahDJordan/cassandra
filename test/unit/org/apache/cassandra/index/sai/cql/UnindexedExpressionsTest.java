@@ -304,6 +304,27 @@ public class UnindexedExpressionsTest extends SAITester
     }
 
     @Test
+    public void inOnAnalyzedColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, t text)");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(t) USING 'sai' WITH OPTIONS = {'case_sensitive': 'false'}");
+        execute("INSERT INTO %s (k, v, t) VALUES (1, 0, 'Foo')");
+        execute("INSERT INTO %s (k, v, t) VALUES (2, 0, 'bar')");
+        execute("INSERT INTO %s (k, v, t) VALUES (3, 1, 'FOO')");
+
+        beforeAndAfterFlush(() -> {
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE t = 'foo'"), row(1), row(3));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE t IN ('foo', 'x') ALLOW FILTERING"), row(1), row(3));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE t IN ('BAR', 'foo') ALLOW FILTERING"), row(1), row(2), row(3));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE t IN ('foo', null) ALLOW FILTERING"), row(1), row(3));
+            assertRows(execute("SELECT k FROM %s WHERE v = 0 AND t IN ('foo', 'x') ALLOW FILTERING"), row(1));
+            assertRows(execute("SELECT k FROM %s WHERE v = 0 AND t IN ? ALLOW FILTERING", list("FOO", "x")), row(1));
+            assertEmpty(execute("SELECT k FROM %s WHERE v = 1 AND t IN ('fo', 'x') ALLOW FILTERING"));
+        });
+    }
+
+    @Test
     public void unindexedFrozenListRangeRestriction() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, l frozen<list<int>>, v int)");

@@ -35,6 +35,7 @@ import java.util.TreeMap;
 import java.util.concurrent.Callable;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
@@ -681,6 +682,27 @@ public class StorageAttachedIndex implements Index
     {
         assert analyzerFactory != null : "Index does not support string analysis";
         return analyzerFactory.create();
+    }
+
+    @Override
+    @Nullable
+    public UnaryOperator<ByteBuffer> getValueAnalysis()
+    {
+        if (analyzerFactory == null || !analyzer().transformValue())
+            return null;
+
+        return value -> {
+            AbstractAnalyzer analyzer = analyzer();
+            analyzer.reset(value.duplicate());
+            try
+            {
+                return analyzer.hasNext() ? analyzer.next() : value;
+            }
+            finally
+            {
+                analyzer.end();
+            }
+        };
     }
 
     public IndexMetrics indexMetrics()

@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.UnaryOperator;
 
 import com.google.common.base.Objects;
 
@@ -66,12 +67,14 @@ import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.serializers.ListSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -227,8 +230,11 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     {
         List<Expression> partitionLevelExpressions = new ArrayList<>();
         List<Expression> rowLevelExpressions = new ArrayList<>();
-        for (Expression e: expressions)
+        for (Expression expression: expressions)
         {
+            Expression e = expression.operator == Operator.IN && expression instanceof SimpleExpression
+                           ? ((SimpleExpression) expression).withIndexAnalysis(metadata)
+                           : expression;
             if (e.column.isStatic() || e.column.isPartitionKey())
                 partitionLevelExpressions.add(e);
             else
@@ -875,6 +881,24 @@ public class RowFilter implements Iterable<RowFilter.Expression>
             throw new AssertionError();
         }
 
+        /**
+         * Returns this {@code IN} expression comparing values with the analysis of an index that serves {@code =} on
+         * the column, as {@code =} does, or this expression if there is no such index.
+         */
+        private SimpleExpression withIndexAnalysis(TableMetadata metadata)
+        {
+            if (metadata.indexes.isEmpty())
+                return this;
+
+            for (Index index : IndexRegistry.obtain(metadata).listIndexes())
+            {
+                UnaryOperator<ByteBuffer> analysis = index.supportsExpression(column, Operator.EQ) ? index.getValueAnalysis() : null;
+                if (analysis != null)
+                    return new AnalyzedInExpression(column, value, analysis);
+            }
+            return this;
+        }
+
         @Override
         protected String toString(boolean cql)
         {
@@ -905,6 +929,34 @@ public class RowFilter implements Iterable<RowFilter.Expression>
         protected Kind kind()
         {
             return Kind.SIMPLE;
+        }
+    }
+
+    /**
+     * An {@code IN} expression that compares the analyzed value of the column with the analyzed values of the list.
+     */
+    private static class AnalyzedInExpression extends SimpleExpression
+    {
+        private final UnaryOperator<ByteBuffer> analysis;
+        private final ByteBuffer analyzedValues;
+
+        AnalyzedInExpression(ColumnMetadata column, ByteBuffer value, UnaryOperator<ByteBuffer> analysis)
+        {
+            super(column, Operator.IN, value);
+            this.analysis = analysis;
+            List<ByteBuffer> values = new ArrayList<>();
+            ListType.getInstance(column.type, false).getSerializer().forEach(value, v -> {
+                if (v != null)
+                    values.add(analysis.apply(v));
+            });
+            this.analyzedValues = ListSerializer.pack(values, values.size());
+        }
+
+        @Override
+        public boolean isSatisfiedBy(TableMetadata metadata, DecoratedKey partitionKey, Row row, long nowInSec)
+        {
+            ByteBuffer foundValue = getValue(metadata, partitionKey, row, nowInSec);
+            return foundValue != null && operator.isSatisfiedBy(column.type, analysis.apply(foundValue), analyzedValues);
         }
     }
 

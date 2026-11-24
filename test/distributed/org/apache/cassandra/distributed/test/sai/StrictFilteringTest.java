@@ -102,6 +102,23 @@ public class StrictFilteringTest extends TestBaseImpl
     }
 
     @Test
+    public void shouldMatchINOnAnalyzedColumnAtCoordinator()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.in_analyzed (k int PRIMARY KEY, t text) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.in_analyzed(t) USING 'sai' WITH OPTIONS = {'case_sensitive': 'false'}"));
+        SAIUtil.waitForIndexQueryable(CLUSTER, KEYSPACE);
+
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.in_analyzed(k, t) VALUES (0, 'Foo') USING TIMESTAMP 2"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.in_analyzed(k, t) VALUES (0, 'bar') USING TIMESTAMP 1"));
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.in_analyzed(k, t) VALUES (1, 'Foo') USING TIMESTAMP 1"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.in_analyzed(k, t) VALUES (1, 'bar') USING TIMESTAMP 2"));
+
+        // resolved via replica filtering protection
+        String select = withKeyspace("SELECT k, t FROM %s.in_analyzed WHERE t IN ('foo', 'x') ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, "Foo"));
+    }
+
+    @Test
     public void testPartialUpdates()
     {
         CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.partial_updates (k int PRIMARY KEY, a int, b int) WITH read_repair = 'NONE'"));
