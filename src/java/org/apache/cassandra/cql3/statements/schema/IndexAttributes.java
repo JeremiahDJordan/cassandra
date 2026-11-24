@@ -35,6 +35,8 @@ public class IndexAttributes extends PropertyDefinitions
 
     public boolean isCustom;
     public String customClass;
+    // whether the class is named with USING, which the default index class doesn't replace
+    public boolean isClassSpecified;
 
     static
     {
@@ -47,7 +49,7 @@ public class IndexAttributes extends PropertyDefinitions
         if (defaultIndexClass == null)
             return;
 
-        if (!isCustom && customClass == null)
+        if (!isCustom && customClass == null && !isClassSpecified)
         {
             isCustom = true;
             customClass = defaultIndexClass;
