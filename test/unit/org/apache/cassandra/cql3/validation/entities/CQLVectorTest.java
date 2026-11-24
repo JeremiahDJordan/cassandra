@@ -20,6 +20,7 @@ package org.apache.cassandra.cql3.validation.entities;
 
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.util.Collections;
 import java.util.List;
 
 import org.junit.Assert;
@@ -27,13 +28,17 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.cql3.functions.NativeFunctions;
 import org.apache.cassandra.cql3.functions.NativeScalarFunction;
 import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.schema.CQLTypeParser;
+import org.apache.cassandra.schema.Types;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
@@ -295,6 +300,69 @@ public class CQLVectorTest extends CQLTester
         while (FBUtilities.timestampMicros() == start)
             Thread.sleep(1);
         return FBUtilities.timestampMicros();
+    }
+
+    @Test
+    public void userTypesInVectors() throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int)");
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v vector<frozen<" + udt + ">, 2>, d vector<frozen<" + udt + ">, 2>, " +
+                    "n frozen<list<vector<frozen<" + udt + ">, 2>>>)");
+
+        Assertions.assertThat(currentTableMetadata().getReferencedUserTypes()).containsExactly(ByteBufferUtil.bytes(udt));
+        assertInvalidThrowMessage("Cannot drop user type '" + KEYSPACE + '.' + udt + "' as it is still used by tables " + currentTable(),
+                                  InvalidRequestException.class,
+                                  "DROP TYPE " + KEYSPACE + '.' + udt);
+
+        schemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " RENAME a TO b");
+        execute("INSERT INTO %s (pk, v, d) VALUES (0, [{b: 1}, {b: 2}], [{b: 1}, {b: 2}])");
+        assertRows(execute("SELECT v FROM %s WHERE pk = 0"), row(vector(userType("b", 1), userType("b", 2))));
+        flush();
+        schemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " ADD c text");
+        execute("INSERT INTO %s (pk, v) VALUES (1, [{b: 3, c: 'x'}, {b: 4}])");
+        assertRows(execute("SELECT v FROM %s WHERE pk = 0"), row(vector(userType("b", 1), userType("b", 2))));
+        assertRows(execute("SELECT v FROM %s WHERE pk = 1"), row(vector(userType("b", 3, "c", "x"), userType("b", 4, "c", null))));
+
+        // dropped column types are stored without user types, so that the schema loads after the type is dropped
+        execute("ALTER TABLE %s DROP d");
+        String dropped = execute("SELECT type FROM system_schema.dropped_columns WHERE keyspace_name = ? AND table_name = ? AND column_name = 'd'",
+                                 KEYSPACE, currentTable()).one().getString("type");
+        Assertions.assertThat(CQLTypeParser.parseDroppedType(KEYSPACE, dropped).asCQL3Type().toString()).isEqualTo("vector<tuple<int, text>, 2>");
+        execute("ALTER TABLE %s DROP n");
+        String nested = execute("SELECT type FROM system_schema.dropped_columns WHERE keyspace_name = ? AND table_name = ? AND column_name = 'n'",
+                                KEYSPACE, currentTable()).one().getString("type");
+        Assertions.assertThat(nested).doesNotContain(udt);
+        CQLTypeParser.parseDroppedType(KEYSPACE, nested);
+
+        // a column added back with the recorded type is read together with the sstable written before the drop
+        execute("ALTER TABLE %s ADD d vector<frozen<tuple<int, text>>, 2>");
+        execute("INSERT INTO %s (pk, d) VALUES (0, [(5, 'y'), (6, null)])");
+        flush();
+        compact();
+        assertRows(execute("SELECT toJson(d) FROM %s WHERE pk = 0"), row("[[5, \"y\"], [6, null]]"));
+    }
+
+    @Test
+    public void userTypesInVectorsLoadInAnyOrder()
+    {
+        // types are loaded in name order, so the type holding the vector comes first
+        Types.RawBuilder builder = Types.rawBuilder(KEYSPACE);
+        builder.add("aaa_outer", Collections.singletonList("v"), Collections.singletonList("vector<frozen<inner>, 2>"));
+        builder.add("inner", Collections.singletonList("a"), Collections.singletonList("int"));
+        Types types = builder.build();
+        Assertions.assertThat(types.getNullable(ByteBufferUtil.bytes("aaa_outer"))).isNotNull();
+    }
+
+    @Test
+    public void overrideKeyspaceOfUserTypesInVectors()
+    {
+        UserType udt = new UserType(KEYSPACE,
+                                    ByteBufferUtil.bytes("udt"),
+                                    Collections.singletonList(FieldIdentifier.forUnquoted("a")),
+                                    Collections.singletonList(Int32Type.instance),
+                                    false);
+        VectorType<?> vector = VectorType.getInstance(udt, 2).overrideKeyspace(keyspace -> "other");
+        Assertions.assertThat(((UserType) vector.elementType).keyspace).isEqualTo("other");
     }
 
     @Test

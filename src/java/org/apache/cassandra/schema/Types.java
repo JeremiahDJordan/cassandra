@@ -48,6 +48,7 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.exceptions.ConfigurationException;
 
 import static com.google.common.collect.Iterables.any;
@@ -145,6 +146,8 @@ public final class Types implements Iterable<UserType>
         {
             recordNestedTypes(subType, userTypes);
         }
+        if (userType.isVector())
+            recordNestedTypes(((VectorType<?>) userType).elementType, userTypes);
 
         if (userType.isUDT())
             userTypes.add((UserType) userType);
@@ -290,6 +293,8 @@ public final class Types implements Iterable<UserType>
     {
         // Reach into subtypes first, so that if the type is a UDT, it's dependencies are recreated first.
         type.subTypes().forEach(t -> addUserTypes(t, types));
+        if (type.isVector())
+            addUserTypes(((VectorType<?>) type).elementType, types);
 
         if (type.isUDT())
             types.add(((UserType) type).name);
