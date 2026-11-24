@@ -25,6 +25,7 @@ import java.util.TreeMap;
 
 import com.google.common.base.MoreObjects;
 import com.google.common.collect.ImmutableMap;
+import com.google.common.primitives.Ints;
 import org.apache.commons.lang3.StringUtils;
 
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -143,7 +144,7 @@ public final class AutoRepairParams
 
     public static boolean isValidInt(String value)
     {
-        return StringUtils.isNumeric(value);
+        return StringUtils.isNumeric(value) && Ints.tryParse(value) != null;
     }
 
     public Map<String, String> options()

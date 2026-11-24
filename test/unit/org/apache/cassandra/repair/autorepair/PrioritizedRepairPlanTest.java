@@ -23,11 +23,18 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.schema.AutoRepairParams;
+import org.apache.cassandra.schema.KeyspaceMetadata;
+import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaTestUtil;
+import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.service.AutoRepairService;
 import org.apache.cassandra.service.StorageService;
 
@@ -178,5 +185,24 @@ public class PrioritizedRepairPlanTest extends CQLTester
         // Verify the order is by descending priority and matches the expected tables
         assertEquals(5, prioritizedRepairPlans.get(0).getPriority());
         assertEquals(table1, prioritizedRepairPlans.get(0).getKeyspaceRepairPlans().get(0).getTableNames().get(0));
+    }
+
+    @Test
+    public void testBuildSkipsTableWithInvalidPriority()
+    {
+        String table1 = createTable("CREATE TABLE %s (k INT PRIMARY KEY, v INT) WITH auto_repair = {'full_enabled': 'true', 'priority': '2'}");
+        String table2 = createTable("CREATE TABLE %s (k INT PRIMARY KEY, v INT)");
+
+        // a stored priority that CREATE and ALTER reject
+        TableMetadata metadata = Schema.instance.getTableMetadata(KEYSPACE, table2);
+        TableParams params = metadata.params.unbuild().automatedRepair(AutoRepairParams.create(ImmutableMap.of("priority", "2147483648"))).build();
+        KeyspaceMetadata keyspace = Schema.instance.getKeyspaceMetadata(KEYSPACE);
+        SchemaTestUtil.addOrUpdateKeyspace(keyspace.withSwapped(keyspace.tables.withSwapped(metadata.unbuild().params(params).build())), true);
+
+        List<PrioritizedRepairPlan> prioritizedRepairPlans = PrioritizedRepairPlan.build(new HashMap<String, List<String>>(){{put(KEYSPACE, Arrays.asList(table1, table2));}}, AutoRepairConfig.RepairType.FULL, (l) -> {},
+                                                                                         AutoRepairService.instance.getAutoRepairConfig().getRepairPrimaryTokenRangeOnly(AutoRepairConfig.RepairType.FULL));
+        assertEquals(1, prioritizedRepairPlans.size());
+        assertEquals(2, prioritizedRepairPlans.get(0).getPriority());
+        assertEquals(Arrays.asList(table1), prioritizedRepairPlans.get(0).getKeyspaceRepairPlans().get(0).getTableNames());
     }
 }

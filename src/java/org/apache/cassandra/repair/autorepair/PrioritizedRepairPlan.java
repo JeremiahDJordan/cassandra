@@ -27,7 +27,11 @@ import java.util.Objects;
 import java.util.TreeSet;
 import java.util.function.Consumer;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.schema.AutoRepairParams;
 
 /**
  * Encapsulates a devised plan to repair tables, grouped by their keyspace and a given priority.  This is used
@@ -37,6 +41,8 @@ import org.apache.cassandra.db.ColumnFamilyStore;
  */
 public class PrioritizedRepairPlan
 {
+    private static final Logger logger = LoggerFactory.getLogger(PrioritizedRepairPlan.class);
+
     private final int priority;
 
     private final List<KeyspaceRepairPlan> keyspaceRepairPlans;
@@ -101,7 +107,9 @@ public class PrioritizedRepairPlan
             String keyspaceName = keyspaceToTableNames.getKey();
             for (String tableName : keyspaceToTableNames.getValue())
             {
-                int priority = getPriority(repairType, keyspaceName, tableName);
+                Integer priority = getPriority(repairType, keyspaceName, tableName);
+                if (priority == null)
+                    continue;
                 Map<String, List<String>> keyspacesForPriority = plans.computeIfAbsent(priority, p -> new HashMap<>());
                 List<String> tableNamesAtPriority = keyspacesForPriority.computeIfAbsent(keyspaceName, k -> new ArrayList<>());
                 tableNamesAtPriority.add(tableName);
@@ -138,11 +146,24 @@ public class PrioritizedRepairPlan
     }
 
     /**
-     * @return The priority of the given table if defined, otherwise 0.
+     * @return The priority of the given table if defined, otherwise 0, or null if its priority is not a valid int.
      */
-    private static int getPriority(AutoRepairConfig.RepairType repairType, String keyspaceName, String tableName)
+    private static Integer getPriority(AutoRepairConfig.RepairType repairType, String keyspaceName, String tableName)
     {
         ColumnFamilyStore cfs = ColumnFamilyStore.getIfExists(keyspaceName, tableName);
-        return cfs != null ? cfs.metadata().params.autoRepair.priority() : 0;
+        if (cfs == null)
+            return 0;
+
+        AutoRepairParams params = cfs.metadata().params.autoRepair;
+        try
+        {
+            return params.priority();
+        }
+        catch (NumberFormatException e)
+        {
+            logger.warn("Skipping {} auto-repair of {}.{}: its auto_repair priority '{}' is not a valid int",
+                        repairType, keyspaceName, tableName, params.options().get(AutoRepairParams.Option.PRIORITY.toString()));
+            return null;
+        }
     }
 }
