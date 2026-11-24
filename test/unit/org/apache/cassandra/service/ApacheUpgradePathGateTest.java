@@ -74,6 +74,7 @@ public class ApacheUpgradePathGateTest extends CQLTester
         InetAddressAndPort unknownMember = InetAddressAndPort.getByName("127.0.0.3");
         StorageService.instance.getTokenMetadata().updateHostId(UUID.randomUUID(), unknownMember);
         ApacheUpgradePath.instance.onJoin(unknownMember, null);
+        assertThatThrownBy(() -> schemaChange(deterministic)).hasMessageContaining("as the members [/127.0.0.3:7012] don't advertise their storage_compatibility_mode");
         ApacheUpgradePath.instance.onRemove(unknownMember);
         StorageService.instance.getTokenMetadata().removeEndpoint(unknownMember);
         assertThatThrownBy(() -> execute(like)).hasMessageContaining("LIKE restriction on column v isn't supported");

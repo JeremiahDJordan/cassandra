@@ -45,6 +45,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.ExecutorPlus;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DurationSpec;
 import org.apache.cassandra.repair.Scheduler;
@@ -697,6 +698,10 @@ public class ActiveRepairService implements IEndpointStateChangeSubscriber, IFai
         register(new ParticipateState(ctx.clock(), ctx.broadcastAddressAndPort(), message));
         for (InetAddressAndPort neighbour : endpoints)
         {
+            String refusal = CassandraRelevantProperties.ALLOW_MIXED_REPAIR.getBoolean() ? null : ApacheUpgradePath.repairRefusal(neighbour);
+            if (refusal != null)
+                failRepair(parentRepairSession, "Rejecting repair: " + refusal); // failRepair throws exception
+
             if (ctx.failureDetector().isAlive(neighbour))
             {
                 sendPrepareWithRetries(parentRepairSession, pending, failedNodes, promise, neighbour, message);

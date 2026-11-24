@@ -23,12 +23,14 @@ import org.apache.cassandra.distributed.api.IUpgradeableInstance;
 import org.apache.cassandra.distributed.shared.WithProperties;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
+import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
 import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * A node of this build moved from storage_compatibility_mode CASSANDRA_5 to UPGRADING has the same schema version as
- * an Apache node, for the internal keyspaces each node defines itself and for schema changes made through either
- * node.
+ * an Apache node, for the internal keyspaces each node defines itself and for schema changes made through the Apache
+ * node, and refuses to coordinate schema changes beside it.
  */
 public class ApacheUpgradePathSchemaTest extends ApacheMixedClusterTestBase
 {
@@ -52,16 +54,22 @@ public class ApacheUpgradePathSchemaTest extends ApacheMixedClusterTestBase
             assertSchemaAgreement(cluster);
 
             cluster.schemaChange(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}"), false, apache);
-            cluster.schemaChange(withKeyspace("CREATE TYPE %s.address (street text, zip int)"), false, current);
+            cluster.schemaChange(withKeyspace("CREATE TYPE %s.address (street text, zip int)"), false, apache);
             cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck int, v text, a frozen<address>, m map<int, text>, PRIMARY KEY (pk, ck)) " +
                                               "WITH CLUSTERING ORDER BY (ck DESC) AND comment = 'c' AND gc_grace_seconds = 3600 " +
                                               "AND compression = {'class': 'LZ4Compressor', 'chunk_length_in_kb': '16'}"), false, apache);
-            cluster.schemaChange(withKeyspace("CREATE TABLE %s.defaults (pk int PRIMARY KEY, v int)"), false, current);
-            cluster.schemaChange(withKeyspace("CREATE INDEX tbl_v ON %s.tbl (v) USING 'sai'"), false, current);
+            cluster.schemaChange(withKeyspace("CREATE INDEX tbl_v ON %s.tbl (v) USING 'sai'"), false, apache);
             cluster.schemaChange(withKeyspace("CREATE FUNCTION %s.plus (a int, b int) CALLED ON NULL INPUT RETURNS int " +
-                                              "LANGUAGE java AS 'return a == null || b == null ? null : a + b;'"), false, current);
-            cluster.schemaChange(withKeyspace("CREATE AGGREGATE %s.total (int) SFUNC plus STYPE int INITCOND 0"), false, current);
-            cluster.schemaChange(withKeyspace("ALTER TABLE %s.defaults WITH comment = 'altered'"), false, apache);
+                                              "LANGUAGE java AS 'return a == null || b == null ? null : a + b;'"), false, apache);
+            cluster.schemaChange(withKeyspace("CREATE AGGREGATE %s.total (int) SFUNC plus STYPE int INITCOND 0"), false, apache);
+            // pulled by the node of this build, which was down, from the Apache node
+            current.shutdown().get();
+            cluster.schemaChange(withKeyspace("ALTER TABLE %s.tbl WITH comment = 'pulled'"), true, apache);
+            current.startup(cluster);
+            assertSchemaAgreement(cluster);
+
+            assertThatThrownBy(() -> current.coordinator().execute(withKeyspace("ALTER TABLE %s.tbl WITH comment = 'altered'"), ALL))
+            .hasMessageContaining("Refused while the Apache upgrade path is active, as the members [/127.0.0.1:7012] don't advertise their storage_compatibility_mode");
             assertSchemaAgreement(cluster);
         }
     }

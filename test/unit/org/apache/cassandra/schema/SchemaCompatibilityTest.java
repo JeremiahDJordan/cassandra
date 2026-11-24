@@ -36,10 +36,12 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
@@ -57,12 +59,17 @@ public class SchemaCompatibilityTest extends CQLTester
     @BeforeClass
     public static void setUpApacheUpgradePath() throws Exception
     {
-        // in UPGRADING after CASSANDRA_5, beside a ring member whose version isn't known
+        // in UPGRADING after CASSANDRA_5, beside a ring member in CASSANDRA_5
         DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.UPGRADING);
         FileUtils.write(new File(DatabaseDescriptor.getMetadataDirectory(), ApacheUpgradePath.FILE),
                         Collections.singletonList(StorageCompatibilityMode.CASSANDRA_5.name()),
                         StandardOpenOption.CREATE, StandardOpenOption.WRITE);
-        StorageService.instance.getTokenMetadata().updateHostId(UUID.randomUUID(), InetAddressAndPort.getByName("127.0.0.2"));
+        InetAddressAndPort member = InetAddressAndPort.getByName("127.0.0.2");
+        UUID hostId = UUID.randomUUID();
+        Gossiper.instance.initializeNodeUnsafe(member, hostId, MessagingService.VERSION_50, 1);
+        Gossiper.instance.injectApplicationState(member, ApacheUpgradePath.GOSSIP_STATE,
+                                                 StorageService.instance.valueFactory.compatibilityModes("mode=CASSANDRA_5;compat=CASSANDRA_5"));
+        StorageService.instance.getTokenMetadata().updateHostId(hostId, member);
         ApacheUpgradePath.instance.initialize();
         ApacheUpgradePath.instance.beforeGossipStart(new HashMap<>());
         assertThat(ApacheUpgradePath.isActive()).isTrue();

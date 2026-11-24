@@ -27,6 +27,7 @@ import com.google.common.annotations.VisibleForTesting;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -48,6 +49,7 @@ import org.apache.cassandra.repair.state.SyncState;
 import org.apache.cassandra.repair.state.ValidationState;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.utils.JVMStabilityInspector;
@@ -139,6 +141,14 @@ public class RepairMessageVerbHandler implements IVerbHandler<RepairMessage>
                     // error is logged in verifyCompactionsPendingThreshold
                     state.phase.fail("Too many pending compactions");
 
+                    sendFailureResponse(message);
+                    return;
+                }
+                String refusal = CassandraRelevantProperties.ALLOW_MIXED_REPAIR.getBoolean() ? null : ApacheUpgradePath.repairRefusal(message.from());
+                if (refusal != null)
+                {
+                    logger.error("Rejecting repair {}: {}", prepareMessage.parentRepairSession, refusal);
+                    state.phase.fail(refusal);
                     sendFailureResponse(message);
                     return;
                 }

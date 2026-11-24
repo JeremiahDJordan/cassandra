@@ -150,6 +150,93 @@ public final class ApacheUpgradePath implements IEndpointStateChangeSubscriber
         return isActive() || instance.apachePeer;
     }
 
+    /**
+     * Whether this node exchanges schema and repairs with {@code endpoint}, which speaks {@code version}, across
+     * messaging versions 13 and 110 (see {@link #bridgesVersion}): at 13, the peer runs in CASSANDRA_5, or is an Apache
+     * Cassandra 5.0 node, without modes in gossip and of a 5.x release; above 13, it runs in UPGRADING after
+     * CASSANDRA_5.
+     */
+    public static boolean bridges(InetAddressAndPort endpoint, int version)
+    {
+        if (!bridgesVersion(version))
+            return false;
+
+        EndpointState peer = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
+        if (peer == null)
+            return false;
+
+        Modes modes = Modes.parse(value(peer, GOSSIP_STATE));
+        if (version != MessagingService.VERSION_50)
+            return modes != null && UPGRADING.name().equals(modes.mode) && CASSANDRA_5.name().equals(modes.compat);
+        if (modes != null)
+            return CASSANDRA_5.name().equals(modes.mode);
+        String release = value(peer, ApplicationState.RELEASE_VERSION);
+        return release != null && release.startsWith(TARGET + '.');
+    }
+
+    /**
+     * Whether a message at {@code version} crosses messaging versions 13 and 110 while the path is active on this
+     * node. Schema mutations and repair messages serialize alike at both.
+     */
+    public static boolean bridgesVersion(int version)
+    {
+        int local = MessagingService.serializationVersion(MessagingService.current_version);
+        int remote = MessagingService.serializationVersion(version);
+        return isActive() && local != remote && isBridgedVersion(local) && isBridgedVersion(remote);
+    }
+
+    private static boolean isBridgedVersion(int version)
+    {
+        return version == MessagingService.VERSION_50 || version == MessagingService.VERSION_DS_20;
+    }
+
+    /**
+     * Why this node, on the path, doesn't repair with {@code endpoint}: the peer's messaging version isn't known, or
+     * differs from this node's and isn't bridged (see {@link #bridges}); null if it does, and always off the path.
+     */
+    @Nullable
+    public static String repairRefusal(InetAddressAndPort endpoint)
+    {
+        if (!isActive() || endpoint.equals(FBUtilities.getBroadcastAddressAndPort()))
+            return null;
+        Integer version = MessagingService.instance().versions.getRawIfKnown(endpoint);
+        if (version == null)
+            return String.format("%s has an unknown messaging version on the Apache upgrade path", endpoint);
+        if (MessagingService.isCurrentSerializationVersion(version) || bridges(endpoint, version))
+            return null;
+        return String.format("%s runs messaging version %d and isn't identified as a node on the Apache upgrade path", endpoint, version);
+    }
+
+    /**
+     * Whether schema changes are checked against Apache Cassandra 5.0: this node is on the path, or a ring member runs
+     * at messaging version 13 with a 5.x release, whatever this node's mode.
+     */
+    public static boolean checksSchemaChanges()
+    {
+        return isActive() || instance.apachePeer;
+    }
+
+    /**
+     * The ring members that don't advertise their modes in gossip, if this node is outside CASSANDRA_5 and on the path.
+     * It doesn't coordinate schema changes beside them: they may be Apache Cassandra nodes, which pull schema only from
+     * nodes at messaging version 13.
+     */
+    public static List<InetAddressAndPort> membersWithoutModes()
+    {
+        if (!isActive() || mode() == CASSANDRA_5)
+            return Collections.emptyList();
+
+        List<InetAddressAndPort> members = new ArrayList<>();
+        InetAddressAndPort local = FBUtilities.getBroadcastAddressAndPort();
+        for (InetAddressAndPort endpoint : StorageService.instance.getTokenMetadata().getAllEndpoints())
+        {
+            EndpointState peer = Gossiper.instance.getEndpointStateForEndpoint(endpoint);
+            if (!endpoint.equals(local) && (peer == null || peer.getApplicationState(GOSSIP_STATE) == null))
+                members.add(endpoint);
+        }
+        return members;
+    }
+
     @Nullable
     private static StorageCompatibilityMode recordAfterStart(StorageCompatibilityMode mode, @Nullable StorageCompatibilityMode previous)
     {

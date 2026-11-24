@@ -65,6 +65,7 @@ import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.NoPayload;
 import org.apache.cassandra.net.RequestCallback;
 import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.FBUtilities;
@@ -387,9 +388,10 @@ public class MigrationCoordinator
             return false;
         }
 
-        if (!MessagingService.isCurrentSerializationVersion(messagingService.versions.getRaw(endpoint)))
+        int version = messagingService.versions.getRaw(endpoint);
+        if (!MessagingService.isCurrentSerializationVersion(version) && !ApacheUpgradePath.bridges(endpoint, version))
         {
-            if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major) && messagingService.versions.getRaw(endpoint) == MessagingService.VERSION_50)
+            if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major) && version == MessagingService.VERSION_50)
             {
                 logger.debug("Allowing schema pull from {} because we are in {} compatibility mode", endpoint, DatabaseDescriptor.getStorageCompatibilityMode());
                 return true;
@@ -789,10 +791,11 @@ public class MigrationCoordinator
 
     private boolean shouldPushSchemaTo(InetAddressAndPort endpoint)
     {
-        // only push schema to nodes with known and equal versions
-        return !endpoint.equals(FBUtilities.getBroadcastAddressAndPort())
-               && messagingService.versions.knows(endpoint)
-               && MessagingService.isCurrentSerializationVersion(messagingService.versions.getRaw(endpoint));
+        // only push schema to nodes with known and equal versions, or across the Apache upgrade path's bridge
+        if (endpoint.equals(FBUtilities.getBroadcastAddressAndPort()) || !messagingService.versions.knows(endpoint))
+            return false;
+        int version = messagingService.versions.getRaw(endpoint);
+        return MessagingService.isCurrentSerializationVersion(version) || ApacheUpgradePath.bridges(endpoint, version);
     }
 
 }

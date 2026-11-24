@@ -36,6 +36,7 @@ import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.TableId;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.utils.TimeUUID;
 
@@ -103,7 +104,7 @@ public class PrepareMessage extends RepairMessage
         public void serialize(PrepareMessage message, DataOutputPlus out, int version) throws IOException
         {
             if (!ALLOW_MIXED_REPAIR)
-                Preconditions.checkArgument(MessagingService.isCurrentSerializationVersion(version),
+                Preconditions.checkArgument(MessagingService.isCurrentSerializationVersion(version) || ApacheUpgradePath.bridgesVersion(version),
                                             MIXED_MODE_ERROR);
 
             out.writeInt(message.tableIds.size());
@@ -125,7 +126,7 @@ public class PrepareMessage extends RepairMessage
         public PrepareMessage deserialize(DataInputPlus in, int version) throws IOException
         {
             if (!ALLOW_MIXED_REPAIR)
-                Preconditions.checkArgument(MessagingService.isCurrentSerializationVersion(version),
+                Preconditions.checkArgument(MessagingService.isCurrentSerializationVersion(version) || ApacheUpgradePath.bridgesVersion(version),
                                             MIXED_MODE_ERROR);
 
             int tableIdCount = in.readInt();

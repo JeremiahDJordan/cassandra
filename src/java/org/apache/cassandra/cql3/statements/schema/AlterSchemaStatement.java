@@ -32,6 +32,8 @@ import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.*;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.service.ApacheUpgradePath;
@@ -41,6 +43,7 @@ import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.Event.SchemaChange;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.schema.KeyspaceMetadata.validateKeyspaceName;
 
@@ -132,7 +135,15 @@ public abstract class AlterSchemaStatement implements CQLStatement.SingleKeyspac
 
         validateKeyspaceName(keyspaceName, AlterSchemaStatement::ire);
 
-        SchemaTransformation transformation = ApacheUpgradePath.isActive() ? compatibleWith(SchemaCompatibility.Target.APACHE_5_0) : this;
+        List<InetAddressAndPort> withoutModes = ApacheUpgradePath.membersWithoutModes();
+        if (!withoutModes.isEmpty())
+            throw ire("Refused while the Apache upgrade path is active, as the members %s don't advertise their " +
+                      "storage_compatibility_mode and may be Apache Cassandra nodes, which pull schema only from nodes at " +
+                      "messaging version %d. Run it on a node in storage_compatibility_mode %s or on an Apache " +
+                      "Cassandra node, or retry once these nodes advertise their mode.",
+                      withoutModes, MessagingService.VERSION_50, StorageCompatibilityMode.CASSANDRA_5);
+
+        SchemaTransformation transformation = ApacheUpgradePath.checksSchemaChanges() ? compatibleWith(SchemaCompatibility.Target.APACHE_5_0) : this;
         SchemaTransformationResult result = Schema.instance.transform(transformation, locally);
 
         clientWarnings(result.diff).forEach(ClientWarn.instance::warn);
