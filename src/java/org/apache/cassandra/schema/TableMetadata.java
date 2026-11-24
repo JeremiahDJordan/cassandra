@@ -1327,6 +1327,8 @@ public class TableMetadata implements SchemaElement
     {
         // Reach into subtypes first, so that if the type is a UDT, it's dependencies are recreated first.
         type.subTypes().forEach(t -> addUserTypes(t, types));
+        if (type.isVector())
+            addUserTypes(((VectorType<?>) type).elementType, types);
 
         if (type.isUDT())
             types.add(((UserType)type).name);

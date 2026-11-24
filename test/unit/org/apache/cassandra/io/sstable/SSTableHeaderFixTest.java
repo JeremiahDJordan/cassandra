@@ -37,10 +37,12 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
 import org.junit.After;
 import org.junit.Before;
+import org.junit.BeforeClass;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.FieldIdentifier;
@@ -59,6 +61,7 @@ import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.rows.EncodingStats;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.Version;
@@ -100,6 +103,12 @@ public class SSTableHeaderFixTest
     public static Collection<Object[]> parameters()
     {
         return MockSchema.sstableIdGenerators();
+    }
+
+    @BeforeClass
+    public static void setupClass()
+    {
+        CassandraRelevantProperties.VECTOR_FLOAT_ONLY.setBoolean(false);
     }
 
     @Before
@@ -244,6 +253,37 @@ public class SSTableHeaderFixTest
         // must not have re-written the stats-component
         header = readHeader(sstable);
         assertFrozenUdt(header, false, true);
+    }
+
+    @Test
+    public void vectorOfUserTypeWithAddedFieldTest() throws Exception
+    {
+        File dir = temporaryFolder;
+
+        UserType udt = (UserType) makeUDT2("udt_in_vector", false);
+        TableMetadata.Builder cols = TableMetadata.builder("ks", "cf")
+                                                  .addPartitionKeyColumn("pk", udtPK)
+                                                  .addClusteringColumn("ck", udtCK);
+        commonColumns(cols);
+        cols.addRegularColumn("udt_in_vector", VectorType.getInstance(udt, 2));
+
+        // the schema has a field added to the user type, as after ALTER TYPE ADD
+        UserType altered = new UserType(udt.keyspace,
+                                        udt.name,
+                                        ImmutableList.<FieldIdentifier>builder().addAll(udt.fieldNames()).add(FieldIdentifier.forUnquoted("added")).build(),
+                                        ImmutableList.<AbstractType<?>>builder().addAll(udt.fieldTypes()).add(Int32Type.instance).build(),
+                                        false);
+        File sstable = buildFakeSSTable(dir, 1, cols, c -> c.name.toString().equals("udt_in_vector")
+                                                           ? c.withNewType(VectorType.getInstance(altered, 2))
+                                                           : c);
+
+        SSTableHeaderFix headerFix = builder().withPath(sstable.toPath())
+                                              .build();
+        headerFix.execute();
+
+        assertFalse(headerFix.hasError());
+        assertFalse(headerFix.hasChanges());
+        assertTrue(updatedColumns.isEmpty());
     }
 
     /**

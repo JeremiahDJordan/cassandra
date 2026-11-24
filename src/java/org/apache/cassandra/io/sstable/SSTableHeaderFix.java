@@ -55,6 +55,7 @@ import org.apache.cassandra.db.marshal.MultiCellCapableType;
 import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.io.sstable.metadata.MetadataComponent;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.util.File;
@@ -637,7 +638,10 @@ public abstract class SSTableHeaderFix
         if (typeInHeader instanceof TupleType)
             return fixTypeInnerAbstractTuple(typeInHeader, typeInSchema, droppedColumnMode);
 
-        // all types, beside CollectionType + AbstractCompositeType + TupleType, should be ok (no nested types) - just check for compatibility
+        if (typeInHeader instanceof VectorType)
+            return fixTypeInnerVector((VectorType<?>) typeInHeader, typeInSchema, droppedColumnMode);
+
+        // all types, beside CollectionType + AbstractCompositeType + TupleType + VectorType, should be ok (no nested types) - just check for compatibility
         if (typeInHeader.isCompatibleWith(typeInSchema))
             return typeInHeader;
 
@@ -787,6 +791,25 @@ public abstract class SSTableHeaderFix
         }
         if (anyChanged)
             return CompositeType.getInstance(cHeaderFixed);
+        return cHeader;
+    }
+
+    private AbstractType<?> fixTypeInnerVector(VectorType<?> cHeader, AbstractType<?> typeInSchema, boolean droppedColumnMode)
+    {
+        if (!(typeInSchema instanceof VectorType) || cHeader.dimension != ((VectorType<?>) typeInSchema).dimension)
+            return null;
+        AbstractType<?> cHeaderElem = cHeader.elementType;
+        AbstractType<?> cSchemaElem = ((VectorType<?>) typeInSchema).elementType;
+        if (!cHeaderElem.referencesUserTypes() && !cSchemaElem.referencesUserTypes())
+            // no user types to fix in the element
+            return cHeader.isCompatibleWith(typeInSchema) ? cHeader : null;
+        AbstractType<?> cHeaderElemFixed = fixTypeInner(cHeaderElem, cSchemaElem, droppedColumnMode);
+        if (cHeaderElemFixed == null)
+            // bummer...
+            return null;
+        if (cHeaderElem != cHeaderElemFixed)
+            // element type changed
+            return VectorType.getInstance(cHeaderElemFixed, cHeader.dimension);
         return cHeader;
     }
 

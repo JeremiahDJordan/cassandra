@@ -734,7 +734,7 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
     /**
      * Whether this type is or contains any UDT.
      */
-    public final boolean referencesUserTypes()
+    public boolean referencesUserTypes()
     {
         return isUDT() || subTypes().stream().anyMatch(AbstractType::referencesUserTypes);
     }

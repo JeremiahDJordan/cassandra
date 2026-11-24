@@ -1228,7 +1228,13 @@ public interface CQL3Type
             @Override
             public void forEachUserType(Consumer<UTName> userTypeNameConsumer)
             {
-                // noop
+                element.forEachUserType(userTypeNameConsumer);
+            }
+
+            @Override
+            public boolean referencesUserType(String name)
+            {
+                return element.referencesUserType(name);
             }
 
             @Override
