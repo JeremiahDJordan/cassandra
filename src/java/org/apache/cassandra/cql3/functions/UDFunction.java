@@ -728,7 +728,10 @@ public abstract class UDFunction extends UserFunction implements ScalarFunction
             && argNames.equals(other.argNames)
             && body.equals(other.body)
             && language.equals(other.language)
-            && calledOnNullInput == other.calledOnNullInput;
+            && calledOnNullInput == other.calledOnNullInput
+            && deterministic == other.deterministic
+            && monotonic == other.monotonic
+            && monotonicOn.equals(other.monotonicOn);
     }
 
     @Override
