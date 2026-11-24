@@ -184,7 +184,7 @@ public class KeyRangeUnionIterator extends KeyRangeIterator
             if (rangeCount() == 1)
             {
                 KeyRangeIterator single = rangeIterators.get(0);
-                single.setOnClose(onClose);
+                single.addOnClose(onClose);
                 return single;
             }
 
