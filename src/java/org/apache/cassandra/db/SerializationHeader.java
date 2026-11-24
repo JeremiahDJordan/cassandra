@@ -49,6 +49,8 @@ import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.DroppedColumn;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.serializers.AbstractTypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -116,9 +118,37 @@ public class SerializationHeader
             stats.updateLocalDeletionTime(sstable.getMinLocalDeletionTime());
             stats.updateTTL(sstable.getMinTTL());
             for (ColumnMetadata column : sstable.header.columns())
-                columns.add(merging ? schemaVersion(metadata, column) : column);
+            {
+                // no cell of a deprecated system column survives a read, so the result doesn't need the column
+                if (!isDeprecatedSystemColumn(metadata, column))
+                    columns.add(merging ? schemaVersion(metadata, column) : column);
+            }
         }
         return new SerializationHeader(true, metadata, columns.build(), stats.get());
+    }
+
+    /**
+     * The header of an sstable written with {@code columns}, such as by a flush. A deprecated system column is left
+     * out, as in {@link #make(TableMetadata, Collection)}.
+     */
+    public static SerializationHeader make(TableMetadata metadata, RegularAndStaticColumns columns, EncodingStats stats)
+    {
+        RegularAndStaticColumns written = columns;
+        for (ColumnMetadata column : columns)
+        {
+            if (isDeprecatedSystemColumn(metadata, column))
+                written = written.without(column);
+        }
+        return new SerializationHeader(true, metadata, written, stats);
+    }
+
+    private static boolean isDeprecatedSystemColumn(TableMetadata metadata, ColumnMetadata column)
+    {
+        // not checked against the columns: the metadata of a trie memtable's flush has its dropped columns as columns
+        if (!SchemaConstants.isLocalSystemKeyspace(metadata.keyspace))
+            return false;
+        DroppedColumn dropped = metadata.droppedColumns.get(column.name.bytes);
+        return dropped != null && dropped.droppedTime == Long.MAX_VALUE;
     }
 
     /**

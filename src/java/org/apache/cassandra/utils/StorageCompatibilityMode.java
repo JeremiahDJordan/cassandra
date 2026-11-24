@@ -33,6 +33,7 @@ public enum StorageCompatibilityMode
      * Stay compatible with Cassandra 4.x, opting out from any new features that will prevent a rollback to 4.x.
      * At the moment, this means:
      *  - Deletion times will be limited to 2038, instead of the year 2106 limit introduced by 5.0.
+     *  - system_schema.functions and system_schema.aggregates have no deterministic and monotonic columns.
      */
     CASSANDRA_4(4),
 

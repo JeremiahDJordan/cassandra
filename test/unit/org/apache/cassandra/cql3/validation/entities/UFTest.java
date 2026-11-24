@@ -47,6 +47,7 @@ import org.apache.cassandra.transport.Event.SchemaChange.Target;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -1144,6 +1145,51 @@ public class UFTest extends CQLTester
             .isInstanceOf(InvalidRequestException.class)
             .hasMessageContaining("Currently only Java UDFs are available in Cassandra. " +
                                   "For more information - CASSANDRA-18252");
+        }
+    }
+
+    @Test
+    public void testDeterministicInCassandra4CompatibilityMode() throws Throwable
+    {
+        String function = createFunction(KEYSPACE, "double, double", "CREATE FUNCTION %s (state double, input double) " +
+                                                                     "CALLED ON NULL INPUT " +
+                                                                     "RETURNS double " +
+                                                                     "LANGUAGE java " +
+                                                                     "AS 'return input;'");
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        try
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_4);
+            assertInvalidMessage("DETERMINISTIC and MONOTONIC functions are not supported while storage_compatibility_mode is CASSANDRA_4",
+                                 "CREATE FUNCTION " + KEYSPACE + ".f_deterministic (input double) " +
+                                 "CALLED ON NULL INPUT " +
+                                 "RETURNS double " +
+                                 "DETERMINISTIC " +
+                                 "LANGUAGE java " +
+                                 "AS 'return input;'");
+            assertInvalidMessage("DETERMINISTIC and MONOTONIC functions are not supported while storage_compatibility_mode is CASSANDRA_4",
+                                 "CREATE FUNCTION " + KEYSPACE + ".f_monotonic (input double) " +
+                                 "CALLED ON NULL INPUT " +
+                                 "RETURNS double " +
+                                 "MONOTONIC " +
+                                 "LANGUAGE java " +
+                                 "AS 'return input;'");
+            assertInvalidMessage("DETERMINISTIC and MONOTONIC functions are not supported while storage_compatibility_mode is CASSANDRA_4",
+                                 "CREATE FUNCTION " + KEYSPACE + ".f_monotonic_on (state double, input double) " +
+                                 "CALLED ON NULL INPUT " +
+                                 "RETURNS double " +
+                                 "MONOTONIC ON input " +
+                                 "LANGUAGE java " +
+                                 "AS 'return input;'");
+            assertInvalidMessage("DETERMINISTIC aggregates are not supported while storage_compatibility_mode is CASSANDRA_4",
+                                 "CREATE AGGREGATE " + KEYSPACE + ".a_deterministic (double) " +
+                                 "SFUNC " + shortFunctionName(function) + " " +
+                                 "STYPE double " +
+                                 "DETERMINISTIC");
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
         }
     }
 
