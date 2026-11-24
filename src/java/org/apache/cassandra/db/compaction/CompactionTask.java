@@ -75,6 +75,8 @@ public class CompactionTask extends AbstractCompactionTask
     protected final boolean keepOriginals;
     /** for trace logging purposes only */
     private static final AtomicLong totalBytesCompacted = new AtomicLong();
+    /** millisecond in the name of the last snapshot taken before a compaction */
+    private static final AtomicLong lastSnapshotMillis = new AtomicLong();
 
     // The compaction strategy is not necessarily available for all compaction tasks (e.g. GC or sstable splitting)
     @Nullable
@@ -147,6 +149,28 @@ public class CompactionTask extends AbstractCompactionTask
         }
     }
 
+    @VisibleForTesting
+    static void setLastSnapshotMillis(long millis)
+    {
+        lastSnapshotMillis.set(millis);
+    }
+
+    /**
+     * Snapshots before compaction are named after their creation millisecond. Tasks that start in the same millisecond,
+     * such as the tasks of a parallel major compaction, take the next millisecond for which no snapshot of that name
+     * exists or is being taken.
+     */
+    private void snapshot(long creationMillis)
+    {
+        boolean taken;
+        do
+        {
+            long millis = lastSnapshotMillis.accumulateAndGet(creationMillis, (last, created) -> Math.max(last + 1, created));
+            taken = realm.snapshotWithoutMemtableIfAbsent(millis + "-compact-" + realm.getTableName());
+        }
+        while (!taken);
+    }
+
     private static long addToTotalBytesCompacted(long bytesCompacted)
     {
         return totalBytesCompacted.addAndGet(bytesCompacted);
@@ -207,7 +231,7 @@ public class CompactionTask extends AbstractCompactionTask
             return;
 
         if (DatabaseDescriptor.isSnapshotBeforeCompaction())
-            realm.snapshotWithoutMemtable(System.currentTimeMillis() + "-compact-" + realm.getTableName());
+            snapshot(System.currentTimeMillis());
 
         // The set of sstables given here may be later modified by buildCompactionCandidatesForAvailableDiskSpace() and
         // the compaction iterators in CompactionController and OverlapTracker will reflect the updated set of sstables.
