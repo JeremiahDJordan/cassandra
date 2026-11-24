@@ -19,11 +19,13 @@ package org.apache.cassandra.cql3.statements.schema;
 
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.cql3.statements.PropertyDefinitions;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.SyntaxException;
@@ -77,6 +79,29 @@ public final class TableAttributes extends PropertyDefinitions
         validBuilder.add(ID);
         validKeywords = validBuilder.build();
         obsoleteKeywords = ImmutableSet.of();
+    }
+
+    /**
+     * Returns the properties as they follow {@code WITH} in a statement. Table properties are strings or maps.
+     */
+    @SuppressWarnings("unchecked")
+    public String toCqlString()
+    {
+        CqlBuilder builder = new CqlBuilder();
+        boolean first = true;
+        for (Map.Entry<String, Object> property : new TreeMap<>(properties).entrySet())
+        {
+            if (!first)
+                builder.append(" AND ");
+            first = false;
+
+            builder.append(property.getKey()).append(" = ");
+            if (property.getValue() instanceof Map)
+                builder.append((Map<String, String>) property.getValue());
+            else
+                builder.appendWithSingleQuotes((String) property.getValue());
+        }
+        return builder.toString();
     }
 
     public void validate()
