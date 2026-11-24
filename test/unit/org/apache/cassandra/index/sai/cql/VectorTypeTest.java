@@ -695,6 +695,60 @@ public class VectorTypeTest extends VectorTester
     }
 
     @Test
+    public void testStaticColumnPredicate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, s int static, sval vector<float, 2> static, val vector<float, 2>, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(sval) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        // the rows are ordered by their distance to [0, 0] as by (pk, ck)
+        for (int pk = 0; pk < 4; pk++)
+        {
+            execute("INSERT INTO %s (pk, s, sval) VALUES (?, ?, ?)", pk, pk % 2, vector((float) -pk, (float) -pk));
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, val) VALUES (?, ?, ?)", pk, ck, vector((float) (pk * 3 + ck), (float) (pk * 3 + ck)));
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY val ANN OF [0, 0] LIMIT 3"),
+                       row(1, 0), row(1, 1), row(1, 2));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY val ANN OF [0, 0] LIMIT 10"),
+                       row(1, 0), row(1, 1), row(1, 2), row(3, 0), row(3, 1), row(3, 2));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 3 AND ck > 0 AND s = 1 ORDER BY val ANN OF [0, 0] LIMIT 1"),
+                       row(3, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY sval ANN OF [-9, -9] LIMIT 3"),
+                       row(3, 0), row(3, 1), row(3, 2));
+        });
+
+        // the static rows are then in a different memtable or sstable than the rows
+        execute("UPDATE %s SET s = 1 WHERE pk = 0");
+        execute("UPDATE %s SET s = 0 WHERE pk = 1");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY val ANN OF [0, 0] LIMIT 4"),
+                       row(0, 0), row(0, 1), row(0, 2), row(3, 0));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 0 ORDER BY val ANN OF [0, 0] LIMIT 2"),
+                       row(1, 0), row(1, 1));
+        });
+    }
+
+    @Test
+    public void testStaticColumnPredicateWithVectorClusteringColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck vector<float, 2>, s int static, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(ck) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        execute("INSERT INTO %s (pk, ck, s) VALUES (0, [1, 1], 0)");
+        execute("INSERT INTO %s (pk, ck) VALUES (0, [2, 2])");
+        execute("INSERT INTO %s (pk, ck, s) VALUES (1, [3, 3], 1)");
+        execute("INSERT INTO %s (pk, ck) VALUES (1, [4, 4])");
+
+        beforeAndAfterFlush(() -> assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY ck ANN OF [0, 0] LIMIT 2"),
+                                             row(1, vector(3f, 3f)), row(1, vector(4f, 4f))));
+    }
+
+    @Test
     public void testTooManyMaterializedKeys() throws Throwable
     {
         int originalValue = QueryController.MAX_MATERIALIZED_KEYS;
