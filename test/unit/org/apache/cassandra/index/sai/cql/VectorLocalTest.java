@@ -21,8 +21,10 @@ package org.apache.cassandra.index.sai.cql;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -42,7 +44,9 @@ import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
+import org.apache.cassandra.index.sai.metrics.ColumnQueryMetrics;
 import org.apache.cassandra.index.sai.utils.Glove;
 import org.assertj.core.data.Percentage;
 
@@ -51,6 +55,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 public class VectorLocalTest extends VectorTester.VersionedWithChecksums
 {
     private static final VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
+
+    // Graph search is approximate, so its recall is checked against a low floor per query and as a mean over queries.
+    private static final double MIN_QUERY_RECALL = 0.5;
 
     private static Glove.WordVector word2vec;
 
@@ -238,18 +245,21 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
 
         int vectorCount = getRandom().nextIntBetween(500, 1000);
 
-        int pk = 0;
-        Multimap<Long, float[]> vectorsByToken = ArrayListMultimap.create();
-        for (int index = 0; index < vectorCount; index++)
+        Map<Integer, Long> tokensByKey = new HashMap<>();
+        for (int pk = 0; pk < vectorCount; pk++)
         {
-            String word = word2vec.word(index);
-            float[] vector = word2vec.vector(word);
-            vectorsByToken.put(Murmur3Partitioner.instance.getToken(Int32Type.instance.decompose(pk)).getLongValue(), vector);
-            execute("INSERT INTO %s (pk, str_val, val) VALUES (?, ?, " + vectorString(vector) + " )", pk++, word);
+            String word = word2vec.word(pk);
+            tokensByKey.put(pk, Murmur3Partitioner.instance.getToken(Int32Type.instance.decompose(pk)).getLongValue());
+            execute("INSERT INTO %s (pk, str_val, val) VALUES (?, ?, " + vectorString(word2vec.vector(word)) + " )", pk, word);
         }
+
+        var index = (StorageAttachedIndex) getCurrentColumnFamilyStore().indexManager.listIndexes().iterator().next();
+        var metrics = (ColumnQueryMetrics.VectorIndexMetrics) index.getIndexContext().getColumnQueryMetrics();
 
         // query memtable index first and then on-disk index
         beforeAndAfterFlush(() -> {
+            double recall = 0;
+            int graphQueries = 0;
             for (int executionCount = 0; executionCount < 50; executionCount++)
             {
                 int key1 = getRandom().nextIntBetween(1, vectorCount * 2);
@@ -259,34 +269,37 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
 
                 long minToken = Math.min(token1, token2);
                 long maxToken = Math.max(token1, token2);
-                List<float[]> expected = vectorsByToken.entries().stream()
-                                                       .filter(e -> e.getKey() >= minToken && e.getKey() <= maxToken)
-                                                       .map(Map.Entry::getValue)
-                                                       .collect(Collectors.toList());
+                Set<Integer> expected = tokensByKey.entrySet().stream()
+                                                   .filter(e -> e.getValue() >= minToken && e.getValue() <= maxToken)
+                                                   .map(Map.Entry::getKey)
+                                                   .collect(Collectors.toSet());
 
                 float[] queryVector = word2vec.vector(word2vec.word(getRandom().nextIntBetween(0, vectorCount - 1)));
 
+                long graphSearches = metrics.annGraphSearches.getCount();
                 UntypedResultSet result = execute("SELECT * FROM %s" +
                                                   " WHERE token(pk) <= " + maxToken +
                                                   " AND token(pk) >= " + minToken +
                                                   " ORDER BY val ANN OF " + Arrays.toString(queryVector) +
                                                   " LIMIT 1000");
-                assertThat(result.size()).isCloseTo(expected.size(), Percentage.withPercentage(20))
-                                         .isLessThanOrEqualTo(1000);
+                assertDescendingScore(queryVector, getVectorsFromResult(result));
 
-                List<float[]> resultVectors = getVectorsFromResult(result);
-                assertDescendingScore(queryVector, resultVectors);
-
-                if (expected.isEmpty())
+                List<Integer> keys = distinctKeys(result);
+                assertThat(expected).containsAll(keys);
+                if (metrics.annGraphSearches.getCount() == graphSearches)
                 {
-                    assertThat(resultVectors).isEmpty();
+                    assertThat(keys).containsExactlyInAnyOrderElementsOf(expected);
                 }
                 else
                 {
-                    double recall = recallMatch(expected, resultVectors, expected.size());
-                    assertThat(recall).isGreaterThanOrEqualTo(0.8);
+                    double queryRecall = (double) keys.size() / expected.size();
+                    assertThat(queryRecall).isGreaterThanOrEqualTo(MIN_QUERY_RECALL);
+                    recall += queryRecall;
+                    graphQueries++;
                 }
             }
+            if (graphQueries > 0)
+                assertThat(recall / graphQueries).isGreaterThanOrEqualTo(0.99);
         });
     }
 
@@ -327,6 +340,7 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
         // query multiple on-disk indexes
         var testCount = 200;
         var start = getRandom().nextIntBetween(vectorCount, word2vec.size() - testCount);
+        double recall = 0;
         for (int i = start; i < start + testCount; i++)
         {
             var q = word2vec.vector(word2vec.word(i));
@@ -336,20 +350,29 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
 
             List<float[]> resultVectors = getVectorsFromResult(result);
             assertDescendingScore(q, resultVectors);
+            distinctKeys(result);
 
-            double recall = bruteForceRecall(q, resultVectors, population, limit);
-            assertThat(recall).isGreaterThanOrEqualTo(0.8);
+            double queryRecall = bruteForceRecall(q, resultVectors, population, limit);
+            assertThat(queryRecall).isGreaterThanOrEqualTo(MIN_QUERY_RECALL);
+            recall += queryRecall;
         }
+        assertThat(recall / testCount).isGreaterThanOrEqualTo(0.98);
     }
 
+    /**
+     * @return the fraction of the results that score at least as high as the {@code limit}-th nearest row, so rows
+     * sharing a vector count once each and ties at the limit are not misses
+     */
     private double bruteForceRecall(float[] q, List<float[]> resultVectors, List<float[]> population, int limit)
     {
-        List<float[]> expected = population
-                                 .stream()
-                                 .sorted(Comparator.comparingDouble(v -> -compareFloatArrays(v, q)))
-                                 .limit(limit)
-                                 .collect(Collectors.toList());
-        return recallMatch(expected, resultVectors, limit);
+        float limitScore = population.stream()
+                                     .map(v -> compareFloatArrays(v, q))
+                                     .sorted(Comparator.reverseOrder())
+                                     .skip(limit - 1)
+                                     .findFirst()
+                                     .orElseThrow();
+        long matches = resultVectors.stream().filter(v -> compareFloatArrays(v, q) >= limitScore).count();
+        return (double) matches / limit;
     }
 
     // search across multiple segments, combined with a non-ann predicate
@@ -406,6 +429,7 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
     {
         UntypedResultSet result = execute("SELECT * FROM %s WHERE str_val = '" + stringValue + "' ORDER BY val ann of " + Arrays.toString(queryVector) + " LIMIT " + limit);
         assertThat(result).hasSize(limit);
+        distinctKeys(result);
         return result;
     }
 
@@ -413,6 +437,7 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
     {
         UntypedResultSet result = execute("SELECT * FROM %s ORDER BY val ann of " + Arrays.toString(queryVector) + " LIMIT " + limit);
         assertThat(result.size()).isCloseTo(limit, Percentage.withPercentage(5));
+        distinctKeys(result);
         return result;
     }
 
@@ -420,7 +445,17 @@ public class VectorLocalTest extends VectorTester.VersionedWithChecksums
     {
         UntypedResultSet result = execute("SELECT * FROM %s ORDER BY val ann of ? LIMIT " + limit, queryVector);
         assertThat(result.size()).isCloseTo(limit, Percentage.withPercentage(5));
+        distinctKeys(result);
         return result;
+    }
+
+    private static List<Integer> distinctKeys(UntypedResultSet result)
+    {
+        List<Integer> keys = new ArrayList<>(result.size());
+        for (UntypedResultSet.Row row : result)
+            keys.add(row.getInt("pk"));
+        assertThat(keys).doesNotHaveDuplicates();
+        return keys;
     }
 
     private void assertDescendingScore(Vector<Float> queryVector, List<float[]> resultVectors)
