@@ -60,12 +60,17 @@ public abstract class AbstractReadRepair<E extends Endpoints<E>, P extends Repli
         private final DataResolver<E, P> dataResolver;
         private final ReadCallback<E, P> readCallback;
         private final Consumer<PartitionIterator> resultConsumer;
+        // whether maybeSendAdditionalReads may speculate, as the read callback was told, and after how long
+        private final boolean speculate;
+        private final long sampleLatencyNanos;
 
-        public DigestRepair(DataResolver<E, P> dataResolver, ReadCallback<E, P> readCallback, Consumer<PartitionIterator> resultConsumer)
+        public DigestRepair(DataResolver<E, P> dataResolver, ReadCallback<E, P> readCallback, Consumer<PartitionIterator> resultConsumer, boolean speculate, long sampleLatencyNanos)
         {
             this.dataResolver = dataResolver;
             this.readCallback = readCallback;
             this.resultConsumer = resultConsumer;
+            this.speculate = speculate;
+            this.sampleLatencyNanos = sampleLatencyNanos;
         }
     }
 
@@ -134,9 +139,11 @@ public abstract class AbstractReadRepair<E extends Endpoints<E>, P extends Repli
 
         // Do a full data read to resolve the correct response (and repair node that need be)
         DataResolver<E, P> resolver = new DataResolver<>(command, replicaPlan, this, queryStartNanoTime, trackRepairedStatus, digestResolver.getReadTracker());
-        ReadCallback<E, P> readCallback = new ReadCallback<>(resolver, command, replicaPlan, queryStartNanoTime);
+        long sampleLatencyNanos = cfs.sampleReadLatencyNanos;
+        boolean speculate = shouldSpeculate(sampleLatencyNanos);
+        ReadCallback<E, P> readCallback = new ReadCallback<>(resolver, command, replicaPlan, queryStartNanoTime, speculate);
 
-        digestRepair = new DigestRepair<>(resolver, readCallback, resultConsumer);
+        digestRepair = new DigestRepair<>(resolver, readCallback, resultConsumer, speculate, sampleLatencyNanos);
 
         // if enabled, request additional info about repaired data from any full replicas
         for (Replica replica : replicaPlan().contacts())
@@ -157,13 +164,13 @@ public abstract class AbstractReadRepair<E extends Endpoints<E>, P extends Repli
         repair.resultConsumer.accept(digestRepair.dataResolver.resolve());
     }
 
-    private boolean shouldSpeculate()
+    private boolean shouldSpeculate(long sampleLatencyNanos)
     {
         ConsistencyLevel consistency = replicaPlan().consistencyLevel();
         ConsistencyLevel speculativeCL = consistency.isDatacenterLocal() ? ConsistencyLevel.LOCAL_QUORUM : ConsistencyLevel.QUORUM;
         return  consistency != ConsistencyLevel.EACH_QUORUM
                 && consistency.satisfies(speculativeCL, replicaPlan.get().replicationStrategy())
-                && cfs.sampleReadLatencyNanos <= command.getTimeout(NANOSECONDS);
+                && sampleLatencyNanos <= command.getTimeout(NANOSECONDS);
     }
 
     public void maybeSendAdditionalReads()
@@ -174,11 +181,14 @@ public abstract class AbstractReadRepair<E extends Endpoints<E>, P extends Repli
         if (repair == null)
             return;
 
-        if (shouldSpeculate() && !repair.readCallback.awaitFrom(System.nanoTime(), cfs.sampleReadLatencyNanos, NANOSECONDS))
+        if (repair.speculate && !repair.readCallback.awaitFrom(System.nanoTime(), repair.sampleLatencyNanos, NANOSECONDS))
         {
             Replica uncontacted = replicaPlan().firstUncontactedCandidate(replica -> true);
             if (uncontacted == null)
+            {
+                repair.readCallback.onNoSpeculativeRetry();
                 return;
+            }
 
             replicaPlan.addToContacts(uncontacted);
             sendReadCommand(uncontacted, repair.readCallback, true, false);
