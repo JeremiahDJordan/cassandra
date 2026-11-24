@@ -657,7 +657,9 @@ public interface CQL3Type
         public String toString(boolean alreadyFrozen, boolean forceFrozen)
         {
             StringBuilder sb = new StringBuilder();
-            sb.append("vector<").append(type.elementType.asCQL3Type()).append(", ").append(type.dimension).append('>');
+            // the element is printed as a top-level type, as Apache Cassandra does
+            sb.append("vector<").append(type.elementType.asCQL3Type().toString(false, forceFrozen))
+              .append(", ").append(type.dimension).append('>');
             return sb.toString();
         }
 
