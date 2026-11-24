@@ -130,9 +130,22 @@ public abstract class KeyRangeIterator extends AbstractGuavaIterator<PrimaryKey>
      */
     protected abstract void performSkipTo(PrimaryKey nextKey);
 
-    public void setOnClose(Runnable onClose)
+    /**
+     * Adds an action to run on {@link #close()}, after the ones this iterator already has.
+     */
+    public void addOnClose(Runnable onClose)
     {
-        this.onClose = onClose;
+        Runnable previous = this.onClose;
+        this.onClose = () -> {
+            try
+            {
+                previous.run();
+            }
+            finally
+            {
+                onClose.run();
+            }
+        };
     }
 
     @Override

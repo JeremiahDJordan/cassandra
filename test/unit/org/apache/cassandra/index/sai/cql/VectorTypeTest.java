@@ -20,10 +20,13 @@ package org.apache.cassandra.index.sai.cql;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.IntPredicate;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import org.junit.Test;
 
@@ -35,6 +38,7 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.disk.SSTableIndex;
 import org.apache.cassandra.index.sai.plan.QueryController;
 import org.apache.cassandra.service.ClientWarn;
 
@@ -200,6 +204,56 @@ public class VectorTypeTest extends VectorTester
 
         result = execute("SELECT * FROM %s WHERE b=true AND str='B' ORDER BY v ANN OF [3.1, 4.1, 5.1] LIMIT 2");
         assertThat(result).hasSize(1);
+    }
+
+    @Test
+    public void testInRestrictionOnIndexedColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, x int, y int, v vector<float, 2>, PRIMARY KEY(pk))");
+        String xIndex = createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(y) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+        disableCompaction(keyspace());
+        // keeps IN ? with one value an IN restriction
+        forcePreparedValues();
+
+        // rows in three sstables and the memtable
+        for (int pk = 0; pk < 100; pk++)
+        {
+            execute("INSERT INTO %s (pk, x, y, v) VALUES (?, ?, ?, ?)", pk, pk % 10, pk % 3, vector((float) pk, (float) pk));
+            if (pk % 30 == 29)
+                flush();
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk FROM %s WHERE x IN (1, 2) ORDER BY v ANN OF [50.2, 50.2] LIMIT 5 ALLOW FILTERING"),
+                       nearestRows(5, pk -> pk % 10 == 1 || pk % 10 == 2));
+            assertRows(execute("SELECT pk FROM %s WHERE x IN (1, 2) ORDER BY v ANN OF [50.2, 50.2] LIMIT 50 ALLOW FILTERING"),
+                       nearestRows(50, pk -> pk % 10 == 1 || pk % 10 == 2));
+            assertRows(execute("SELECT pk FROM %s WHERE x IN ? ORDER BY v ANN OF [50.2, 50.2] LIMIT 5 ALLOW FILTERING", list(1)),
+                       nearestRows(5, pk -> pk % 10 == 1));
+            assertRows(execute("SELECT pk FROM %s WHERE x IN (1, 2, 3) AND y = 0 ORDER BY v ANN OF [50.2, 50.2] LIMIT 5 ALLOW FILTERING"),
+                       nearestRows(5, pk -> pk % 10 >= 1 && pk % 10 <= 3 && pk % 3 == 0));
+            assertRows(execute("SELECT pk FROM %s WHERE x IN (1, 2, 3) AND y IN (0, 1) ORDER BY v ANN OF [50.2, 50.2] LIMIT 5 ALLOW FILTERING"),
+                       nearestRows(5, pk -> pk % 10 >= 1 && pk % 10 <= 3 && pk % 3 != 2));
+        });
+
+        // the queries have released the sstable indexes they searched, so compaction releases them
+        StorageAttachedIndex index = (StorageAttachedIndex) getCurrentColumnFamilyStore().indexManager.getIndexByName(xIndex);
+        Collection<SSTableIndex> sstableIndexes = index.view().getIndexes();
+        compact();
+        assertTrue(sstableIndexes.stream().allMatch(SSTableIndex::isReleased));
+    }
+
+    private static Object[][] nearestRows(int limit, IntPredicate matches)
+    {
+        return IntStream.range(0, 100)
+                        .filter(matches)
+                        .boxed()
+                        .sorted(Comparator.comparingDouble(pk -> Math.abs(pk - 50.2)))
+                        .limit(limit)
+                        .map(pk -> row(pk))
+                        .toArray(Object[][]::new);
     }
 
     @Test
