@@ -26,11 +26,16 @@ import java.util.ListIterator;
 import com.google.common.collect.ListMultimap;
 
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionPurger;
+import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.ColumnMetadata.Kind;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.index.sai.plan.Operation.OperationType;
@@ -103,7 +108,12 @@ public class FilterTree
             {
                 Expression filter = filterIterator.previous();
 
-                if (TypeUtil.isNonFrozenCollection(column.type))
+                // RowFilter would match a static row alone on any regular column
+                if (filter.unindexedMapEntry != null && row != null && row.isStatic() == column.isStatic())
+                {
+                    result = op.apply(result, isSatisfiedBy(filter.unindexedMapEntry, filter.context.columnFamilyStore().metadata(), key, row, now));
+                }
+                else if (TypeUtil.isNonFrozenCollection(column.type))
                 {
                     Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);
                     result = op.apply(result, filter.isSatisfiedBy(valueIterator));
@@ -119,6 +129,17 @@ public class FilterTree
             }
         }
         return result;
+    }
+
+    /**
+     * Evaluates the map entry comparison on the live cells of the row, as {@link RowFilter} expects.
+     */
+    private static boolean isSatisfiedBy(RowFilter.MapComparisonExpression mapEntry, TableMetadata metadata, DecoratedKey key, Row row, int now)
+    {
+        Row live = row.purge(DeletionPurger.PURGE_ALL, now, metadata.enforceStrictLiveness());
+        if (live == null)
+            live = row.isStatic() ? Rows.EMPTY_STATIC_ROW : BTreeRow.emptyRow(row.clustering());
+        return mapEntry.isSatisfiedBy(metadata, key, live);
     }
 
     /**
