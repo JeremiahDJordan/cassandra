@@ -87,6 +87,7 @@ public abstract class AbstractReadExecutor
                          ReadCommand command,
                          ReplicaPlan.ForTokenRead replicaPlan,
                          int initialDataRequestCount,
+                         boolean couldSpeculate,
                          Dispatcher.RequestTime requestTime,
                          QueryInfoTracker.ReadTracker readTracker)
     {
@@ -96,7 +97,7 @@ public abstract class AbstractReadExecutor
         // the ReadRepair and DigestResolver both need to see our updated
         this.readRepair = ReadRepair.create(command, this.replicaPlan, requestTime);
         this.digestResolver = new DigestResolver<>(command, this.replicaPlan, requestTime, readTracker);
-        this.handler = new ReadCallback<>(digestResolver, command, this.replicaPlan, requestTime);
+        this.handler = new ReadCallback<>(digestResolver, command, this.replicaPlan, requestTime, couldSpeculate);
         this.cfs = cfs;
         this.traceState = Tracing.instance.get();
         this.requestTime = requestTime;
@@ -296,7 +297,7 @@ public abstract class AbstractReadExecutor
 
         public NeverSpeculatingReadExecutor(ColumnFamilyStore cfs, ReadCommand command, ReplicaPlan.ForTokenRead replicaPlan, Dispatcher.RequestTime requestTime, boolean logFailedSpeculation, QueryInfoTracker.ReadTracker readTracker)
         {
-            super(cfs, command, replicaPlan, 1, requestTime, readTracker);
+            super(cfs, command, replicaPlan, 1, false, requestTime, readTracker);
             this.logFailedSpeculation = logFailedSpeculation;
         }
 
@@ -322,7 +323,7 @@ public abstract class AbstractReadExecutor
             // We're hitting additional targets for read repair (??).  Since our "extra" replica is the least-
             // preferred by the snitch, we do an extra data read to start with against a replica more
             // likely to respond; better to let RR fail than the entire query.
-            super(cfs, command, replicaPlan, replicaPlan.readQuorum() < replicaPlan.contacts().size() ? 2 : 1, requestTime, readTracker);
+            super(cfs, command, replicaPlan, replicaPlan.readQuorum() < replicaPlan.contacts().size() ? 2 : 1, true, requestTime, readTracker);
         }
 
         public void maybeTryAdditionalReplicas()
@@ -356,6 +357,7 @@ public abstract class AbstractReadExecutor
                         cfs.metric.speculativeInsufficientReplicas.inc();
                         // cannot safely speculate a new data request, without more work - requests assumed to be
                         // unique per endpoint, and we have no full nodes left to speculate against
+                        handler.onNoSpeculativeRetry();
                         return;
                     }
                 }
@@ -370,6 +372,10 @@ public abstract class AbstractReadExecutor
                 logger.trace("speculating read retry on {}", extraReplica);
 
                 MessagingService.instance().sendWithCallback(retryCommand.createMessage(false, requestTime), extraReplica.endpoint(), handler);
+            }
+            else
+            {
+                handler.onNoSpeculativeRetry();
             }
         }
 
@@ -393,7 +399,7 @@ public abstract class AbstractReadExecutor
         {
             // presumably, we speculate an extra data request here in case it is our data request that fails to respond,
             // and there are no more nodes to consult
-            super(cfs, command, replicaPlan, replicaPlan.contacts().size() > 1 ? 2 : 1, requestTime, readTracker);
+            super(cfs, command, replicaPlan, replicaPlan.contacts().size() > 1 ? 2 : 1, false, requestTime, readTracker);
         }
 
         public void maybeTryAdditionalReplicas()
