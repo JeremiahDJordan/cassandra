@@ -247,6 +247,14 @@ public abstract class ReadCommand extends AbstractReadQuery
     protected abstract void serializeSelection(DataOutputPlus out, int version) throws IOException;
     protected abstract long selectionSerializedSize(int version);
 
+    /**
+     * Throws if this command can't be sent to nodes on the given messaging version. Checked before the command writes
+     * anything, as a large message may be flushed to the network while it's being serialized.
+     */
+    protected void checkSerializable(int version)
+    {
+    }
+
     public abstract boolean isLimitedToOnePartition();
 
     /**
@@ -1737,6 +1745,8 @@ public abstract class ReadCommand extends AbstractReadQuery
 
         public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
         {
+            command.checkSerializable(version);
+
             out.writeByte(command.kind.ordinal());
             out.writeByte(
                     digestFlag(command.isDigestQuery())
