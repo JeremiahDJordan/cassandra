@@ -24,6 +24,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -32,6 +33,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import com.google.common.collect.Iterators;
+import com.google.common.util.concurrent.Uninterruptibles;
 import com.googlecode.concurrenttrees.common.Iterables;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.compaction.TableOperation;
@@ -84,6 +86,7 @@ import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
 import static org.apache.cassandra.db.ColumnFamilyStore.STATUS.INVALID_DROPPED;
 import static org.apache.cassandra.db.ColumnFamilyStore.STATUS.INVALID_UNLOADED;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.*;
 
 public class ColumnFamilyStoreTest
@@ -612,6 +615,45 @@ public class ColumnFamilyStoreTest
                  .forEach(originalFiles::add);
         assertThat(originalFiles.stream().anyMatch(f -> f.toString().endsWith(indexTableFile))).isTrue();
         assertThat(originalFiles.stream().anyMatch(f -> f.toString().endsWith(baseTableFile))).isTrue();
+    }
+
+    @Test
+    public void testSnapshotWithNameOfSnapshotBeingTaken() throws Exception
+    {
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        new RowUpdateBuilder(cfs.metadata(), 0, "key1").clustering("Column1").add("val", "asdf").build().applyUnsafe();
+        cfs.forceBlockingFlush(UNIT_TESTS);
+        String snapshotName = "beingTaken";
+
+        // an ephemeral snapshot held while it selects its SSTables, before it creates any directory
+        CountDownLatch selecting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompletableFuture<Set<SSTableReader>> held = CompletableFuture.supplyAsync(() -> cfs.snapshotWithoutMemtable(snapshotName, sstable -> {
+            selecting.countDown();
+            Uninterruptibles.awaitUninterruptibly(release, 1, TimeUnit.MINUTES);
+            return true;
+        }, true, null));
+        try
+        {
+            assertTrue(selecting.await(1, TimeUnit.MINUTES));
+            assertFalse(cfs.snapshotExists(snapshotName));
+            assertFalse(cfs.snapshotWithoutMemtableIfAbsent(snapshotName));
+            assertThatThrownBy(() -> cfs.snapshotWithoutMemtable(snapshotName)).hasMessageContaining("is being taken");
+        }
+        finally
+        {
+            release.countDown();
+        }
+        assertThat(held.get(1, TimeUnit.MINUTES)).hasSize(1);
+        assertFalse(cfs.snapshotWithoutMemtableIfAbsent(snapshotName));
+        cfs.clearSnapshot(snapshotName);
+
+        // a snapshot that fails frees its name
+        assertThatThrownBy(() -> cfs.snapshotWithoutMemtable("failed", sstable -> { throw new IllegalStateException(); }, false, null))
+        .isInstanceOf(IllegalStateException.class);
+        assertTrue(cfs.snapshotWithoutMemtableIfAbsent("failed"));
+        cfs.clearSnapshot("failed");
     }
 
     @Test
