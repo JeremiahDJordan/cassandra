@@ -59,6 +59,7 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.locator.EndpointsForRange;
 import org.apache.cassandra.locator.EndpointsForToken;
@@ -323,6 +324,38 @@ public abstract  class AbstractReadRepairTest
     {
         return createInstrumentedReadRepair(command, replicaPlan, System.nanoTime());
 
+    }
+
+    /**
+     * A failed read of a read repair that won't speculate fails the repair right away.
+     */
+    @Test
+    public void readFailureWithoutSpeculation()
+    {
+        cfs.sampleReadLatencyNanos = command.getTimeout(TimeUnit.NANOSECONDS) + 1;
+        InstrumentedReadRepair repair = createInstrumentedReadRepair(ReplicaPlan.shared(replicaPlan(replicas, EndpointsForRange.of(replica1, replica2))));
+        repair.startRepair(mock(DigestResolver.class), new ResultConsumer());
+
+        repair.getReadCallback().onFailure(target1, RequestFailureReason.UNKNOWN);
+        Assert.assertTrue(repair.getReadCallback().awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+    }
+
+    /**
+     * A failed read of a read repair that may speculate waits for the speculative read, which is sent after the delay
+     * the read repair started with.
+     */
+    @Test
+    public void readFailureWithSpeculation()
+    {
+        InstrumentedReadRepair repair = createInstrumentedReadRepair(ReplicaPlan.shared(replicaPlan(replicas, EndpointsForRange.of(replica1, replica2))));
+        repair.startRepair(mock(DigestResolver.class), new ResultConsumer());
+
+        repair.getReadCallback().onFailure(target1, RequestFailureReason.UNKNOWN);
+        Assert.assertFalse(repair.getReadCallback().awaitFrom(System.nanoTime(), 0, TimeUnit.MILLISECONDS));
+        // the speculation threshold of the table changes after the read repair started
+        cfs.sampleReadLatencyNanos = TimeUnit.DAYS.toNanos(1);
+        repair.maybeSendAdditionalReads();
+        Assert.assertEquals(epSet(target1, target2, target3), repair.getReadRecipients());
     }
 
     /**
