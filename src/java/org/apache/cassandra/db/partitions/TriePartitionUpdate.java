@@ -58,6 +58,7 @@ import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.db.tries.DeletionAwareTrie;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
+import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -89,9 +90,10 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                 int rowCountIncludingStatic,
                                 int tombstoneCount,
                                 int dataSize,
-                                InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie)
+                                InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie,
+                                Trie<byte[][]> originalClusterings)
     {
-        super(key, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, metadata);
+        super(key, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, originalClusterings, metadata);
         this.dataSize = dataSize;
     }
 
@@ -128,7 +130,8 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                        0,
                                        0,
                                        0,
-                                       newTrieWithPartitionMarker());
+                                       newTrieWithPartitionMarker(),
+                                       null);
     }
 
     /** @see PartitionUpdate.Factory#fullPartitionDelete */
@@ -144,7 +147,8 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                        0,
                                        1,
                                        deletionTime.dataSize(),
-                                       trie);
+                                       trie,
+                                       null);
     }
 
     /** @see PartitionUpdate.Factory#singleRowUpdate */
@@ -161,8 +165,12 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
 
         // Only count the row if it has live data, as the other ways of building trie-backed partitions do.
         boolean hasLiveData = putInTrie(makeNoConflictMutator(trie), metadata, metadata.comparator, row);
+        OriginalClusterings.Builder originalClusterings = OriginalClusterings.builder(metadata.comparator);
+        if (originalClusterings != null)
+            originalClusterings.add(row.clustering());
 
-        return new TriePartitionUpdate(metadata, key, columns, stats, hasLiveData ? 1 : 0, row.deletion().isLive() ? 0 : 1, row.dataSize(), trie);
+        return new TriePartitionUpdate(metadata, key, columns, stats, hasLiveData ? 1 : 0, row.deletion().isLive() ? 0 : 1, row.dataSize(), trie,
+                                       originalClusterings != null ? originalClusterings.build() : null);
     }
 
     /** @see PartitionUpdate.Factory#fromIterator(UnfilteredRowIterator)  */
@@ -178,7 +186,8 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                        builder.rowCountIncludingStatic(),
                                        builder.tombstoneCount(),
                                        builder.dataSize(),
-                                       builder.trie());
+                                       builder.trie(),
+                                       builder.originalClusterings());
     }
 
     /**
@@ -221,6 +230,30 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         try (UnfilteredRowIterator iterator = update.unfilteredIterator())
         {
             return build(iterator, destination, false).trie().prefixedBy(update.partitionKey());
+        }
+    }
+
+    /**
+     * Convert the given update to a trie-backed partition whose cells are keyed with the column ids of the given table
+     * metadata, as {@link #asMergableTrie(PartitionUpdate, TableMetadata)} does, keeping its
+     * {@link OriginalClusterings} values.
+     */
+    public static TrieBackedPartition asTrieUpdate(PartitionUpdate update, TableMetadata destination)
+    {
+        if (update instanceof TriePartitionUpdate && hasSameColumns(update.metadata(), destination))
+            return (TriePartitionUpdate) update;
+
+        try (UnfilteredRowIterator iterator = update.unfilteredIterator())
+        {
+            ContentBuilder builder = build(iterator, destination, false);
+            return new TrieBackedPartition(update.partitionKey(),
+                                           update.columns(),
+                                           update.stats(),
+                                           builder.rowCountIncludingStatic(),
+                                           builder.tombstoneCount(),
+                                           builder.trie(),
+                                           builder.originalClusterings(),
+                                           destination);
         }
     }
 
@@ -280,10 +313,10 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             throw new AssertionError(e);
         }
         // Note: the tombstoneCount here may be an overestimation (some boundaries become covering deletions).
-        TriePartitionUpdate updated = new TriePartitionUpdate(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        TriePartitionUpdate updated = new TriePartitionUpdate(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t, originalClusterings);
         // Commit.isReproposal reads the ballot back from stats().minTimestamp, so the stats must follow the new timestamps.
         EncodingStats updatedStats = EncodingStats.Collector.collect(updated.staticRow(), updated.rowIterator(), updated.deletionInfo());
-        return new TriePartitionUpdate(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        return new TriePartitionUpdate(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, tombstoneCount, dataSize, t, originalClusterings);
     }
 
     @Override
@@ -294,7 +327,9 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         MutableDeletionInfo.Builder builder = MutableDeletionInfo.builder(partitionLevelDeletion, metadata.comparator, false);
         for (Map.Entry<ByteComparable.Preencoded, TrieTombstoneMarker> entry : trie.deletionBranchAtRoot().entrySet())
         {
-            RangeTombstoneMarker marker = entry.getValue().toRangeTombstoneMarker(entry.getKey(), BYTE_COMPARABLE_VERSION, metadata.comparator);
+            RangeTombstoneMarker marker = OriginalClusterings.withOriginalValues(entry.getValue().toRangeTombstoneMarker(entry.getKey(), BYTE_COMPARABLE_VERSION, metadata.comparator),
+                                                                                 originalClusterings,
+                                                                                 entry.getKey());
             if (marker != null)
                 builder.add(marker);
         }
@@ -475,7 +510,8 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                        rowCountIncludingStatic,
                                        tombstoneCount,
                                        dataSize,
-                                       (InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trie);
+                                       (InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>) trie,
+                                       originalClusterings);
     }
 
     /// Returns true iff the given marker has a new row-level deletion on its right side.
@@ -507,6 +543,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
         private final RegularAndStaticColumns columns;
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = newTrieWithPartitionMarker();
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Object, TrieTombstoneMarker> mutator;
+        private final OriginalClusterings.Builder originalClusterings;
         private final EncodingStats.Collector statsCollector = new EncodingStats.Collector();
         /// Counts live rows (i.e. instances of LivenessInfo including EMPTY)
         private int rowCountIncludingStatic;
@@ -527,6 +564,7 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
             rowCountIncludingStatic = 0;
             tombstoneCount = 0;
             dataSize = 0;
+            originalClusterings = OriginalClusterings.builder(metadata.comparator);
             mutator = trie.mutator(this::mergeIncomingData,
                                    this::mergeTombstones,
                                    this::applyIncomingTombstone,
@@ -550,6 +588,8 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                 return;
 
             putInTrie(mutator, metadata, metadata.comparator, row);
+            if (originalClusterings != null)
+                originalClusterings.add(row.clustering());
         }
 
         @Override
@@ -567,6 +607,11 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                    metadata.comparator.asByteComparable(range.deletedSlice().start()),
                                    metadata.comparator.asByteComparable(range.deletedSlice().end()),
                                    range.deletionTime());
+            if (originalClusterings != null)
+            {
+                originalClusterings.add(range.deletedSlice().start());
+                originalClusterings.add(range.deletedSlice().end());
+            }
         }
 
         @Override
@@ -593,7 +638,8 @@ public class TriePartitionUpdate extends TrieBackedPartition implements Partitio
                                            rowCountIncludingStatic,
                                            tombstoneCount,
                                            Ints.saturatedCast(dataSize),
-                                           trie);
+                                           trie,
+                                           originalClusterings != null ? originalClusterings.build() : null);
         }
 
         /** Merge in live data from the update trie. This can be various markers, liveness info or cells. */

@@ -38,28 +38,34 @@ public abstract class AbstractBufferCellData implements CellData<ByteBuffer, Abs
         return ByteBufferAccessor.instance;
     }
 
+    /// Cell data with the given content, keeping the cell path stored with this one (see [CellData#storedPath()]).
+    protected BufferCellData newData(ByteBuffer value, long timestamp, long localDeletionTime, int ttl, boolean isCounterCell)
+    {
+        return new BufferCellData(value, timestamp, localDeletionTime, ttl, isCounterCell);
+    }
+
     @Override
     public BufferCellData withNewData(long timestamp, long localDeletionTime, int ttl, ByteBuffer value)
     {
-        return new BufferCellData(value, timestamp, localDeletionTime, ttl, isCounterCell());
+        return newData(value, timestamp, localDeletionTime, ttl, isCounterCell());
     }
 
     @Override
     public BufferCellData withUpdatedTimestampAndLocalDeletionTime(long newTimestamp, long newLocalDeletionTime)
     {
-        return new BufferCellData(value(), newTimestamp, newLocalDeletionTime, ttl(), isCounterCell());
+        return newData(value(), newTimestamp, newLocalDeletionTime, ttl(), isCounterCell());
     }
 
     @Override
     public BufferCellData updateAllTimestamp(long newTimestamp)
     {
-        return new BufferCellData(value(), isTombstone() ? newTimestamp - 1 : newTimestamp, localDeletionTime(), ttl(), isCounterCell());
+        return newData(value(), isTombstone() ? newTimestamp - 1 : newTimestamp, localDeletionTime(), ttl(), isCounterCell());
     }
 
     @Override
     public BufferCellData withSkippedValue()
     {
-        return new BufferCellData(ByteBufferUtil.EMPTY_BYTE_BUFFER, timestamp(), localDeletionTime(), ttl(), isCounterCell());
+        return newData(ByteBufferUtil.EMPTY_BYTE_BUFFER, timestamp(), localDeletionTime(), ttl(), isCounterCell());
     }
 
     @Override
@@ -76,7 +82,7 @@ public abstract class AbstractBufferCellData implements CellData<ByteBuffer, Abs
     {
         ByteBuffer value = value();
         ByteBuffer newBuffer = cloner.clone(value);
-        return newBuffer == value ? this : new BufferCellData(newBuffer, timestamp(), localDeletionTime(), ttl(), isCounterCell());
+        return newBuffer == value ? this : newData(newBuffer, timestamp(), localDeletionTime(), ttl(), isCounterCell());
     }
 
     @Override
@@ -97,7 +103,7 @@ public abstract class AbstractBufferCellData implements CellData<ByteBuffer, Abs
                 // Note that as long as the expiring column and the tombstone put together live longer than GC grace seconds,
                 // we'll fulfil our responsibility to repair. See discussion at
                 // http://cassandra-user-incubator-apache-org.3065146.n2.nabble.com/repair-compaction-and-tombstone-rows-td7583481.html
-                return BufferCellData.tombstone(timestamp(), localDeletionTime() - ttl()).purge(purger, nowInSec);
+                return newData(ByteBufferUtil.EMPTY_BYTE_BUFFER, timestamp(), localDeletionTime() - ttl(), NO_TTL, false).purge(purger, nowInSec);
             }
         }
         return this;
@@ -116,7 +122,7 @@ public abstract class AbstractBufferCellData implements CellData<ByteBuffer, Abs
 
         ByteBuffer value = buffer();
         ByteBuffer marked = CounterContext.instance().markLocalToBeCleared(value);
-        return marked == value ? this : new BufferCellData(marked, timestamp(), localDeletionTime(), ttl(), true);
+        return marked == value ? this : newData(marked, timestamp(), localDeletionTime(), ttl(), true);
     }
 
     @Override

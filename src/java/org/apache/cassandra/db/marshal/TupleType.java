@@ -254,6 +254,42 @@ public class TupleType extends MultiCellCapableType<ByteBuffer>
     }
 
     @Override
+    public boolean decodesComparableBytesExactly()
+    {
+        // A value can have fewer components than the type, any negative length for a null and empty components, and
+        // decodes with all components, nulls of length -1 and empty components as nulls.
+        return false;
+    }
+
+    @Override
+    public <V> boolean decodesComparableBytesExactly(V value, ValueAccessor<V> accessor)
+    {
+        if (accessor.isEmpty(value))
+            return true;
+        int length = accessor.size(value);
+        int position = 0;
+        for (int i = 0; i < size(); i++)
+        {
+            if (position + 4 > length)
+                return false;
+            int componentLength = accessor.getInt(value, position);
+            position += 4;
+            if (componentLength < 0)
+            {
+                if (componentLength != -1)
+                    return false;
+                continue;
+            }
+            if (componentLength == 0 || position + componentLength > length)
+                return false;
+            if (!type(i).decodesComparableBytesExactly(accessor.slice(value, position, componentLength), accessor))
+                return false;
+            position += componentLength;
+        }
+        return true;
+    }
+
+    @Override
     public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
     {
         assert version != ByteComparable.Version.LEGACY; // Reverse translation is not supported for the legacy version.

@@ -54,6 +54,7 @@ import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.db.tries.DeletionAwareTrie;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
 import org.apache.cassandra.db.tries.RangeTrie;
+import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
@@ -82,9 +83,10 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                                       int rowCountIncludingStatic,
                                       int tombstoneCount,
                                       int dataSize,
-                                      DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
+                                      DeletionAwareTrie<Object, TrieTombstoneMarker> trie,
+                                      Trie<byte[][]> originalClusterings)
     {
-        super(key, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, metadata);
+        super(key, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, originalClusterings, metadata);
         this.dataSize = dataSize;
     }
 
@@ -139,7 +141,8 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                                              0,
                                              0,
                                              0,
-                                             newTrie());
+                                             newTrie(),
+                                             null);
     }
 
     /**
@@ -163,7 +166,8 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                                              0,
                                              1,
                                              0,
-                                             trie);
+                                             trie,
+                                             null);
     }
 
     /**
@@ -194,8 +198,12 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         {
             throw new AssertionError(e);
         }
+        OriginalClusterings.Builder originalClusterings = row.deletion().isLive() ? null : OriginalClusterings.builder(metadata.comparator);
+        if (originalClusterings != null)
+            originalClusterings.add(row.clustering());
 
-        return new TriePartitionUpdateStage3(metadata, key, columns, stats, 1, row.deletion().isLive() ? 0 : 1, row.dataSize(), trie);
+        return new TriePartitionUpdateStage3(metadata, key, columns, stats, 1, row.deletion().isLive() ? 0 : 1, row.dataSize(), trie,
+                                             originalClusterings != null ? originalClusterings.build() : null);
     }
 
     /**
@@ -232,7 +240,8 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                                              builder.rowCountIncludingStatic(),
                                              builder.tombstoneCount(),
                                              builder.dataSize(),
-                                             builder.trie());
+                                             builder.trie(),
+                                             builder.originalClusterings());
     }
 
     public static TriePartitionUpdateStage3 asTrieUpdate(PartitionUpdate update)
@@ -284,9 +293,9 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                                                ? update.livenessInfo
                                                : update.livenessInfo.withUpdatedTimestamp(newTimestamp);
 
-                        return new RowData(BTree.transformAndFilter(update.columnsBTree,
-                                                                    (ColumnData cd) -> cd.updateAllTimestamp(newTimestamp)),
-                                           newInfo);
+                        return update.withContent(BTree.transformAndFilter(update.columnsBTree,
+                                                                           (ColumnData cd) -> cd.updateAllTimestamp(newTimestamp)),
+                                                  newInfo);
                     },
                     (shouldBeNull, o) ->
                     {
@@ -302,9 +311,9 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         {
             throw new AssertionError(e);
         }
-        TriePartitionUpdateStage3 updated = new TriePartitionUpdateStage3(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        TriePartitionUpdateStage3 updated = new TriePartitionUpdateStage3(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, t, originalClusterings);
         EncodingStats updatedStats = EncodingStats.Collector.collect(updated.staticRow(), updated.rowIterator(), updated.deletionInfo());
-        return new TriePartitionUpdateStage3(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, tombstoneCount, dataSize, t);
+        return new TriePartitionUpdateStage3(metadata, partitionKey, columns, updatedStats, rowCountIncludingStatic, tombstoneCount, dataSize, t, originalClusterings);
     }
 
     @Override
@@ -315,7 +324,9 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         MutableDeletionInfo.Builder builder = MutableDeletionInfo.builder(partitionLevelDeletion, metadata.comparator, false);
         for (Map.Entry<ByteComparable.Preencoded, TrieTombstoneMarker> entry : trie.deletionBranchAtRoot().entrySet())
         {
-            RangeTombstoneMarker marker = entry.getValue().toRangeTombstoneMarker(entry.getKey(), BYTE_COMPARABLE_VERSION, metadata.comparator);
+            RangeTombstoneMarker marker = OriginalClusterings.withOriginalValues(entry.getValue().toRangeTombstoneMarker(entry.getKey(), BYTE_COMPARABLE_VERSION, metadata.comparator),
+                                                                                 originalClusterings,
+                                                                                 entry.getKey());
             if (marker != null)
                 builder.add(marker);
         }
@@ -460,7 +471,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                 columnSet.add(column.column());
 
         RegularAndStaticColumns columns = RegularAndStaticColumns.builder().addAll(columnSet).build();
-        return new TriePartitionUpdateStage3(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, trie);
+        return new TriePartitionUpdateStage3(metadata, partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, dataSize, trie, originalClusterings);
     }
 
     /**
@@ -476,6 +487,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
         private final RegularAndStaticColumns columns;
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> trie = InMemoryDeletionAwareTrie.shortLived(BYTE_COMPARABLE_VERSION);
         private final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker>.Mutator<Row, TrieTombstoneMarker> mutator;
+        private final OriginalClusterings.Builder originalClusterings;
         private final EncodingStats.Collector statsCollector = new EncodingStats.Collector();
         private int rowCountIncludingStatic;
         private int tombstoneCount;
@@ -492,6 +504,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
             tombstoneCount = 0;
             dataSize = 0;
             cf = ColumnFilter.all(metadata);
+            originalClusterings = OriginalClusterings.builder(metadata.comparator);
             mutator = trie.mutator(this::mergeIncomingRow,
                                    this::mergeTombstones,
                                    this::applyIncomingTombstone,
@@ -534,6 +547,8 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                 {
                     putRowDeletionInTrie(comparableClustering,
                                          deletionTime);
+                    if (originalClusterings != null)
+                        originalClusterings.add(clustering);
                 }
                 if (!row.isEmptyAfterDeletion())
                 {
@@ -604,6 +619,11 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
             putDeletionInTrie(metadata.comparator.asByteComparable(range.deletedSlice().start()),
                               metadata.comparator.asByteComparable(range.deletedSlice().end()),
                               range.deletionTime());
+            if (originalClusterings != null)
+            {
+                originalClusterings.add(range.deletedSlice().start());
+                originalClusterings.add(range.deletedSlice().end());
+            }
         }
 
         public DecoratedKey partitionKey()
@@ -633,7 +653,8 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                                                                          rowCountIncludingStatic,
                                                                          tombstoneCount,
                                                                          Ints.saturatedCast(dataSize),
-                                                                         trie);
+                                                                         trie,
+                                                                         originalClusterings != null ? originalClusterings.build() : null);
 
             return pu;
         }
@@ -644,7 +665,8 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
             {
                 // this is not expected to happen much, so going through toRow and the existing size is okay
                 RowData rowData = (RowData) existing;
-                update = Rows.merge(rowData.toRow(update.clustering(), DeletionTime.LIVE), update);
+                Clustering<?> clustering = rowData.clustering();
+                update = Rows.merge(rowData.toRow(clustering != null ? clustering : update.clustering(), DeletionTime.LIVE), update);
                 dataSize += update.dataSize() - rowData.dataSize();
             }
             else
@@ -653,7 +675,7 @@ public class TriePartitionUpdateStage3 extends TrieBackedPartitionStage3 impleme
                 dataSize += update.dataSize();
             }
 
-            return rowToData(update);
+            return rowToData(metadata.comparator, update);
         }
 
         private Row applyExistingTombstoneToIncomingRow(TrieTombstoneMarker trieTombstoneMarker, Row o)

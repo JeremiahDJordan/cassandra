@@ -200,4 +200,12 @@ public interface CellData<V, C extends CellData<?, ?>> extends IDataSize
      * Binds a CellData object to the given column and cell path to turn it into a Cell.
      */
     Cell<V> toCell(ColumnMetadata column, CellPath cellPath);
+
+    /**
+     * The cell path stored with this data, or null if the path is only given by the data's key in a trie.
+     */
+    default ByteBuffer storedPath()
+    {
+        return null;
+    }
 }

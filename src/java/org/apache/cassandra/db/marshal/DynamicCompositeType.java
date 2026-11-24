@@ -329,6 +329,13 @@ public class DynamicCompositeType extends AbstractCompositeType
     }
 
     @Override
+    public boolean decodesComparableBytesExactly()
+    {
+        // Components can be of any type, not only the aliased ones.
+        return false;
+    }
+
+    @Override
     public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, Version version)
     {
         // For ByteComparable.Version.LEGACY the terminator byte is ByteSource.END_OF_STREAM. Just like with

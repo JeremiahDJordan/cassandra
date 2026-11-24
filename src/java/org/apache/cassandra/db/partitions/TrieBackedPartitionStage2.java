@@ -156,9 +156,66 @@ public class TrieBackedPartitionStage2 implements Partition
             Object[] tree = BTree.<ColumnData, ColumnData>transform(columnsBTree, c -> c.clone(cloner));
             return new RowData(tree, livenessInfo, deletion, minLocalDeletionTime);
         }
+
+        /// The clustering the row was written with, or null if it is only given by the row's path in the trie.
+        Clustering<?> clustering()
+        {
+            return null;
+        }
+
+        /// Row data with the given content and the clustering of this one.
+        RowData withContent(Object[] columnsBTree, LivenessInfo livenessInfo, DeletionTime deletion)
+        {
+            return new RowData(columnsBTree, livenessInfo, deletion);
+        }
+    }
+
+    /// [RowData] of a table whose clusterings are not decoded exactly from their byte-comparable form (see
+    /// [ClusteringComparator#decodesComparableBytesExactly()]), which keeps the clustering the row was written with.
+    static class RowDataWithClustering extends RowData
+    {
+        final Clustering<?> clustering;
+
+        RowDataWithClustering(Clustering<?> clustering, Object[] columnsBTree, LivenessInfo livenessInfo, DeletionTime deletion)
+        {
+            super(columnsBTree, livenessInfo, deletion);
+            this.clustering = clustering;
+        }
+
+        RowDataWithClustering(Clustering<?> clustering, Object[] columnsBTree, LivenessInfo livenessInfo, DeletionTime deletion, long minLocalDeletionTime)
+        {
+            super(columnsBTree, livenessInfo, deletion, minLocalDeletionTime);
+            this.clustering = clustering;
+        }
+
+        @Override
+        Clustering<?> clustering()
+        {
+            return clustering;
+        }
+
+        @Override
+        RowData withContent(Object[] columnsBTree, LivenessInfo livenessInfo, DeletionTime deletion)
+        {
+            return new RowDataWithClustering(clustering, columnsBTree, livenessInfo, deletion);
+        }
+
+        @Override
+        public long unsharedHeapSizeExcludingData()
+        {
+            return super.unsharedHeapSizeExcludingData() + EMPTY_ROWDATA_WITH_CLUSTERING_EXTRA_SIZE + clustering.unsharedHeapSizeExcludingData();
+        }
+
+        @Override
+        public RowData clone(Cloner cloner)
+        {
+            Object[] tree = BTree.<ColumnData, ColumnData>transform(columnsBTree, c -> c.clone(cloner));
+            return new RowDataWithClustering(cloner.clone(clustering), tree, livenessInfo, deletion, minLocalDeletionTime);
+        }
     }
 
     private static final long EMPTY_ROWDATA_SIZE = ObjectSizes.measure(new RowData(null, null, null, 0));
+    private static final long EMPTY_ROWDATA_WITH_CLUSTERING_EXTRA_SIZE = ObjectSizes.measure(new RowDataWithClustering(null, null, null, null, 0)) - EMPTY_ROWDATA_SIZE;
 
     protected final Trie<Object> trie;
     protected final DecoratedKey partitionKey;
@@ -248,10 +305,11 @@ public class TrieBackedPartitionStage2 implements Partition
         protected Row mapContent(Object content, byte[] bytes, int byteLength)
         {
             var rd = (RowData) content;
-            return toRow(rd,
-                         metadata.comparator.clusteringFromByteComparable(
-                             ByteBufferAccessor.instance,
-                             ByteComparable.preencoded(BYTE_COMPARABLE_VERSION, bytes, 0, byteLength)));
+            Clustering<?> clustering = rd.clustering();
+            if (clustering == null)
+                clustering = metadata.comparator.clusteringFromByteComparable(ByteBufferAccessor.instance,
+                                                                              ByteComparable.preencoded(BYTE_COMPARABLE_VERSION, bytes, 0, byteLength));
+            return toRow(rd, clustering);
         }
     }
 
@@ -260,10 +318,12 @@ public class TrieBackedPartitionStage2 implements Partition
         return new RowIterator(trie, direction);
     }
 
-    static RowData rowToData(Row row)
+    static RowData rowToData(ClusteringComparator comparator, Row row)
     {
         BTreeRow brow = BTreeRow.asBTreeRow(row);
-        return new RowData(brow.getBTree(), row.primaryKeyLivenessInfo(), row.deletion().time(), brow.getMinLocalDeletionTime());
+        if (comparator.decodesComparableBytesExactly())
+            return new RowData(brow.getBTree(), row.primaryKeyLivenessInfo(), row.deletion().time(), brow.getMinLocalDeletionTime());
+        return new RowDataWithClustering(row.clustering(), brow.getBTree(), row.primaryKeyLivenessInfo(), row.deletion().time(), brow.getMinLocalDeletionTime());
     }
 
     /**
@@ -284,7 +344,7 @@ public class TrieBackedPartitionStage2 implements Partition
      */
     protected static void putInTrie(ClusteringComparator comparator, boolean useRecursive, InMemoryTrie<Object> trie, Row row) throws TrieSpaceExhaustedException
     {
-        trie.putSingleton(comparator.asByteComparable(row.clustering()), rowToData(row), NO_CONFLICT_RESOLVER, useRecursive);
+        trie.putSingleton(comparator.asByteComparable(row.clustering()), rowToData(comparator, row), NO_CONFLICT_RESOLVER, useRecursive);
     }
 
     /**
@@ -426,7 +486,7 @@ public class TrieBackedPartitionStage2 implements Partition
             return BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(activeDeletion));
         }
 
-        Row row = toRow(data, clustering);
+        Row row = toRow(data, data.clustering() != null ? data.clustering() : clustering);
         if (!activeDeletion.isLive())
             row = row.filter(ColumnFilter.selection(columns()), activeDeletion, true, metadata());
         return row;
@@ -472,7 +532,10 @@ public class TrieBackedPartitionStage2 implements Partition
                     Clustering<?> clustering = clusterings.next();
                     Object rowData = trie.get(path(clustering));
                     if (rowData instanceof RowData)
-                        return toRow((RowData) rowData, clustering);
+                    {
+                        RowData data = (RowData) rowData;
+                        return toRow(data, data.clustering() != null ? data.clustering() : clustering);
+                    }
                 }
                 return endOfData();
             }

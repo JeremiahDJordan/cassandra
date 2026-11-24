@@ -198,6 +198,13 @@ public class DecimalType extends NumberType<BigDecimal>
     }
 
     @Override
+    public boolean decodesComparableBytesExactly()
+    {
+        // The byte-comparable form drops the scale, and decoding gives one with an even number of fractional digits.
+        return false;
+    }
+
+    @Override
     public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
     {
         if (comparableBytes == null)
