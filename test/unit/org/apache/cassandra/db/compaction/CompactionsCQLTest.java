@@ -20,10 +20,12 @@ package org.apache.cassandra.db.compaction;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 
 import org.apache.commons.lang3.StringUtils;
 import org.junit.After;
@@ -865,5 +867,47 @@ public class CompactionsCQLTest extends CQLTester
         CompactionManager.periodicReports();
         assertTrue(cs.periodicReportsCalled > prCount);
 
+    }
+
+    @Test
+    public void testSnapshotBeforeParallelMajorCompaction() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int) WITH compaction = {'class': 'UnifiedCompactionStrategy', 'base_shard_count': '8', 'min_sstable_size': '0B'}");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+        boolean snapshotBeforeCompaction = DatabaseDescriptor.getRawConfig().snapshot_before_compaction;
+        try
+        {
+            // the tasks name their snapshots after the counter, and its next 20 names are taken
+            long millis = System.currentTimeMillis() + TimeUnit.DAYS.toMillis(1);
+            CompactionTask.setLastSnapshotMillis(millis);
+            for (int i = 1; i <= 20; i++)
+                cfs.snapshotWithoutMemtable((millis + i) + "-compact-" + cfs.name);
+
+            for (int i = 0; i < 4; i++)
+            {
+                for (int k = 0; k < 2000; k++)
+                    execute("INSERT INTO %s (k, v) VALUES (?, ?)", i * 2000 + k, i);
+                flush();
+            }
+            Set<SSTableReader> before = cfs.getLiveSSTables();
+
+            DatabaseDescriptor.getRawConfig().snapshot_before_compaction = true;
+            cfs.forceMajorCompaction(true, 8);
+
+            assertTrue(Collections.disjoint(before, cfs.getLiveSSTables()));
+            long compactionSnapshots = cfs.getSnapshotDetails().keySet().stream()
+                                       .map(tag -> Long.parseLong(tag.substring(0, tag.indexOf('-'))))
+                                       .filter(m -> m > millis + 20)
+                                       .count();
+            assertTrue(compactionSnapshots > 1);
+            assertEquals(8000, execute("SELECT * FROM %s").size());
+        }
+        finally
+        {
+            DatabaseDescriptor.getRawConfig().snapshot_before_compaction = snapshotBeforeCompaction;
+            CompactionTask.setLastSnapshotMillis(0);
+            cfs.clearSnapshot("");
+        }
     }
 }

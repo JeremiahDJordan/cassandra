@@ -186,6 +186,7 @@ import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.OverlapIterator;
+import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.WrappedRunnable;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.concurrent.Refs;
@@ -292,6 +293,9 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
     private static final CompositeType COUNTER_COMPOSITE_TYPE;
 
     private static final String SAMPLING_RESULTS_NAME = "SAMPLING_RESULTS";
+
+    /** The tables and names of the snapshots being taken, see {@link #snapshotWithoutMemtable} */
+    private static final Set<Pair<TableId, String>> snapshotsInProgress = new HashSet<>();
 
     public static final String SNAPSHOT_TRUNCATE_PREFIX = "truncated";
     public static final String SNAPSHOT_DROP_PREFIX = "dropped";
@@ -2248,14 +2252,55 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
         snapshotWithoutMemtable(snapshotName, null, false, null);
     }
 
+    @Override
+    public boolean snapshotWithoutMemtableIfAbsent(String snapshotName)
+    {
+        return snapshotWithoutMemtable(snapshotName, null, false, null, true) != null;
+    }
+
     /**
      * @param ephemeral If this flag is set to true, the snapshot will be cleaned during next startup
      */
     public Set<SSTableReader> snapshotWithoutMemtable(String snapshotName, Predicate<SSTableReader> predicate, boolean ephemeral, RateLimiter rateLimiter)
     {
+        return snapshotWithoutMemtable(snapshotName, predicate, ephemeral, rateLimiter, false);
+    }
+
+    /**
+     * A snapshot is registered while it is taken: another snapshot of the table with the same name would hard-link the
+     * same files into the same directories, so it fails before it links any.
+     *
+     * @param ifAbsent whether to take no snapshot, and return null, if a snapshot of the table with that name exists or
+     * is being taken
+     */
+    private Set<SSTableReader> snapshotWithoutMemtable(String snapshotName, Predicate<SSTableReader> predicate, boolean ephemeral, RateLimiter rateLimiter, boolean ifAbsent)
+    {
         if (rateLimiter == null)
             rateLimiter = DatabaseDescriptor.getSnapshotRateLimiter();
 
+        Pair<TableId, String> inProgress = Pair.create(metadata().id, snapshotName);
+        synchronized (snapshotsInProgress)
+        {
+            if (ifAbsent && (snapshotsInProgress.contains(inProgress) || snapshotExists(snapshotName)))
+                return null;
+            if (!snapshotsInProgress.add(inProgress))
+                throw new RuntimeException(String.format("Snapshot %s for %s.%s is being taken.", snapshotName, getKeyspaceName(), getTableName()));
+        }
+        try
+        {
+            return linkSnapshot(snapshotName, predicate, ephemeral, rateLimiter);
+        }
+        finally
+        {
+            synchronized (snapshotsInProgress)
+            {
+                snapshotsInProgress.remove(inProgress);
+            }
+        }
+    }
+
+    private Set<SSTableReader> linkSnapshot(String snapshotName, Predicate<SSTableReader> predicate, boolean ephemeral, RateLimiter rateLimiter)
+    {
         Set<SSTableReader> snapshottedSSTables = new HashSet<>();
         final JSONArray filesJSONArr = new JSONArray();
         for (ColumnFamilyStore cfs : concatWithIndexes())

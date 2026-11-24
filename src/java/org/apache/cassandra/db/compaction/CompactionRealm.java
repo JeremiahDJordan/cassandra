@@ -307,6 +307,18 @@ public interface CompactionRealm
     void snapshotWithoutMemtable(String snapshotId);
 
     /**
+     * Create a CFS snapshot with the given name, unless a snapshot with that name exists or is being taken. The default
+     * takes the snapshot.
+     *
+     * @return whether the snapshot was taken
+     */
+    default boolean snapshotWithoutMemtableIfAbsent(String snapshotId)
+    {
+        snapshotWithoutMemtable(snapshotId);
+        return true;
+    }
+
+    /**
      * Change the repaired status of a set of sstables, usually to reflect a completed repair operation.
      */
     int mutateRepairedWithLock(Collection<SSTableReader> originals, long repairedAt, UUID pendingRepair, boolean isTransient) throws IOException;
