@@ -1122,6 +1122,8 @@ public enum CassandraRelevantProperties
     TABLE_METRICS_EXPORT_GLOBALS("cassandra.table_metrics_export_globals", "true"),
 
     TEST_ALLOW_LOCAL_STRATEGY("test.allow.local_strategy"),
+    /** Directory with the Apache Cassandra dtest jar that mixed-cluster tests run their Apache nodes from. */
+    TEST_APACHE_DTEST_JAR_DIR("cassandra.test.apache_dtest_jar_dir"),
     TEST_BBFAILHELPER_ENABLED("test.bbfailhelper.enabled"),
     TEST_BLOB_SHARED_SEED("cassandra.test.blob.shared.seed"),
     TEST_BYTEMAN_TRANSFORMATIONS_DEBUG("cassandra.test.byteman.transformations.debug"),
