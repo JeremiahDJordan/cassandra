@@ -18,6 +18,7 @@
 package org.apache.cassandra.schema;
 
 import java.util.Arrays;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.TreeMap;
@@ -46,16 +47,16 @@ public final class AutoRepairParams
         @Override
         public String toString()
         {
-            return name().toLowerCase();
+            return name().toLowerCase(Locale.US);
         }
     }
 
     private final ImmutableMap<String, String> options;
 
     public static final Map<String, String> DEFAULT_OPTIONS = ImmutableMap.of(
-    Option.FULL_ENABLED.name().toLowerCase(), Boolean.toString(true),
-    Option.INCREMENTAL_ENABLED.name().toLowerCase(), Boolean.toString(true),
-    Option.PREVIEW_REPAIRED_ENABLED.name().toLowerCase(), Boolean.toString(true),
+    Option.FULL_ENABLED.toString(), Boolean.toString(true),
+    Option.INCREMENTAL_ENABLED.toString(), Boolean.toString(true),
+    Option.PREVIEW_REPAIRED_ENABLED.toString(), Boolean.toString(true),
     Option.PRIORITY.toString(), "0"
     );
 
@@ -72,13 +73,16 @@ public final class AutoRepairParams
         Map<String, String> optionsMap = new TreeMap<>(DEFAULT_OPTIONS);
         if (options != null)
         {
-            for (Map.Entry<String, String> entry : options.entrySet())
+            // a key in lower case takes precedence over the same key in another case, and otherwise the last of its
+            // spellings in sort order
+            for (Map.Entry<String, String> entry : new TreeMap<>(options).entrySet())
             {
-                if (Arrays.stream(Option.values()).noneMatch(option -> option.toString().equalsIgnoreCase(entry.getKey())))
-                {
-                    throw new ConfigurationException(format("Unknown property '%s'", entry.getKey()));
-                }
-                optionsMap.put(entry.getKey(), entry.getValue());
+                Option option = Arrays.stream(Option.values())
+                                      .filter(o -> o.toString().equalsIgnoreCase(entry.getKey()))
+                                      .findFirst()
+                                      .orElseThrow(() -> new ConfigurationException(format("Unknown property '%s'", entry.getKey())));
+                if (entry.getKey().equals(option.toString()) || !options.containsKey(option.toString()))
+                    optionsMap.put(option.toString(), entry.getValue());
             }
         }
         return new AutoRepairParams(optionsMap);
@@ -86,7 +90,7 @@ public final class AutoRepairParams
 
     public boolean repairEnabled(AutoRepairConfig.RepairType type)
     {
-        String option = type.toString().toLowerCase() + "_enabled";
+        String option = type.toString().toLowerCase(Locale.US) + "_enabled";
         String enabled = options.getOrDefault(option, DEFAULT_OPTIONS.get(option));
         return Boolean.parseBoolean(enabled);
     }
