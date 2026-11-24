@@ -17,6 +17,7 @@
 package org.apache.cassandra.distributed.test.sai;
 
 import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -39,8 +40,10 @@ import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.ICoordinator;
+import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.SimpleQueryResult;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
+import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.metrics.ClientRequestsMetricsProvider;
 import org.apache.cassandra.net.MessagingService;
@@ -50,6 +53,7 @@ import org.assertj.core.api.Assertions;
 import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+import static org.awaitility.Awaitility.await;
 
 /**
  * Tests that queries using parts of {@link RowFilter} that only exist in DataStax's Cassandra (see
@@ -184,6 +188,44 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
 
             assertRejected(cluster, DATASTAX_ONLY_QUERIES);
             assertNonStrictInRejected(cluster);
+        }
+    }
+
+    /**
+     * After a rolling upgrade from the Apache Cassandra 5.0 messaging version, every coordinator accepts OR and LIKE
+     * without waiting for its connections to the other nodes to connect again on the new version.
+     */
+    @Test
+    public void testRollingUpgradeFromApache50Messaging() throws Throwable
+    {
+        try (Cluster cluster = init(Cluster.build(NUM_REPLICAS)
+                                           .withInstanceInitializer((classLoader, threadGroup, node, generation) -> {
+                                               if (generation == 0)
+                                                   SAIUtil.pinMessagingVersion(MessagingService.VERSION_50, 1, 2).accept(classLoader, node);
+                                           })
+                                           .withConfig(config -> config.with(GOSSIP).with(NETWORK))
+                                           .start(), RF))
+        {
+            createSchema(cluster);
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.large (k int PRIMARY KEY, b blob)"));
+            String orQuery = "SELECT k FROM %s.t WHERE n = 1 OR n = 2";
+            String likeQuery = "SELECT k FROM %s.t WHERE a LIKE 'app%%' ALLOW FILTERING";
+
+            restart(cluster, 1);
+            // a write large enough for the large message connection, which connects on the Apache Cassandra version
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.large (k, b) VALUES (0, ?)"),
+                                           ConsistencyLevel.ALL, ByteBuffer.allocate(100_000));
+            assertRejected(cluster, Collections.singletonList(new String[]{ orQuery, "The OR operator" }));
+            for (int i = 1; i <= cluster.size(); i++)
+            {
+                ICoordinator coordinator = cluster.coordinator(i);
+                Assertions.assertThatThrownBy(() -> coordinator.execute(withKeyspace(likeQuery), ConsistencyLevel.ALL))
+                          .hasMessageContaining(LikeFilteringDistributedTest.REJECTION);
+            }
+
+            restart(cluster, 2);
+            assertAccepted(cluster, orQuery);
+            assertAccepted(cluster, likeQuery);
         }
     }
 
@@ -456,6 +498,39 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
             OutboundConnections connections = MessagingService.instance().channelManagers.get(node);
             return connections == null ? 0L : connections.small.errorCount() + connections.large.errorCount() + connections.urgent.errorCount();
         });
+    }
+
+    /**
+     * Restarts the given node, without its pinned messaging version, and waits until it and the other nodes see each
+     * other alive with their versions, and its indexes are queryable.
+     */
+    private static void restart(Cluster cluster, int node) throws Exception
+    {
+        cluster.get(node).shutdown().get();
+        cluster.get(node).startup();
+        for (IInvokableInstance other : cluster)
+        {
+            if (other.config().num() != node)
+            {
+                awaitKnown(other, cluster.get(node));
+                awaitKnown(cluster.get(node), other);
+            }
+        }
+        for (String index : Arrays.asList("n_idx", "v_idx", "a_idx", "u_idx", "m_idx", "vec_idx"))
+            SAIUtil.waitForIndexQueryable(cluster, KEYSPACE, index, node);
+    }
+
+    /** Waits until the given observer sees the given node alive, with its messaging version capped to the observer's. */
+    private static void awaitKnown(IInvokableInstance observer, IInvokableInstance node)
+    {
+        InetSocketAddress address = node.broadcastAddress();
+        int version = node.callOnInstance(() -> MessagingService.current_version);
+        await().atMost(1, TimeUnit.MINUTES).until(() -> observer.callOnInstance(() -> {
+            InetAddressAndPort endpoint = InetAddressAndPort.getByAddress(address);
+            Integer known = MessagingService.instance().versions.getRawIfKnown(endpoint);
+            int current = MessagingService.current_version;
+            return known != null && Math.min(known, current) == Math.min(version, current) && FailureDetector.instance.isAlive(endpoint);
+        }));
     }
 
     /**
