@@ -44,12 +44,14 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.statements.schema.CreateIndexStatement;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.index.IndexBuildInProgressException;
 import org.apache.cassandra.index.IndexNotAvailableException;
@@ -57,6 +59,7 @@ import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.StubIndex;
 import org.apache.cassandra.index.internal.CustomCassandraIndex;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -66,6 +69,7 @@ import org.apache.cassandra.utils.Pair;
 import static java.lang.String.format;
 
 import static org.apache.cassandra.Util.throwAssert;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DEFAULT_INDEX_CLASS;
 import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
@@ -205,6 +209,46 @@ public class SecondaryIndexTest extends CQLTester
             UUID id1 = UUID.fromString("550e8400-e29b-41d4-a716-446655440000");
             execute("INSERT INTO %s (userid, firstname, lastname, age) VALUES (?, 'Frodo', 'Baggins', 32)", id1);
             assertEmpty(execute("SELECT firstname FROM %s WHERE userid = ? AND age = 33", id1));
+        }
+        finally
+        {
+            DatabaseDescriptor.setDefaultSecondaryIndex(CassandraIndex.NAME);
+        }
+    }
+
+    @Test
+    public void shouldCreateCassandraIndexExplicitlyWithDefaultIndexClass() throws Throwable
+    {
+        try (WithProperties properties = new WithProperties().set(DEFAULT_INDEX_CLASS, StorageAttachedIndex.class.getName()))
+        {
+            createTable("CREATE TABLE %s (userid uuid PRIMARY KEY, firstname text, lastname text, age int)");
+            createIndex("CREATE INDEX byAge ON %s(age) USING 'legacy_local_table'");
+            createIndex("CREATE INDEX byFirstName ON %s(firstname)");
+
+            SecondaryIndexManager indexManager = getCurrentColumnFamilyStore().indexManager;
+            assertTrue(indexManager.getIndexByName("byage") instanceof CassandraIndex);
+            assertTrue(indexManager.getIndexByName("byfirstname") instanceof StorageAttachedIndex);
+        }
+    }
+
+    @Test
+    public void shouldCreateCassandraIndexExplicitlyWhenPreparedAgain() throws Throwable
+    {
+        createTable("CREATE TABLE %s (userid uuid PRIMARY KEY, firstname text, lastname text, age int)");
+        DatabaseDescriptor.setDefaultSecondaryIndex(StorageAttachedIndex.NAME);
+        try
+        {
+            CreateIndexStatement.Raw raw = (CreateIndexStatement.Raw) QueryProcessor.parseStatement(formatQuery("CREATE INDEX byAge ON %s(age) USING 'legacy_local_table'"));
+            raw.prepare(ClientState.forInternalCalls());
+            CreateIndexStatement statement = raw.prepare(ClientState.forInternalCalls());
+            statement.validate(ClientState.forInternalCalls());
+            IndexMetadata index = statement.apply(Schema.instance.distributedKeyspaces())
+                                           .getNullable(keyspace())
+                                           .getTableNullable(currentTable())
+                                           .indexes
+                                           .get("byage")
+                                           .get();
+            assertFalse(index.isCustom());
         }
         finally
         {

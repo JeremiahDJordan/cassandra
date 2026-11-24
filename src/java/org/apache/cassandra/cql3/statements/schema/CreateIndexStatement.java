@@ -420,13 +420,17 @@ public final class CreateIndexStatement extends AlterSchemaStatement
                 throw ire(KEYSPACE_DOES_NOT_MATCH_INDEX, keyspaceName, tableName);
 
             // Set the configured default 2i implementation if one isn't specified with USING:
-            if (attrs.customClass == null)
+            if (attrs.customClass == null && !attrs.isClassSpecified)
             {
                 if (DatabaseDescriptor.getDefaultSecondaryIndexEnabled())
                     attrs.customClass = DatabaseDescriptor.getDefaultSecondaryIndex();
                 else
                     // However, operators may require an implementation be specified
                     throw ire(MUST_SPECIFY_INDEX_IMPLEMENTATION);
+            }
+            else
+            {
+                attrs.isClassSpecified = true;
             }
 
             // If we explicitly specify the index type "legacy_local_table", we can just clear the custom class, and the
