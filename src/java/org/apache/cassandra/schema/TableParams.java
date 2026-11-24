@@ -335,8 +335,8 @@ public final class TableParams
                .append("AND compression = ").append(compression.asMap())
                .newLine();
 
-        // Use map format for pre-5.0 compatibility, string format for 5.0
-        if (usePre50Schema)
+        // Use map format for CC4 compatibility, string format otherwise
+        if (compatibilityMode == StorageCompatibilityMode.HCD_1)
             builder.append("AND memtable = ").append(memtable.toMapForCC4());
         else
             builder.append("AND memtable = ").appendWithSingleQuotes(memtable.configurationKey());
@@ -377,7 +377,7 @@ public final class TableParams
                .newLine()
                .append("AND speculative_retry = ").appendWithSingleQuotes(speculativeRetry.toString());
 
-        if (!usePre50Schema
+        if (compatibilityMode != StorageCompatibilityMode.HCD_1
             && DatabaseDescriptor.getRawConfig() != null
             && DatabaseDescriptor.getAutoRepairConfig().isAutoRepairSchedulingEnabled())
         {

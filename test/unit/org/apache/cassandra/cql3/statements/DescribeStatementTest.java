@@ -44,6 +44,7 @@ import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static java.lang.String.format;
 import static org.apache.cassandra.schema.SchemaConstants.AUTH_KEYSPACE_NAME;
@@ -1081,7 +1082,7 @@ public class  DescribeStatementTest extends CQLTester
         // In compatibility mode (pre-5.0), some properties differ
         boolean isCompatibilityMode = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5);
 
-        String memtableFormat = isCompatibilityMode
+        String memtableFormat = DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                                 ? "    AND memtable = {}\n"
                                 : "    AND memtable = 'default'\n";
 
@@ -1120,7 +1121,7 @@ public class  DescribeStatementTest extends CQLTester
         // In compatibility mode (pre-5.0), some properties differ
         boolean isCompatibilityMode = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5);
 
-        String memtableFormat = isCompatibilityMode
+        String memtableFormat = DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                                 ? "    AND memtable = {}\n"
                                 : "    AND memtable = 'default'\n";
 

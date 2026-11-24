@@ -60,7 +60,6 @@ import org.apache.cassandra.schema.ColumnMetadata.ClusteringOrder;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.service.reads.repair.ReadRepairStrategy;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Simulate;
@@ -156,7 +155,7 @@ public final class SchemaKeyspace
               + "PRIMARY KEY ((keyspace_name), table_name))");
 
     // CC5 schema with memtable as text
-    // Used when storage_compatibility_mode is NONE (no downgrade support)
+    // Used when storage_compatibility_mode is not HCD_1
     // auto_repair column is only included if AUTOREPAIR_ENABLE is true to avoid schema disagreement
     // with pre-5.0.8 nodes that don't have this column in their system_schema.tables definition
     private static final TableMetadata Tables =
@@ -431,22 +430,22 @@ public final class SchemaKeyspace
 
     /**
      * Returns the appropriate Tables schema table metadata based on current storage compatibility mode.
-     * Uses TablesLegacy ({@code frozen<map>} for memtable) in CC4 mode, Tables (text for memtable) otherwise.
+     * Uses TablesLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, Tables (text for memtable) otherwise.
      */
     private static TableMetadata tablesTableMetadata()
     {
-        return DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major)
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                ? TablesLegacy
                : Tables;
     }
 
     /**
      * Returns the appropriate Views schema table metadata based on current storage compatibility mode.
-     * Uses ViewsLegacy ({@code frozen<map>} for memtable) in CC4 mode, Views (text for memtable) otherwise.
+     * Uses ViewsLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, Views (text for memtable) otherwise.
      */
     private static TableMetadata viewsTableMetadata()
     {
-        return DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major)
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                ? ViewsLegacy
                : Views;
     }
@@ -821,10 +820,10 @@ public final class SchemaKeyspace
 
         // As above, only add the memtable column if the table uses a non-default memtable configuration to avoid RTE
         // in mixed operation with pre-4.1 versioned node during upgrades.
-        // Write in CC4 format (map) or CC5 format (text) based on storage compatibility mode
+        // Write in CC4 format (map) in HCD_1 mode, CC5 format (text) otherwise
         if (params.memtable != MemtableParams.DEFAULT)
         {
-            if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major))
+            if (DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1)
                 builder.add("memtable", params.memtable.asSchemaValueMap());
             else
                 builder.add("memtable", params.memtable.asSchemaValueText());

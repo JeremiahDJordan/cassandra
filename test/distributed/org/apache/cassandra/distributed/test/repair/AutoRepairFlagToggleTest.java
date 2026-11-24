@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.distributed.test.repair;
 
+import java.util.Map;
+
 import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
@@ -27,6 +29,7 @@ import org.apache.cassandra.distributed.api.Feature;
 import org.apache.cassandra.distributed.test.TestBaseImpl;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
@@ -234,6 +237,58 @@ public class AutoRepairFlagToggleTest extends TestBaseImpl
             assertTrue("Expected user-friendly message instructing to set cassandra.autorepair.enable=true",
                        cluster.get(1).logs().grep("Set -Dcassandra.autorepair.enable=true and restart")
                               .getResult().size() > 0);
+        }
+    }
+
+    @Test
+    public void testAutoRepairInCassandra4Mode() throws Exception
+    {
+        CassandraRelevantProperties.AUTOREPAIR_ENABLE.setBoolean(false);
+
+        try (Cluster cluster = Cluster.build(1)
+                                      .withConfig(config -> config
+                                              .with(Feature.GOSSIP, Feature.NETWORK)
+                                              .set("sstable", Map.of("selected_format", "big"))
+                                              .set("storage_compatibility_mode", StorageCompatibilityMode.CASSANDRA_4.toString()))
+                                      .start())
+        {
+            cluster.schemaChange("CREATE KEYSPACE test_ks WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+            cluster.schemaChange("CREATE TABLE test_ks.test_tbl (pk int PRIMARY KEY, v int)");
+            for (String schemaTable : new String[]{ "tables", "views" })
+            {
+                assertFalse("auto_repair should not be a column of system_schema." + schemaTable + " when flag is disabled",
+                            cluster.coordinator(1).executeWithResult("SELECT * FROM system_schema." + schemaTable, ConsistencyLevel.LOCAL_ONE)
+                                   .names().contains("auto_repair"));
+            }
+
+            cluster.get(1).nodetoolResult("drain").asserts().success();
+            cluster.get(1).shutdown().get();
+            CassandraRelevantProperties.AUTOREPAIR_ENABLE.setBoolean(true);
+            cluster.get(1).startup();
+            cluster.get(1).runOnInstance(() -> {
+                org.apache.cassandra.config.DatabaseDescriptor.getAutoRepairConfig().setAutoRepairSchedulingEnabled(true);
+            });
+
+            // as in Cassandra 5.0, CASSANDRA_4 has the auto_repair column when the flag is enabled
+            assertTrue("auto_repair should be a column of system_schema.views when flag is enabled",
+                       cluster.coordinator(1).executeWithResult("SELECT * FROM system_schema.views", ConsistencyLevel.LOCAL_ONE)
+                              .names().contains("auto_repair"));
+            cluster.schemaChange("ALTER TABLE test_ks.test_tbl WITH auto_repair = {'full_enabled': 'false'}");
+            Object[][] rows = cluster.coordinator(1).execute("SELECT auto_repair FROM system_schema.tables WHERE keyspace_name = 'test_ks' AND table_name = 'test_tbl'",
+                                                             ConsistencyLevel.LOCAL_ONE);
+            assertEquals("false", ((Map<?, ?>) rows[0][0]).get("full_enabled"));
+
+            String createStatement = (String) cluster.coordinator(1).execute("DESCRIBE TABLE test_ks.test_tbl", ConsistencyLevel.LOCAL_ONE)[0][3];
+            assertTrue(createStatement, createStatement.contains("'full_enabled': 'false'"));
+
+            cluster.get(1).nodetoolResult("drain").asserts().success();
+            cluster.get(1).shutdown().get();
+            cluster.get(1).startup();
+            cluster.get(1).runOnInstance(() -> {
+                org.apache.cassandra.config.DatabaseDescriptor.getAutoRepairConfig().setAutoRepairSchedulingEnabled(true);
+            });
+            createStatement = (String) cluster.coordinator(1).execute("DESCRIBE TABLE test_ks.test_tbl", ConsistencyLevel.LOCAL_ONE)[0][3];
+            assertTrue(createStatement, createStatement.contains("'full_enabled': 'false'"));
         }
     }
 }

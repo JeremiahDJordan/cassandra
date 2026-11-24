@@ -46,7 +46,7 @@ import org.apache.cassandra.schema.TableParams;
 import org.apache.cassandra.schema.TableParams.Option;
 import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
 import org.apache.cassandra.service.reads.repair.ReadRepairStrategy;
-import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static java.lang.String.format;
 import static org.apache.cassandra.schema.TableParams.Option.*;
@@ -87,7 +87,7 @@ public final class TableAttributes extends PropertyDefinitions
         {
             if (!CassandraRelevantProperties.AUTOREPAIR_ENABLE.getBoolean())
                 throw new ConfigurationException("auto_repair option is not supported unless auto-repair is enabled with -Dcassandra.autorepair.enable=true");
-            if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major))
+            if (DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1)
                 throw new ConfigurationException("auto_repair option is not supported while storage_compatibility_mode is "
                                                  + DatabaseDescriptor.getStorageCompatibilityMode()
                                                  + "; set storage_compatibility_mode to UPGRADING or NONE");

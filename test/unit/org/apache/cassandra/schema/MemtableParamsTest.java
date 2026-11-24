@@ -498,22 +498,17 @@ public class MemtableParamsTest
     // ========================================================================
 
     /**
-     * Test that asSchemaValueMap() returns a Map in HCD_1 and CASSANDRA_4 compatibility modes.
-     * Both modes should write memtable as {@code frozen<map<text, text>>} for CC4 compatibility.
+     * Test that asSchemaValueMap() returns a Map in HCD_1 compatibility mode.
+     * HCD_1 writes memtable as {@code frozen<map<text, text>>} for CC4 compatibility.
      * This ensures downgrade to CC4 is safe.
      */
     @Test
-    public void testAsSchemaValueMapInCC4CompatibilityModes()
+    public void testAsSchemaValueMapInCC4CompatibilityMode()
     {
-        // Test both HCD_1 and CASSANDRA_4 modes (they should behave identically)
-        for (StorageCompatibilityMode mode : new StorageCompatibilityMode[]{StorageCompatibilityMode.HCD_1,
-                                                                             StorageCompatibilityMode.CASSANDRA_4})
-        {
-            // Test DEFAULT memtable - CC4 writes empty map {} for "default" configuration
-            Map<String, String> defaultMap = MemtableParams.DEFAULT.asSchemaValueMap(mode);
-            assertNotNull("Should return Map in " + mode + " mode", defaultMap);
-            assertTrue("Default should be empty map in " + mode + " mode", defaultMap.isEmpty());
-        }
+        // Test DEFAULT memtable - CC4 writes empty map {} for "default" configuration
+        Map<String, String> defaultMap = MemtableParams.DEFAULT.asSchemaValueMap(StorageCompatibilityMode.HCD_1);
+        assertNotNull("Should return Map in HCD_1 mode", defaultMap);
+        assertTrue("Default should be empty map in HCD_1 mode", defaultMap.isEmpty());
     }
 
     /**
@@ -523,6 +518,15 @@ public class MemtableParamsTest
     public void testAsSchemaValueMapThrowsInCC5Mode()
     {
         MemtableParams.DEFAULT.asSchemaValueMap(StorageCompatibilityMode.NONE);
+    }
+
+    /**
+     * Test that asSchemaValueMap() throws exception when called in CASSANDRA_4 mode, which uses Cassandra's text.
+     */
+    @Test(expected = IllegalStateException.class)
+    public void testAsSchemaValueMapThrowsInCassandra4Mode()
+    {
+        MemtableParams.DEFAULT.asSchemaValueMap(StorageCompatibilityMode.CASSANDRA_4);
     }
 
     /**
@@ -573,6 +577,18 @@ public class MemtableParamsTest
         // Test DEFAULT memtable in CC5 mode
         String defaultValue = MemtableParams.DEFAULT.asSchemaValueText(StorageCompatibilityMode.NONE);
         assertEquals("default", defaultValue);
+    }
+
+    /**
+     * Test that asSchemaValueText() returns a String in CASSANDRA_4 mode, as Cassandra 4.1 and 5.0 do.
+     */
+    @Test
+    public void testAsSchemaValueTextInCassandra4Mode()
+    {
+        assertEquals("default", MemtableParams.DEFAULT.asSchemaValueText(StorageCompatibilityMode.CASSANDRA_4));
+        // the map form has no sharded memtables
+        MemtableParams shardedParams = MemtableParams.forTesting(MemtableParams.DEFAULT.factory(), "sharded-skiplist");
+        assertEquals("sharded-skiplist", shardedParams.asSchemaValueText(StorageCompatibilityMode.CASSANDRA_4));
     }
 
     /**

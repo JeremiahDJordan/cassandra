@@ -388,7 +388,7 @@ public class SchemaCQLHelperTest extends CQLTester
         ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
 
         boolean isCompatibilityMode = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5);
-        String memtableFormat = isCompatibilityMode
+        String memtableFormat = DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                                 ? "    AND memtable = {}\n"
                                 : "    AND memtable = 'default'\n";
 
@@ -894,6 +894,29 @@ public class SchemaCQLHelperTest extends CQLTester
         {
             assertThat(e.getCause(), instanceOf(ConfigurationException.class));
             assertThat(e.getCause().getMessage(), containsString("Memtable configuration \"com.example.CustomMemtable\" not found"));
+        }
+    }
+
+    @Test
+    public void testMemtableFormatInCassandra4Mode()
+    {
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication={ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }");
+        StorageCompatibilityMode originalMode = TableParams.storageCompatibilityModeOverride;
+
+        try
+        {
+            TableParams.storageCompatibilityModeOverride = StorageCompatibilityMode.CASSANDRA_4;
+
+            String tableName = createTable(keyspace, "CREATE TABLE %s (id int PRIMARY KEY, value text) WITH memtable = 'trie'");
+            ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(tableName);
+            String cql = SchemaCQLHelper.getTableMetadataAsCQL(cfs.metadata(), cfs.keyspace.getMetadata());
+            // Cassandra 4.1 and 5.0 syntax
+            Assertions.assertThat(cql).contains("memtable = 'trie'");
+            Assertions.assertThat(cql).doesNotContain("memtable = {");
+        }
+        finally
+        {
+            TableParams.storageCompatibilityModeOverride = originalMode;
         }
     }
 
