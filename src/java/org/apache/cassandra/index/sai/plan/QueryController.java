@@ -401,12 +401,30 @@ public class QueryController
     {
         List<PrimaryKey> primaryKeys = materializeKeysAndCloseSource(source);
         if (primaryKeys != null)
-            primaryKeys = replaceStaticKeysByRowKeys(primaryKeys, queryExpressionView);
+            primaryKeys = queryExpressionView.expression.getIndexTermType().columnMetadata().isStatic()
+                          ? replaceRowKeysByStaticKeys(primaryKeys)
+                          : replaceStaticKeysByRowKeys(primaryKeys, queryExpressionView);
         if (primaryKeys == null)
             return getTopKRows(queryExpressionView);
         if (primaryKeys.isEmpty())
             return CloseableIterator.empty();
         return getTopKRows(primaryKeys, queryExpressionView);
+    }
+
+    /**
+     * An index on a static vector column only orders the keys of static rows, and the key of a static row stands for
+     * every row of its partition.
+     */
+    private static List<PrimaryKey> replaceRowKeysByStaticKeys(List<PrimaryKey> keys)
+    {
+        List<PrimaryKey> staticKeys = new ArrayList<>(keys.size());
+        for (PrimaryKey key : keys)
+        {
+            PrimaryKey staticKey = key.toStatic();
+            if (staticKeys.isEmpty() || !staticKeys.get(staticKeys.size() - 1).equals(staticKey))
+                staticKeys.add(staticKey);
+        }
+        return staticKeys;
     }
 
     /**
@@ -420,7 +438,7 @@ public class QueryController
     private List<PrimaryKey> replaceStaticKeysByRowKeys(List<PrimaryKey> keys, QueryViewBuilder.QueryExpressionView queryExpressionView)
     {
         ColumnMetadata column = queryExpressionView.expression.getIndexTermType().columnMetadata();
-        if (column.isStatic() || keys.stream().noneMatch(key -> key.kind() == PrimaryKey.Kind.STATIC))
+        if (keys.stream().noneMatch(key -> key.kind() == PrimaryKey.Kind.STATIC))
             return keys;
 
         ColumnFamilyStore.ViewFragment view = queryExpressionView.computeViewFragment();
