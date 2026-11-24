@@ -144,6 +144,7 @@ public class CassandraStreamManager implements TableStreamManager
             List<Range<Token>> normalizedFullRanges = Range.normalize(replicas.onlyFull().ranges());
             List<Range<Token>> normalizedAllRanges = Range.normalize(replicas.ranges());
             //Create outgoing file streams for ranges possibly skipping repaired ranges in sstables
+            CassandraOutgoingFile.BtiDaReceiver receiver = CassandraOutgoingFile.BtiDaReceiver.of(session.peer);
             for (SSTableReader sstable : new ArrayList<>(refs))
             {
                 List<Range<Token>> ranges = sstable.isRepaired() ? normalizedFullRanges : normalizedAllRanges;
@@ -156,7 +157,7 @@ public class CassandraStreamManager implements TableStreamManager
                 }
                 Ref<SSTableReader> ref = refs.get(sstable);
                 streams.add(new CassandraOutgoingFile(session.getStreamOperation(), ref, sections, ranges,
-                                                      sstable.estimatedKeysForRanges(ranges)));
+                                                      sstable.estimatedKeysForRanges(ranges), receiver));
             }
 
             return streams;

@@ -226,10 +226,15 @@ public class TypeUtil
 
     public static ByteBuffer fromComparableBytes(ByteComparable value, AbstractType<?> type, ByteComparable.Version version)
     {
-        if (isInetAddress(type) || isBigInteger(type) || isBigDecimal(type))
-            return ByteBuffer.wrap(ByteSourceInverse.readBytes(value.asComparableBytes(version)));
+        return fromComparableBytes(value.asComparableBytes(version), type, version);
+    }
 
-        return type.fromComparableBytes(ByteSource.peekable(value.asComparableBytes(version)), version);
+    public static ByteBuffer fromComparableBytes(ByteSource bytes, AbstractType<?> type, ByteComparable.Version version)
+    {
+        if (isInetAddress(type) || isBigInteger(type) || isBigDecimal(type))
+            return ByteBuffer.wrap(ByteSourceInverse.readBytes(bytes));
+
+        return type.fromComparableBytes(ByteSource.peekable(bytes), version);
     }
 
     public static ByteComparable asComparableBytes(ByteBuffer value, AbstractType<?> type)
@@ -248,7 +253,21 @@ public class TypeUtil
         // to keep all comparable values the same length
         else if (type instanceof LongType)
             return ByteSource.optionalSignedFixedLengthNumber(ByteBufferAccessor.instance, value);
+        // A DESC bigint column is indexed reversed (see #isIndexedUnreversed), in the same fixed length.
+        else if (type.isReversed() && type.unwrap() instanceof LongType)
+            return type.asComparableBytes(value, BYTE_COMPARABLE_VERSION);
         return type.asComparableBytes(value, version);
+    }
+
+    /**
+     * The bytes of an index term. A term read from an index is preencoded in the version of its component, which for
+     * {@link Version#AA} on sstables of a later byte-comparable version isn't {@link #BYTE_COMPARABLE_VERSION}, but
+     * its bytes are those of that version.
+     */
+    public static ByteSource termBytes(ByteComparable term)
+    {
+        return term.asComparableBytes(term instanceof ByteComparable.Preencoded ? ((ByteComparable.Preencoded) term).encodingVersion()
+                                                                                : BYTE_COMPARABLE_VERSION);
     }
 
     /**

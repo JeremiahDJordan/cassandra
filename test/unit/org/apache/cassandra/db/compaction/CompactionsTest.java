@@ -40,6 +40,7 @@ import org.junit.Test;
 import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -206,14 +207,16 @@ public class CompactionsTest
         // disable compaction while flushing
         store.disableAutoCompaction();
 
-        //Populate sstable1 with keys [0a..29a], with 30-character suffixes: with BTI, worthDroppingTombstones estimates
-        //the overlapping keys from the mean partition size, which the histogram rounds up to the next bucket offset;
-        //these partitions are just below one, so the estimate stays close to the real count.
-        populate(KEYSPACE1, CF_STANDARD1, 0, 29, "a".repeat(30), 3); //ttl=3s
+        //Populate sstable1 with keys [0a..29a]: with BTI, worthDroppingTombstones estimates the overlapping keys from
+        //the mean partition size, which the histogram rounds up to the next bucket offset; the suffixes put the
+        //partitions just below one (signed deletion times take 11 more bytes per partition), so the estimate stays
+        //close to the real count.
+        int suffixLength = DatabaseDescriptor.getSelectedSSTableFormat().getLatestVersion().hasUIntDeletionTime() ? 11 : 30;
+        populate(KEYSPACE1, CF_STANDARD1, 0, 29, "a".repeat(suffixLength), 3); //ttl=3s
         Util.flush(store);
 
         //Populate sstable2 with with keys [0b..29b] (keys do not overlap with SSTable1, but the range is almost fully covered)
-        long timestamp2 = populate(KEYSPACE1, CF_STANDARD1, 0, 29, "b".repeat(30), 3); //ttl=3s
+        long timestamp2 = populate(KEYSPACE1, CF_STANDARD1, 0, 29, "b".repeat(suffixLength), 3); //ttl=3s
         Util.flush(store);
 
         assertEquals(2, store.getLiveSSTables().size());

@@ -31,10 +31,12 @@ import com.google.common.net.HostAndPort;
 import org.junit.Test;
 
 import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.tools.OfflineToolUtils.sstableDirName;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 // LoaderOptionsTester for custom configuration
@@ -107,6 +109,21 @@ public class LoaderOptionsTest
                                       .getBytes(StandardCharsets.UTF_8));
         String[] args = { "-d", "127.9.9.1", "-f", noEntireSSTables.toString(), sstableDirName("legacy_sstables", "legacy_ma_simple") };
         assertFalse(LoaderOptions.builder().parseArgs(args).build().streamEntireSSTables);
+    }
+
+    @Test
+    public void testStorageCompatibilityMode() throws IOException
+    {
+        String[] noConfig = { "-d", "127.9.9.1", sstableDirName("legacy_sstables", "legacy_ma_simple") };
+        assertNull(LoaderOptions.builder().parseArgs(noConfig).build().storageCompatibilityMode);
+
+        File config = new File(Paths.get(".", "test", "conf", "cassandra.yaml").normalize());
+        Path none = Files.createTempFile("cassandra", ".yaml");
+        none.toFile().deleteOnExit();
+        Files.write(none, (new String(Files.readAllBytes(config.toPath()), StandardCharsets.UTF_8) + "\nstorage_compatibility_mode: NONE\n")
+                          .getBytes(StandardCharsets.UTF_8));
+        String[] args = { "-d", "127.9.9.1", "-f", none.toString(), sstableDirName("legacy_sstables", "legacy_ma_simple") };
+        assertEquals(StorageCompatibilityMode.NONE, LoaderOptions.builder().parseArgs(args).build().storageCompatibilityMode);
     }
 
     @Test

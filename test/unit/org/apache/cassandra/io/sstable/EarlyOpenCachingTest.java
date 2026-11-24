@@ -84,7 +84,8 @@ public class EarlyOpenCachingTest extends CQLTester
         SSTABLE_FORMAT_DEFAULT.setString(format.name());
         createTable("CREATE TABLE %s (pkey text, ckey text, val blob, PRIMARY KEY (pkey, ckey))");
 
-        for (int i = 0; i < 800; i++)
+        // enough for the row index of a bti sstable to pass its 64 KiB write buffer, which an early open waits for
+        for (int i = 0; i < 1000; i++)
         {
             String pkey = getRandom().nextAsciiString(10, 10);
             for (int j = 0; j < 100; j++)

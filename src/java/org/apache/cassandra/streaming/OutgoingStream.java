@@ -43,6 +43,13 @@ public interface OutgoingStream
     void finish();
 
     /**
+     * Throws if the stream can't be sent to the peer of its session, which fails the session before anything is sent.
+     */
+    default void checkCanSend()
+    {
+    }
+
+    /**
      * Release any coordination status this stream reserved at construction.
      */
     default void releaseStreamRebuildStatus()

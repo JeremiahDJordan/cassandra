@@ -186,27 +186,77 @@ Upgrading
       changes reach every node during the upgrade; without it, the earlier releases neither pull schema from 5.0.10
       nodes nor push schema to them. LIKE and blob indexes stay unavailable until the option is removed: a node
       started with it counts as a node that supports neither.
+    - The sstable versions written by default follow storage_compatibility_mode. In CASSANDRA_4, UPGRADING and NONE,
+      the modes of Apache Cassandra 5.0, a node and its offline tools write what Apache Cassandra 5.0 writes: big "nb"
+      in CASSANDRA_4 and "oa" in the others, and bti "da" (in CASSANDRA_4, where bti can't be the selected format, for
+      the bti tables it receives by partitions). In HCD_1, the DataStax mode, they write big "nb" and bti "cc", the
+      versions its releases read. Earlier releases wrote bti "cc" in every mode, which can't hold local deletion times
+      after 2038-01-19T03:14:06Z, see the next entry. -Dcassandra.trie_index_format_version still sets the bti version
+      in every mode, see the entry about the sstable versions read for its values; a node in HCD_1 that it makes write
+      a version later than "cc" logs a warning at startup.
+      A cluster that runs an earlier release in HCD_1 stays in HCD_1 during the upgrade, and sets UPGRADING only once
+      every node runs this release. In CASSANDRA_4, UPGRADING and NONE an upgraded node writes bti "da" (in
+      CASSANDRA_4, for the bti tables it receives by partitions). The nodes of earlier DataStax 5.0 releases accept an
+      entire "da" sstable but don't read it, so a node streams its "da" sstables by partitions to the nodes of earlier
+      DataStax 5.0 messaging versions: those of the earlier releases, and those of this release started with
+      -Dds.current_messaging_version=110, which advertise the same version. The DataStax nodes before 5.0 (HCD 1.x,
+      DSE 6.8) can't decode them even by partitions, so a stream of a "da" sstable to them, or to a node whose
+      messaging version isn't known yet, fails, naming the sstable to rewrite as "cc" first: a cluster that still has
+      such nodes must neither import "da" sstables nor set -Dcassandra.trie_index_format_version=da. Apache Cassandra
+      nodes and nodes of this release's messaging version receive "da" sstables entire, as before. Starting each
+      upgraded node with -Dcassandra.trie_index_format_version=cc until every node runs this release avoids writing
+      "da" at all, so that a rollback needs no rewrite; set -Dcassandra.trie_index_format_version=da only once every
+      node runs this release. Nodes in UPGRADING and NONE stream "da" sstables entire to nodes of this release in
+      HCD_1, which read them with the warning described in the entry about the sstable versions read. In UPGRADING and
+      NONE, flushes and compactions write "da", and nodetool upgradesstables, or automatic_sstable_upgrade if enabled,
+      rewrites the "cc" sstables as "da".
+      The offline tools that write sstables, such as sstableupgrade, sstablescrub and sstablesplit, now run in the
+      storage_compatibility_mode of their cassandra.yaml, HCD_1 if it sets none, as in Apache Cassandra, instead of
+      NONE: they write the versions of that mode and, in CASSANDRA_4, refuse big "oa" as the node does. Clients run in
+      NONE, as in Apache Cassandra, but unless their configuration sets one of its modes they write the versions of
+      HCD_1, bti "cc" and big "nb" (instead of "oa" before), and limit expirations to 2038 as HCD_1 does.
+      sstableloader takes the storage_compatibility_mode of its --conf-path file: without one or with HCD_1, it writes
+      the versions of HCD_1 and so streams big "oa" sstables by partitions; with CASSANDRA_4, UPGRADING or NONE, the
+      file doesn't set its stream_entire_sstables, as in Apache Cassandra. It doesn't know the messaging versions of
+      the nodes it loads into, so it always streams bti "da" sstables by partitions; don't load them into DataStax
+      nodes before 5.0.
+      To roll back to an earlier release that ran in HCD_1, restart every node in HCD_1 without
+      -Dcassandra.trie_index_format_version set to a version later than "cc", rewrite the sstables of every node with
+      nodetool upgradesstables -a, and check that no node logs the warning about sstables of versions newer than a
+      release of HCD_1 reads when it next starts. For an earlier release that ran in CASSANDRA_4, UPGRADING or NONE,
+      keep the mode, restart every node with -Dcassandra.trie_index_format_version=cc, rewrite the sstables of every
+      node with nodetool upgradesstables -a, and check that no live bti sstable of major version "d" is left (no file
+      named d*-bti-Data.db in the data directories, outside of snapshots and backups). Only then install the earlier
+      release. Do this before 2038-01-19T03:14:06Z: a rewrite as "cc" or "nb" records the partition deletions made
+      after that date as that time (see the next entry), which these checks, that only look at sstable versions, don't
+      show.
     - The sstable versions without unsigned deletion times (BTI cc and earlier, BIG nb and earlier) can't represent a
       local deletion time after 2038-01-19T03:14:06Z in their metadata, their partition deletions and the copies of
       open range tombstones kept in their row indexes; the expiration times of cells and rows are encoded separately.
-      BTI cc is the default BTI version in every storage_compatibility_mode that allows BTI, including NONE, where
-      data can expire up to 2106, and UPGRADING, where it can once every node supports it (BIG writes oa in those
-      modes). This has two consequences. First, an sstable holding only data with a TTL, whose latest expiration is
-      after 2038, recorded 2038-01-19T03:14:06Z as its maximum local deletion time, so from that date plus
-      gc_grace_seconds compaction could drop it whole as fully expired, losing the data that is still live. Such a
-      maximum, or one equal to that time, is now recorded as unknown, and the 2038 value written by earlier releases
-      is read as unknown too, so no rewrite is needed while running this release. On this release, such sstables are
-      not dropped whole once their data expires: compaction purges the expired data when it rewrites them and the data
-      is purgeable, but TimeWindowCompactionStrategy, which runs no single-sstable tombstone compactions by default,
-      keeps them until something rewrites them, such as nodetool garbagecollect. After a downgrade, earlier releases
-      read the 2038 value as a real time again, in the sstables that weren't rewritten and in the ones they write, and
-      can drop them whole too early. Second, from 2038-01-19 on, a partition deletion written in these versions is
-      recorded as 2038-01-19T03:14:06Z, so once that date plus gc_grace_seconds has passed it can be purged as soon as
-      it is written, and a replica that missed the deletion can bring the deleted data back; reads that start inside a
-      range tombstone through the row index can likewise drop it too early. Every node must write sstables in a
-      version with unsigned deletion times before 2038, then rewrite its older sstables with nodetool
-      upgradesstables -a: BTI da (sstable.selected_format: bti and -Dcassandra.trie_index_format_version=da) or BIG oa
-      (sstable.selected_format: big with storage_compatibility_mode NONE or UPGRADING).
+      BTI cc is the default BTI version in HCD_1, and was in every storage_compatibility_mode that allows BTI before
+      this release, including NONE, where data can expire up to 2106, and UPGRADING, where it can once every node
+      supports it (BIG writes oa in those modes). This has two consequences. First, an sstable holding only data with
+      a TTL, whose latest expiration is after 2038, recorded 2038-01-19T03:14:06Z as its maximum local deletion time,
+      so from that date plus gc_grace_seconds compaction could drop it whole as fully expired, losing the data that is
+      still live. Such a maximum, or one equal to that time, is now recorded as unknown, and the 2038 value written by
+      earlier releases is read as unknown too, so no rewrite is needed while running this release. On this release,
+      such sstables are not dropped whole once their data expires: compaction purges the expired data when it rewrites
+      them and the data is purgeable, but TimeWindowCompactionStrategy, which runs no single-sstable tombstone
+      compactions by default, keeps them until something rewrites them, such as nodetool garbagecollect. After a
+      downgrade, earlier releases read the 2038 value as a real time again, in the sstables that weren't rewritten and
+      in the ones they write, and can drop them whole too early. Second, from 2038-01-19 on, a partition deletion
+      written in these versions is recorded as 2038-01-19T03:14:06Z, so once that date plus gc_grace_seconds has
+      passed it can be purged as soon as it is written, and a replica that missed the deletion can bring the deleted
+      data back; reads that start inside a range tombstone through the row index can likewise drop it too early. Every
+      node must write sstables in a version with unsigned deletion times before 2038, then rewrite its older sstables
+      with nodetool upgradesstables -a: BTI da (sstable.selected_format: bti, with storage_compatibility_mode NONE or
+      UPGRADING, or in HCD_1 with -Dcassandra.trie_index_format_version=da, both once every node runs this release) or
+      BIG oa (sstable.selected_format: big with storage_compatibility_mode NONE or UPGRADING).
+    - A node that ran an earlier release with -Dcassandra.trie_index_format_version=da and SAI on-disk version aa
+      (-Dcassandra.sai.latest.version=aa, or a version selector that selects it) wrote wrong entries for some values
+      of DESC bigint clustering columns into the SAI indexes of its "da" sstables, so that queries on those columns
+      can miss rows. This release writes them correctly; once every node runs it, rebuild those indexes with nodetool
+      rebuild_index.
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
       return the same value as the address column. This avoids the risk of client connections overwhelming
       DNS. (CASSANDRA-21539)
@@ -483,11 +533,10 @@ Upgrading
       version of Apache Cassandra 5.0), whatever version it writes, except for big "oa" in storage_compatibility_mode
       CASSANDRA_4: in CASSANDRA_4, UPGRADING and NONE, the modes of Apache Cassandra 5.0, a node reads what Apache
       Cassandra 5.0 reads, so CASSANDRA_4 refuses big "oa" at startup and on import, and reads bti "da". A node
-      writing the default bti version "cc" no longer needs -Dcassandra.trie_index_format_version=da to start with,
-      import or load "da" sstables, and the offline tools read them too. Compaction rewrites them in the version
-      written; "cc" records the latest expiration time of an sstable capped at 2038, see the entry about expiration
-      times after 2038. An sstable of a version newer than the one written is streamed by partitions instead of as an
-      entire sstable, so that the receiver writes its data in its own version.
+      writing bti "cc" no longer needs -Dcassandra.trie_index_format_version=da to start with, import or load "da"
+      sstables, and the offline tools read them too. Compaction rewrites them in the version written ("cc" can't hold
+      deletion times after 2038, see the entry about them). An sstable of a version newer than the one written is
+      streamed by partitions instead of as an entire sstable, so that the receiver writes its data in its own version.
       In HCD_1, the DataStax mode, a node reads the sstables of a major version later than the releases of that mode
       read (big after "n", bti after "c"), such as those it imports or receives as entire sstables by streaming from
       nodes in UPGRADING or NONE, but those releases can't, so the node logs a warning that a downgrade isn't possible

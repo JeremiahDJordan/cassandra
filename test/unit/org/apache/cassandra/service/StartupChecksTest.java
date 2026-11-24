@@ -179,7 +179,7 @@ public class StartupChecksTest
                     verifyFailure(startupChecks, "newer than storage_compatibility_mode CASSANDRA_4");
                 else
                     startupChecks.verify(options);
-                assertTrue(testAppender.list.stream().noneMatch(event -> event.getFormattedMessage().contains("newer than a release of storage_compatibility_mode")));
+                assertTrue(testAppender.list.stream().noneMatch(event -> event.getFormattedMessage().contains("sstables of versions newer than a release of storage_compatibility_mode")));
 
                 for (StorageCompatibilityMode compatibilityMode : new StorageCompatibilityMode[]{ StorageCompatibilityMode.HCD_1, StorageCompatibilityMode.UPGRADING, StorageCompatibilityMode.NONE })
                 {
@@ -188,7 +188,7 @@ public class StartupChecksTest
                     startupChecks.verify(options);
                     assertEquals(version + " in " + compatibilityMode,
                                  newer && compatibilityMode == StorageCompatibilityMode.HCD_1,
-                                 testAppender.list.stream().anyMatch(event -> event.getFormattedMessage().contains("newer than a release of storage_compatibility_mode")));
+                                 testAppender.list.stream().anyMatch(event -> event.getFormattedMessage().contains("sstables of versions newer than a release of storage_compatibility_mode")));
                 }
             }
 

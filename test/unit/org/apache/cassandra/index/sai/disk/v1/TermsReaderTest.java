@@ -56,7 +56,6 @@ import static org.apache.cassandra.index.sai.metrics.QueryEventListeners.NO_OP_T
 
 public class TermsReaderTest extends SaiRandomizedTest
 {
-    public static final ByteComparable.Version VERSION = TypeUtil.BYTE_COMPARABLE_VERSION;
 
     private final Version version;
 
@@ -136,7 +135,7 @@ public class TermsReaderTest extends SaiRandomizedTest
                 for (ByteComparable term = actualTermsEnum.next(); term != null; term = actualTermsEnum.next())
                 {
                     final ByteComparable expected = termsEnum.get(i++).byteComparableBytes;
-                    assertEquals(0, ByteComparable.compare(expected, term, VERSION));
+                    assertEquals(0, ByteComparable.compare(expected, term, TypeUtil.byteComparableVersionForTermsData(version)));
                 }
             }
         }
@@ -173,13 +172,14 @@ public class TermsReaderTest extends SaiRandomizedTest
                                                   termsFooterPointer,
                                                   version))
         {
+            ByteComparable.Version termsVersion = components.byteComparableVersionFor(IndexComponentType.TERMS_DATA);
             var iter = termsEnum.stream()
                     .map(InvertedIndexBuilder::toTermWithFrequency)
                     .collect(Collectors.toList());
             for (Pair<ByteComparable.Preencoded, List<RowMapping.RowIdWithFrequency>> pair : iter)
             {
-                final byte[] bytes = ByteSourceInverse.readBytes(pair.left.asComparableBytes(VERSION));
-                try (PostingList actualPostingList = reader.exactMatch(ByteComparable.preencoded(VERSION, bytes),
+                final byte[] bytes = ByteSourceInverse.readBytes(pair.left.asComparableBytes(termsVersion));
+                try (PostingList actualPostingList = reader.exactMatch(ByteComparable.preencoded(termsVersion, bytes),
                                                                        (QueryEventListener.TrieIndexEventListener)NO_OP_TRIE_LISTENER,
                                                                        new QueryContext()))
                 {
@@ -200,7 +200,7 @@ public class TermsReaderTest extends SaiRandomizedTest
                 }
 
                 // test skipping
-                try (PostingList actualPostingList = reader.exactMatch(ByteComparable.preencoded(VERSION, bytes),
+                try (PostingList actualPostingList = reader.exactMatch(ByteComparable.preencoded(termsVersion, bytes),
                                                                        (QueryEventListener.TrieIndexEventListener)NO_OP_TRIE_LISTENER,
                                                                        new QueryContext()))
                 {

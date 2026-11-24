@@ -249,6 +249,8 @@ public class DatabaseDescriptor
     private static ImmutableMap<String, SSTableFormat<?, ?>> sstableFormats;
     private static volatile SSTableFormat<?, ?> selectedSSTableFormat;
     private static StorageCompatibilityMode storageCompatibilityMode = CassandraRelevantProperties.TEST_STORAGE_COMPATIBILITY_MODE.getEnum(true, StorageCompatibilityMode.class);
+    // the mode set by the configuration, if any, which decides what clients, running in NONE, write
+    private static StorageCompatibilityMode configuredStorageCompatibilityMode;
 
     private static Function<CommitLog, AbstractCommitLogSegmentManager> commitLogSegmentMgrProvider = c -> DatabaseDescriptor.isCDCEnabled()
                                                                                                            ? new CommitLogSegmentManagerCDC(c, DatabaseDescriptor.getCommitLogLocation())
@@ -1714,8 +1716,10 @@ public class DatabaseDescriptor
 
     private static void applyCompatibilityMode()
     {
-        if (isClientOrToolInitialized())
-            // tools or clients should not limit the sstable formats they support
+        configuredStorageCompatibilityMode = conf == null ? null : conf.storage_compatibility_mode;
+
+        if (isClientInitialized())
+            // clients should not limit the sstable formats they support
             storageCompatibilityMode = StorageCompatibilityMode.NONE;
         else if (conf != null && conf.storage_compatibility_mode != null)
             storageCompatibilityMode = conf.storage_compatibility_mode;
@@ -1754,7 +1758,11 @@ public class DatabaseDescriptor
         selectedSSTableFormat = getAndValidateWriteFormat(sstableFormats, sstableFormatsConfig.selected_format);
 
         sstableFormats.values().forEach(SSTableFormat::allComponents); // make sure to reach all supported components for a type so that we know all of them are registered
-        logger.info("Supported sstable formats are: {}", sstableFormats.values().stream().map(f -> f.name() + " -> " + f.getClass().getName() + " with singleton components: " + f.allComponents()).collect(Collectors.joining(", ")));
+        logger.info("Supported sstable formats are: {}", sstableFormats.values().stream()
+                                                                    .map(f -> f.name() + " -> " + f.getClass().getName() +
+                                                                              " writing version " + f.getLatestVersion() +
+                                                                              " with singleton components: " + f.allComponents())
+                                                                    .collect(Collectors.joining(", ")));
     }
 
     /**
@@ -5522,6 +5530,21 @@ public class DatabaseDescriptor
     public static StorageCompatibilityMode getStorageCompatibilityMode()
     {
         return storageCompatibilityMode;
+    }
+
+    /**
+     * @return the storage compatibility mode that decides the sstable versions written by default and their expiration
+     * limit. Clients run in {@link StorageCompatibilityMode#NONE}, as in Apache Cassandra, unless their configuration
+     * sets {@link StorageCompatibilityMode#HCD_1} or no mode, which a node runs in by default: then they write for
+     * HCD_1.
+     */
+    public static StorageCompatibilityMode getStorageCompatibilityModeForWrites()
+    {
+        if (!isClientInitialized())
+            return storageCompatibilityMode;
+        return configuredStorageCompatibilityMode == null || configuredStorageCompatibilityMode == StorageCompatibilityMode.HCD_1
+               ? StorageCompatibilityMode.HCD_1
+               : StorageCompatibilityMode.NONE;
     }
 
     @VisibleForTesting

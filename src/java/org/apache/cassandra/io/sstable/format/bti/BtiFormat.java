@@ -67,10 +67,11 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
     private final static Logger logger = LoggerFactory.getLogger(BtiFormat.class);
 
     public static final String NAME = "bti";
-    // the newest version that the releases of storage compatibility mode HCD_1 read
+    // the version written by default in storage compatibility mode HCD_1, the newest one its releases read
     public static final String STORAGE_COMPATIBILITY_HCD_1_VERSION = "cc";
 
-    private final Version latestVersion = new BtiVersion(this, BtiVersion.current_version);
+    private final String currentVersion = currentVersion();
+    private final Version latestVersion = new BtiVersion(this, currentVersion);
     static final BtiTableReaderFactory readerFactory = new BtiTableReaderFactory();
     static final BtiTableWriterFactory writerFactory = new BtiTableWriterFactory();
 
@@ -129,6 +130,19 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
     public BtiFormat(Map<String, String> options)
     {
         super(NAME, options);
+        logger.debug("Trie index format current version: {}", currentVersion);
+    }
+
+    /**
+     * @return the version written: the one set by -Dcassandra.trie_index_format_version, else
+     * {@link #STORAGE_COMPATIBILITY_HCD_1_VERSION} in storage compatibility mode HCD_1 and "da", as Apache Cassandra
+     * writes, in the others
+     */
+    private static String currentVersion()
+    {
+        if (CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.isPresent())
+            return BtiVersion.checkWritable(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getString());
+        return DatabaseDescriptor.getStorageCompatibilityModeForWrites() == StorageCompatibilityMode.HCD_1 ? STORAGE_COMPATIBILITY_HCD_1_VERSION : "da";
     }
 
     public static boolean is(SSTableFormat<?, ?> format)
@@ -304,17 +318,8 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
 
     static class BtiVersion extends Version
     {
-        private static final Logger logger = LoggerFactory.getLogger(BtiVersion.class);
-
         // the versions that can be written: the released ones
         private static final Set<String> WRITABLE_VERSIONS = ImmutableSet.of("aa", "ac", "ad", "ba", "bb", "ca", "cb", "cc", "da");
-
-        public static final String current_version = checkWritable(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getString());
-
-        static
-        {
-            logger.info("Trie index format current version: {}", current_version);
-        }
 
         public static final String earliest_supported_version = "aa";
         // the newest version read, whatever version is written
@@ -340,6 +345,8 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
         // da (5.0): initial version of the BIT format
         // NOTE: when adding a new version, please add that to LegacySSTableTest and update latest_supported_version, too.
 
+        // the version its format writes
+        private final String currentVersion;
         private final boolean isLatestVersion;
 
         /**
@@ -372,7 +379,8 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
         {
             super(format, version);
 
-            isLatestVersion = version.compareTo(current_version) == 0;
+            currentVersion = format.currentVersion;
+            isLatestVersion = version.compareTo(currentVersion) == 0;
             // the features below are computed for 'ba' when the version is 'ab'
             version = mapAb(version);
 
@@ -572,7 +580,7 @@ public class BtiFormat extends AbstractSSTableFormat<BtiTableReader, BtiTableWri
         @Override
         public boolean isCompatibleForStreaming()
         {
-            return isCompatible() && version.charAt(0) == current_version.charAt(0);
+            return isCompatible() && version.charAt(0) == currentVersion.charAt(0);
         }
 
         @Override

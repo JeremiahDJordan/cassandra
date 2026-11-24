@@ -69,6 +69,7 @@ import org.apache.cassandra.exceptions.StartupException;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.UUIDBasedSSTableId;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
 import org.apache.cassandra.io.util.File;
@@ -681,6 +682,16 @@ public class StartupChecks
                             BigFormat.STORAGE_COMPATIBILITY_4_VERSION,
                             BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION,
                             newerThanCompatibilityMode.stream().map(d -> d.ksname + '.' + d.cfname).distinct().sorted().collect(Collectors.joining(", ")));
+
+            Version btiVersion = BtiFormat.getInstance().getLatestVersion();
+            if (btiVersion.isNewerThanStorageCompatibilityMode())
+                logger.warn("-D{}={} makes this node write bti sstables of a version newer than a release of " +
+                            "storage_compatibility_mode {} reads ({}). A downgrade to such a release isn't possible while " +
+                            "they exist; see NEWS.txt",
+                            CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getKey(),
+                            btiVersion,
+                            DatabaseDescriptor.getStorageCompatibilityMode(),
+                            BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION);
 
             if (!withIllegalGenId.isEmpty())
                 throw new StartupException(StartupException.ERR_WRONG_CONFIG,

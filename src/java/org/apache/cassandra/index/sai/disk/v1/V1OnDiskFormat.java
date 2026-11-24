@@ -313,8 +313,8 @@ public class V1OnDiskFormat implements OnDiskFormat
     public ByteBuffer decodeFromTrie(ByteComparable value, AbstractType<?> type)
     {
         return TypeUtil.isLiteral(type)
-               ? ByteBuffer.wrap(ByteSourceInverse.readBytes(value.asComparableBytes(ByteComparable.Version.OSS41)))
-               : TypeUtil.fromComparableBytes(value, type, ByteComparable.Version.OSS41);
+               ? ByteBuffer.wrap(ByteSourceInverse.readBytes(TypeUtil.termBytes(value)))
+               : TypeUtil.fromComparableBytes(TypeUtil.termBytes(value), type, ByteComparable.Version.OSS41);
     }
 
     /**

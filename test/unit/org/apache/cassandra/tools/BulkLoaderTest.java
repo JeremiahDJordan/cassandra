@@ -29,6 +29,7 @@ import com.datastax.driver.core.exceptions.NoHostAvailableException;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.tools.ToolRunner.ToolResult;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.hamcrest.CoreMatchers;
 
 import static org.junit.Assert.assertEquals;
@@ -240,6 +241,8 @@ public class BulkLoaderTest extends OfflineToolUtils
                                                  OfflineToolUtils.sstableDirName("legacy_sstables", "legacy_ma_simple"));
         assertEquals(-1, tool.getExitCode());
         assertFalse(DatabaseDescriptor.streamEntireSSTables());
+        // the configuration sets no storage_compatibility_mode
+        assertEquals(StorageCompatibilityMode.HCD_1, DatabaseDescriptor.getStorageCompatibilityModeForWrites());
         throw tool.getException().getCause().getCause().getCause();
     }
 }
