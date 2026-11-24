@@ -92,6 +92,16 @@ public class AutoRepairParamsTest extends CQLTester
     }
 
     @Test
+    public void testPriorityOutOfIntRange() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
+        assertInvalidMessage("Invalid value 2147483648 for 'priority' repair sub-option - must be an integer",
+                             "ALTER TABLE %s WITH auto_repair = {'priority': '2147483648'}");
+        alterTable("ALTER TABLE %s WITH auto_repair = {'priority': '2147483647'}");
+        assertEquals(Integer.MAX_VALUE, autoRepairParams().priority());
+    }
+
+    @Test
     public void testKeyInSeveralCasesWithoutLowerCase()
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
