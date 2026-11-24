@@ -113,6 +113,13 @@ public class FilterTree
                 {
                     result = op.apply(result, isSatisfiedBy(filter.unindexedMapEntry, filter.context.columnFamilyStore().metadata(), key, row, now));
                 }
+                else if (filter.unindexed != null)
+                {
+                    // the row filter expression reads the cells of a purged row, as RowFilter#isSatisfiedBy gives it
+                    TableMetadata metadata = filter.context.columnFamilyStore().metadata();
+                    Row purged = row == null ? null : row.purge(DeletionPurger.PURGE_ALL, now, metadata.enforceStrictLiveness());
+                    result = op.apply(result, purged != null && filter.unindexed.isSatisfiedBy(metadata, key, purged));
+                }
                 else if (TypeUtil.isNonFrozenCollection(column.type))
                 {
                     Iterator<ByteBuffer> valueIterator = filter.context.getValuesOf(row, now);

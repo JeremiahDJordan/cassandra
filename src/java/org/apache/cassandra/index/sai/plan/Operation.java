@@ -93,6 +93,13 @@ public class Operation
                 continue;
             }
 
+            // filtered as it is (see FilterTree), with the analyzer of the = it negates, for a != that no index serves
+            if (e.operator() == Operator.NEQ && e.analyzer() != null)
+            {
+                perColumn.add(Expression.unindexed(indexContext, e));
+                continue;
+            }
+
             AbstractAnalyzer.AnalyzerFactory analyzerFactory = indexContext.getQueryAnalyzerFactory();
             AbstractAnalyzer analyzer = analyzerFactory.create();
             try

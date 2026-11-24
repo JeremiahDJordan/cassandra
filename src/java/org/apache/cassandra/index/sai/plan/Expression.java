@@ -171,6 +171,9 @@ public class Expression
     // The map entry comparison this expression filters with when no index scan serves it, without bounds: its key or
     // value can be too large for a CompositeType component
     RowFilter.MapComparisonExpression unindexedMapEntry;
+    // The row filter expression this expression filters with, without bounds, when no index scan serves it: an
+    // analyzed != (see Operation#analyzeGroup)
+    RowFilter.Expression unindexed;
 
     public Expression(IndexContext indexContext)
     {
@@ -208,6 +211,17 @@ public class Expression
         Expression expression = new Expression(indexContext);
         expression.operation = Op.valueOf(mapEntry.operator());
         expression.unindexedMapEntry = mapEntry;
+        return expression;
+    }
+
+    /**
+     * @return an expression that filters the rows with the given row filter expression, which no index scan serves
+     */
+    static Expression unindexed(IndexContext indexContext, RowFilter.Expression unindexed)
+    {
+        Expression expression = new Expression(indexContext);
+        expression.operation = Op.valueOf(unindexed.operator());
+        expression.unindexed = unindexed;
         return expression;
     }
 
@@ -695,7 +709,8 @@ public class Expression
                                     .append(exclusions)
                                     .append(allTerms)
                                     .append(withoutTerms)
-                                    .append(unindexedMapEntry).build();
+                                    .append(unindexedMapEntry)
+                                    .append(unindexed).build();
     }
 
     public boolean equals(Object other)
@@ -716,7 +731,8 @@ public class Expression
                 && exclusions.equals(o.exclusions)
                 && Objects.equals(allTerms, o.allTerms)
                 && withoutTerms == o.withoutTerms
-                && Objects.equals(unindexedMapEntry, o.unindexedMapEntry);
+                && Objects.equals(unindexedMapEntry, o.unindexedMapEntry)
+                && Objects.equals(unindexed, o.unindexed);
     }
 
     /**
