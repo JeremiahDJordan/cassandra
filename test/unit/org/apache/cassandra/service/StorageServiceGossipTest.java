@@ -41,6 +41,7 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.dht.IPartitioner;
@@ -70,6 +71,7 @@ import org.apache.cassandra.service.StorageService.LeavingReplica;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.BOOTSTRAP_SKIP_SCHEMA_CHECK;
+import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -381,6 +383,56 @@ public class StorageServiceGossipTest
         Gossiper.instance.injectApplicationState(newestNode, ApplicationState.TOKENS, new VersionedValue.VersionedValueFactory(partitioner).tokens(Collections.singleton(token)));
         ss.onChange(newestNode, ApplicationState.STATUS_WITH_PORT, valueFactory.normal(Collections.singleton(token)));
         assertEquals("Newest node didn't win host ID", newestNode, tmd.getEndpointForHostId(hostId));
+    }
+
+    @Test
+    public void testNormalStateExistingEndpointOnAnotherPort() throws UnknownHostException
+    {
+        // the node restarts with the same address and host ID on another storage port; the new endpoint is learnt
+        // after the old one, or before it
+        checkNormalStateExistingEndpointOnAnotherPort("127.0.0.110", false);
+        checkNormalStateExistingEndpointOnAnotherPort("127.0.0.111", true);
+    }
+
+    private void checkNormalStateExistingEndpointOnAnotherPort(String address, boolean newEndpointFirst) throws UnknownHostException
+    {
+        StorageService ss = StorageService.instance;
+        TokenMetadata tmd = ss.getTokenMetadata();
+        tmd.clearUnsafe();
+        IPartitioner partitioner = new RandomPartitioner();
+        VersionedValue.VersionedValueFactory valueFactory = new VersionedValue.VersionedValueFactory(partitioner);
+        Token token = new RandomPartitioner.BigIntegerToken("1");
+        UUID hostId = UUID.randomUUID();
+        UUID newSchemaVersion = UUID.randomUUID();
+        InetAddressAndPort oldNativeAddress = InetAddressAndPort.getByNameOverrideDefaults("127.0.1.1", 9042);
+        InetAddressAndPort newNativeAddress = InetAddressAndPort.getByNameOverrideDefaults("127.0.1.2", 9042);
+
+        InetAddressAndPort oldEndpoint = InetAddressAndPort.getByNameOverrideDefaults(address, 7000);
+        InetAddressAndPort newEndpoint = InetAddressAndPort.getByNameOverrideDefaults(address, 7001);
+        List<InetAddressAndPort> endpoints = newEndpointFirst ? Arrays.asList(newEndpoint, oldEndpoint) : Arrays.asList(oldEndpoint, newEndpoint);
+        for (InetAddressAndPort endpoint : endpoints)
+        {
+            boolean isNew = endpoint.equals(newEndpoint);
+            Gossiper.instance.initializeNodeUnsafe(endpoint, hostId, MessagingService.current_version, isNew ? 2 : 1);
+            Gossiper.instance.injectApplicationState(endpoint, ApplicationState.SCHEMA, valueFactory.schema(isNew ? newSchemaVersion : UUID.randomUUID()));
+            Gossiper.instance.injectApplicationState(endpoint, ApplicationState.NATIVE_ADDRESS_AND_PORT, valueFactory.nativeaddressAndPort(isNew ? newNativeAddress : oldNativeAddress));
+            if (!isNew)
+                Gossiper.instance.injectApplicationState(endpoint, ApplicationState.RACK, valueFactory.rack("oldRack"));
+            Gossiper.instance.injectApplicationState(endpoint, ApplicationState.TOKENS, valueFactory.tokens(Collections.singleton(token)));
+            ss.onChange(endpoint, ApplicationState.STATUS_WITH_PORT, valueFactory.normal(Collections.singleton(token)));
+        }
+        assertEquals("Newest endpoint didn't win host ID", newEndpoint, tmd.getEndpointForHostId(hostId));
+        Nodes.getInstance().awaitInflightUpdateCompletion();
+
+        UntypedResultSet peersV2 = executeInternal("SELECT peer_port FROM system.peers_v2 WHERE peer = ?", newEndpoint.getAddress());
+        assertEquals(1, peersV2.size());
+        assertEquals(7001, peersV2.one().getInt("peer_port"));
+        UntypedResultSet peers = executeInternal("SELECT host_id, schema_version, rpc_address, rack FROM system.peers WHERE peer = ?", newEndpoint.getAddress());
+        assertEquals(1, peers.size());
+        assertEquals(hostId, peers.one().getUUID("host_id"));
+        assertEquals(newSchemaVersion, peers.one().getUUID("schema_version"));
+        assertEquals(newNativeAddress.getAddress(), peers.one().getInetAddress("rpc_address"));
+        assertFalse(peers.one().has("rack"));
     }
 
     private static class TestEndpointSubscriber implements IEndpointLifecycleSubscriber

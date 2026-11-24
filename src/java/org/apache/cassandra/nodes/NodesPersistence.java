@@ -123,6 +123,9 @@ public class NodesPersistence implements INodesPersistence
     private static final String DELETE_LEGACY_PEER_STMT = format("DELETE FROM system.%s " +
                                                                  "WHERE peer = ?", LEGACY_PEERS);
 
+    private static final String SELECT_PEER_AT_ADDRESS_STMT = format("SELECT * FROM system.%s " +
+                                                                     "WHERE peer = ? LIMIT 1", PEERS_V2);
+
 
     @Override
     public LocalInfo loadLocal()
@@ -188,13 +191,16 @@ public class NodesPersistence implements INodesPersistence
         UntypedResultSet results = QueryProcessor.executeInternal("SELECT * FROM system." + PEERS_V2);
         if (results == null || results.isEmpty())
             return Stream.empty();
-        return StreamSupport.stream(results.spliterator(), false).map(row -> {
-            PeerInfo info = readCommonInfo(new PeerInfo(), row);
-            info.setPeerAddressAndPort(readInetAddressAndPort(row, "peer", "peer_port", DatabaseDescriptor.getStoragePort()))
-                .setPreferredAddressAndPort(readInetAddressAndPort(row, "preferred_ip", "preferred_port", DatabaseDescriptor.getStoragePort()))
-                .setNativeTransportAddressAndPort(readInetAddressAndPort(row, "native_address", "native_port", DatabaseDescriptor.getNativeTransportPort()));
-            return info;
-        });
+        return StreamSupport.stream(results.spliterator(), false).map(this::readPeer);
+    }
+
+    private PeerInfo readPeer(Row row)
+    {
+        PeerInfo info = readCommonInfo(new PeerInfo(), row);
+        info.setPeerAddressAndPort(readInetAddressAndPort(row, "peer", "peer_port", DatabaseDescriptor.getStoragePort()))
+            .setPreferredAddressAndPort(readInetAddressAndPort(row, "preferred_ip", "preferred_port", DatabaseDescriptor.getStoragePort()))
+            .setNativeTransportAddressAndPort(readInetAddressAndPort(row, "native_address", "native_port", DatabaseDescriptor.getNativeTransportPort()));
+        return info;
     }
 
     @Override
@@ -208,7 +214,11 @@ public class NodesPersistence implements INodesPersistence
                                                                serializePort(info.getNativeTransportAddressAndPort()),
                                                                }, serializeCommonInfo(info));
         QueryProcessor.executeInternal(INSERT_PEER_STMT, peersValues);
+        saveLegacyPeer(info);
+    }
 
+    private void saveLegacyPeer(PeerInfo info)
+    {
         Object[] legacyPeersValues = ArrayUtils.addAll(new Object[]{ serializeAddress(info.getPeerAddressAndPort()),
                                                                      serializeAddress(info.getPreferredAddressAndPort()),
                                                                      serializeAddress(info.getNativeTransportAddressAndPort()),
@@ -221,7 +231,12 @@ public class NodesPersistence implements INodesPersistence
     public void deletePeer(InetAddressAndPort endpoint)
     {
         QueryProcessor.executeInternal(DELETE_PEER_STMT, serializeAddress(endpoint), serializePort(endpoint));
-        QueryProcessor.executeInternal(DELETE_LEGACY_PEER_STMT, serializeAddress(endpoint));
+        // system.peers has one row per address: a peer left at the address on another port keeps it, with its own values
+        UntypedResultSet remaining = QueryProcessor.executeInternal(SELECT_PEER_AT_ADDRESS_STMT, serializeAddress(endpoint));
+        if (remaining.isEmpty())
+            QueryProcessor.executeInternal(DELETE_LEGACY_PEER_STMT, serializeAddress(endpoint));
+        else
+            saveLegacyPeer(readPeer(remaining.one()));
     }
 
     @Override

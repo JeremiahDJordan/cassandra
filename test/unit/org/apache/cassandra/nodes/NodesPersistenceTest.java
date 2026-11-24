@@ -100,6 +100,7 @@ public class NodesPersistenceTest extends CQLTester
         np.deletePeer(info.getPeerAddressAndPort());
         List<PeerInfo> loaded2 = np.loadPeers().collect(Collectors.toList());
         assertThat(loaded2).isEmpty();
+        assertThat(executeInternal("SELECT * FROM system.peers WHERE peer = ?", info.getPeerAddressAndPort().getAddress())).isEmpty();
     }
 
     @Test
