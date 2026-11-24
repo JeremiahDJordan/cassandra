@@ -19,6 +19,7 @@ package org.apache.cassandra.schema;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Map.Entry;
 
@@ -660,6 +661,8 @@ public final class TableParams
             }
             if (version.isAtLeast(Version.V8))
                 out.writeUTF(t.securityLabel);
+            if (version.isAtLeast(Version.V11))
+                serializeMapWithVIntLength(t.autoRepair.asMap(), out);
         }
 
         public TableParams deserialize(DataInputPlus in, Version version) throws IOException
@@ -693,6 +696,8 @@ public final class TableParams
             }
             if (version.isAtLeast(Version.V8))
                 builder.securityLabel(in.readUTF());
+            if (version.isAtLeast(Version.V11))
+                builder.automatedRepair(AutoRepairParams.fromMap(deserializeMapWithVIntLength(in)));
             return builder.build();
         }
 
@@ -728,6 +733,10 @@ public final class TableParams
             {
                 size += sizeof(t.securityLabel);
             }
+            if (version.isAtLeast(Version.V11))
+            {
+                size += serializedSizeMapWithVIntLength(t.autoRepair.asMap());
+            }
             return size;
         }
 
@@ -750,6 +759,60 @@ public final class TableParams
                 size += sizeof(entry.getValue());
             }
             return size;
+        }
+
+        private void serializeMapWithVIntLength(Map<String, String> map, DataOutputPlus out) throws IOException
+        {
+            out.writeUnsignedVInt32(map.size());
+            for (Map.Entry<String, String> entry : map.entrySet())
+            {
+                writeWithVIntLength(entry.getKey(), out);
+                writeWithVIntLength(entry.getValue(), out);
+            }
+        }
+
+        private long serializedSizeMapWithVIntLength(Map<String, String> map)
+        {
+            long size = sizeofUnsignedVInt(map.size());
+            for (Map.Entry<String, String> entry : map.entrySet())
+            {
+                size += sizeofWithVIntLength(entry.getKey());
+                size += sizeofWithVIntLength(entry.getValue());
+            }
+            return size;
+        }
+
+        private Map<String, String> deserializeMapWithVIntLength(DataInputPlus in) throws IOException
+        {
+            int size = in.readUnsignedVInt32();
+            Map<String, String> map = Maps.newHashMapWithExpectedSize(size);
+            for (int i = 0; i < size; i++)
+            {
+                String key = readWithVIntLength(in);
+                String value = readWithVIntLength(in);
+                map.put(key, value);
+            }
+            return map;
+        }
+
+        private static void writeWithVIntLength(String value, DataOutputPlus out) throws IOException
+        {
+            byte[] bytes = value.getBytes(StandardCharsets.UTF_8);
+            out.writeUnsignedVInt32(bytes.length);
+            out.write(bytes);
+        }
+
+        private static long sizeofWithVIntLength(String value)
+        {
+            int length = value.getBytes(StandardCharsets.UTF_8).length;
+            return sizeofUnsignedVInt(length) + length;
+        }
+
+        private static String readWithVIntLength(DataInputPlus in) throws IOException
+        {
+            byte[] bytes = new byte[in.readUnsignedVInt32()];
+            in.readFully(bytes);
+            return new String(bytes, StandardCharsets.UTF_8);
         }
 
         private void serializeMapBB(Map<String, ByteBuffer> map, DataOutputPlus out) throws IOException

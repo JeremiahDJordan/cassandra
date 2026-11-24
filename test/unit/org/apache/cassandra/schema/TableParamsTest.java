@@ -18,17 +18,24 @@
 
 package org.apache.cassandra.schema;
 
+import java.io.IOException;
+
+import com.google.common.collect.ImmutableMap;
+
 import org.junit.Test;
 
 import accord.utils.Gen;
 
+import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.tcm.membership.NodeVersion;
 import org.apache.cassandra.tcm.serialization.AsymmetricMetadataSerializers;
+import org.apache.cassandra.tcm.serialization.Version;
 import org.apache.cassandra.utils.CassandraGenerators.TableParamsBuilder;
 import org.apache.cassandra.utils.Generators;
 
 import static accord.utils.Property.qt;
+import static org.assertj.core.api.Assertions.assertThat;
 
 
 public class TableParamsTest
@@ -42,12 +49,48 @@ public class TableParamsTest
         });
     }
 
+    @Test
+    public void serdeAutoRepair() throws IOException
+    {
+        TableParams params = TableParams.builder()
+                                        .automatedRepair(AutoRepairParams.fromMap(ImmutableMap.of("full_enabled", "false", "priority", "3")))
+                                        .build();
+        AsymmetricMetadataSerializers.testSerde(new DataOutputBuffer(), TableParams.serializer, params, Version.V11);
+    }
+
+    @Test
+    public void serdeAutoRepairLongValue() throws IOException
+    {
+        String priority = "0".repeat(70000) + '3';
+        TableParams params = TableParams.builder()
+                                        .automatedRepair(AutoRepairParams.fromMap(ImmutableMap.of("priority", priority)))
+                                        .build();
+        params.autoRepair.validate();
+        AsymmetricMetadataSerializers.testSerde(new DataOutputBuffer(), TableParams.serializer, params, Version.V11);
+    }
+
+    @Test
+    public void serdeAutoRepairBeforeV11() throws IOException
+    {
+        TableParams params = TableParams.builder()
+                                        .automatedRepair(AutoRepairParams.fromMap(ImmutableMap.of("full_enabled", "false", "priority", "3")))
+                                        .build();
+        DataOutputBuffer output = new DataOutputBuffer();
+        TableParams.serializer.serialize(params, output, Version.V10);
+        assertThat(output.getLength()).isEqualTo(TableParams.serializer.serializedSize(params, Version.V10));
+        DataInputBuffer in = new DataInputBuffer(output.unsafeGetBufferAndFlip(), false);
+        TableParams read = TableParams.serializer.deserialize(in, Version.V10);
+        assertThat(in.available()).isZero();
+        assertThat(read).isEqualTo(params.unbuild().automatedRepair(AutoRepairParams.DEFAULT).build());
+    }
+
     private static Gen<TableParams> tableParams()
     {
         return Generators.toGen(new TableParamsBuilder()
                                 .withKnownMemtables()
                                 .withTransactionalMode()
                                 .withFastPathStrategy()
+                                .withAutoRepair()
                                 .build());
     }
 }
