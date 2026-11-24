@@ -48,6 +48,15 @@ public interface HintsEndpointProvider
 
     boolean isSameSchemaVersion(UUID hostId);
 
+    default boolean isSameSchemaVersion(InetAddressAndPort endpoint)
+    {
+        // a node that has left the ring has no host id, but keeps its gossip state while it transfers its hints
+        UUID hostId = hostForEndpoint(endpoint);
+        return hostId != null
+               ? isSameSchemaVersion(hostId)
+               : Schema.instance.isSameVersion(Gossiper.instance.getSchemaVersion(endpoint));
+    }
+
     boolean isAlive(UUID hostId);
 
     InetAddressAndPort endpointForHost(UUID hostId);
@@ -92,7 +101,7 @@ public interface HintsEndpointProvider
         public boolean isSameSchemaVersion(UUID hostId)
         {
             InetAddressAndPort peer = this.endpointForHost(hostId);
-            return Schema.instance.isSameVersion(Gossiper.instance.getSchemaVersion(peer));
+            return peer != null && Schema.instance.isSameVersion(Gossiper.instance.getSchemaVersion(peer));
         }
 
         @Override
