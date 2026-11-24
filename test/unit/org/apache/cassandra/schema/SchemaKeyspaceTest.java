@@ -49,11 +49,14 @@ import org.apache.cassandra.cql3.functions.FunctionName;
 import org.apache.cassandra.cql3.functions.UDAggregate;
 import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
+import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -146,7 +149,7 @@ public class SchemaKeyspaceTest
         ColumnMetadata memtableColumn = tablesTable.getColumn(new ColumnIdentifier("memtable", true));
         assertNotNull("Memtable column should exist in mode " + mode, memtableColumn);
 
-        String expectedType = mode.isBefore(5) ? "frozen<map<text, text>>" : "text";
+        String expectedType = mode == StorageCompatibilityMode.HCD_1 ? "frozen<map<text, text>>" : "text";
         assertEquals("Memtable column type should match mode " + mode,
                     expectedType,
                     memtableColumn.type.asCQL3Type().toString());
@@ -283,6 +286,23 @@ public class SchemaKeyspaceTest
             for (String column : new String[]{ "deterministic", "monotonic", "monotonic_on" })
                 assertEquals("functions " + column + " in mode " + mode, hasDeterminism, writesColumn(mutation, SchemaKeyspaceTables.FUNCTIONS, column));
             assertEquals("aggregates in mode " + mode, hasDeterminism, writesColumn(mutation, SchemaKeyspaceTables.AGGREGATES, "deterministic"));
+        }, true);
+    }
+
+    @Test
+    public void testMemtableMutation() throws Exception
+    {
+        TableMetadata table = Schema.instance.getTableMetadata(KEYSPACE1, CF_STANDARD1).unbuild()
+                                             .memtable(MemtableParams.get("skiplist"))
+                                             .build();
+        KeyspaceMetadata keyspace = Schema.instance.getKeyspaceMetadata(KEYSPACE1).withSwapped(Tables.of(table));
+        runWithAllCompatibilityModes(mode -> {
+            Mutation mutation = SchemaKeyspace.makeCreateKeyspaceMutation(keyspace, FBUtilities.timestampMicros()).build();
+            PartitionUpdate update = mutation.getPartitionUpdate(SchemaKeyspace.metadata().tables.getNullable(SchemaKeyspaceTables.TABLES));
+            Cell<?> cell = update.getRow(Clustering.make(UTF8Type.instance.decompose(CF_STANDARD1)))
+                                 .getCell(update.metadata().getColumn(new ColumnIdentifier("memtable", true)));
+            Object expected = mode == StorageCompatibilityMode.HCD_1 ? ImmutableMap.of("class", "SkipListMemtable") : "skiplist";
+            assertEquals("memtable in mode " + mode, expected, cell.column().type.compose(cell.buffer()));
         }, true);
     }
 

@@ -44,7 +44,6 @@ import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.memtable.TrieMemtableFactory;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.serializers.MarshalException;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 /**
@@ -425,7 +424,7 @@ public final class MemtableParams
 
     /**
      * Returns the memtable value as a map for CC4 compatibility mode.
-     * Used when storage_compatibility_mode is HCD_1 or CASSANDRA_4.
+     * Used when storage_compatibility_mode is HCD_1.
      *
      * @return Map representation for CC4 schema (frozen&lt;map&lt;text,text&gt;&gt;)
      * @throws ConfigurationException if the memtable type is not compatible with CC4
@@ -446,8 +445,8 @@ public final class MemtableParams
     @VisibleForTesting
     Map<String, String> asSchemaValueMap(StorageCompatibilityMode mode)
     {
-        if (!mode.isBefore(CassandraVersion.CASSANDRA_5_0.major))
-            throw new IllegalStateException("Cannot get map value in CC5 mode. Use asSchemaValueText() instead.");
+        if (mode != StorageCompatibilityMode.HCD_1)
+            throw new IllegalStateException("Cannot get map value outside of CC4 compatibility mode. Use asSchemaValueText() instead.");
 
         // CC4 writes empty map {} for "default" configuration
         if ("default".equals(configurationKey))
@@ -471,7 +470,7 @@ public final class MemtableParams
 
     /**
      * Returns the memtable value as text for CC5 mode.
-     * Used when storage_compatibility_mode is NONE.
+     * Used when storage_compatibility_mode is not HCD_1.
      *
      * @return String representation for CC5 schema (text)
      */
@@ -491,7 +490,7 @@ public final class MemtableParams
     @VisibleForTesting
     String asSchemaValueText(StorageCompatibilityMode mode)
     {
-        if (mode.isBefore(CassandraVersion.CASSANDRA_5_0.major))
+        if (mode == StorageCompatibilityMode.HCD_1)
             throw new IllegalStateException("Cannot get text value in CC4 compatibility mode. Use asSchemaValueMap() instead.");
 
         return configurationKey;
@@ -518,7 +517,7 @@ public final class MemtableParams
             throw new ConfigurationException(
                 String.format("Memtable configuration '%s' is not compatible with CC4. " +
                              "Sharded memtable types were introduced in CC5. " +
-                             "Please use 'skiplist' or 'trie' when storage_compatibility_mode is HCD_1 or CASSANDRA_4.",
+                             "Please use 'skiplist' or 'trie' when storage_compatibility_mode is HCD_1.",
                              configKey));
         }
 

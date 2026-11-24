@@ -28,7 +28,6 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.memtable.Memtable;
@@ -644,7 +643,7 @@ public class AlterTest extends CQLTester
         assertSame(MemtableParams.DEFAULT.factory(), getCurrentColumnFamilyStore().metadata().params.memtable.factory());
         Class<? extends Memtable> defaultMemtableClass = getCurrentColumnFamilyStore().getTracker().getView().getCurrentMemtable().getClass();
 
-        if (mode.isBefore(CassandraVersion.CASSANDRA_5_0.major))
+        if (mode == StorageCompatibilityMode.HCD_1)
         {
             assertMemtableOptionVersion4(null, null);
             testMemtableConfigVersion4("skiplist", map("class", "SkipListMemtable"), SkipListMemtable.FACTORY, SkipListMemtable.class);
@@ -663,7 +662,7 @@ public class AlterTest extends CQLTester
         alterTable("ALTER TABLE %s"
                    + " WITH compression = {'class': 'LZ4Compressor'};");
 
-        if (mode.isBefore(CassandraVersion.CASSANDRA_5_0.major))
+        if (mode == StorageCompatibilityMode.HCD_1)
         {
             assertMemtableOptionVersion4("test_shortname", map("class", "TestMemtable", "skiplist", "true"));
             testMemtableConfigVersion4("default", null, MemtableParams.DEFAULT.factory(), defaultMemtableClass);
