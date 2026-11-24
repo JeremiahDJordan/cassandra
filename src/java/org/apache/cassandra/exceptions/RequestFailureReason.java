@@ -32,6 +32,7 @@ import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.utils.vint.VIntCoding;
 
 import static org.apache.cassandra.net.MessagingService.VERSION_40;
+import static org.apache.cassandra.net.MessagingService.VERSION_DS_10;
 
 public enum RequestFailureReason
 {
@@ -129,7 +130,7 @@ public enum RequestFailureReason
         public void serialize(RequestFailureReason reason, DataOutputPlus out, int version) throws IOException
         {
             assert version >= VERSION_40;
-            out.writeUnsignedVInt32(reason.code);
+            out.writeUnsignedVInt32(codeFor(reason, version));
         }
 
         public RequestFailureReason deserialize(DataInputPlus in, int version) throws IOException
@@ -141,7 +142,18 @@ public enum RequestFailureReason
         public long serializedSize(RequestFailureReason reason, int version)
         {
             assert version >= VERSION_40;
-            return VIntCoding.computeVIntSize(reason.code);
+            return VIntCoding.computeVIntSize(codeFor(reason, version));
+        }
+
+        /**
+         * Apache Cassandra nodes (messaging versions below {@code VERSION_DS_10}) don't know
+         * {@link #UNKNOWN_COLUMN} and {@link #UNKNOWN_TABLE}, and report their exceptions as {@link #INCOMPATIBLE_SCHEMA}.
+         */
+        private static int codeFor(RequestFailureReason reason, int version)
+        {
+            if (version < VERSION_DS_10 && (reason == UNKNOWN_COLUMN || reason == UNKNOWN_TABLE))
+                return INCOMPATIBLE_SCHEMA.code;
+            return reason.code;
         }
     }
 }
