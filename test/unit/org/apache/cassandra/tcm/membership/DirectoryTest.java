@@ -18,8 +18,13 @@
 
 package org.apache.cassandra.tcm.membership;
 
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
 import org.junit.Test;
 
+import org.apache.cassandra.io.util.DataInputBuffer;
+import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.tcm.serialization.Version;
 import org.apache.cassandra.utils.CassandraVersion;
 
@@ -177,6 +182,21 @@ public class DirectoryTest
         assertEquals(NodeVersion.CURRENT_METADATA_VERSION, dir.commonSerializationVersion);
     }
 
+    @Test
+    public void commonSerializationVersionFutureNodesTest() throws IOException
+    {
+        Location DC1_R1 = new Location("datacenter1", "rack1");
+        Directory dir = new Directory();
+        NodeAddresses current = addresses(1);
+        dir = dir.with(current, DC1_R1, NodeVersion.CURRENT);
+        dir = dir.with(addresses(2), DC1_R1, futureVersion());
+        assertEquals(NodeVersion.CURRENT_METADATA_VERSION, dir.commonSerializationVersion);
+
+        // the last node at the current version leaves
+        dir = dir.withNodeState(dir.peerId(current.broadcastAddress), NodeState.LEFT);
+        assertEquals(NodeVersion.CURRENT_METADATA_VERSION, dir.commonSerializationVersion);
+    }
+
 
     private static NodeAddresses addresses(int i)
     {
@@ -186,6 +206,21 @@ public class DirectoryTest
     private static NodeVersion withSerializationVersion(Version version)
     {
         return new NodeVersion(CassandraVersion.NULL_VERSION, version);
+    }
+
+    private static NodeVersion futureVersion() throws IOException
+    {
+        ByteBuffer bb;
+        try (DataOutputBuffer dob = new DataOutputBuffer())
+        {
+            NodeVersion.Serializer.serializeHelper(dob, "8.0.0", NodeVersion.CURRENT.serializationVersion + 1);
+            bb = dob.asNewBuffer();
+        }
+
+        try (DataInputBuffer in = new DataInputBuffer(bb, false))
+        {
+            return NodeVersion.serializer.deserialize(in, NodeVersion.CURRENT.serializationVersion());
+        }
     }
 
     private void assertInvalidLocationUpdate(Directory dir, NodeId nodeId, Location loc, String message)

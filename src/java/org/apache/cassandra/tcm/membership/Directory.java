@@ -861,8 +861,9 @@ public class Directory implements MetadataValue<Directory>, EndpointLookup, Node
         if (minVersion == null)
             return new ClusterVersions(CURRENT, CURRENT, CURRENT_METADATA_VERSION);
 
+        // every remaining node may have a later version than this node knows; they read the latest one it writes
         return new ClusterVersions(minVersion, maxVersion,
-                                   commonVersion == Integer.MAX_VALUE ? NodeVersion.CURRENT_METADATA_VERSION : Version.fromInt(commonVersion));
+                                   commonVersion > CURRENT_METADATA_VERSION.asInt() ? CURRENT_METADATA_VERSION : Version.fromInt(commonVersion));
     }
 
     @Override
