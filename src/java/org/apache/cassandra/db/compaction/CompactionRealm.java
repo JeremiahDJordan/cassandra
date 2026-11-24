@@ -322,6 +322,18 @@ public interface CompactionRealm extends SSTableReader.Owner
     TableSnapshot snapshotWithoutMemtable(String snapshotName, Instant creationTime);
 
     /**
+     * Create a CFS snapshot with the given name and timestamp, unless a snapshot with that name exists or is being
+     * taken. The default takes the snapshot.
+     *
+     * @return whether the snapshot was taken
+     */
+    default boolean snapshotWithoutMemtableIfAbsent(String snapshotName, Instant creationTime)
+    {
+        snapshotWithoutMemtable(snapshotName, creationTime);
+        return true;
+    }
+
+    /**
      * Change the repaired status of a set of sstables, usually to reflect a completed repair operation.
      */
     int mutateRepairedWithLock(Collection<SSTableReader> originals, long repairedAt, TimeUUID pendingRepair, boolean isTransient) throws IOException;

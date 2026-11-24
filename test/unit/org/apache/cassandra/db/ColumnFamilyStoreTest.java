@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -40,6 +41,7 @@ import java.util.stream.IntStream;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Iterators;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -96,6 +98,7 @@ import org.apache.cassandra.utils.concurrent.OpOrder.Group;
 import static org.apache.cassandra.db.ColumnFamilyStore.STATUS.INVALID_DROPPED;
 import static org.apache.cassandra.db.ColumnFamilyStore.STATUS.INVALID_UNLOADED;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -670,6 +673,45 @@ public class ColumnFamilyStoreTest
                  .forEach(originalFiles::add);
         assertThat(originalFiles.stream().anyMatch(f -> f.toString().endsWith(indexTableFile))).isTrue();
         assertThat(originalFiles.stream().anyMatch(f -> f.toString().endsWith(baseTableFile))).isTrue();
+    }
+
+    @Test
+    public void testSnapshotWithNameOfSnapshotBeingTaken() throws Exception
+    {
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_STANDARD1);
+        cfs.truncateBlocking();
+        writeData(cfs);
+        String snapshotName = "beingTaken";
+
+        // an ephemeral snapshot held while it selects its SSTables, before it creates any directory
+        CountDownLatch selecting = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompletableFuture<TableSnapshot> held = CompletableFuture.supplyAsync(() -> cfs.snapshotWithoutMemtable(snapshotName, sstable -> {
+            selecting.countDown();
+            Uninterruptibles.awaitUninterruptibly(release, 1, TimeUnit.MINUTES);
+            return true;
+        }, true, null, null, FBUtilities.now()));
+        try
+        {
+            assertTrue(selecting.await(1, TimeUnit.MINUTES));
+            assertFalse(cfs.snapshotExists(snapshotName));
+            assertFalse(cfs.snapshotWithoutMemtableIfAbsent(snapshotName, FBUtilities.now()));
+            assertThatThrownBy(() -> cfs.snapshotWithoutMemtable(snapshotName)).hasMessageContaining("is being taken");
+        }
+        finally
+        {
+            release.countDown();
+        }
+        held.get(1, TimeUnit.MINUTES);
+        assertThat(SnapshotManifest.deserializeFromJsonFile(cfs.getDirectories().getSnapshotManifestFile(snapshotName)).getFiles()).hasSize(1);
+        assertFalse(cfs.snapshotWithoutMemtableIfAbsent(snapshotName, FBUtilities.now()));
+        cfs.clearSnapshot(snapshotName);
+
+        // a snapshot that fails frees its name
+        assertThatThrownBy(() -> cfs.snapshotWithoutMemtable("failed", sstable -> { throw new IllegalStateException(); }, false, null, null, FBUtilities.now()))
+        .isInstanceOf(IllegalStateException.class);
+        assertTrue(cfs.snapshotWithoutMemtableIfAbsent("failed", FBUtilities.now()));
+        cfs.clearSnapshot("failed");
     }
 
     private void createSnapshotAndDelete(String ks, String table, boolean writeData)
