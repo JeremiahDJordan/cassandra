@@ -32,6 +32,7 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -39,17 +40,21 @@ import static org.apache.cassandra.hints.HintsTestUtil.assertHintsEqual;
 import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 
 public class HintMessageTest
 {
     private static final String KEYSPACE = "hint_message_test";
     private static final String TABLE = "table";
+    private static final String DROPPED_TABLE = "dropped_table";
 
     @BeforeClass
     public static void setup()
     {
         SchemaLoader.prepareServer();
-        SchemaLoader.createKeyspace(KEYSPACE, KeyspaceParams.simple(1), SchemaLoader.standardCFMD(KEYSPACE, TABLE));
+        SchemaLoader.createKeyspace(KEYSPACE, KeyspaceParams.simple(1),
+                                    SchemaLoader.standardCFMD(KEYSPACE, TABLE),
+                                    SchemaLoader.standardCFMD(KEYSPACE, DROPPED_TABLE));
     }
 
     @Test
@@ -118,5 +123,33 @@ public class HintMessageTest
         assertEquals(hostId, deserializedMessage.hostId);
         assertNotNull(deserializedMessage.hint);
         assertHintsEqual(hint, deserializedMessage.hint);
+    }
+
+    @Test
+    public void testSerializerForDroppedTable() throws IOException
+    {
+        UUID hostId = UUID.randomUUID();
+        long now = FBUtilities.timestampMicros();
+        TableMetadata table = Schema.instance.getTableMetadata(KEYSPACE, DROPPED_TABLE);
+
+        Mutation mutation =
+            new RowUpdateBuilder(table, now, bytes("key")).clustering("column").add("val", "val" + 1234).build();
+
+        Hint hint = Hint.create(mutation, now / 1000);
+        HintMessage message = new HintMessage(hostId, hint);
+
+        try (DataOutputBuffer dob = new DataOutputBuffer())
+        {
+            HintMessage.serializer.serialize(message, dob, MessagingService.current_version);
+            SchemaTestUtil.announceTableDrop(KEYSPACE, DROPPED_TABLE);
+
+            DataInputBuffer di = new DataInputBuffer(dob.buffer(), true);
+            HintMessage deserializedMessage = HintMessage.serializer.deserialize(di, MessagingService.current_version);
+
+            assertEquals(hostId, deserializedMessage.hostId);
+            assertNull(deserializedMessage.hint);
+            assertEquals(table.id, deserializedMessage.unknownTableID);
+            assertEquals(0, di.available());
+        }
     }
 }

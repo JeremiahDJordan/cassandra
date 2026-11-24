@@ -28,6 +28,7 @@ import javax.annotation.Nullable;
 import com.google.common.primitives.Ints;
 
 import org.apache.cassandra.db.TypeSizes;
+import org.apache.cassandra.exceptions.CoordinatorBehindException;
 import org.apache.cassandra.exceptions.UnknownTableException;
 import org.apache.cassandra.io.IVersionedAsymmetricSerializer;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -160,10 +161,11 @@ public final class HintMessage implements SerializableHintMessage
             {
                 return new HintMessage(hostId, Hint.serializer.deserialize(countingIn, version));
             }
-            catch (UnknownTableException e)
+            catch (UnknownTableException | CoordinatorBehindException e)
             {
+                TableId id = ((UnknownTableException) (e instanceof CoordinatorBehindException ? e.getCause() : e)).id;
                 in.skipBytes(Ints.checkedCast(hintSize - countingIn.getBytesRead()));
-                return new HintMessage(hostId, e.id);
+                return new HintMessage(hostId, id);
             }
         }
     }
