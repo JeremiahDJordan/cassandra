@@ -324,6 +324,15 @@ public abstract class ColumnFilter
     }
 
     /**
+     * Returns this filter without its synthetic columns. See {@code ReadCommand#columnFilter(int)} for the nodes that
+     * are sent it.
+     */
+    public ColumnFilter withoutSyntheticColumns()
+    {
+        return this;
+    }
+
+    /**
      * Checks if this {@code ColumnFilter} is for a wildcard query.
      *
      * @return {@code true} if this {@code ColumnFilter} is for a wildcard query, {@code false} otherwise.
@@ -751,6 +760,37 @@ public abstract class ColumnFilter
             if (dropsNotQueriedCellsOlderThanRow || allFetchedColumnsAreQueried())
                 return this;
             return new SelectionColumnFilter(fetchingStrategy, queried, fetched, subSelections, true);
+        }
+
+        @Override
+        public ColumnFilter withoutSyntheticColumns()
+        {
+            // the fetched columns include the queried ones
+            if (!hasSyntheticColumns(fetched))
+                return this;
+
+            return new SelectionColumnFilter(fetchingStrategy,
+                                             withoutSyntheticColumns(queried),
+                                             withoutSyntheticColumns(fetched),
+                                             subSelections);
+        }
+
+        private static boolean hasSyntheticColumns(RegularAndStaticColumns columns)
+        {
+            // synthetic columns sort first
+            Iterator<ColumnMetadata> iterator = columns.regulars.iterator();
+            return iterator.hasNext() && iterator.next().isSynthetic();
+        }
+
+        private static RegularAndStaticColumns withoutSyntheticColumns(RegularAndStaticColumns columns)
+        {
+            RegularAndStaticColumns.Builder builder = RegularAndStaticColumns.builder();
+            for (ColumnMetadata column : columns)
+            {
+                if (!column.isSynthetic())
+                    builder.add(column);
+            }
+            return builder.build();
         }
 
         @Override

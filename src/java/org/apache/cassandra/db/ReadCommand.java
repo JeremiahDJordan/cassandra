@@ -409,6 +409,18 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     /**
+     * The column filter of this command as it is sent to a node on the given messaging version. Nodes below
+     * {@link MessagingService#VERSION_DS_10}, such as Apache Cassandra 5.0 nodes, can't deserialize synthetic columns,
+     * so an ANN command is sent to them without them. The coordinator then computes the scores of their rows from the
+     * vector column, which the filter has for the ANN restriction (see {@code TopKProcessor}). A BM25 score can't be
+     * computed on the coordinator, and those nodes don't know BM25 anyway, so a BM25 command keeps its score.
+     */
+    public ColumnFilter columnFilter(int version)
+    {
+        return version < MessagingService.VERSION_DS_10 && !isBM25() ? columnFilter().withoutSyntheticColumns() : columnFilter();
+    }
+
+    /**
      * @return {@code true} if this command is a BM25 request, {@code false} otherwise
      */
     public boolean isBM25()
@@ -1758,7 +1770,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                 out.writeUnsignedVInt32(command.digestVersion());
             command.metadata().id.serialize(out);
             out.writeInt(MessagingService.Version.supportsExtendedDeletionTime(version) ? CassandraUInt.fromLong(command.nowInSec()) : (int) command.nowInSec());
-            ColumnFilter.serializer.serialize(command.columnFilter(), out, version);
+            ColumnFilter.serializer.serialize(command.columnFilter(version), out, version);
             RowFilter.serializer.serialize(command.rowFilter(), out, version);
             DataLimits.serializer.serialize(command.limits(), out, version, command.metadata().comparator);
             // Using the name of one of the indexes in the plan to identify the index group because we want
@@ -1919,7 +1931,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                    + (command.isDigestQuery() ? TypeSizes.sizeofUnsignedVInt(command.digestVersion()) : 0)
                    + command.metadata().id.serializedSize()
                    + TypeSizes.INT_SIZE // command.nowInSec() is serialized as uint
-                   + ColumnFilter.serializer.serializedSize(command.columnFilter(), version)
+                   + ColumnFilter.serializer.serializedSize(command.columnFilter(version), version)
                    + RowFilter.serializer.serializedSize(command.rowFilter(), version)
                    + DataLimits.serializer.serializedSize(command.limits(), version, command.metadata().comparator)
                    + command.selectionSerializedSize(version)
