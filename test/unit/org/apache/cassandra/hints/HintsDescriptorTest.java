@@ -229,6 +229,10 @@ public class HintsDescriptorTest
                     assertEquals("Mode " + mode + " should use VERSION_40 for hints storage",
                                  MessagingService.VERSION_40, expectedVersion);
                     break;
+                case CASSANDRA_5:
+                    assertEquals("Mode " + mode + " should use VERSION_50 for hints storage",
+                                 MessagingService.VERSION_50, expectedVersion);
+                    break;
                 case UPGRADING:
                 case NONE:
                     // These modes should use the serialization of current_version

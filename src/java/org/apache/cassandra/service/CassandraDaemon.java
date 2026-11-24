@@ -64,6 +64,7 @@ import org.apache.cassandra.metrics.DefaultNameFactory;
 import org.apache.cassandra.net.StartupClusterConnectivityChecker;
 import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaCompatibility;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.security.ThreadAwareSecurityManager;
@@ -75,6 +76,7 @@ import org.apache.cassandra.utils.JMXServerUtils;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
 import org.apache.cassandra.utils.Mx4jTool;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.FutureCombiner;
 import org.apache.cassandra.utils.logging.LoggingSupportFactory;
@@ -265,6 +267,7 @@ public class CassandraDaemon
 
         INativeLibrary.instance.tryMlockall();
 
+        StorageCompatibilityMode.current().validateMessagingVersion();
         CommitLog.instance.start();
 
         runStartupChecks();
@@ -360,6 +363,9 @@ public class CassandraDaemon
         {
             throw new RuntimeException(e);
         }
+
+        SchemaCompatibility.reportStoredSchemaInCassandra5Mode();
+        RollbackEligibility.warnInCassandra5Mode();
 
         Nodes.getInstance().reload();
 

@@ -51,6 +51,7 @@ import org.apache.cassandra.service.AbstractWriteResponseHandler;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.concurrent.AsyncPromise;
 import org.apache.cassandra.utils.concurrent.FutureCombiner;
 
@@ -308,6 +309,10 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
 
     private static int currentVersion()
     {
+        // per node rather than per JVM, so that in-JVM tests can run nodes in several modes
+        if (DatabaseDescriptor.isDaemonInitialized() && DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_5)
+            return VERSION_50;
+
         int version = CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION.getInt();
         for (Version v : Version.values())
         {

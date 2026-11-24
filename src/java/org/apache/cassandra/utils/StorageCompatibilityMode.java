@@ -51,6 +51,14 @@ public enum StorageCompatibilityMode
     HCD_1(4),
 
     /**
+     * Write only what Apache Cassandra 5.0 reads, and talk to the other nodes as Apache Cassandra 5.0 does, so that
+     * Apache Cassandra 5.0 nodes can share the cluster and every node can go back to Apache Cassandra 5.0: messaging
+     * version {@link MessagingService#VERSION_50} for storage and internode connections, and Apache Cassandra 5.0's
+     * schema tables. Use it to upgrade from Apache Cassandra 5.0, then move to {@link #UPGRADING} and {@link #NONE}.
+     */
+    CASSANDRA_5(5),
+
+    /**
      * Use the storage formats of the current version, but disabling features that are not compatible with any
      * not-upgraded nodes in the cluster. Use this during rolling upgrades to a new major Cassandra version. Once all
      * nodes have been upgraded, you can set the compatibility to {@link #NONE}.
@@ -86,6 +94,18 @@ public enum StorageCompatibilityMode
         return this.major < major;
     }
 
+    /**
+     * Throws if this node runs in {@link #CASSANDRA_5} with another messaging version than
+     * {@link MessagingService#VERSION_50}, which happens when {@link MessagingService} was initialized before the mode
+     * was known.
+     */
+    public void validateMessagingVersion()
+    {
+        if (this == CASSANDRA_5 && MessagingService.current_version != MessagingService.VERSION_50)
+            throw new IllegalStateException(String.format("Messaging version %d in storage_compatibility_mode %s, which uses %d",
+                                                          MessagingService.current_version, this, MessagingService.VERSION_50));
+    }
+
     public void validateSstableFormat(SSTableFormat<?, ?> selectedFormat)
     {
         if (selectedFormat.name().equals(BtiFormat.NAME) && this == StorageCompatibilityMode.CASSANDRA_4)
@@ -108,6 +128,8 @@ public enum StorageCompatibilityMode
             case CASSANDRA_4:
             case HCD_1:
                 return MessagingService.VERSION_40;
+            case CASSANDRA_5:
+                return MessagingService.VERSION_50;
             case UPGRADING:
             case NONE:
             default:

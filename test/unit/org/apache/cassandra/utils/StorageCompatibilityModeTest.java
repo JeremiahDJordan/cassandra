@@ -42,6 +42,7 @@ public class StorageCompatibilityModeTest
             switch (mode)
             {
                 case HCD_1:
+                case CASSANDRA_5:
                 case UPGRADING:
                 case NONE:
                     mode.validateSstableFormat(big);
@@ -70,6 +71,9 @@ public class StorageCompatibilityModeTest
         int current = MessagingService.serializationVersion(MessagingService.current_version);
         assertEquals(current, StorageCompatibilityMode.UPGRADING.storageMessagingVersion());
         assertEquals(current, StorageCompatibilityMode.NONE.storageMessagingVersion());
+
+        // CASSANDRA_5 stores what Apache Cassandra 5.0 reads
+        assertEquals(MessagingService.VERSION_50, StorageCompatibilityMode.CASSANDRA_5.storageMessagingVersion());
     }
 
     @Test
@@ -85,6 +89,9 @@ public class StorageCompatibilityModeTest
                 case HCD_1:
                     assertEquals("Mode " + mode + " should use VERSION_40 for storage",
                                  MessagingService.VERSION_40, version);
+                    break;
+                case CASSANDRA_5:
+                    assertEquals("Mode " + mode + " should use VERSION_50 for storage", MessagingService.VERSION_50, version);
                     break;
                 case UPGRADING:
                 case NONE:

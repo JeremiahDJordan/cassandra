@@ -16,16 +16,25 @@
 
 package org.apache.cassandra.schema;
 
+import java.util.Collection;
 import java.util.Map;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
+import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.distributed.shared.WithProperties;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.APACHE_UPGRADE_PATH;
 import static org.apache.cassandra.schema.SchemaCompatibility.Target.APACHE_5_0;
@@ -198,6 +207,82 @@ public class SchemaCompatibilityTest extends CQLTester
         KeyspaceMetadata keyspace = KeyspaceMetadata.create(KEYSPACE, KeyspaceParams.simple(1), Tables.of(table.withSwapped(Indexes.of(index))));
 
         assertThat(SchemaCompatibility.incompatibilities(APACHE_5_0, Keyspaces.none(), Keyspaces.of(keyspace))).isEmpty();
+    }
+
+    @Test
+    public void testReportInCassandra5Mode()
+    {
+        TableMetadata table = CreateTableStatement.parse("CREATE TABLE t (k int PRIMARY KEY, v int) " +
+                                                         "WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'log': 'all'}", KEYSPACE)
+                                                  .build();
+        Keyspaces received = Keyspaces.of(KeyspaceMetadata.create(KEYSPACE, KeyspaceParams.simple(1), Tables.of(table)));
+        assertThat(SchemaCompatibility.reportInCassandra5Mode(Keyspaces.none(), received)).isEmpty();
+
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
+        try
+        {
+            assertThat(SchemaCompatibility.reportInCassandra5Mode(Keyspaces.none(), received))
+            .containsExactly("table " + KEYSPACE + ".t: compaction option 'log' of SizeTieredCompactionStrategy");
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
+    }
+
+    @Test
+    public void testStoredSchemaReported()
+    {
+        TableMetadata table = CreateTableStatement.parse("CREATE TABLE t (k int PRIMARY KEY, v int) " +
+                                                         "WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'log': 'all'}", "stored_only")
+                                                  .build();
+        KeyspaceMetadata stored = KeyspaceMetadata.create("stored_only", KeyspaceParams.simple(1), Tables.of(table));
+        // in the schema tables only, as a replayed schema mutation is before the schema is reloaded
+        SchemaKeyspace.applyChanges(SchemaKeyspace.convertSchemaDiffToMutations(Keyspaces.diff(Keyspaces.none(), Keyspaces.of(stored)), FBUtilities.timestampMicros()));
+
+        inCassandra5Mode(() -> assertThat(SchemaCompatibility.reportStoredSchemaInCassandra5Mode())
+                               .contains("table stored_only.t: compaction option 'log' of SizeTieredCompactionStrategy"));
+    }
+
+    @Test
+    public void testReceivedSchemaReported()
+    {
+        TableMetadata table = CreateTableStatement.parse("CREATE TABLE received (k int PRIMARY KEY, v int) " +
+                                                         "WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'log': 'all'}", KEYSPACE)
+                                                  .build();
+        KeyspaceMetadata before = Schema.instance.getKeyspaceMetadata(KEYSPACE);
+        KeyspaceMetadata after = before.withSwapped(before.tables.with(table));
+        Collection<Mutation> mutations = SchemaKeyspace.convertSchemaDiffToMutations(Keyspaces.diff(Keyspaces.of(before), Keyspaces.of(after)), FBUtilities.timestampMicros());
+
+        Logger logger = (Logger) LoggerFactory.getLogger(SchemaCompatibility.class);
+        ListAppender<ILoggingEvent> logs = new ListAppender<>();
+        logs.start();
+        logger.addAppender(logs);
+        try
+        {
+            inCassandra5Mode(() -> ((DefaultSchemaUpdateHandler) Schema.instance.updateHandler).applyMutations(mutations));
+        }
+        finally
+        {
+            logger.detachAppender(logs);
+        }
+        assertThat(logs.list).extracting(ILoggingEvent::getFormattedMessage)
+                             .anyMatch(message -> message.contains("table " + KEYSPACE + ".received: compaction option 'log' of SizeTieredCompactionStrategy"));
+    }
+
+    private static void inCassandra5Mode(Runnable runnable)
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
+        try
+        {
+            runnable.run();
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
     }
 
     private static KeyspaceMetadata withTrigger(KeyspaceMetadata keyspace, TableMetadata table, String triggerClass)

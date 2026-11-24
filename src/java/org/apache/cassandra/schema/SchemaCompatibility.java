@@ -17,6 +17,7 @@
 package org.apache.cassandra.schema;
 
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -27,8 +28,12 @@ import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.cql3.functions.FunctionName;
 import org.apache.cassandra.cql3.functions.UDAggregate;
@@ -52,6 +57,7 @@ import org.apache.cassandra.schema.KeyspaceMetadata.KeyspaceDiff;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 /**
  * Checks that schema changes are ones the nodes of an Apache Cassandra release read and accept, so that those nodes
@@ -65,6 +71,8 @@ import org.apache.cassandra.utils.Pair;
  */
 public final class SchemaCompatibility
 {
+    private static final Logger logger = LoggerFactory.getLogger(SchemaCompatibility.class);
+
     public enum Target
     {
         APACHE_5_0("Apache Cassandra 5.0");
@@ -228,6 +236,73 @@ public final class SchemaCompatibility
             keyspaceDiff.udas.altered.forEach(altered -> checkAggregate(altered.after, incompatibilities));
         }
 
+        return incompatibilities;
+    }
+
+    /**
+     * The reasons {@code target} doesn't accept {@code compaction} as the compaction of {@code element}; empty if none.
+     */
+    public static List<String> compactionIncompatibilities(Target target, String element, CompactionParams compaction)
+    {
+        List<String> incompatibilities = new ArrayList<>();
+        checkCompaction(element, compaction, incompatibilities);
+        return incompatibilities;
+    }
+
+    /**
+     * The reasons {@code target} doesn't accept {@code compressor}, a compressor class and its options, as the
+     * compressor of {@code element}, a commit log or hints setting, whose files name their compressor: only its own
+     * compressors; empty if none, or if the class is empty, which disables compression.
+     */
+    public static List<String> compressorIncompatibilities(Target target, String element, ParameterizedClass compressor)
+    {
+        List<String> incompatibilities = new ArrayList<>();
+        if (compressor.class_name == null || compressor.class_name.isEmpty())
+            return incompatibilities;
+
+        String className = compressor.class_name.contains(".") ? compressor.class_name : "org.apache.cassandra.io.compress." + compressor.class_name;
+        if (!COMPRESSOR_OPTIONS.containsKey(className))
+        {
+            incompatibilities.add(String.format("%s: compressor %s", element, className));
+            return incompatibilities;
+        }
+
+        if (compressor.parameters != null)
+        {
+            for (String option : compressor.parameters.keySet())
+            {
+                if (!COMPRESSOR_OPTIONS.get(className).contains(option))
+                    incompatibilities.add(String.format("%s: compressor option '%s'", element, option));
+            }
+        }
+        return incompatibilities;
+    }
+
+    /**
+     * In storage_compatibility_mode CASSANDRA_5, logs an error for each element of the schema stored in the schema
+     * tables, including what the commit log replayed into them, that Apache Cassandra 5.0 doesn't read or accept, and
+     * returns them.
+     */
+    public static List<String> reportStoredSchemaInCassandra5Mode()
+    {
+        if (DatabaseDescriptor.getStorageCompatibilityMode() != StorageCompatibilityMode.CASSANDRA_5)
+            return Collections.emptyList();
+        return reportInCassandra5Mode(Keyspaces.none(), SchemaKeyspace.fetchNonSystemKeyspaces());
+    }
+
+    /**
+     * In storage_compatibility_mode CASSANDRA_5, logs an error for each element created or changed from {@code before}
+     * to {@code after} that Apache Cassandra 5.0 doesn't read or accept, and returns them.
+     */
+    public static List<String> reportInCassandra5Mode(Keyspaces before, Keyspaces after)
+    {
+        if (DatabaseDescriptor.getStorageCompatibilityMode() != StorageCompatibilityMode.CASSANDRA_5)
+            return Collections.emptyList();
+
+        List<String> incompatibilities = incompatibilities(Target.APACHE_5_0, before, after);
+        for (String incompatibility : incompatibilities)
+            logger.error("Schema not supported by {}: {}. Alter or drop the element with a statement {} accepts.",
+                         Target.APACHE_5_0, incompatibility, Target.APACHE_5_0);
         return incompatibilities;
     }
 

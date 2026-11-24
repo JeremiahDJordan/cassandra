@@ -521,10 +521,10 @@ public final class SchemaKeyspace
      */
     private static List<TableMetadata> allTableMetadata()
     {
-        return ImmutableList.of(Keyspaces,
+        return ImmutableList.of(keyspacesTableMetadata(),
                                 // Use legacy schema (frozen<map>) when in HCD_1 compatibility mode to support downgrade
                                 tablesTableMetadata(),
-                                Columns,
+                                columnsTableMetadata(),
                                 ColumnMasks,
                                 Triggers,
                                 DroppedColumns,
@@ -536,11 +536,32 @@ public final class SchemaKeyspace
     }
 
     /**
+     * Whether the schema tables are Apache Cassandra 5.0's, as they are in CASSANDRA_5 mode.
+     */
+    private static boolean cassandra5Layouts()
+    {
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_5;
+    }
+
+    private static TableMetadata keyspacesTableMetadata()
+    {
+        return cassandra5Layouts() ? KeyspacesCassandra5 : Keyspaces;
+    }
+
+    private static TableMetadata columnsTableMetadata()
+    {
+        return cassandra5Layouts() ? ColumnsCassandra5 : Columns;
+    }
+
+    /**
      * Returns the appropriate Tables schema table metadata based on current storage compatibility mode.
-     * Uses TablesLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, Tables (text for memtable) otherwise.
+     * Uses TablesLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, TablesCassandra5 in CASSANDRA_5 mode, Tables
+     * (text for memtable) otherwise.
      */
     private static TableMetadata tablesTableMetadata()
     {
+        if (cassandra5Layouts())
+            return TablesCassandra5;
         return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                ? TablesLegacy
                : Tables;
@@ -548,10 +569,13 @@ public final class SchemaKeyspace
 
     /**
      * Returns the appropriate Views schema table metadata based on current storage compatibility mode.
-     * Uses ViewsLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, Views (text for memtable) otherwise.
+     * Uses ViewsLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, ViewsCassandra5 in CASSANDRA_5 mode, Views
+     * (text for memtable) otherwise.
      */
     private static TableMetadata viewsTableMetadata()
     {
+        if (cassandra5Layouts())
+            return ViewsCassandra5;
         return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                ? ViewsLegacy
                : Views;
@@ -559,22 +583,23 @@ public final class SchemaKeyspace
 
     /**
      * Returns the appropriate Functions schema table metadata based on current storage compatibility mode.
-     * Uses FunctionsCassandra4 (no deterministic and monotonic columns) in CASSANDRA_4 mode, Functions otherwise.
+     * Uses FunctionsCassandra4 (no deterministic and monotonic columns) in CASSANDRA_4 and CASSANDRA_5 modes,
+     * Functions otherwise.
      */
     private static TableMetadata functionsTableMetadata()
     {
-        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_4
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_4 || cassandra5Layouts()
                ? FunctionsCassandra4
                : Functions;
     }
 
     /**
      * Returns the appropriate Aggregates schema table metadata based on current storage compatibility mode.
-     * Uses AggregatesCassandra4 (no deterministic column) in CASSANDRA_4 mode, Aggregates otherwise.
+     * Uses AggregatesCassandra4 (no deterministic column) in CASSANDRA_4 and CASSANDRA_5 modes, Aggregates otherwise.
      */
     private static TableMetadata aggregatesTableMetadata()
     {
-        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_4
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_4 || cassandra5Layouts()
                ? AggregatesCassandra4
                : Aggregates;
     }
@@ -842,10 +867,11 @@ public final class SchemaKeyspace
 
     private static Mutation.SimpleBuilder makeCreateKeyspaceMutation(String name, KeyspaceParams params, long timestamp)
     {
-        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(Keyspaces.keyspace, decorate(Keyspaces, name))
+        TableMetadata keyspacesTable = keyspacesTableMetadata();
+        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(keyspacesTable.keyspace, decorate(keyspacesTable, name))
                                                  .timestamp(timestamp);
 
-        builder.update(Keyspaces)
+        builder.update(keyspacesTable)
                .row()
                .add(KeyspaceParams.Option.DURABLE_WRITES.toString(), params.durableWrites)
                .add(KeyspaceParams.Option.REPLICATION.toString(), params.replication.asMap());
@@ -869,7 +895,7 @@ public final class SchemaKeyspace
 
     private static Mutation.SimpleBuilder makeDropKeyspaceMutation(KeyspaceMetadata keyspace, long timestamp)
     {
-        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(SchemaConstants.SCHEMA_KEYSPACE_NAME, decorate(Keyspaces, keyspace.name))
+        Mutation.SimpleBuilder builder = Mutation.simpleBuilder(SchemaConstants.SCHEMA_KEYSPACE_NAME, decorate(keyspacesTableMetadata(), keyspace.name))
                                                  .timestamp(timestamp);
 
         for (TableMetadata schemaTable : allTableMetadata())
@@ -1098,7 +1124,7 @@ public final class SchemaKeyspace
     {
         AbstractType<?> type = column.type.unwrap();
 
-        builder.update(Columns)
+        builder.update(columnsTableMetadata())
                .row(table.name, column.name.toString())
                .add("column_name_bytes", column.name.bytes)
                .add("kind", column.kind.toString().toLowerCase())
@@ -1156,7 +1182,7 @@ public final class SchemaKeyspace
     private static void dropColumnFromSchemaMutation(TableMetadata table, ColumnMetadata column, Mutation.SimpleBuilder builder)
     {
         // Note: we do want to use name.toString(), not name.bytes directly for backward compatibility (For CQL3, this won't make a difference).
-        builder.update(Columns).row(table.name, column.name.toString()).delete();
+        builder.update(columnsTableMetadata()).row(table.name, column.name.toString()).delete();
     }
 
     private static void addDroppedColumnToSchemaMutation(TableMetadata table, DroppedColumn column, Mutation.SimpleBuilder builder)

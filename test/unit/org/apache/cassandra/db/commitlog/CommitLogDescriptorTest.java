@@ -407,6 +407,10 @@ public class CommitLogDescriptorTest
                     Assert.assertEquals("Mode " + mode + " should map to commit log VERSION_40",
                                         CommitLogDescriptor.VERSION_40, expectedVersion);
                     break;
+                case CASSANDRA_5:
+                    Assert.assertEquals("Mode " + mode + " should map to commit log VERSION_50",
+                                        CommitLogDescriptor.VERSION_50, expectedVersion);
+                    break;
                 case UPGRADING:
                 case NONE:
                     // These modes should use current_version messaging

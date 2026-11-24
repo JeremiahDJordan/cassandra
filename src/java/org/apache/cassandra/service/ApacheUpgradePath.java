@@ -16,12 +16,15 @@
 
 package org.apache.cassandra.service;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
+
 import static org.apache.cassandra.config.CassandraRelevantProperties.APACHE_UPGRADE_PATH;
 
 /**
- * The upgrade of a cluster from Apache Cassandra 5.0, during which nodes outside the Apache-compatible storage mode
- * keep the schema in the form Apache Cassandra 5.0 nodes agree with: schema versions and function and aggregate rows
- * over Apache's schema columns, and Apache's default compaction for tables created without one.
+ * The upgrade of a cluster from Apache Cassandra 5.0, during which nodes keep the schema in the form Apache Cassandra
+ * 5.0 nodes agree with: schema versions and function and aggregate rows over Apache's schema columns, Apache's
+ * default compaction for tables created without one, and schema changes Apache accepts.
  */
 public final class ApacheUpgradePath
 {
@@ -32,10 +35,12 @@ public final class ApacheUpgradePath
     }
 
     /**
-     * Whether the path is active on this node, as set with {@code -Dcassandra.apache_upgrade_path=active}.
+     * Whether the path is active on this node: it runs in storage_compatibility_mode CASSANDRA_5, or the path is set
+     * with {@code -Dcassandra.apache_upgrade_path=active}.
      */
     public static boolean isActive()
     {
-        return ACTIVE.equals(APACHE_UPGRADE_PATH.getString());
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_5
+               || ACTIVE.equals(APACHE_UPGRADE_PATH.getString());
     }
 }

@@ -221,6 +221,7 @@ public class DefaultSchemaUpdateHandler implements SchemaUpdateHandler, IEndpoin
 
         logger.info("Applying schema change due to received mutations: {}", update);
         updateSchema(update, false);
+        SchemaCompatibility.reportInCassandra5Mode(before.getKeyspaces(), afterKeyspaces);
         return update;
     }
 

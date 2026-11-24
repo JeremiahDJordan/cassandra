@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
+import java.util.regex.Matcher;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -213,6 +214,23 @@ public final class HintsService implements HintsServiceMBean
         Iterable<HintsStore> stores = filter(transform(hostIds, catalog::getNullable), Objects::nonNull);
         writeExecutor.flushBufferPool(bufferPool, stores);
         writeExecutor.fsyncWritersBlockingly(stores);
+    }
+
+    /**
+     * Whether {@code directory} holds hints files of a DataStax version, which Apache Cassandra 5.0 doesn't read.
+     */
+    public static boolean hasDataStaxVersionFiles(File directory)
+    {
+        File[] files = directory.tryList();
+        if (files == null)
+            return false;
+        for (File file : files)
+        {
+            Matcher matcher = HintsDescriptor.pattern.matcher(file.name());
+            if (matcher.matches() && Integer.parseInt(matcher.group(2)) > HintsDescriptor.VERSION_50)
+                return true;
+        }
+        return false;
     }
 
     public synchronized void startDispatch()

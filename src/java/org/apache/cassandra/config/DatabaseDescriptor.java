@@ -549,6 +549,9 @@ public class DatabaseDescriptor
         applySslContext();
 
         applyStartupChecks();
+
+        if (daemonInitialized && storageCompatibilityMode == StorageCompatibilityMode.CASSANDRA_5)
+            Cassandra5ModeChecks.validateConfiguration(conf);
     }
 
     private static void applySimpleConfig()
@@ -1723,6 +1726,9 @@ public class DatabaseDescriptor
             storageCompatibilityMode = StorageCompatibilityMode.NONE;
         else if (conf != null && conf.storage_compatibility_mode != null)
             storageCompatibilityMode = conf.storage_compatibility_mode;
+
+        if (storageCompatibilityMode == StorageCompatibilityMode.CASSANDRA_5 || configuredStorageCompatibilityMode == StorageCompatibilityMode.CASSANDRA_5)
+            Cassandra5ModeChecks.validateMode(daemonInitialized);
     }
 
     private static void applySSTableFormats()
@@ -5536,12 +5542,14 @@ public class DatabaseDescriptor
      * @return the storage compatibility mode that decides the sstable versions written by default and their expiration
      * limit. Clients run in {@link StorageCompatibilityMode#NONE}, as in Apache Cassandra, unless their configuration
      * sets {@link StorageCompatibilityMode#HCD_1} or no mode, which a node runs in by default: then they write for
-     * HCD_1.
+     * HCD_1. A client whose configuration sets {@link StorageCompatibilityMode#CASSANDRA_5} writes for it.
      */
     public static StorageCompatibilityMode getStorageCompatibilityModeForWrites()
     {
         if (!isClientInitialized())
             return storageCompatibilityMode;
+        if (configuredStorageCompatibilityMode == StorageCompatibilityMode.CASSANDRA_5)
+            return StorageCompatibilityMode.CASSANDRA_5;
         return configuredStorageCompatibilityMode == null || configuredStorageCompatibilityMode == StorageCompatibilityMode.HCD_1
                ? StorageCompatibilityMode.HCD_1
                : StorageCompatibilityMode.NONE;

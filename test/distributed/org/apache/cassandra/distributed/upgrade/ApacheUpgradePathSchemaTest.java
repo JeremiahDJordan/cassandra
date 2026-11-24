@@ -16,27 +16,14 @@
 
 package org.apache.cassandra.distributed.upgrade;
 
-import java.net.InetSocketAddress;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.UUID;
-import java.util.concurrent.TimeUnit;
-
 import org.junit.Test;
 
-import com.datastax.driver.core.Row;
-import com.datastax.driver.core.Session;
-import com.datastax.driver.core.policies.RoundRobinPolicy;
-import com.datastax.driver.core.policies.WhiteListPolicy;
 import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
 import org.apache.cassandra.distributed.shared.WithProperties;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.APACHE_UPGRADE_PATH;
 import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
-import static org.awaitility.Awaitility.await;
 
 /**
  * A node of this build outside the Apache-compatible storage mode, with the Apache upgrade path active, has the same
@@ -73,45 +60,6 @@ public class ApacheUpgradePathSchemaTest extends ApacheMixedClusterTestBase
             cluster.schemaChange(withKeyspace("CREATE AGGREGATE %s.total (int) SFUNC plus STYPE int INITCOND 0"), false, current);
             cluster.schemaChange(withKeyspace("ALTER TABLE %s.defaults WITH comment = 'altered'"), false, apache);
             assertSchemaAgreement(cluster);
-        }
-    }
-
-    /**
-     * Waits until every node reports, over the native protocol, its own schema version and every peer's in
-     * system.local and system.peers, all of them equal.
-     */
-    private static void assertSchemaAgreement(UpgradeableCluster cluster)
-    {
-        List<com.datastax.driver.core.Cluster> drivers = new ArrayList<>();
-        try
-        {
-            List<Session> sessions = new ArrayList<>();
-            cluster.stream().forEach(instance -> {
-                InetSocketAddress address = new InetSocketAddress(instance.broadcastAddress().getAddress(), 9042);
-                com.datastax.driver.core.Cluster driver = com.datastax.driver.core.Cluster.builder()
-                                                                                          .addContactPointsWithPorts(address)
-                                                                                          .withLoadBalancingPolicy(new WhiteListPolicy(new RoundRobinPolicy(), Collections.singletonList(address)))
-                                                                                          .build();
-                drivers.add(driver);
-                sessions.add(driver.connect());
-            });
-
-            await().atMost(1, TimeUnit.MINUTES).until(() -> {
-                List<UUID> versions = new ArrayList<>();
-                for (Session session : sessions)
-                {
-                    versions.add(session.execute("SELECT schema_version FROM system.local").one().getUUID("schema_version"));
-                    List<Row> peers = session.execute("SELECT schema_version FROM system.peers").all();
-                    if (peers.size() != cluster.size() - 1)
-                        return false;
-                    peers.forEach(peer -> versions.add(peer.getUUID("schema_version")));
-                }
-                return !versions.contains(null) && new HashSet<>(versions).size() == 1;
-            });
-        }
-        finally
-        {
-            drivers.forEach(com.datastax.driver.core.Cluster::close);
         }
     }
 }

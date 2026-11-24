@@ -1157,6 +1157,8 @@ public enum CassandraRelevantProperties
     TEST_BBFAILHELPER_ENABLED("test.bbfailhelper.enabled"),
     TEST_BLOB_SHARED_SEED("cassandra.test.blob.shared.seed"),
     TEST_BYTEMAN_TRANSFORMATIONS_DEBUG("cassandra.test.byteman.transformations.debug"),
+    /** Allows storage_compatibility_mode CASSANDRA_5, which isn't complete yet, for tests. */
+    TEST_CASSANDRA_5_MODE_ENABLED("cassandra.test.cassandra_5_mode_enabled"),
     TEST_CASSANDRA_KEEPBRIEFBRIEF("cassandra.keepBriefBrief"),
     TEST_CASSANDRA_RELEVANT_PROPERTIES("org.apache.cassandra.conf.CassandraRelevantPropertiesTest"),
     /** A property for various mechanisms for syncing files that makes it possible it intercept and skip syncing. */

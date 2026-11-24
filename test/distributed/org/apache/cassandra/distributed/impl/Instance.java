@@ -123,6 +123,7 @@ import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.schema.MigrationCoordinator;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaCompatibility;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.repair.autorepair.AutoRepair;
@@ -134,6 +135,7 @@ import org.apache.cassandra.service.DefaultFSErrorHandler;
 import org.apache.cassandra.service.NodeToolServerExtensions;
 import org.apache.cassandra.service.PendingRangeCalculatorService;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.RollbackEligibility;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.service.StorageServiceMBean;
 import org.apache.cassandra.service.paxos.PaxosRepair;
@@ -157,6 +159,7 @@ import org.apache.cassandra.utils.DiagnosticSnapshotService;
 import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Ref;
 import org.apache.cassandra.utils.logging.LoggingSupportFactory;
@@ -640,6 +643,7 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 FileUtils.setFSErrorHandler(new DefaultFSErrorHandler());
                 CassandraDaemon.getInstanceForTesting().migrateSystemDataIfNeeded();
                 CassandraDaemon.logSystemInfo(inInstancelogger);
+                StorageCompatibilityMode.current().validateMessagingVersion();
                 CommitLog.instance.start();
 
                 // MessagingService setup needs to be configured before any interaction with Schema because Schema
@@ -696,6 +700,9 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 {
                     throw new RuntimeException(e);
                 }
+
+                SchemaCompatibility.reportStoredSchemaInCassandra5Mode();
+                RollbackEligibility.warnInCassandra5Mode();
 
                 Nodes.getInstance().reload();
 
