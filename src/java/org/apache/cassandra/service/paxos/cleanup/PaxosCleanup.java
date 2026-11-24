@@ -90,6 +90,9 @@ public class PaxosCleanup extends AsyncFuture<Void> implements Runnable
     public void run()
     {
         EndpointState localEpState = ctx.gossiper().getEndpointStateForEndpoint(ctx.broadcastAddressAndPort());
+        // copy the local state to avoid it changing between serializedSize and serialize calls
+        if (localEpState != null)
+            localEpState = new EndpointState(localEpState);
         startPrepare = PaxosStartPrepareCleanup.prepare(ctx, table.id, endpoints, localEpState, ranges);
         addCallback(startPrepare, this::finishPrepare);
     }
