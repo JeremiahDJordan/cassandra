@@ -141,21 +141,24 @@ public class RowFilterPeerCompatibilityTest extends SAITester
     /**
      * When SAI filters the read, a != or a NOT IN with a restriction that selects an index on nodes below DS 10 isn't
      * sent to them, as their SAI ignores it, nor a != in a filter that needs reconciliation and intersects mutable
-     * columns, which they apply strictly without SAI, nor an IN in a filter that they relax, which their SAI refuses.
-     * Other filters with a !=, and filters that SAI doesn't serve, are sent.
+     * columns, which they apply strictly without SAI, nor an IN in a filter that they relax, which their SAI refuses,
+     * nor a CONTAINS or CONTAINS KEY on a frozen collection, which their SAI compares with the whole collection or
+     * refuses. Other filters with a !=, and filters that SAI doesn't serve, are sent.
      */
     @Test
     public void testSAIFiltering() throws Throwable
     {
         // reads need reconciliation only with several replicas
         String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 2}");
-        createTable(keyspace, "CREATE TABLE %s (k int, c int, d int, x int, y int, z int, w int, s set<int>, st int static, PRIMARY KEY (k, c, d))");
+        createTable(keyspace, "CREATE TABLE %s (k int, c int, d int, x int, y int, z int, w int, s set<int>, st int static, " +
+                                      "fs frozen<set<int>>, fm frozen<map<text, int>>, fl frozen<list<int>>, PRIMARY KEY (k, c, d))");
         createIndex(keyspace, "CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
         createIndex(keyspace, "CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
         createIndex(keyspace, "CREATE CUSTOM INDEX ON %s(st) USING 'StorageAttachedIndex'");
         createIndex(keyspace, "CREATE INDEX ON %s(z) USING 'legacy_local_table'");
 
         String nonStrictIn = String.format(RowFilter.SAI_NON_STRICT_OPERATOR, "IN");
+        String frozenElement = RowFilter.FROZEN_COLLECTION_ELEMENT_RESTRICTION;
         Object[][] queries = {
             { "SELECT * FROM %s WHERE x = 1 AND y != 0 ALLOW FILTERING", ConsistencyLevel.ONE, RowFilter.SAI_EXCLUSION },
             { "SELECT * FROM %s WHERE x > 0 AND x != 2", ConsistencyLevel.ONE, RowFilter.SAI_EXCLUSION },
@@ -190,6 +193,13 @@ public class RowFilterPeerCompatibilityTest extends SAITester
             { "SELECT * FROM %s WHERE d IN (1, 2) AND s CONTAINS 1 AND s CONTAINS 2 ALLOW FILTERING", ConsistencyLevel.QUORUM, nonStrictIn },
             { "SELECT * FROM %s WHERE d IN (1, 2) AND s CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.QUORUM, null },
             { "SELECT * FROM %s WHERE z = 1 AND y IN (0, 2) ALLOW FILTERING", ConsistencyLevel.QUORUM, null },
+            { "SELECT * FROM %s WHERE x = 1 AND fs CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.ONE, frozenElement },
+            { "SELECT * FROM %s WHERE x = 1 AND fm CONTAINS KEY 'a' ALLOW FILTERING", ConsistencyLevel.ONE, frozenElement },
+            { "SELECT * FROM %s WHERE x = 1 AND fm CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.ONE, frozenElement },
+            { "SELECT * FROM %s WHERE s CONTAINS 1 AND fl CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.ONE, frozenElement },
+            { "SELECT * FROM %s WHERE x = 1 AND fs = {1, 2} ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE fs CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.ONE, null },
+            { "SELECT * FROM %s WHERE z = 1 AND fs CONTAINS 1 ALLOW FILTERING", ConsistencyLevel.ONE, null },
         };
 
         List<String> failures = new ArrayList<>();

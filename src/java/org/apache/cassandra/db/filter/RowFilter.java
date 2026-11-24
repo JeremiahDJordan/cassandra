@@ -135,6 +135,8 @@ public class RowFilter
     public static final String SAI_EXCLUSION = "A != or NOT IN that SAI filters";
     public static final String SAI_NON_STRICT_OPERATOR =
     "The %s operator in an intersection that SAI filters for a read that needs replica reconciliation";
+    public static final String FROZEN_COLLECTION_ELEMENT_RESTRICTION =
+    "A CONTAINS or CONTAINS KEY on a frozen collection that SAI filters";
 
     public final FilterElement root;
     public final IndexHints indexHints;
@@ -271,10 +273,12 @@ public class RowFilter
     /**
      * Same as {@link #dataStaxOnlyFeature()}, plus, for a read that SAI filters, the restrictions that the SAI of
      * Apache Cassandra 5.0 nodes drops or refuses: a != (which NOT IN is sent as) with a restriction that selects one of
-     * their indexes (see {@link #selectsIndexBelowDS10}), as their index query plan ignores it, and an IN in a filter
-     * that they relax (see {@link #isRelaxedBelowDS10()}). Without such a restriction, they apply the filter without
-     * SAI, strictly, so a filter with a != is refused too if it needs reconciliation and intersects mutable columns, as
-     * they would miss the rows whose columns only match once reconciled.
+     * their indexes (see {@link #selectsIndexBelowDS10}), as their index query plan ignores it, an IN in a filter that
+     * they relax (see {@link #isRelaxedBelowDS10()}), and a CONTAINS or CONTAINS KEY on a frozen collection, which
+     * their SAI compares with the whole collection, or refuses. Without a restriction that selects one of their
+     * indexes, they apply the filter without SAI, strictly, so a filter with a != is refused too if it needs
+     * reconciliation and intersects mutable columns, as they would miss the rows whose columns only match once
+     * reconciled, and a frozen collection CONTAINS is refused although they would apply it.
      *
      * @param filteredBySAI whether the replicas filter the read with SAI
      */
@@ -295,7 +299,12 @@ public class RowFilter
         boolean selectsIndex = false;
         for (Expression expression : expressions())
         {
-            if (expression.operator() == Operator.NEQ)
+            Operator operator = expression.operator();
+            if ((operator == Operator.CONTAINS || operator == Operator.CONTAINS_KEY)
+                && TypeUtil.isFrozenCollection(expression.column.type))
+                return FROZEN_COLLECTION_ELEMENT_RESTRICTION;
+
+            if (operator == Operator.NEQ)
                 hasNotEquals = true;
             else if (!selectsIndex)
                 selectsIndex = selectsIndexBelowDS10(expression);

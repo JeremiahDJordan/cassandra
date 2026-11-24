@@ -69,7 +69,9 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         new String[]{ "SELECT k FROM %s.t ORDER BY v BM25 OF 'apple' LIMIT 3", "ORDER BY BM25" },
         // the SAI filtering of Apache Cassandra 5.0 nodes ignores !=, which NOT IN is sent as
         new String[]{ "SELECT k FROM %s.t WHERE n >= 0 AND n != 1 ALLOW FILTERING", RowFilter.SAI_EXCLUSION },
-        new String[]{ "SELECT k FROM %s.t WHERE a = 'APPLE' AND n NOT IN (1, 2) ALLOW FILTERING", RowFilter.SAI_EXCLUSION });
+        new String[]{ "SELECT k FROM %s.t WHERE a = 'APPLE' AND n NOT IN (1, 2) ALLOW FILTERING", RowFilter.SAI_EXCLUSION },
+        // the SAI filtering of Apache Cassandra 5.0 nodes compares the whole frozen collection with the element
+        new String[]{ "SELECT k FROM %s.t WHERE n = 1 AND fs CONTAINS 1 ALLOW FILTERING", RowFilter.FROZEN_COLLECTION_ELEMENT_RESTRICTION });
 
     /** A query whose IN the SAI of Apache Cassandra 5.0 nodes refuses at a consistency level that needs reconciliation. */
     private static final String NON_STRICT_IN_QUERY = "SELECT k FROM %s.t WHERE n IN (1, 5) AND m['a'] = 1 ALLOW FILTERING";
@@ -86,6 +88,8 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         // a read of a single row doesn't use the index
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE k = 1 AND n >= 0 AND n != 1 ALLOW FILTERING", 0);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE s CONTAINS 1 ALLOW FILTERING", 3);
+        APACHE_QUERIES.put("SELECT k FROM %s.t WHERE fs CONTAINS 1 ALLOW FILTERING", 3);
+        APACHE_QUERIES.put("SELECT k FROM %s.t WHERE n = 1 AND fs = {1, 2} ALLOW FILTERING", 1);
         // sent as the analyzed equality it is on a non-tokenizing index
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE a = 'APPLE'", 3);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE a : 'APPLE'", 3);
@@ -114,8 +118,9 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
 
             for (String[] query : DATASTAX_ONLY_QUERIES)
             {
-                // BM25 needs a later SAI version than the default one of this cluster, and isn't about messaging
-                if (query[1].contains("BM25"))
+                // BM25 needs a later SAI version than the default one of this cluster, and isn't about messaging. SAI
+                // fails CONTAINS on an unindexed frozen collection.
+                if (query[1].contains("BM25") || query[1].equals(RowFilter.FROZEN_COLLECTION_ELEMENT_RESTRICTION))
                     continue;
                 assertAccepted(cluster, query[0]);
             }
@@ -226,8 +231,8 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         for (int node = 1; node <= cluster.size(); node++)
         {
             cluster.get(node).schemaChangeInternal(withKeyspace("CREATE TABLE IF NOT EXISTS %s.t " +
-                                                                "(k int PRIMARY KEY, n int, s set<int>, v text, a text, u text, " +
-                                                                "m map<text, int>, vec vector<float, 2>) " +
+                                                                "(k int PRIMARY KEY, n int, s set<int>, fs frozen<set<int>>, v text, a text, " +
+                                                                "u text, m map<text, int>, vec vector<float, 2>) " +
                                                                 "WITH ID = " + tableId));
             cluster.get(node).schemaChangeInternal(withKeyspace("CREATE CUSTOM INDEX IF NOT EXISTS n_idx ON %s.t(n) USING 'StorageAttachedIndex'"));
             cluster.get(node).schemaChangeInternal(withKeyspace("CREATE CUSTOM INDEX IF NOT EXISTS v_idx ON %s.t(v) USING 'StorageAttachedIndex' " +
@@ -247,8 +252,8 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
 
         for (int k = 0; k < 3; k++)
         {
-            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.t (k, n, s, v, a, u, m, vec) " +
-                                                        "VALUES (?, ?, {1, 2}, 'apple pie', 'Apple', 'Apple', {'a': 1}, [1, 1])"),
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.t (k, n, s, fs, v, a, u, m, vec) " +
+                                                        "VALUES (?, ?, {1, 2}, {1, 2}, 'apple pie', 'Apple', 'Apple', {'a': 1}, [1, 1])"),
                                            ConsistencyLevel.ALL, k, k);
         }
     }
