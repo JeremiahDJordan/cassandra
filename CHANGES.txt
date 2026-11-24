@@ -1,4 +1,5 @@
 6.0-alpha3
+ * Load cluster metadata snapshots with a memtable configuration the node does not define (CASSANDRA-XXXXX)
  * Fix equals and hashCode of column constraints and document removal of custom constraint providers with TCM (CASSANDRA-21879)
  * Move the metadata snapshot trigger task off nonPeriodicTasks (CASSANDRA-21855)
  * Accord: TTLs are zero-initialised and not set at execution time, so data is immediately expired (CASSANDRA-21728)
