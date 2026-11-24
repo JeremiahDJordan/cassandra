@@ -24,6 +24,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiPredicate;
+import java.util.function.Function;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.cql3.CQL3Type;
@@ -117,6 +119,79 @@ public final class VectorType<T> extends AbstractType<List<T>>
 
         Key key = new Key(v.left, v.right);
         return instances.computeIfAbsent(key, Key::create);
+    }
+
+    @Override
+    public <V> boolean referencesUserType(V name, ValueAccessor<V> accessor)
+    {
+        return elementType.referencesUserType(name, accessor);
+    }
+
+    @Override
+    public boolean referencesUserTypes()
+    {
+        return elementType.referencesUserTypes();
+    }
+
+    @Override
+    public VectorType<?> withUpdatedUserType(UserType udt)
+    {
+        if (!referencesUserType(udt.name))
+            return this;
+
+        instances.remove(new Key(elementType, dimension));
+
+        return getInstance(elementType.withUpdatedUserType(udt), dimension);
+    }
+
+    @Override
+    public AbstractType<?> expandUserTypes()
+    {
+        return referencesUserTypes() ? getInstance(elementType.expandUserTypes(), dimension) : this;
+    }
+
+    @Override
+    public VectorType<T> overrideKeyspace(Function<String, String> overrideKeyspace)
+    {
+        AbstractType<T> newType = elementType.overrideKeyspace(overrideKeyspace);
+
+        if (newType == elementType)
+            return this;
+
+        return getInstance(newType, dimension);
+    }
+
+    @Override
+    public boolean isCompatibleWith(AbstractType<?> previous)
+    {
+        return isElementCompatibleWith(previous, AbstractType::isCompatibleWith);
+    }
+
+    @Override
+    protected boolean isValueCompatibleWithInternal(AbstractType<?> previous)
+    {
+        return isElementCompatibleWith(previous, AbstractType::isSerializationCompatibleWith);
+    }
+
+    /**
+     * Vectors of the same dimension whose elements hold user types follow the compatibility of their elements, so that
+     * {@code ALTER TYPE} reaches vector columns. Other vectors are only compatible with themselves.
+     */
+    private boolean isElementCompatibleWith(AbstractType<?> previous,
+                                            BiPredicate<AbstractType<?>, AbstractType<?>> elementsCompatible)
+    {
+        if (equals(previous))
+            return true;
+
+        if (!(previous instanceof VectorType))
+            return false;
+
+        VectorType<?> prev = (VectorType<?>) previous;
+        return dimension == prev.dimension &&
+               elementType.referencesUserTypes() &&
+               prev.elementType.referencesUserTypes() &&
+               elementType.valueLengthIfFixed() == prev.elementType.valueLengthIfFixed() &&
+               elementsCompatible.test(elementType, prev.elementType);
     }
 
     @Override
