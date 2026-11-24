@@ -74,6 +74,19 @@ public class BooleanType extends AbstractType<Boolean>
     }
 
     @Override
+    public boolean decodesComparableBytesExactly()
+    {
+        // Any non-zero byte is true and decodes to 1.
+        return false;
+    }
+
+    @Override
+    public <V> boolean decodesComparableBytesExactly(V value, ValueAccessor<V> accessor)
+    {
+        return accessor.isEmpty(value) || (accessor.toByte(value) & ~1) == 0;
+    }
+
+    @Override
     public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
     {
         if (comparableBytes == null)

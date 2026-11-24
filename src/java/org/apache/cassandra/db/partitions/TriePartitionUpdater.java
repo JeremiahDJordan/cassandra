@@ -83,7 +83,7 @@ implements InMemoryTrie.UpsertTransformerWithKeyProducer<Object, Object>
             RowData data = insert.clone(cloner);
 
             if (indexer != UpdateTransaction.NO_OP)
-                indexer.onInserted(data.toRow(clusteringFor(keyState)));
+                indexer.onInserted(data.toRow(clusteringFor(data, keyState)));
 
             this.dataSize += data.dataSize();
             this.heapSize += data.unsharedHeapSizeExcludingData();
@@ -97,7 +97,7 @@ implements InMemoryTrie.UpsertTransformerWithKeyProducer<Object, Object>
 
             if (indexer != UpdateTransaction.NO_OP)
             {
-                Clustering<?> clustering = clusteringFor(keyState);
+                Clustering<?> clustering = clusteringFor(existing, keyState);
                 indexer.onUpdated(existing.toRow(clustering), reconciled.toRow(clustering));
             }
 
@@ -116,11 +116,13 @@ implements InMemoryTrie.UpsertTransformerWithKeyProducer<Object, Object>
         Object[] tree = BTreeRow.mergeRowBTrees(this,
                                                 existing.columnsBTree, update.columnsBTree,
                                                 deletion, existing.deletion);
-        return new RowData(tree, livenessInfo, deletion);
+        return existing.withContent(tree, livenessInfo, deletion);
     }
 
-    private Clustering<?> clusteringFor(InMemoryTrie.KeyProducer<Object> keyState)
+    private Clustering<?> clusteringFor(RowData data, InMemoryTrie.KeyProducer<Object> keyState)
     {
+        if (data.clustering() != null)
+            return data.clustering();
         return metadata.comparator.clusteringFromByteComparable(
             ByteArrayAccessor.instance,
             ByteComparable.preencoded(TrieBackedPartition.BYTE_COMPARABLE_VERSION,

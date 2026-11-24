@@ -135,6 +135,12 @@ public class ReversedType<T> extends AbstractType<T>
     }
 
     @Override
+    public <V> boolean decodesComparableBytesExactly(V value, ValueAccessor<V> accessor)
+    {
+        return baseType.decodesComparableBytesExactly(value, accessor);
+    }
+
+    @Override
     public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
     {
         return baseType.fromComparableBytes(accessor, ReversedPeekableByteSource.of(comparableBytes), version);
