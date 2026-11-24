@@ -858,8 +858,8 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
 
     /**
      * Returns the endpoints for the given keyspace that are known to be alive and have a connection whose
-     * messaging version is older than the given version. To be used for example when we want to be sure a message
-     * can be serialized to all endpoints, according to their negotiated version at connection time.
+     * messaging version is older than the given version (see {@link #hasConnectionWithVersionNotMatching}). To be used
+     * for example when we want to be sure a message can be serialized to all endpoints.
      *
      * @param keyspace a keyspace
      * @param version a messaging version
@@ -878,7 +878,9 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
 
     /**
      * Whether any of our messaging connections to the given node uses a version the given predicate doesn't accept.
-     * A connection that isn't established yet uses the version we know the node announced, capped to ours.
+     * A connection that isn't connected counts with the version we know the node announced, if we know it, capped to
+     * ours: it negotiates its version again when it connects, and until then keeps the one of its last connection, or
+     * the one known when it was created.
      *
      * @param node a node
      * @param accepted the accepted messaging versions
@@ -894,8 +896,15 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
         for (ConnectionType type : ConnectionType.MESSAGING_TYPES)
         {
             OutboundConnection connection = connections.connectionFor(type);
-            if (connection != null && !accepted.test(connection.messagingVersion()))
-                return true;
+            if (connection != null)
+            {
+                Integer announced = versions.getRawIfKnown(node);
+                int version = connection.isConnected() || announced == null
+                              ? connection.messagingVersion()
+                              : Math.min(announced, current_version);
+                if (!accepted.test(version))
+                    return true;
+            }
         }
 
         return false;
@@ -903,18 +912,6 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
 
     private boolean hasConnectionWithVersionBelow(InetAddressAndPort node, int version)
     {
-        OutboundConnections connections = getOutbound(node, false);
-
-        if (connections == null)
-            return false;
-
-        for (ConnectionType type : ConnectionType.MESSAGING_TYPES)
-        {
-            OutboundConnection connection = connections.connectionFor(type);
-            if (connection != null && connection.messagingVersion() < version)
-                return true;
-        }
-
-        return false;
+        return hasConnectionWithVersionNotMatching(node, v -> v >= version);
     }
 }
