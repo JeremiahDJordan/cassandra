@@ -49,6 +49,7 @@ import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.index.SecondaryIndexManager;
@@ -313,15 +314,20 @@ public class TopKProcessor
         if ((column.isClusteringColumn() || column.isRegular()) && row.isStatic())
             return 0;
 
-        // If we have a synthetic score column, use it
+        // If we have a synthetic score column, use it, unless the row's vector is newer than the score: a replica sends
+        // the score with the timestamp of the value it is computed from (see StorageAttachedIndexSearcher), and a newer
+        // vector can come from a replica that sends no score.
         var scoreData = row.getColumnData(scoreColumn);
         if (scoreData != null)
         {
             var cell = (Cell<?>) scoreData;
-            return FloatType.instance.compose(cell.buffer());
+            ColumnData valueData = expression.operator() == Operator.BM25 ? null : row.getColumnData(column);
+            if (valueData == null || valueData.maxTimestamp() <= cell.timestamp())
+                return FloatType.instance.compose(cell.buffer());
         }
 
-        // TODO remove this once we enable Ordering.Ann.USE_SYNTHETIC_SCORE
+        // Replicas send no ANN score if the query doesn't use synthetic scores (see Ordering.Ann), or if they are on a
+        // messaging version below DS 10 (see ReadCommand#columnFilter(int)).
         ByteBuffer value = indexContext.getValueOf(key, row, FBUtilities.nowInSeconds());
         if (value != null)
         {
