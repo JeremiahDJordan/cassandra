@@ -334,7 +334,7 @@ abstract public class VectorCompactionTest extends VectorTester
                 }
 
                 Vector<Float> v;
-                if (R.nextDouble() < duplicateChance && !vectorsInserted.isEmpty())
+                if ((R.nextDouble() < duplicateChance || vectorsInserted.size() >= vectorsPerSstable) && !vectorsInserted.isEmpty())
                 {
                     // insert a duplicate
                     v = vectorsInserted.get(R.nextIntBetween(0, vectorsInserted.size() - 1));
@@ -514,7 +514,7 @@ abstract public class VectorCompactionTest extends VectorTester
             while (vectorsInserted.size() < vectorsPerSstable || !duplicateExists)
             {
                 Vector<Float> v;
-                if (R.nextDouble() < duplicateChance && !vectorsInserted.isEmpty())
+                if ((R.nextDouble() < duplicateChance || vectorsInserted.size() >= vectorsPerSstable) && !vectorsInserted.isEmpty())
                 {
                     v = vectorsInserted.get(R.nextIntBetween(0, vectorsInserted.size() - 1));
                     duplicateExists = true;
