@@ -178,7 +178,7 @@ public final class TableAttributes extends PropertyDefinitions
         if (hasOption(Option.COMPACTION))
         {
             if (hasUnsupportedDseCompaction())
-                builder.compaction(CompactionParams.DEFAULT);
+                builder.compaction(CompactionParams.defaultCompaction());
             else
                 builder.compaction(CompactionParams.fromMap(getMap(Option.COMPACTION)));
         }

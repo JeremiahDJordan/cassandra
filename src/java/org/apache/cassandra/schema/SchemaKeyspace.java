@@ -51,10 +51,13 @@ import org.apache.cassandra.cql3.functions.masking.ColumnMask;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.filter.DataLimits;
+import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.*;
 import org.apache.cassandra.db.partitions.*;
 import org.apache.cassandra.db.rows.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.reads.SpeculativeRetryPolicy;
 import org.apache.cassandra.schema.ColumnMetadata.ClusteringOrder;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
@@ -409,6 +412,110 @@ public final class SchemaKeyspace
         .recordDeprecatedSystemColumn("deterministic", BooleanType.instance)
         .build();
 
+    // Apache Cassandra 5.0 schema of the tables that have DataStax-only columns above (origin/cassandra-5.0
+    // SchemaKeyspace); its functions and aggregates tables are the Cassandra 4.x ones
+    private static final TableMetadata KeyspacesCassandra5 =
+        parse(KEYSPACES,
+              "keyspace definitions",
+              "CREATE TABLE %s ("
+              + "keyspace_name text,"
+              + "durable_writes boolean,"
+              + "replication frozen<map<text, text>>,"
+              + "PRIMARY KEY ((keyspace_name)))");
+
+    private static final TableMetadata TablesCassandra5 =
+        parse(TABLES,
+              "table definitions",
+              "CREATE TABLE %s ("
+              + "keyspace_name text,"
+              + "table_name text,"
+              + "allow_auto_snapshot boolean,"
+              + "bloom_filter_fp_chance double,"
+              + "caching frozen<map<text, text>>,"
+              + "comment text,"
+              + "compaction frozen<map<text, text>>,"
+              + "compression frozen<map<text, text>>,"
+              + "memtable text,"
+              + "crc_check_chance double,"
+              + "dclocal_read_repair_chance double," // no longer used, left for drivers' sake
+              + "default_time_to_live int,"
+              + "extensions frozen<map<text, blob>>,"
+              + "flags frozen<set<text>>," // SUPER, COUNTER, DENSE, COMPOUND
+              + "gc_grace_seconds int,"
+              + "incremental_backups boolean,"
+              + "id uuid,"
+              + "max_index_interval int,"
+              + "memtable_flush_period_in_ms int,"
+              + "min_index_interval int,"
+              + "read_repair_chance double," // no longer used, left for drivers' sake
+              + "speculative_retry text,"
+              + "additional_write_policy text,"
+              + "cdc boolean,"
+              + "read_repair text,"
+              + (CassandraRelevantProperties.AUTOREPAIR_ENABLE.getBoolean() ? "auto_repair frozen<map<text, text>>," : "")
+              + "PRIMARY KEY ((keyspace_name), table_name))");
+
+    private static final TableMetadata ColumnsCassandra5 =
+        parse(COLUMNS,
+              "column definitions",
+              "CREATE TABLE %s ("
+              + "keyspace_name text,"
+              + "table_name text,"
+              + "column_name text,"
+              + "clustering_order text,"
+              + "column_name_bytes blob,"
+              + "kind text,"
+              + "position int,"
+              + "type text,"
+              + "PRIMARY KEY ((keyspace_name), table_name, column_name))");
+
+    private static final TableMetadata ViewsCassandra5 =
+        parse(VIEWS,
+              "view definitions",
+              "CREATE TABLE %s ("
+              + "keyspace_name text,"
+              + "view_name text,"
+              + "base_table_id uuid,"
+              + "base_table_name text,"
+              + "where_clause text,"
+              + "allow_auto_snapshot boolean,"
+              + "bloom_filter_fp_chance double,"
+              + "caching frozen<map<text, text>>,"
+              + "comment text,"
+              + "compaction frozen<map<text, text>>,"
+              + "compression frozen<map<text, text>>,"
+              + "memtable text,"
+              + "crc_check_chance double,"
+              + "dclocal_read_repair_chance double," // no longer used, left for drivers' sake
+              + "default_time_to_live int,"
+              + "extensions frozen<map<text, blob>>,"
+              + "gc_grace_seconds int,"
+              + "incremental_backups boolean,"
+              + "id uuid,"
+              + "include_all_columns boolean,"
+              + "max_index_interval int,"
+              + "memtable_flush_period_in_ms int,"
+              + "min_index_interval int,"
+              + "read_repair_chance double," // no longer used, left for drivers' sake
+              + "speculative_retry text,"
+              + "additional_write_policy text,"
+              + "cdc boolean,"
+              + "read_repair text,"
+              + (CassandraRelevantProperties.AUTOREPAIR_ENABLE.getBoolean() ? "auto_repair frozen<map<text, text>>," : "")
+              + "PRIMARY KEY ((keyspace_name), view_name))");
+
+    private static final List<TableMetadata> CASSANDRA_5_TABLE_METADATA = ImmutableList.of(KeyspacesCassandra5,
+                                                                                         TablesCassandra5,
+                                                                                         ColumnsCassandra5,
+                                                                                         ColumnMasks,
+                                                                                         Triggers,
+                                                                                         DroppedColumns,
+                                                                                         ViewsCassandra5,
+                                                                                         Types,
+                                                                                         FunctionsCassandra4,
+                                                                                         AggregatesCassandra4,
+                                                                                         Indexes);
+
     /**
      * Returns the list of schema table metadata based on current storage compatibility mode.
      */
@@ -479,6 +586,15 @@ public final class SchemaKeyspace
     public static boolean hasDeterminismColumns()
     {
         return isWritable(functionsTableMetadata(), "deterministic");
+    }
+
+    /**
+     * Whether the deterministic and monotonic columns are written to the functions or aggregates schema table: the
+     * table has them, and the Apache upgrade path, whose schema has no such columns, isn't active.
+     */
+    private static boolean writesDeterminism(TableMetadata schemaTable)
+    {
+        return isWritable(schemaTable, "deterministic") && !ApacheUpgradePath.isActive();
     }
 
     /**
@@ -589,13 +705,17 @@ public final class SchemaKeyspace
     /**
      * Read schema from system keyspace and calculate MD5 digest of every row, resulting digest
      * will be converted into UUID which would act as content-based version of the schema.
+     * While the Apache upgrade path is active, only the columns of Apache Cassandra 5.0's schema tables are read, so
+     * that the digest equals the one Apache Cassandra 5.0 nodes compute.
      */
     public static UUID calculateSchemaDigest()
     {
         Digest digest = Digest.forSchema();
+        boolean cassandra5Columns = ApacheUpgradePath.isActive();
         for (String table : ALL)
         {
-            ReadCommand cmd = getReadCommandForTableSchema(table);
+            ReadCommand cmd = cassandra5Columns ? getCassandra5ColumnsReadCommandForTableSchema(table)
+                                                : getReadCommandForTableSchema(table);
             try (ReadExecutionController executionController = cmd.executionController();
                  PartitionIterator schema = cmd.executeInternal(executionController))
             {
@@ -629,6 +749,24 @@ public final class SchemaKeyspace
     {
         ColumnFamilyStore cfs = getSchemaCFS(schemaTableName);
         return PartitionRangeReadCommand.allDataRead(cfs.metadata(), FBUtilities.nowInSeconds());
+    }
+
+    private static ReadCommand getCassandra5ColumnsReadCommandForTableSchema(String schemaTableName)
+    {
+        TableMetadata metadata = getSchemaCFS(schemaTableName).metadata();
+        TableMetadata cassandra5Table = CASSANDRA_5_TABLE_METADATA.stream()
+                                                                  .filter(table -> table.name.equals(schemaTableName))
+                                                                  .findFirst()
+                                                                  .orElseThrow(() -> new IllegalStateException("No Apache Cassandra 5.0 layout for " + schemaTableName));
+        RegularAndStaticColumns.Builder columns = RegularAndStaticColumns.builder();
+        for (ColumnMetadata column : cassandra5Table.regularAndStaticColumns())
+            columns.add(metadata.getColumn(column.name));
+        return PartitionRangeReadCommand.create(metadata,
+                                                FBUtilities.nowInSeconds(),
+                                                ColumnFilter.selection(columns.build()),
+                                                RowFilter.none(),
+                                                DataLimits.NONE,
+                                                DataRange.allData(metadata.partitioner));
     }
 
     static Collection<Mutation> convertSchemaToMutations()
@@ -1122,7 +1260,7 @@ public final class SchemaKeyspace
     private static void addFunctionToSchemaMutation(UDFunction function, Mutation.SimpleBuilder builder)
     {
         TableMetadata schemaTable = functionsTableMetadata();
-        boolean withDeterminism = isWritable(schemaTable, "deterministic");
+        boolean withDeterminism = writesDeterminism(schemaTable);
         Row.SimpleBuilder rowBuilder = builder.update(schemaTable).row(function.name().name, function.argumentsList());
         // the row may have deterministic and monotonic cells of an earlier definition
         if (!withDeterminism)
@@ -1163,7 +1301,7 @@ public final class SchemaKeyspace
     private static void addAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
     {
         TableMetadata schemaTable = aggregatesTableMetadata();
-        boolean withDeterminism = isWritable(schemaTable, "deterministic");
+        boolean withDeterminism = writesDeterminism(schemaTable);
         Row.SimpleBuilder rowBuilder = builder.update(schemaTable).row(aggregate.name().name, aggregate.argumentsList());
         // the row may have a deterministic cell of an earlier definition
         if (!withDeterminism)

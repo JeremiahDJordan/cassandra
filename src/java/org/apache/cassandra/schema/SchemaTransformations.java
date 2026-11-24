@@ -226,6 +226,11 @@ public class SchemaTransformations
 
                             TableMetadata.Builder updatedBuilder = desiredTable.unbuild();
 
+                            // a table defined without a compaction keeps the one it has, as the default depends on the
+                            // mode and the Apache upgrade path
+                            if (CompactionParams.isDefault(desiredTable.params.compaction))
+                                updatedBuilder.compaction(curTable.params.compaction);
+
                             for (ColumnMetadata column : curTable.regularAndStaticColumns())
                             {
                                 if (!desiredTable.regularAndStaticColumns().contains(column))

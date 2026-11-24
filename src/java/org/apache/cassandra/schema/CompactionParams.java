@@ -36,6 +36,7 @@ import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
 import org.apache.cassandra.db.compaction.TimeWindowCompactionStrategy;
 import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.commons.lang3.StringUtils;
 
@@ -82,9 +83,11 @@ public final class CompactionParams
                         Option.MAX_THRESHOLD.toString(), Integer.toString(CompactionStrategyOptions.DEFAULT_MAX_THRESHOLD));
 
     public static final CompactionParams DEFAULT;
+    private static final boolean DEFAULT_CONFIGURED;
     static
     {
         ParameterizedClass defaultCompaction = DatabaseDescriptor.getDefaultCompaction();
+        DEFAULT_CONFIGURED = defaultCompaction != null;
         if (defaultCompaction == null)
         {
             DEFAULT = new CompactionParams(UnifiedCompactionStrategy.class,
@@ -97,6 +100,29 @@ public final class CompactionParams
             DEFAULT = create(classFromName(defaultCompaction.class_name),
                              defaultCompaction.parameters);
         }
+    }
+
+    // Apache Cassandra 5.0's default when default_compaction is unset (origin/cassandra-5.0 CompactionParams)
+    private static final CompactionParams CASSANDRA_5_DEFAULT = new CompactionParams(SizeTieredCompactionStrategy.class,
+                                                                                     DEFAULT_THRESHOLDS,
+                                                                                     DEFAULT_ENABLED,
+                                                                                     DEFAULT_PROVIDE_OVERLAPPING_TOMBSTONES_PROPERTY_VALUE);
+
+    /**
+     * The compaction of a table defined without one: {@link #DEFAULT}, or Apache Cassandra 5.0's default while the
+     * Apache upgrade path is active and default_compaction is unset.
+     */
+    public static CompactionParams defaultCompaction()
+    {
+        return !DEFAULT_CONFIGURED && ApacheUpgradePath.isActive() ? CASSANDRA_5_DEFAULT : DEFAULT;
+    }
+
+    /**
+     * Whether {@code params} is a default compaction, this node's or Apache Cassandra 5.0's.
+     */
+    public static boolean isDefault(CompactionParams params)
+    {
+        return params.equals(DEFAULT) || params.equals(CASSANDRA_5_DEFAULT);
     }
 
     private final CompactionStrategyOptions strategyOptions;
