@@ -267,6 +267,18 @@ public abstract class Threshold extends Guardrail
         }
 
         /**
+         * Triggers the failure that {@link #add} would trigger if the provided increment were added, adding it then,
+         * and does nothing otherwise: for a value that is only added later, or not at all.
+         *
+         * @param increment the increment to check.
+         */
+        public void checkIncrement(long increment)
+        {
+            if (accumulated + increment > failValue)
+                add(increment);
+        }
+
+        /**
          * Trigger the warn if the currently accumulated counter value crosses warning threshold and the failure
          * has not been triggered yet.
          * <p>

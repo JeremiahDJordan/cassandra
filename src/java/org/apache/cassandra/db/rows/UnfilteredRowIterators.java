@@ -17,7 +17,12 @@
  */
 package org.apache.cassandra.db.rows;
 
+import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
+import java.util.function.Consumer;
+
+import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -155,6 +160,116 @@ public abstract class UnfilteredRowIterators
     public static UnfilteredRowIterator noRowsIterator(final TableMetadata metadata, final DecoratedKey partitionKey, final Row staticRow, final DeletionTime partitionDeletion, final boolean isReverseOrder)
     {
         return EmptyIterators.unfilteredRow(metadata, partitionKey, isReverseOrder, staticRow, partitionDeletion);
+    }
+
+    /**
+     * Returns the given partition if it has a row with live data, or {@code null}, after closing it, if it has none:
+     * range tombstone markers and rows without live data are no match for a filter on their own. With
+     * {@code keepDeletions} (a read that needs reconciliation), the markers and rows without live data are kept, and
+     * those before the first live row are held in memory until it is found, each passed to {@code onHeld}; without it,
+     * they are dropped. What isn't returned is passed to {@code onDropped}. The partition is closed if this throws.
+     *
+     * @param onHeld    called with each item held, or {@code null}
+     * @param onDropped called with each marker and row without live data that isn't returned, or {@code null}
+     */
+    @Nullable
+    public static UnfilteredRowIterator withLiveRowsOrNull(UnfilteredRowIterator partition,
+                                                           boolean keepDeletions,
+                                                           long nowInSec,
+                                                           boolean enforceStrictLiveness,
+                                                           @Nullable Consumer<Unfiltered> onHeld,
+                                                           @Nullable Consumer<Unfiltered> onDropped)
+    {
+        try
+        {
+            return withLiveRowsOrNullUnsafe(partition, keepDeletions, nowInSec, enforceStrictLiveness, onHeld, onDropped);
+        }
+        catch (Throwable t)
+        {
+            try
+            {
+                partition.close();
+            }
+            catch (Throwable closing)
+            {
+                t.addSuppressed(closing);
+            }
+            throw t;
+        }
+    }
+
+    private static UnfilteredRowIterator withLiveRowsOrNullUnsafe(UnfilteredRowIterator partition,
+                                                                  boolean keepDeletions,
+                                                                  long nowInSec,
+                                                                  boolean enforceStrictLiveness,
+                                                                  @Nullable Consumer<Unfiltered> onHeld,
+                                                                  @Nullable Consumer<Unfiltered> onDropped)
+    {
+        if (!keepDeletions)
+        {
+            UnfilteredRowIterator live = Transformation.apply(partition, new Transformation<UnfilteredRowIterator>()
+            {
+                @Override
+                protected Row applyToRow(Row row)
+                {
+                    if (row.hasLiveData(nowInSec, enforceStrictLiveness))
+                        return row;
+                    if (onDropped != null)
+                        onDropped.accept(row);
+                    return null;
+                }
+
+                @Override
+                protected RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+                {
+                    if (onDropped != null)
+                        onDropped.accept(marker);
+                    return null;
+                }
+            });
+            if (live.hasNext())
+                return live;
+            live.close();
+            return null;
+        }
+
+        List<Unfiltered> held = new ArrayList<>();
+        while (partition.hasNext())
+        {
+            Unfiltered next = partition.next();
+            held.add(next);
+            boolean live = next.isRow() && ((Row) next).hasLiveData(nowInSec, enforceStrictLiveness);
+            if (!live && onHeld != null)
+                onHeld.accept(next);
+            if (live)
+            {
+                Iterator<Unfiltered> heldIterator = held.iterator();
+                return new WrappingUnfilteredRowIterator()
+                {
+                    @Override
+                    public UnfilteredRowIterator wrapped()
+                    {
+                        return partition;
+                    }
+
+                    @Override
+                    public boolean hasNext()
+                    {
+                        return heldIterator.hasNext() || partition.hasNext();
+                    }
+
+                    @Override
+                    public Unfiltered next()
+                    {
+                        return heldIterator.hasNext() ? heldIterator.next() : partition.next();
+                    }
+                };
+            }
+        }
+        if (onDropped != null)
+            held.forEach(onDropped);
+        partition.close();
+        return null;
     }
 
     public static UnfilteredRowIterator singleton(Unfiltered unfiltered,
