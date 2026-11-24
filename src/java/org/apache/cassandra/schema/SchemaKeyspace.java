@@ -1479,7 +1479,10 @@ public final class SchemaKeyspace
                 !udf.isAggregate() &&
                 udf.language().equals(language) &&
                 udf.body().equals(body) &&
-                udf.isCalledOnNullInput() == calledOnNullInput)
+                udf.isCalledOnNullInput() == calledOnNullInput &&
+                udf.isDeterministic() == deterministic &&
+                udf.isMonotonic() == monotonic &&
+                udf.monotonicOn().equals(monotonicOn))
             {
                 logger.trace("Skipping duplicate compilation of already existing UDF {}", name);
                 return udf;
