@@ -62,7 +62,7 @@ public class EarlyOpenWithBytemanTest
     private static final String KEYSPACE = "early_open_byteman_test";
     private static final String CF = "Standard1";
     private static final int EARLY_OPEN_INTERVAL_MIB = 1;
-    private static final int PARTITIONS = 100_000;
+    private static final int PARTITIONS = 150_000;
 
     private final List<Object> leaks = new CopyOnWriteArrayList<>();
     private boolean savedDisableEarlyOpening;

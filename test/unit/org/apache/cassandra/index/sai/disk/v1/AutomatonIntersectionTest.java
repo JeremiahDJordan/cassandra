@@ -434,7 +434,7 @@ public class AutomatonIntersectionTest extends SaiRandomizedTest
                          .sorted((a, b) -> compareUnsigned(a.left, b.left))
                          .map(e -> Pair.create(version.onDiskFormat()
                                                       .encodeForTrie(ByteBuffer.wrap(e.left), UTF8Type.instance)
-                                                      .preencode(TypeUtil.BYTE_COMPARABLE_VERSION),
+                                                      .preencode(TypeUtil.byteComparableVersionForTermsData(version)),
                                                e.right.stream().map(r -> new RowMapping.RowIdWithFrequency(r, 1)).collect(Collectors.toList())))
                          .collect(Collectors.toList());
     }

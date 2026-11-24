@@ -22,19 +22,27 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 
+import javax.annotation.Nullable;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.streaming.OutgoingStream;
 import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.StreamingDataOutputPlus;
+import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.TimeUUID;
 import org.apache.cassandra.utils.concurrent.Ref;
 
@@ -49,15 +57,27 @@ public class CassandraOutgoingFile implements OutgoingStream
     private final String filename;
     private final boolean shouldStreamEntireSSTable;
     private final StreamOperation operation;
+    private final BtiDaReceiver receiver;
     private final CassandraStreamHeader header;
 
     public CassandraOutgoingFile(StreamOperation operation, Ref<? extends SSTableReader> ref,
                                  List<SSTableReader.PartitionPositionBounds> sections, List<Range<Token>> normalizedRanges,
                                  long estimatedKeys)
     {
+        this(operation, ref, sections, normalizedRanges, estimatedKeys, BtiDaReceiver.ENTIRE);
+    }
+
+    /**
+     * @param receiver what the peer reads of bti sstables of major version "d"
+     */
+    public CassandraOutgoingFile(StreamOperation operation, Ref<? extends SSTableReader> ref,
+                                 List<SSTableReader.PartitionPositionBounds> sections, List<Range<Token>> normalizedRanges,
+                                 long estimatedKeys, BtiDaReceiver receiver)
+    {
         Preconditions.checkNotNull(ref.get());
         Range.assertNormalized(normalizedRanges);
         this.operation = operation;
+        this.receiver = receiver;
         this.ref = ref;
         this.estimatedKeys = estimatedKeys;
         this.sections = sections;
@@ -195,12 +215,33 @@ public class CassandraOutgoingFile implements OutgoingStream
             return false;
 
         // an sstable of a version newer than the one written is streamed by partitions, so the receiver writes the
-        // data in its own version
+        // data in its own version; only HCD_1 and an explicit bti version write a version older than one they read
         Version version = ref.get().descriptor.version;
-        if (version.version.compareTo(version.format.getLatestVersion().version) > 0)
+        if ((DatabaseDescriptor.getStorageCompatibilityModeForWrites() == StorageCompatibilityMode.HCD_1
+             || BtiFormat.is(version.format) && CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.isPresent())
+            && version.version.compareTo(version.format.getLatestVersion().version) > 0)
+            return false;
+
+        if (!receiver.entire && isBtiD(version))
             return false;
 
         return contained(sections, ref.get());
+    }
+
+    @Override
+    public void checkCanSend()
+    {
+        if (receiver.refusal != null && isBtiD(ref.get().descriptor.version))
+            throw new IllegalStateException(String.format(BtiDaReceiver.REFUSAL, ref.get().descriptor, receiver.peer, receiver.refusal,
+                                                          BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION,
+                                                          CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getKey(),
+                                                          CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getKey(),
+                                                          BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION));
+    }
+
+    private static boolean isBtiD(Version version)
+    {
+        return BtiFormat.is(version.format) && version.version.charAt(0) > BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION.charAt(0);
     }
 
     @VisibleForTesting
@@ -239,5 +280,52 @@ public class CassandraOutgoingFile implements OutgoingStream
     public String toString()
     {
         return "CassandraOutgoingFile{" + filename + '}';
+    }
+
+    /**
+     * What a peer reads of bti sstables of major version "d", from one snapshot of its messaging version.
+     */
+    public static final class BtiDaReceiver
+    {
+        // a peer they are sent to entire: this node, an Apache Cassandra node or a DataStax 5.0 node, though the
+        // earlier 5.0 releases, which don't read them, have the same messaging version
+        public static final BtiDaReceiver ENTIRE = new BtiDaReceiver(true, null, null);
+        // a peer that may not read them entire, as for sstableloader, which doesn't know the versions of its targets
+        public static final BtiDaReceiver PARTITIONS = new BtiDaReceiver(false, null, null);
+
+        private static final String REFUSAL = "Cannot stream %s to %s, %s: make the sending node write bti %s " +
+                                              "(storage_compatibility_mode HCD_1 without a later -D%s, or -D%s=%s), " +
+                                              "then rewrite it with nodetool upgradesstables -a";
+
+        @VisibleForTesting
+        final boolean entire;
+        @Nullable
+        private final InetAddressAndPort peer;
+        // why the peer can't receive an sstable of major version "d" at all, if it can't
+        @VisibleForTesting
+        @Nullable
+        final String refusal;
+
+        private BtiDaReceiver(boolean entire, @Nullable InetAddressAndPort peer, @Nullable String refusal)
+        {
+            this.entire = entire;
+            this.peer = peer;
+            this.refusal = refusal;
+        }
+
+        /**
+         * The DataStax nodes before 5.0 (DS 10 to DS 12, DSE 6.8) can't decode the partitions of a bti sstable of major
+         * version "d", nor can a node whose version isn't known yet be shown not to be one of them.
+         */
+        public static BtiDaReceiver of(InetAddressAndPort peer)
+        {
+            if (peer.equals(FBUtilities.getBroadcastAddressAndPort()))
+                return ENTIRE;
+            Integer version = MessagingService.instance().versions.getRawIfKnown(peer);
+            if (version != null && (version < MessagingService.VERSION_DS_10 || MessagingService.isVersion50OrLater(version)))
+                return ENTIRE;
+            return new BtiDaReceiver(false, peer, version == null ? "whose messaging version isn't known yet"
+                                                                  : "whose messaging version " + version + " doesn't read it");
+        }
     }
 }

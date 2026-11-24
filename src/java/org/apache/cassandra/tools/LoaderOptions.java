@@ -28,6 +28,7 @@ import java.net.MalformedURLException;
 import java.net.UnknownHostException;
 import java.util.HashSet;
 import java.util.Set;
+import javax.annotation.Nullable;
 
 import com.google.common.net.HostAndPort;
 import org.apache.commons.cli.CommandLine;
@@ -50,6 +51,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.tools.BulkLoader.CmdLineOptions;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.config.DataRateSpec.DataRateUnit.MEBIBYTES_PER_SECOND;
 
@@ -119,6 +121,8 @@ public class LoaderOptions
     public final int entireSSTableThrottleMebibytes;
     public final int entireSSTableInterDcThrottleMebibytes;
     public final boolean streamEntireSSTables;
+    @Nullable
+    public final StorageCompatibilityMode storageCompatibilityMode;
     public final int storagePort;
     public final int sslStoragePort;
     public final EncryptionOptions clientEncOptions;
@@ -144,6 +148,7 @@ public class LoaderOptions
         entireSSTableThrottleMebibytes = builder.entireSSTableThrottleMebibytes;
         entireSSTableInterDcThrottleMebibytes = builder.entireSSTableInterDcThrottleMebibytes;
         streamEntireSSTables = builder.streamEntireSSTables;
+        storageCompatibilityMode = builder.storageCompatibilityMode;
         storagePort = builder.storagePort;
         sslStoragePort = builder.sslStoragePort;
         clientEncOptions = builder.clientEncOptions;
@@ -171,6 +176,7 @@ public class LoaderOptions
         int entireSSTableThrottleMebibytes = 0;
         int entireSSTableInterDcThrottleMebibytes = 0;
         boolean streamEntireSSTables = true;
+        StorageCompatibilityMode storageCompatibilityMode;
 
         int storagePort;
         int sslStoragePort;
@@ -554,6 +560,7 @@ public class LoaderOptions
 
                 throttleBytes = config.stream_throughput_outbound.toBytesPerSecondAsInt();
                 streamEntireSSTables = config.stream_entire_sstables;
+                storageCompatibilityMode = config.storage_compatibility_mode;
 
                 if (cmd.hasOption(SSL_STORAGE_PORT_OPTION))
                     System.out.println("ssl storage port is deprecated and not used, all communication goes through storage port " +
@@ -824,7 +831,8 @@ public class LoaderOptions
                 "you will need to have the files Standard1-g-1-Data.db and Standard1-g-1-Index.db into a directory /path/to/Keyspace1/Standard1/.";
         String footer = System.lineSeparator() +
                 "You can provide cassandra.yaml file with -f command line option to set up streaming throughput, client and server encryption options. " +
-                "Only stream_throughput_outbound, stream_entire_sstables, server_encryption_options and client_encryption_options are read from yaml. " +
+                "Only stream_throughput_outbound, stream_entire_sstables, storage_compatibility_mode, server_encryption_options and client_encryption_options are read from yaml, " +
+                "stream_entire_sstables only without storage_compatibility_mode or with HCD_1. " +
                 "You can override options read from cassandra.yaml with corresponding command line options.";
         new HelpFormatter().printHelp(usage, header, options, footer);
     }

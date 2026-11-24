@@ -65,14 +65,14 @@ public class PrimaryKeyWithByteComparable extends PrimaryKeyWithSortKey
     {
         if (context.isLiteral())
         {
-            ByteSource byteSource = byteComparable.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION);
+            ByteSource byteSource = TypeUtil.termBytes(byteComparable);
             byte[] indexedValue = ByteSourceInverse.readBytes(byteSource);
             byte[] liveValue = ByteBufferUtil.getArray(value);
             return Arrays.compare(indexedValue, liveValue) == 0;
         }
         else
         {
-            var peekableBytes = ByteSource.peekable(byteComparable.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION));
+            var peekableBytes = ByteSource.peekable(TypeUtil.termBytes(byteComparable));
             var bytes = context.getValidator().fromComparableBytes(peekableBytes, TypeUtil.BYTE_COMPARABLE_VERSION);
             return value.compareTo(bytes) == 0;
         }
@@ -84,7 +84,7 @@ public class PrimaryKeyWithByteComparable extends PrimaryKeyWithSortKey
         if (!(o instanceof PrimaryKeyWithByteComparable))
             throw new IllegalArgumentException("Cannot compare PrimaryKeyWithByteComparable with " + o.getClass().getSimpleName());
 
-        return ByteComparable.compare(byteComparable, ((PrimaryKeyWithByteComparable) o).byteComparable, TypeUtil.BYTE_COMPARABLE_VERSION);
+        return ByteSource.compare(TypeUtil.termBytes(byteComparable), TypeUtil.termBytes(((PrimaryKeyWithByteComparable) o).byteComparable));
     }
 
     @Override

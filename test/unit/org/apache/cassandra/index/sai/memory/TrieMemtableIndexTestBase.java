@@ -61,6 +61,7 @@ import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
 import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.index.sai.utils.PrimaryKeys;
+import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.compress.BufferType;
@@ -399,7 +400,7 @@ public abstract class TrieMemtableIndexTestBase extends SAITester
 
     private int termFromComparable(ByteComparable comparable)
     {
-        ByteSource.Peekable peekable = ByteSource.peekable(comparable.asComparableBytes(ByteComparable.Version.OSS41));
+        ByteSource.Peekable peekable = ByteSource.peekable(TypeUtil.termBytes(comparable));
         return Int32Type.instance.compose(Int32Type.instance.fromComparableBytes(peekable, ByteComparable.Version.OSS41));
     }
 

@@ -107,14 +107,58 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - The sstable versions written by default follow storage_compatibility_mode. In CASSANDRA_4, UPGRADING and NONE,
+      the modes of Apache Cassandra 5.0, a node and its offline tools write what Apache Cassandra 5.0 writes: big "nb"
+      in CASSANDRA_4 and "oa" in the others, and bti "da" (in CASSANDRA_4, where bti can't be the selected format, for
+      the bti tables it receives by partitions). In HCD_1, the DataStax mode, they write big "nb" and bti "cc", the
+      versions its releases read. Earlier releases wrote bti "cc" in every mode, which can't hold local deletion times
+      after 2038-01-19T03:14:06Z: from that date on, its partition deletions and the copies of open range tombstones
+      kept in its row indexes are recorded as that time, so once it plus gc_grace_seconds has passed they can be
+      purged as soon as they are written, and a replica that missed the deletion can bring the deleted data back.
+      -Dcassandra.trie_index_format_version still sets the bti version in every mode, see the next entry for its
+      values; a node in HCD_1 that it makes write a version later than "cc" logs a warning at startup.
+      A cluster that runs an earlier release in HCD_1 stays in HCD_1 during the upgrade, and sets UPGRADING only once
+      every node runs this release. In CASSANDRA_4, UPGRADING and NONE an upgraded node writes bti "da" (in
+      CASSANDRA_4, for the bti tables it receives by partitions). The nodes of earlier DataStax 5.0 releases accept an
+      entire "da" sstable but don't read it, and then fail to start; they advertise the messaging version of this
+      release, so a node streams its "da" sstables entire to them. A cluster that runs an earlier release in
+      CASSANDRA_4, UPGRADING or NONE therefore starts each upgraded node with
+      -Dcassandra.trie_index_format_version=cc, whatever its selected sstable format, and removes the option in a
+      rolling restart only once every node runs this release; set -Dcassandra.trie_index_format_version=da only then
+      as well. The DataStax nodes before 5.0 (HCD 1.x, DSE 6.8) can't decode "da" sstables even by partitions, so a
+      stream of a "da" sstable to them, or to a node whose messaging version isn't known yet, fails, naming the
+      sstable to rewrite as "cc" first: a cluster that still has such nodes must neither import "da" sstables nor set
+      -Dcassandra.trie_index_format_version=da. Apache Cassandra nodes receive "da" sstables entire, as before. Nodes
+      in UPGRADING and NONE stream "da" sstables entire to nodes of this release in HCD_1, which read them with the
+      warning described in the next entry. In UPGRADING and NONE, flushes and compactions write "da", and nodetool
+      upgradesstables, or automatic_sstable_upgrade if enabled, rewrites the "cc" sstables as "da".
+      The offline tools that write sstables, such as sstableupgrade, sstablescrub and sstablesplit, now run in the
+      storage_compatibility_mode of their cassandra.yaml, HCD_1 if it sets none, as in Apache Cassandra, instead of
+      NONE: they write the versions of that mode and, in CASSANDRA_4, refuse big "oa" as the node does. Clients run in
+      NONE, as in Apache Cassandra, but unless their configuration sets one of its modes they write the versions of
+      HCD_1, bti "cc" and big "nb" (instead of "oa" before), and limit expirations to 2038 as HCD_1 does.
+      sstableloader takes the storage_compatibility_mode of its --conf-path file: without one or with HCD_1, it writes
+      the versions of HCD_1 and so streams big "oa" sstables by partitions; with CASSANDRA_4, UPGRADING or NONE, the
+      file doesn't set its stream_entire_sstables, as in Apache Cassandra. It doesn't know the messaging versions of
+      the nodes it loads into, so it always streams bti "da" sstables by partitions; don't load them into DataStax
+      nodes before 5.0.
+      To roll back to an earlier release that ran in HCD_1, restart every node in HCD_1 without
+      -Dcassandra.trie_index_format_version set to a version later than "cc", rewrite the sstables of every node with
+      nodetool upgradesstables -a, and check that no node logs the warning about sstables of versions newer than a
+      release of HCD_1 reads when it next starts. For an earlier release that ran in CASSANDRA_4, UPGRADING or NONE,
+      keep the mode, restart every node with -Dcassandra.trie_index_format_version=cc, rewrite the sstables of every
+      node with nodetool upgradesstables -a, and check that no live bti sstable of major version "d" is left (no file
+      named d*-bti-Data.db in the data directories, outside of snapshots and backups). Only then install the earlier
+      release. Do this before 2038-01-19T03:14:06Z: a rewrite as "cc" or "nb" records the partition deletions made
+      after that date as that time (see above), which these checks, that only look at sstable versions, don't show.
     - A node reads the sstables of every version this release supports, up to big "o" ("oa") and bti "d" ("da", the
       version of Apache Cassandra 5.0), whatever version it writes, except for big "oa" in storage_compatibility_mode
       CASSANDRA_4: in CASSANDRA_4, UPGRADING and NONE, the modes of Apache Cassandra 5.0, a node reads what Apache
       Cassandra 5.0 reads, so CASSANDRA_4 refuses big "oa" at startup and on import, and reads bti "da". A node
-      writing the default bti version "cc" no longer needs -Dcassandra.trie_index_format_version=da to start with,
-      import or load "da" sstables, and the offline tools read them too. Compaction rewrites them in the version
-      written. An sstable of a version newer than the one written is streamed by partitions instead of as an entire
-      sstable, so that the receiver writes its data in its own version.
+      writing bti "cc" no longer needs -Dcassandra.trie_index_format_version=da to start with, import or load "da"
+      sstables, and the offline tools read them too. Compaction rewrites them in the version written. An sstable of a
+      version newer than the one written is streamed by partitions instead of as an entire sstable, so that the
+      receiver writes its data in its own version.
       In HCD_1, the DataStax mode, a node reads the sstables of a major version later than the releases of that mode
       read (big after "n", bti after "c"), such as those it imports or receives as entire sstables by streaming from
       nodes in UPGRADING or NONE, but those releases can't, so the node logs a warning that a downgrade isn't possible
@@ -129,6 +173,11 @@ Upgrading
       -Dcassandra.trie_index_format_version must be a released bti version (aa, ac, ad, ba, bb, ca, cb, cc or da);
       other values fail startup.
       Snapshots and backups taken outside of the mode aren't rewritten.
+    - A node that ran an earlier release with -Dcassandra.trie_index_format_version=da and SAI on-disk version aa
+      (-Dcassandra.sai.latest.version=aa, or a version selector that selects it) wrote wrong entries for some values
+      of DESC bigint clustering columns into the SAI indexes of its "da" sstables, so that queries on those columns
+      can miss rows. This release writes them correctly; once every node runs it, rebuild those indexes with nodetool
+      rebuild_index.
 
 5.0.7
 ======

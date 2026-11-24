@@ -56,7 +56,7 @@ public interface CellData<V, C extends CellData<?, ?>> extends IDataSize
 
     public static long getVersionedMaxDeletiontionTime()
     {
-        if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5))
+        if (DatabaseDescriptor.getStorageCompatibilityModeForWrites().isBefore(5))
             return MAX_DELETION_TIME_2038_LEGACY_CAP;
 
         if (DatabaseDescriptor.getStorageCompatibilityMode().disabled())

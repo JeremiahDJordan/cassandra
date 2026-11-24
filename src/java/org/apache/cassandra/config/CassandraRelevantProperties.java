@@ -1190,9 +1190,10 @@ public enum CassandraRelevantProperties
     /** To be used for tests: whether trie cursors should be verified for correctness. */
     TRIE_DEBUG("cassandra.debug_tries"),
     /**
-     * Allows to set custom current trie index format. This node will produce sstables in this format.
+     * Allows to set custom current trie index format. This node will produce sstables in this format. By default, it
+     * is "cc" in storage compatibility mode HCD_1 and "da", as in Apache Cassandra, in the others (see BtiFormat).
      */
-    TRIE_INDEX_FORMAT_VERSION("cassandra.trie_index_format_version", "cc"),
+    TRIE_INDEX_FORMAT_VERSION("cassandra.trie_index_format_version"),
 
     /**
      * Number of shards for TrieMemtable. If not specified, defaults to {@link TrieMemtable#autoShardCount}

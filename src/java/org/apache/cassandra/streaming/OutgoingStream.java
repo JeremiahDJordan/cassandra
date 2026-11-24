@@ -42,6 +42,13 @@ public interface OutgoingStream
      */
     void finish();
 
+    /**
+     * Throws if the stream can't be sent to the peer of its session, which fails the session before anything is sent.
+     */
+    default void checkCanSend()
+    {
+    }
+
     long getRepairedAt();
     TimeUUID getPendingRepair();
 

@@ -25,6 +25,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -33,6 +34,7 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import javax.crypto.SecretKey;
 import javax.crypto.spec.SecretKeySpec;
 
@@ -55,6 +57,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
@@ -90,12 +93,19 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileInputStreamPlus;
 import org.apache.cassandra.io.util.FileOutputStreamPlus;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.locator.RangesAtEndpoint;
+import org.apache.cassandra.net.EndpointMessagingVersions;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.OutgoingStream;
+import org.apache.cassandra.streaming.PreviewKind;
 import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.streaming.StreamPlan;
+import org.apache.cassandra.streaming.StreamSession;
+import org.apache.cassandra.streaming.async.NettyStreamingConnectionFactory;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Clock;
 import org.apache.cassandra.utils.FBUtilities;
@@ -939,6 +949,71 @@ public class LegacySSTableTest
         {
             ((ch.qos.logback.classic.Logger) LoggerFactory.getLogger(Tracker.class)).detachAppender(warnings);
             warnings.stop();
+        }
+    }
+
+    /**
+     * A bti "da" sstable is streamed or not, depending on the messaging version of the peer.
+     */
+    @Test
+    public void testBtiDaStreamPerPeerMessagingVersion() throws Exception
+    {
+        loadLegacyTable("da", "simple");
+        ColumnFamilyStore cfs = Keyspace.open(LEGACY_TABLES_KEYSPACE).getColumnFamilyStore("legacy_da_simple");
+        SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
+        InetAddressAndPort peer = InetAddressAndPort.getByName("127.0.0.2");
+        EndpointMessagingVersions versions = MessagingService.instance().versions;
+        // an sstable of a version newer than the one written goes by partitions to every peer
+        boolean entire = sstable.descriptor.version.version.compareTo(BtiFormat.getInstance().getLatestVersion().version) <= 0
+                         || DatabaseDescriptor.getStorageCompatibilityModeForWrites() != StorageCompatibilityMode.HCD_1
+                            && !CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.isPresent();
+        try
+        {
+            assertOutgoingStream(cfs, FBUtilities.getBroadcastAddressAndPort(), entire, null);
+            for (int version : new int[]{ MessagingService.VERSION_50, MessagingService.VERSION_DS_20 })
+            {
+                versions.set(peer, version);
+                assertOutgoingStream(cfs, peer, entire, null);
+            }
+            for (int version : new int[]{ MessagingService.VERSION_DS_12, MessagingService.VERSION_DSE_68 })
+            {
+                versions.set(peer, version);
+                assertOutgoingStream(cfs, peer, false, "Cannot stream " + sstable.descriptor + " to " + peer + ", whose messaging version " + version + " doesn't read it");
+            }
+            versions.reset(peer);
+            assertOutgoingStream(cfs, peer, false, "Cannot stream " + sstable.descriptor + " to " + peer + ", whose messaging version isn't known yet");
+            InetAddressAndPort scoped = InetAddressAndPort.getByName("fe80::1%1");
+            assertOutgoingStream(cfs, scoped, false, "Cannot stream " + sstable.descriptor + " to " + scoped + ", whose messaging version isn't known yet");
+        }
+        finally
+        {
+            versions.reset(peer);
+        }
+    }
+
+    private static void assertOutgoingStream(ColumnFamilyStore cfs, InetAddressAndPort peer, boolean entire, @Nullable String refusal)
+    {
+        IPartitioner p = cfs.getPartitioner();
+        List<Range<Token>> ranges = Collections.singletonList(new Range<>(p.getMinimumToken(), p.getMinimumToken()));
+        StreamSession session = new StreamSession(StreamOperation.OTHER, peer, new NettyStreamingConnectionFactory(), null,
+                                                  MessagingService.current_version, false, 0, null, PreviewKind.NONE);
+        Collection<OutgoingStream> streams = cfs.getStreamManager().createOutgoingStreams(session, RangesAtEndpoint.toDummyList(ranges),
+                                                                                         NO_PENDING_REPAIR, PreviewKind.NONE);
+        try
+        {
+            assertThat(streams).hasSize(1);
+            CassandraOutgoingFile stream = (CassandraOutgoingFile) streams.iterator().next();
+            assertThat(stream.computeShouldStreamEntireSSTables()).describedAs(peer.toString()).isEqualTo(entire);
+            if (refusal == null)
+                stream.checkCanSend();
+            else
+                assertThatThrownBy(stream::checkCanSend).isInstanceOf(IllegalStateException.class)
+                                                        .hasMessageContaining(refusal)
+                                                        .hasMessageContaining("make the sending node write bti cc");
+        }
+        finally
+        {
+            streams.forEach(OutgoingStream::finish);
         }
     }
 

@@ -19,9 +19,11 @@
 package org.apache.cassandra.db.streaming;
 
 import java.io.IOException;
+import java.net.UnknownHostException;
 import java.util.Arrays;
 import java.util.List;
 
+import org.junit.Assume;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -36,12 +38,19 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.net.EndpointMessagingVersions;
+import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.schema.CachingParams;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.streaming.StreamOperation;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.FBUtilities;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
 
 public class CassandraOutgoingFileTest
@@ -84,6 +93,58 @@ public class CassandraOutgoingFileTest
         CompactionManager.instance.performMaximal(store, false);
 
         sstable = store.getLiveSSTables().iterator().next();
+    }
+
+    @Test
+    public void testBtiDaReceiver() throws UnknownHostException
+    {
+        InetAddressAndPort peer = InetAddressAndPort.getByName("127.0.0.2");
+        EndpointMessagingVersions versions = MessagingService.instance().versions;
+        try
+        {
+            assertSame(CassandraOutgoingFile.BtiDaReceiver.ENTIRE, CassandraOutgoingFile.BtiDaReceiver.of(FBUtilities.getBroadcastAddressAndPort()));
+            assertNotNull(CassandraOutgoingFile.BtiDaReceiver.of(peer).refusal);
+            for (int version : new int[]{ MessagingService.VERSION_40, MessagingService.VERSION_50, MessagingService.VERSION_DS_20 })
+            {
+                versions.set(peer, version);
+                assertSame(String.valueOf(version), CassandraOutgoingFile.BtiDaReceiver.ENTIRE, CassandraOutgoingFile.BtiDaReceiver.of(peer));
+            }
+            for (int version : new int[]{ MessagingService.VERSION_DS_10, MessagingService.VERSION_DS_12, MessagingService.VERSION_DSE_68 })
+            {
+                versions.set(peer, version);
+                CassandraOutgoingFile.BtiDaReceiver receiver = CassandraOutgoingFile.BtiDaReceiver.of(peer);
+                assertFalse(String.valueOf(version), receiver.entire);
+                assertNotNull(String.valueOf(version), receiver.refusal);
+            }
+        }
+        finally
+        {
+            versions.reset(peer);
+        }
+    }
+
+    /**
+     * An entire bti "da" sstable is streamed by partitions to a peer that may not read it, entire to the others.
+     */
+    @Test
+    public void testEntireBtiDaToPeerThatDoesntReadIt()
+    {
+        Assume.assumeTrue("the sstable is a bti da one", sstable.descriptor.version.toFormatAndVersionString().equals("bti-da"));
+        List<Range<Token>> requestedRanges = Arrays.asList(new Range<>(store.getPartitioner().getMinimumToken(), sstable.getLast().getToken()));
+        List<SSTableReader.PartitionPositionBounds> sections = sstable.getPositionsForRanges(requestedRanges);
+        for (CassandraOutgoingFile.BtiDaReceiver receiver : new CassandraOutgoingFile.BtiDaReceiver[]{ CassandraOutgoingFile.BtiDaReceiver.ENTIRE, CassandraOutgoingFile.BtiDaReceiver.PARTITIONS })
+        {
+            CassandraOutgoingFile cof = new CassandraOutgoingFile(StreamOperation.BOOTSTRAP, sstable.ref(), sections,
+                                                                  requestedRanges, sstable.estimatedKeys(), receiver);
+            try
+            {
+                assertEquals(receiver.entire, cof.computeShouldStreamEntireSSTables());
+            }
+            finally
+            {
+                cof.getRef().release();
+            }
+        }
     }
 
     @Test
