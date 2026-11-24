@@ -776,6 +776,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         InetAddressAndPort replaceAddress = DatabaseDescriptor.getReplaceAddress();
         logger.info("Gathering node replacement information for {}", replaceAddress);
         Map<InetAddressAndPort, EndpointState> epStates = Gossiper.instance.doShadowRound();
+        ApacheUpgradePath.instance.onShadowRound(epStates);
         // as we've completed the shadow round of gossip, we should be able to find the node we're replacing
         EndpointState state = epStates.get(replaceAddress);
         if (state == null)
@@ -892,6 +893,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
         logger.debug("Starting shadow gossip round to check for endpoint collision");
         Map<InetAddressAndPort, EndpointState> epStates = Gossiper.instance.doShadowRound(peers);
+        ApacheUpgradePath.instance.onShadowRound(epStates);
 
         if (epStates.isEmpty() && DatabaseDescriptor.getSeeds().contains(FBUtilities.getBroadcastAddressAndPort()))
             logger.info("Unable to gossip with any peers but continuing anyway since node is in its own seed list. Broadcast address: {}, seeds: {}", FBUtilities.getBroadcastAddressAndPort(), DatabaseDescriptor.getSeeds());
@@ -1281,9 +1283,11 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             appStates.put(ApplicationState.RPC_ADDRESS, valueFactory.rpcaddress(FBUtilities.getJustBroadcastNativeAddress()));
             appStates.put(ApplicationState.RELEASE_VERSION, valueFactory.releaseVersion());
             appStates.put(ApplicationState.SSTABLE_VERSIONS, valueFactory.sstableVersions(sstablesTracker.versionsInUse()));
+            ApacheUpgradePath.instance.beforeGossipStart(appStates);
 
             logger.debug("Starting up server gossip");
             Gossiper.instance.register(this);
+            Gossiper.instance.register(ApacheUpgradePath.instance);
             Gossiper.instance.start(SystemKeyspace.incrementAndGetGeneration(), appStates); // needed for node-ring gathering.
             gossipActive = true;
 

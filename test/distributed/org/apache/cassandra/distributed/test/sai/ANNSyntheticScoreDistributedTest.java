@@ -42,6 +42,7 @@ import org.apache.cassandra.distributed.test.TestBaseImpl;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.net.OutboundConnections;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.assertj.core.api.Assertions;
@@ -112,6 +113,8 @@ public class ANNSyntheticScoreDistributedTest extends TestBaseImpl
                                            .withInstanceInitializer((classLoader, threadGroup, node, generation) -> {
                                                if (generation > 0)
                                                    SAIUtil.pinMessagingVersion(MessagingService.VERSION_50, 2).accept(classLoader, node);
+                                               else
+                                                   SAIUtil.ignoreApachePeers(classLoader, node);
                                            })
                                            .withConfig(config -> config.with(GOSSIP).with(NETWORK))
                                            .start(), 1))
@@ -161,11 +164,13 @@ public class ANNSyntheticScoreDistributedTest extends TestBaseImpl
                 // it, so that the real outbound connection serializes the read commands.
                 MessagingService.instance().outboundSink.clear();
                 InetAddressAndPort node2 = InetAddressAndPort.getByAddressOverrideDefaults(address.getAddress(), address.getPort());
+                // a message sent once the connections are closed, such as gossip, opens new ones
+                OutboundConnections connections = MessagingService.instance().channelManagers.get(node2);
                 MessagingService.instance().closeOutboundNow(node2);
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
-                while (MessagingService.instance().channelManagers.containsKey(node2) && System.nanoTime() < deadline)
+                while (MessagingService.instance().channelManagers.get(node2) == connections && System.nanoTime() < deadline)
                     Uninterruptibles.sleepUninterruptibly(10, TimeUnit.MILLISECONDS);
-                Assertions.assertThat(MessagingService.instance().channelManagers).doesNotContainKey(node2);
+                Assertions.assertThat(MessagingService.instance().channelManagers.get(node2)).isNotSameAs(connections);
                 MessagingService.instance().versions.reset(node2);
             });
 

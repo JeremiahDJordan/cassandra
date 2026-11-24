@@ -134,17 +134,17 @@ public class GossipInfoTableTest extends CQLTester
         assertVersion(row, "status_with_port_version", localState, ApplicationState.STATUS_WITH_PORT);
         assertVersion(row, "sstable_versions_version", localState, ApplicationState.SSTABLE_VERSIONS);
         assertVersion(row, "disk_usage_version", localState, ApplicationState.DISK_USAGE);
-        assertVersion(row, "x_11_padding", localState, ApplicationState.X_11_PADDING);
-        assertVersion(row, "x1", localState, ApplicationState.X1);
-        assertVersion(row, "x2", localState, ApplicationState.X2);
-        assertVersion(row, "x3", localState, ApplicationState.X3);
-        assertVersion(row, "x4", localState, ApplicationState.X4);
-        assertVersion(row, "x5", localState, ApplicationState.X5);
-        assertVersion(row, "x6", localState, ApplicationState.X6);
-        assertVersion(row, "x7", localState, ApplicationState.X7);
-        assertVersion(row, "x8", localState, ApplicationState.X8);
-        assertVersion(row, "x9", localState, ApplicationState.X9);
-        assertVersion(row, "x10", localState, ApplicationState.X10);
+        assertVersion(row, "x_11_padding_version", localState, ApplicationState.X_11_PADDING);
+        assertVersion(row, "x1_version", localState, ApplicationState.X1);
+        assertVersion(row, "x2_version", localState, ApplicationState.X2);
+        assertVersion(row, "x3_version", localState, ApplicationState.X3);
+        assertVersion(row, "x4_version", localState, ApplicationState.X4);
+        assertVersion(row, "x5_version", localState, ApplicationState.X5);
+        assertVersion(row, "x6_version", localState, ApplicationState.X6);
+        assertVersion(row, "x7_version", localState, ApplicationState.X7);
+        assertVersion(row, "x8_version", localState, ApplicationState.X8);
+        assertVersion(row, "x9_version", localState, ApplicationState.X9);
+        assertVersion(row, "x10_version", localState, ApplicationState.X10);
     }
 
     private void assertValue(UntypedResultSet.Row row, String column, EndpointState localState, ApplicationState key)

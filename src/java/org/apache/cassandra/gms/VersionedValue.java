@@ -322,6 +322,11 @@ public class VersionedValue implements Comparable<VersionedValue>
             return new VersionedValue(version);
         }
 
+        public VersionedValue compatibilityModes(String modes)
+        {
+            return new VersionedValue(modes);
+        }
+
         @VisibleForTesting
         public VersionedValue networkVersion(int version)
         {

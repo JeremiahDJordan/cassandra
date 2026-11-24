@@ -213,7 +213,7 @@ public final class ReplicaWarnings
     private static boolean shouldSend(InetAddressAndPort destination)
     {
         MessagingService messaging = MessagingService.instance();
-        return shouldSend(MessagingService.current_version,
+        return shouldSend(MessagingService.featureVersion(),
                           messaging.versions.getRawIfKnown(destination),
                           messaging.hasConnectionWithVersionNotMatching(destination, MessagingService::isDataStax50OrLater),
                           destination.equals(FBUtilities.getBroadcastAddressAndPort()));

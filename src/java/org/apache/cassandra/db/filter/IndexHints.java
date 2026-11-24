@@ -435,7 +435,7 @@ public class IndexHints
 
         // Ensure that all nodes in the cluster are in a version that supports index hints, including this one
         Set<InetAddressAndPort> badNodes = MessagingService.instance().endpointsWithConnectionsOnVersionBelow(table.keyspace, MessagingService.VERSION_DS_12);
-        if (MessagingService.current_version < MessagingService.VERSION_DS_12)
+        if (MessagingService.featureVersion() < MessagingService.VERSION_DS_12)
             badNodes.add(FBUtilities.getBroadcastAddressAndPort());
         if (!badNodes.isEmpty())
             throw new InvalidRequestException("Index hints are not supported in clusters below DS 12.");

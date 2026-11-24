@@ -16,13 +16,17 @@
 
 package org.apache.cassandra.schema;
 
+import java.nio.file.StandardOpenOption;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
-import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 import org.slf4j.LoggerFactory;
@@ -32,11 +36,15 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.Mutation;
-import org.apache.cassandra.distributed.shared.WithProperties;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.locator.InetAddressAndPort;
+import org.apache.cassandra.service.ApacheUpgradePath;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.APACHE_UPGRADE_PATH;
 import static org.apache.cassandra.schema.SchemaCompatibility.Target.APACHE_5_0;
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -46,18 +54,18 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 public class SchemaCompatibilityTest extends CQLTester
 {
-    private static WithProperties properties;
-
     @BeforeClass
-    public static void setUpApacheUpgradePath()
+    public static void setUpApacheUpgradePath() throws Exception
     {
-        properties = new WithProperties().set(APACHE_UPGRADE_PATH, "active");
-    }
-
-    @AfterClass
-    public static void tearDownApacheUpgradePath()
-    {
-        properties.close();
+        // in UPGRADING after CASSANDRA_5, beside a ring member whose version isn't known
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.UPGRADING);
+        FileUtils.write(new File(DatabaseDescriptor.getMetadataDirectory(), ApacheUpgradePath.FILE),
+                        Collections.singletonList(StorageCompatibilityMode.CASSANDRA_5.name()),
+                        StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+        StorageService.instance.getTokenMetadata().updateHostId(UUID.randomUUID(), InetAddressAndPort.getByName("127.0.0.2"));
+        ApacheUpgradePath.instance.initialize();
+        ApacheUpgradePath.instance.beforeGossipStart(new HashMap<>());
+        assertThat(ApacheUpgradePath.isActive()).isTrue();
     }
 
     @Test
@@ -112,9 +120,6 @@ public class SchemaCompatibilityTest extends CQLTester
                       "CREATE INDEX t2_analyzed ON " + table + " (t2) USING 'sai' WITH OPTIONS = {'index_analyzer': 'standard'}");
         assertRefused("analysis options on column ck",
                       "CREATE INDEX ck_analyzed ON " + table + " (ck) USING 'sai' WITH OPTIONS = {'ascii': 'true'}");
-        assertRefused("index on blob values of column b", "CREATE INDEX b_index ON " + table + " (b) USING 'sai'");
-        assertRefused("index on blob values of column l", "CREATE INDEX l_index ON " + table + " (l) USING 'sai'");
-        assertRefused("index on blob values of column mb", "CREATE INDEX mb_index ON " + table + " (ENTRIES(mb)) USING 'sai'");
         assertRefused("more than one storage-attached index on column t", "CREATE INDEX t_unanalyzed ON " + table + " (t) USING 'sai'");
 
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v vector<float, 2>)");
@@ -197,6 +202,25 @@ public class SchemaCompatibilityTest extends CQLTester
         assertThat(SchemaCompatibility.incompatibilities(APACHE_5_0, Keyspaces.none(), Keyspaces.of(withTrigger(keyspace, table, "com.example.Trigger")))).isEmpty();
         assertThat(SchemaCompatibility.incompatibilities(APACHE_5_0, Keyspaces.none(), Keyspaces.of(withTrigger(keyspace, table, "org.apache.cassandra.triggers.Trigger"))))
         .containsExactly("table " + KEYSPACE + ".t: trigger org.apache.cassandra.triggers.Trigger");
+    }
+
+    @Test
+    public void testIndexesOnBlobValues()
+    {
+        TableMetadata table = CreateTableStatement.parse("CREATE TABLE t (k int PRIMARY KEY, b blob, l list<blob>, fl frozen<list<blob>>, mb map<int, blob>)", KEYSPACE).build();
+
+        assertThat(withStorageAttachedIndex(table, "full(fl)")).isEmpty();
+        assertThat(withStorageAttachedIndex(table, "b")).containsExactly("table " + KEYSPACE + ".t index i: index on blob values of column b");
+        assertThat(withStorageAttachedIndex(table, "values(l)")).containsExactly("table " + KEYSPACE + ".t index i: index on blob values of column l");
+        assertThat(withStorageAttachedIndex(table, "entries(mb)")).containsExactly("table " + KEYSPACE + ".t index i: index on blob values of column mb");
+    }
+
+    private static List<String> withStorageAttachedIndex(TableMetadata table, String target)
+    {
+        IndexMetadata index = IndexMetadata.fromSchemaMetadata("i", IndexMetadata.Kind.CUSTOM, Map.of(IndexTarget.CUSTOM_INDEX_OPTION_NAME, StorageAttachedIndex.class.getName(),
+                                                                                                       IndexTarget.TARGET_OPTION_NAME, target));
+        KeyspaceMetadata keyspace = KeyspaceMetadata.create(KEYSPACE, KeyspaceParams.simple(1), Tables.of(table.withSwapped(Indexes.of(index))));
+        return SchemaCompatibility.incompatibilities(APACHE_5_0, Keyspaces.none(), Keyspaces.of(keyspace));
     }
 
     @Test

@@ -156,6 +156,7 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION.setInt(MessagingService.VERSION_50);
 
         try (Cluster cluster = init(Cluster.build(NUM_REPLICAS)
+                                           .withInstanceInitializer(SAIUtil::ignoreApachePeers)
                                            .withConfig(config -> config.with(GOSSIP).with(NETWORK))
                                            .start(), RF))
         {

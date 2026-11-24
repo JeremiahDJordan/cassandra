@@ -128,6 +128,7 @@ import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.repair.autorepair.AutoRepair;
 import org.apache.cassandra.service.ActiveRepairService;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.CassandraDaemon;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
@@ -672,6 +673,8 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
                 // Same order to populate tokenMetadata for the first time,
                 // see org.apache.cassandra.service.CassandraDaemon.setup
                 StorageService.instance.populateTokenMetadata();
+
+                ApacheUpgradePath.instance.initialize();
 
                 try
                 {

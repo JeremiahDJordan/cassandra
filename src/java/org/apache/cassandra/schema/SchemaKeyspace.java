@@ -615,11 +615,12 @@ public final class SchemaKeyspace
 
     /**
      * Whether the deterministic and monotonic columns are written to the functions or aggregates schema table: the
-     * table has them, and the Apache upgrade path, whose schema has no such columns, isn't active.
+     * table has them, and this node doesn't use Apache's schema columns, which have none of them (see
+     * {@link ApacheUpgradePath#usesApacheSchemaColumns()}).
      */
     private static boolean writesDeterminism(TableMetadata schemaTable)
     {
-        return isWritable(schemaTable, "deterministic") && !ApacheUpgradePath.isActive();
+        return isWritable(schemaTable, "deterministic") && !ApacheUpgradePath.usesApacheSchemaColumns();
     }
 
     /**
@@ -730,13 +731,14 @@ public final class SchemaKeyspace
     /**
      * Read schema from system keyspace and calculate MD5 digest of every row, resulting digest
      * will be converted into UUID which would act as content-based version of the schema.
-     * While the Apache upgrade path is active, only the columns of Apache Cassandra 5.0's schema tables are read, so
-     * that the digest equals the one Apache Cassandra 5.0 nodes compute.
+     * While this node uses Apache's schema columns (see {@link ApacheUpgradePath#usesApacheSchemaColumns()}), only the
+     * columns of Apache Cassandra 5.0's schema tables are read, so that the digest equals the one Apache Cassandra 5.0
+     * nodes compute.
      */
     public static UUID calculateSchemaDigest()
     {
         Digest digest = Digest.forSchema();
-        boolean cassandra5Columns = ApacheUpgradePath.isActive();
+        boolean cassandra5Columns = ApacheUpgradePath.usesApacheSchemaColumns();
         for (String table : ALL)
         {
             ReadCommand cmd = cassandra5Columns ? getCassandra5ColumnsReadCommandForTableSchema(table)

@@ -36,6 +36,7 @@ import java.util.stream.Collectors;
 import net.bytebuddy.ByteBuddy;
 import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
 import net.bytebuddy.implementation.FixedValue;
+import net.bytebuddy.implementation.StubMethod;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
@@ -57,6 +58,7 @@ import org.apache.cassandra.index.sai.virtual.ColumnIndexesSystemView;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.ClientState;
 import org.assertj.core.util.Streams;
 import org.awaitility.core.ConditionTimeoutException;
@@ -332,7 +334,8 @@ public class SAIUtil
     }
 
     /**
-     * Returns an instance initializer that makes the given nodes speak the given messaging version.
+     * Returns an instance initializer that makes the given nodes speak the given messaging version. A node pinned to
+     * messaging version 13 isn't taken for an Apache Cassandra 5.0 node (see {@link #ignoreApachePeers}).
      */
     public static BiConsumer<ClassLoader, Integer> pinMessagingVersion(int version, int... nodes)
     {
@@ -345,7 +348,24 @@ public class SAIUtil
                                .make()
                                .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
             }
+            if (version == MessagingService.VERSION_50)
+                ignoreApachePeers(classLoader, node);
         };
+    }
+
+    /**
+     * An instance initializer that keeps the Apache upgrade path from taking the nodes at messaging version 13 of this
+     * build for Apache Cassandra 5.0 nodes, which would make the node check schema changes against Apache Cassandra 5.0
+     * and use its schema columns. Its schema handling is tested with Apache nodes (see
+     * {@code ApacheMixedClusterTestBase}).
+     */
+    public static void ignoreApachePeers(ClassLoader classLoader, int node)
+    {
+        new ByteBuddy().rebase(ApacheUpgradePath.class)
+                       .method(named("decide"))
+                       .intercept(StubMethod.INSTANCE)
+                       .make()
+                       .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
     }
 
     public static List<String> toStrings(Object[][] rows)

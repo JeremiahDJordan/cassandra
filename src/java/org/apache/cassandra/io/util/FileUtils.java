@@ -611,6 +611,25 @@ public final class FileUtils
     }
 
     /**
+     * Replaces the content of {@code file} with {@code lines}, so that a crash leaves either the old or the new
+     * content: writes and syncs a temporary file beside it, renames it over {@code file} and syncs the directory.
+     */
+    public static void writeAtomically(File file, List<String> lines)
+    {
+        File temporary = new File(file.parent(), file.name() + ".tmp");
+        write(temporary, lines, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING, StandardOpenOption.SYNC);
+        try
+        {
+            Files.move(temporary.toPath(), file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        }
+        catch (IOException e)
+        {
+            throw new FSWriteError(e, file);
+        }
+        SyncUtil.trySyncDir(file.parent());
+    }
+
+    /**
      * Write lines to a file adding a newline to the end of each supplied line using the provided open options.
      *
      * If open option sync or dsync is provided this will not open the file with sync or dsync since it might end up syncing

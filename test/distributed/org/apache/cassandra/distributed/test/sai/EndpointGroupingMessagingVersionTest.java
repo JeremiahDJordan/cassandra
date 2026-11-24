@@ -127,6 +127,8 @@ public class EndpointGroupingMessagingVersionTest extends TestBaseImpl
                                            .withInstanceInitializer((classLoader, threadGroup, node, generation) -> {
                                                if (generation > 0)
                                                    SAIUtil.pinMessagingVersion(MessagingService.VERSION_50, 3).accept(classLoader, node);
+                                               else
+                                                   SAIUtil.ignoreApachePeers(classLoader, node);
                                            })
                                            .withConfig(config -> config.with(GOSSIP).with(NETWORK))
                                            .start(), 2))

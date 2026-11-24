@@ -236,7 +236,7 @@ public class RowFilter
      */
     private static boolean mayHavePeersBelowDS10(String keyspace, ConsistencyLevel consistency)
     {
-        if (MessagingService.current_version < MessagingService.VERSION_DS_10)
+        if (MessagingService.featureVersion() < MessagingService.VERSION_DS_10)
             return true;
 
         return peerChecks.get(keyspace, consistency) || isMarkedBelowDS10(keyspace);

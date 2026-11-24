@@ -21,7 +21,7 @@ import org.junit.Test;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.shared.WithProperties;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.APACHE_UPGRADE_PATH;
+import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 
 /**
  * While the Apache upgrade path is active, a vector index is accepted on a node with one data directory and a
@@ -32,10 +32,11 @@ public class ApacheUpgradePathVectorIndexTest extends TestBaseImpl
     @Test
     public void testVectorIndexWithSeparateLocalSystemDataDirectory() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(APACHE_UPGRADE_PATH, "active");
+        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
              Cluster cluster = init(Cluster.build(1)
                                            .withDataDirCount(1)
-                                           .withConfig(config -> config.set("local_system_data_file_directory",
+                                           .withConfig(config -> config.set("storage_compatibility_mode", "CASSANDRA_5")
+                                                                       .set("local_system_data_file_directory",
                                                                             ((String[]) config.get("data_file_directories"))[0] + "_local_system"))
                                            .start()))
         {

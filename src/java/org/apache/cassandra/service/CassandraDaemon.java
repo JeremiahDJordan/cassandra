@@ -292,6 +292,8 @@ public class CassandraDaemon
         // Populate token metadata before flushing, for token-aware sstable partitioning (#6696)
         StorageService.instance.populateTokenMetadata();
 
+        ApacheUpgradePath.instance.initialize();
+
         try
         {
             // load schema from disk

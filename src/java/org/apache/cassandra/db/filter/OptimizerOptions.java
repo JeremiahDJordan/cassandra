@@ -144,7 +144,7 @@ public class OptimizerOptions
     {
         assert keyspace != null;
         Set<InetAddressAndPort> badNodes = MessagingService.instance().endpointsWithConnectionsOnVersionBelow(keyspace, MessagingService.VERSION_DS_20);
-        if (MessagingService.current_version < MessagingService.VERSION_DS_20)
+        if (MessagingService.featureVersion() < MessagingService.VERSION_DS_20)
             badNodes.add(FBUtilities.getBroadcastAddressAndPort());
         if (!badNodes.isEmpty())
             throw new InvalidRequestException("SAI optimizer options are not supported in clusters below DS 20.");

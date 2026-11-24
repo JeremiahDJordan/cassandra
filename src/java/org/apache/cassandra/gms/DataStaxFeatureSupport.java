@@ -94,7 +94,7 @@ public final class DataStaxFeatureSupport
         Set<InetAddressAndPort> nodes = new HashSet<>();
 
         InetAddressAndPort local = FBUtilities.getBroadcastAddressAndPort();
-        if (!MessagingService.isDataStax21OrLater(MessagingService.current_version))
+        if (!MessagingService.isDataStax21OrLater(MessagingService.featureVersion()))
             nodes.add(local);
 
         MessagingService messaging = MessagingService.instance();

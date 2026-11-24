@@ -48,6 +48,7 @@ import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
 import org.apache.cassandra.metrics.MessagingMetrics;
 import org.apache.cassandra.service.AbstractWriteResponseHandler;
+import org.apache.cassandra.service.ApacheUpgradePath;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
@@ -320,6 +321,15 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
                 return version;
         }
         throw new IllegalArgumentException("Unsupported current messaging version: " + version);
+    }
+
+    /**
+     * The messaging version whose features this node uses for its own requests: {@link #VERSION_50} while the Apache
+     * upgrade path is active, as Apache Cassandra 5.0 nodes may share the cluster, {@link #current_version} otherwise.
+     */
+    public static int featureVersion()
+    {
+        return ApacheUpgradePath.isActive() ? VERSION_50 : current_version;
     }
 
     /**
