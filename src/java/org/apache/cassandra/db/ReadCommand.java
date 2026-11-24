@@ -94,6 +94,7 @@ import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexNotAvailableException;
 import org.apache.cassandra.index.IndexRegistry;
 import org.apache.cassandra.index.SecondaryIndexManager;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -392,6 +393,15 @@ public abstract class ReadCommand extends AbstractReadQuery
         return indexQueryPlan != null
                && !rowFilter().isStrict()
                && indexQueryPlan.returnsCandidatesForNonStrictFilters();
+    }
+
+    /**
+     * Whether the replicas filter this read with SAI: they build their index query plan from the index that the read
+     * names (see Serializer#serialize).
+     */
+    public boolean isFilteredBySAI()
+    {
+        return indexQueryPlan != null && indexQueryPlan.getFirst() instanceof StorageAttachedIndex;
     }
 
     /**
@@ -1771,7 +1781,7 @@ public abstract class ReadCommand extends AbstractReadQuery
             command.metadata().id.serialize(out);
             out.writeInt(MessagingService.Version.supportsExtendedDeletionTime(version) ? CassandraUInt.fromLong(command.nowInSec()) : (int) command.nowInSec());
             ColumnFilter.serializer.serialize(command.columnFilter(version), out, version);
-            RowFilter.serializer.serialize(command.rowFilter(), out, version);
+            RowFilter.serializer.serialize(command.rowFilter(), out, version, command.isFilteredBySAI());
             DataLimits.serializer.serialize(command.limits(), out, version, command.metadata().comparator);
             // Using the name of one of the indexes in the plan to identify the index group because we want
             // to keep compatibility with legacy nodes. Each replica can create its own different index query plan

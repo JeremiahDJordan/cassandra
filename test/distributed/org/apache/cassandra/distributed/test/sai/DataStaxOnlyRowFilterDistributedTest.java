@@ -77,7 +77,13 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         new String[]{ "SELECT k FROM %s.t WHERE n = 1 OR n = 2", "The OR operator" },
         new String[]{ "SELECT k FROM %s.t WHERE GEO_DISTANCE(vec, [1, 1]) < 1000", "GEO_DISTANCE" },
         new String[]{ "SELECT k FROM %s.t ORDER BY n ASC LIMIT 3", "ORDER BY on a non-clustering column" },
-        new String[]{ "SELECT k FROM %s.t ORDER BY v BM25 OF 'apple' LIMIT 3", "ORDER BY BM25" });
+        new String[]{ "SELECT k FROM %s.t ORDER BY v BM25 OF 'apple' LIMIT 3", "ORDER BY BM25" },
+        // the SAI filtering of Apache Cassandra 5.0 nodes ignores !=, which NOT IN is sent as
+        new String[]{ "SELECT k FROM %s.t WHERE n >= 0 AND n != 1 ALLOW FILTERING", RowFilter.SAI_EXCLUSION },
+        new String[]{ "SELECT k FROM %s.t WHERE a = 'APPLE' AND n NOT IN (1, 2) ALLOW FILTERING", RowFilter.SAI_EXCLUSION });
+
+    /** A query whose IN the SAI of Apache Cassandra 5.0 nodes refuses at a consistency level that needs reconciliation. */
+    private static final String NON_STRICT_IN_QUERY = "SELECT k FROM %s.t WHERE n = 1 AND u IN ('Apple', 'pear') ALLOW FILTERING";
 
     /** Queries that Apache Cassandra 5.0 nodes can deserialize, with the number of rows they find. */
     private static final Map<String, Integer> APACHE_QUERIES = new LinkedHashMap<>();
@@ -88,6 +94,8 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE n NOT IN (1, 2) ALLOW FILTERING", 1);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE n > 0 AND n < 2", 1);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE n != 2 ALLOW FILTERING", 2);
+        // a read of a single row doesn't use the index
+        APACHE_QUERIES.put("SELECT k FROM %s.t WHERE k = 1 AND n >= 0 AND n != 1 ALLOW FILTERING", 0);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE s CONTAINS 1 ALLOW FILTERING", 3);
         // sent as the analyzed equality it is on a non-tokenizing index
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE a = 'APPLE'", 3);
@@ -97,6 +105,8 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE u IN ('Apple', 'pear') ALLOW FILTERING", 3);
         APACHE_QUERIES.put("SELECT k FROM %s.t WHERE m['a'] = 1", 3);
         APACHE_QUERIES.put("SELECT k FROM %s.t ORDER BY vec ANN OF [1, 1] LIMIT 1", 1);
+        // top-k reads are read at ONE, which needs no reconciliation
+        APACHE_QUERIES.put("SELECT k FROM %s.t WHERE m['a'] = 1 AND n IN (0, 1) ORDER BY vec ANN OF [1, 1] LIMIT 1", 1);
     }
 
     @After
@@ -125,6 +135,7 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
                 assertAccepted(cluster, query[0]);
             }
             assertRowCounts(cluster, APACHE_QUERIES);
+            assertRowCounts(cluster, Collections.singletonMap(NON_STRICT_IN_QUERY, 1));
         }
     }
 
@@ -144,6 +155,7 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
 
             assertRejected(cluster, DATASTAX_ONLY_QUERIES);
             assertRowCounts(cluster, APACHE_QUERIES);
+            assertNonStrictInRejected(cluster);
         }
     }
 
@@ -167,6 +179,7 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
             assertRowCounts(cluster, APACHE_QUERIES);
 
             assertRejected(cluster, DATASTAX_ONLY_QUERIES);
+            assertNonStrictInRejected(cluster);
         }
     }
 
@@ -195,7 +208,9 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
             for (String query : Arrays.asList("SELECT k FROM %s.t WHERE n = 1 OR n = 2",
                                               "SELECT k FROM %s.t WHERE s NOT CONTAINS 7 ALLOW FILTERING",
                                               "SELECT k FROM %s.t WHERE k = 1 AND s NOT CONTAINS 7 ALLOW FILTERING",
-                                              "SELECT k FROM %s.t WHERE m['a'] > 0"))
+                                              "SELECT k FROM %s.t WHERE m['a'] > 0",
+                                              "SELECT k FROM %s.t WHERE n >= 0 AND n != 1 ALLOW FILTERING",
+                                              NON_STRICT_IN_QUERY))
             {
                 long start = System.nanoTime();
                 Assertions.assertThatThrownBy(() -> cluster.coordinator(2).execute(withKeyspace(query), ConsistencyLevel.ALL))
@@ -274,6 +289,13 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
             Assertions.assertThat(cluster.get(2).logs().grep("Cannot serialize a row filter for messaging version " +
                                                              MessagingService.VERSION_50 + ": nodes on that version don't apply it strictly")
                                          .getResult()).isNotEmpty();
+
+            // the read of a single row doesn't use the index, but the read again with a filter that replicas can relax
+            // does, and its filter is checked again
+            waitForMarkExpiry();
+            String notEqualQuery = "SELECT k FROM %s.t WHERE k = 1 AND n = 1 AND a = 'APPLE' AND u != 'x' ALLOW FILTERING";
+            Assertions.assertThatThrownBy(() -> execute(cluster, notEqualQuery, ConsistencyLevel.ALL, false))
+                      .hasMessageContaining(String.format(RowFilter.DATASTAX_ONLY_FEATURE_ERROR, RowFilter.SAI_EXCLUSION));
         }
     }
 
@@ -490,7 +512,26 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
         }
     }
 
+    /**
+     * The IN of {@link #NON_STRICT_IN_QUERY} is rejected at ALL, and accepted at ONE, which needs no reconciliation.
+     */
+    private static void assertNonStrictInRejected(Cluster cluster)
+    {
+        String feature = String.format(RowFilter.SAI_NON_STRICT_OPERATOR, "IN");
+        assertRejected(cluster, Collections.singletonList(new String[]{ NON_STRICT_IN_QUERY, feature }), ConsistencyLevel.ALL);
+        for (int i = 1; i <= cluster.size(); i++)
+        {
+            Object[][] rows = cluster.coordinator(i).execute(withKeyspace(NON_STRICT_IN_QUERY), ConsistencyLevel.ONE);
+            Assertions.assertThat(rows.length).as("node" + i).isEqualTo(1);
+        }
+    }
+
     private static void assertRejected(Cluster cluster, List<String[]> queries)
+    {
+        assertRejected(cluster, queries, ConsistencyLevel.ONE);
+    }
+
+    private static void assertRejected(Cluster cluster, List<String[]> queries, ConsistencyLevel consistency)
     {
         List<String> notRejected = new ArrayList<>();
         for (String[] query : queries)
@@ -501,7 +542,7 @@ public class DataStaxOnlyRowFilterDistributedTest extends TestBaseImpl
                 ICoordinator coordinator = cluster.coordinator(i);
                 try
                 {
-                    coordinator.execute(withKeyspace(query[0]), ConsistencyLevel.ONE);
+                    coordinator.execute(withKeyspace(query[0]), consistency);
                     notRejected.add("node" + i + ": " + query[0]);
                 }
                 catch (Throwable t)

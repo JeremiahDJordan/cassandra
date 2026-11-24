@@ -97,6 +97,7 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.PartitionRangeReadQuery;
+import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.ReadQuery;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
@@ -553,7 +554,8 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
 
     /**
      * Returns the given read with a row filter that replicas can relax, if its filter was made strict and the read can
-     * contact nodes below DS 10, or {@code null} otherwise.
+     * contact nodes below DS 10, or {@code null} otherwise. The new read may be filtered by SAI where the given one
+     * wasn't, so its filter is checked for those nodes again (see {@link RowFilter#validateForPeers}).
      */
     @Nullable
     private ReadQuery withRelaxableRowFilter(ReadQuery query, QueryOptions options, ClientState state)
@@ -562,8 +564,10 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         if (rowFilter == null)
             return null;
 
-        return getReadQuery(options, state, query.columnFilter(), rowFilter, query.limits(), query.nowInSec(),
-                            IndexRegistry.obtain(table));
+        ReadQuery retry = getReadQuery(options, state, query.columnFilter(), rowFilter, query.limits(),
+                                       query.nowInSec(), IndexRegistry.obtain(table));
+        rowFilter.validateForPeers(table.keyspace, options.getConsistency(), isFilteredBySAI(retry));
+        return retry;
     }
 
     /**
@@ -649,12 +653,6 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         RowFilter rowFilter = restrictions.getRowFilter(indexRegistry, options, state, selectOptions);
         DataLimits dataLimits = getDataLimits(state, userLimit, perPartitionLimit, userOffset, aggregationSpec);
 
-        // Reject the DataStax-only parts of the filter (operators, OR...) while there are nodes that can't
-        // deserialize them, such as Apache Cassandra nodes during an upgrade. Local tables are never sent to them.
-        // Other queries that only run locally (e.g. internal ones) are rejected too, as where they run isn't known here.
-        if (!table.isVirtual() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
-            rowFilter.validateForPeers(table.keyspace, options.getConsistency());
-
         ReadQuery query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
 
         // Whether the read uses an index is decided from its index query plan rather than from the restrictions, which
@@ -700,6 +698,13 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
             // We don't support aggregation for top-k queries because we don't support paging.
             checkFalse(aggregationSpec != null, TOPK_AGGREGATION_ERROR);
         }
+
+        // Reject the DataStax-only parts of the filter (operators, OR...) while there are nodes that can't
+        // deserialize them, or evaluate them differently, such as Apache Cassandra nodes during an upgrade. Local
+        // tables are never sent to them. Other queries that only run locally (e.g. internal ones) are rejected too, as
+        // where they run isn't known here.
+        if (!table.isVirtual() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
+            rowFilter.validateForPeers(table.keyspace, options.getConsistency(), isFilteredBySAI(query));
 
         guardIntersectFiltering(rowFilter, state);
 
@@ -1131,6 +1136,25 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     {
         checkFalse(!parameters.orderings.isEmpty() && !query.rowFilter().hasOrdering() && hasIndexQueryPlan(query),
                    ORDER_BY_WITH_INDEX_MESSAGE);
+    }
+
+    /**
+     * Returns whether SAI filters the given read, or any of the single-partition reads that it groups.
+     */
+    private static boolean isFilteredBySAI(ReadQuery query)
+    {
+        if (query instanceof ReadCommand)
+            return ((ReadCommand) query).isFilteredBySAI();
+
+        if (query instanceof SinglePartitionReadQuery.Group)
+        {
+            for (SinglePartitionReadQuery partitionQuery : ((SinglePartitionReadQuery.Group<?>) query).queries)
+            {
+                if (partitionQuery instanceof ReadCommand && ((ReadCommand) partitionQuery).isFilteredBySAI())
+                    return true;
+            }
+        }
+        return false;
     }
 
     /**

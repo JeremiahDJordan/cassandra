@@ -630,7 +630,7 @@ public class RowFilterPeerGateTest extends CQLTester
                                                ClientState.forInternalCalls());
         try
         {
-            filter.validateForPeers(KEYSPACE, consistency);
+            filter.validateForPeers(KEYSPACE, consistency, false);
             return true;
         }
         catch (InvalidRequestException e)
