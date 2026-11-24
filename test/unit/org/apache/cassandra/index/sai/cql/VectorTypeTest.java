@@ -27,17 +27,34 @@ import java.util.stream.Collectors;
 
 import org.junit.Test;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.PartitionRangeReadCommand;
+import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
+import org.apache.cassandra.index.sai.disk.SSTableIndex;
+import org.apache.cassandra.index.sai.disk.v1.V1SSTableIndex;
+import org.apache.cassandra.index.sai.memory.VectorMemoryIndex;
 import org.apache.cassandra.index.sai.plan.QueryController;
+import org.apache.cassandra.inject.ActionBuilder;
+import org.apache.cassandra.inject.Expression;
+import org.apache.cassandra.inject.Injection;
+import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
+import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.inject.InvokePointBuilder.newInvokePoint;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
@@ -46,6 +63,14 @@ import static org.junit.Assert.assertTrue;
 public class VectorTypeTest extends VectorTester
 {
     private static final IPartitioner partitioner = Murmur3Partitioner.instance;
+    private static final Injection FAIL_INDEX_BUILD = Injections.newCustom("fail_index_build")
+                                                                .add(newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("build"))
+                                                                .add(ActionBuilder.newActionBuilder().actions().doThrow(RuntimeException.class, Expression.quote("Injected failure!")))
+                                                                .build();
+    private static final Injections.Counter VECTOR_SEARCH_COUNTER = Injections.newCounter("VectorSearchCounter")
+                                                                              .add(newInvokePoint().onClass(VectorMemoryIndex.class).onMethod("orderBy"))
+                                                                              .add(newInvokePoint().onClass(V1SSTableIndex.class).onMethod("orderBy"))
+                                                                              .build();
 
     @Test
     public void endToEndTest()
@@ -200,6 +225,135 @@ public class VectorTypeTest extends VectorTester
 
         result = execute("SELECT * FROM %s WHERE b=true AND str='B' ORDER BY v ANN OF [3.1, 4.1, 5.1] LIMIT 2");
         assertThat(result).hasSize(1);
+    }
+
+    @Test
+    public void testInRestrictionOnIndexedColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, x int, v vector<float, 2>, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        List<Object[]> inPositiveTokens = new ArrayList<>();
+        for (int i = 0; i < 100; i++)
+        {
+            execute("INSERT INTO %s (pk, x, v) VALUES (?, ?, ?)", i, i % 10, vector((float) i, (float) i));
+            if ((i % 10 == 1 || i % 10 == 2) && (long) partitioner.getToken(Int32Type.instance.decompose(i)).getTokenValue() >= 0)
+                inPositiveTokens.add(row(i));
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk FROM %s WHERE x IN (1, 2) ORDER BY v ANN OF [50, 50] LIMIT 5 ALLOW FILTERING"),
+                       row(51), row(52), row(42), row(41), row(61));
+            assertRowCount(execute("SELECT pk FROM %s WHERE x IN (1, 2) ORDER BY v ANN OF [50, 50] LIMIT 50 ALLOW FILTERING"), 20);
+            // in a restricted token range, forceBruteForceQueries chooses between brute force and graph search
+            assertRowsIgnoringOrder(execute("SELECT pk FROM %s WHERE token(pk) >= 0 AND x IN (1, 2) ORDER BY v ANN OF [50, 50] LIMIT 50 ALLOW FILTERING"),
+                                    inPositiveTokens.toArray(new Object[0][]));
+        });
+    }
+
+    @Test
+    public void testSelectiveInRestrictionUsesIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, x int, v vector<float, 2>, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        for (int i = 0; i < 1000; i++)
+            execute("INSERT INTO %s (pk, x, v) VALUES (?, ?, ?)", i, i, vector((float) i, (float) i));
+
+        Injections.inject(VECTOR_SEARCH_COUNTER);
+        beforeAndAfterFlush(() -> {
+            VECTOR_SEARCH_COUNTER.reset();
+            assertRows(execute("SELECT pk FROM %s ORDER BY v ANN OF [500, 500] LIMIT 1"), row(500));
+            assertTrue(VECTOR_SEARCH_COUNTER.get() > 0);
+
+            // the IN is served by the index on x, and only its rows are ordered, without searching the vector index
+            VECTOR_SEARCH_COUNTER.reset();
+            assertRows(execute("SELECT pk FROM %s WHERE x IN (10, 980) ORDER BY v ANN OF [500, 500] LIMIT 10 ALLOW FILTERING"),
+                       row(980), row(10));
+            assertEquals(0, VECTOR_SEARCH_COUNTER.get());
+        });
+    }
+
+    @Test
+    public void testInRestrictionOnNotQueryableIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, x int, v vector<float, 2>, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+        for (int i = 0; i < 100; i++)
+            execute("INSERT INTO %s (pk, x, v) VALUES (?, ?, ?)", i, i % 10, vector((float) i, (float) i));
+        flush();
+
+        Injections.inject(FAIL_INDEX_BUILD);
+        FAIL_INDEX_BUILD.enable();
+        try
+        {
+            verifyInitialIndexFailed(createIndexAsync("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'"));
+        }
+        finally
+        {
+            FAIL_INDEX_BUILD.disable();
+        }
+        execute("INSERT INTO %s (pk, x, v) VALUES (?, ?, ?)", 1000, 1, vector(50f, 50f));
+
+        // the IN is applied to the rows the ANN index orders, as the index on x can't be searched
+        assertRows(execute("SELECT pk FROM %s WHERE x IN (1, 2) ORDER BY v ANN OF [50, 50] LIMIT 5 ALLOW FILTERING"),
+                   row(1000), row(51), row(52), row(42), row(41));
+    }
+
+    @Test
+    public void testInRestrictionReleasesIndexes() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, x int, v vector<float, 2>, PRIMARY KEY(pk))");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+        for (int i = 0; i < 100; i++)
+            execute("INSERT INTO %s (pk, x, v) VALUES (?, ?, ?)", i, i, vector((float) i, (float) i));
+        flush();
+
+        Collection<SSTableIndex> sstableIndexes = ((StorageAttachedIndex) getIndex(index)).view().getIndexes();
+        assertRows(execute("SELECT pk FROM %s WHERE x IN (10, 1000) ORDER BY v ANN OF [50, 50] LIMIT 5 ALLOW FILTERING"), row(10));
+
+        // the indexes of the compacted SSTables are released once no query references them
+        execute("INSERT INTO %s (pk, x, v) VALUES (?, ?, ?)", 100, 100, vector(100f, 100f));
+        flush();
+        compact();
+        waitForAssert(() -> assertTrue(sstableIndexes.stream().allMatch(SSTableIndex::isReleased)));
+    }
+
+    @Test
+    public void testInRestrictionWithReconciliation() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, x int, y int, v vector<float, 2>, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(y) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        // y = 2 may be on another replica
+        execute("INSERT INTO %s (pk, x, v) VALUES (1, 1, [1, 1])");
+
+        beforeAndAfterFlush(() -> {
+            assertEquals(List.of(1), readNeedingReconciliation("SELECT pk FROM %s WHERE x = 1 AND y = 2 ORDER BY v ANN OF [1, 1] LIMIT 5 ALLOW FILTERING"));
+            assertEquals(List.of(1), readNeedingReconciliation("SELECT pk FROM %s WHERE x IN (1, 9) AND y = 2 ORDER BY v ANN OF [1, 1] LIMIT 5 ALLOW FILTERING"));
+        });
+    }
+
+    @Test
+    public void testInRestrictionOnStaticColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, s int static, v vector<float, 2>, PRIMARY KEY (pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+        for (int pk = 0; pk < 5; pk++)
+        {
+            execute("INSERT INTO %s (pk, s) VALUES (?, ?)", pk, pk);
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, v) VALUES (?, ?, ?)", pk, ck, vector((float) (pk * 3 + ck), (float) (pk * 3 + ck)));
+        }
+
+        beforeAndAfterFlush(() -> assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE s IN (1, 3) ORDER BY v ANN OF [4, 4] LIMIT 10 ALLOW FILTERING"),
+                                                          row(1, 0), row(1, 1), row(1, 2), row(3, 0), row(3, 1), row(3, 2)));
     }
 
     @Test
@@ -719,5 +873,19 @@ public class VectorTypeTest extends VectorTester
         {
             QueryController.MAX_MATERIALIZED_KEYS = originalValue;
         }
+    }
+
+    /**
+     * Returns the partition keys this node returns for the query as a replica of a read that needs reconciliation.
+     */
+    private List<Integer> readNeedingReconciliation(String query)
+    {
+        SelectStatement select = (SelectStatement) QueryProcessor.getStatement(formatQuery(query), ClientState.forInternalCalls());
+        PartitionRangeReadCommand command = (PartitionRangeReadCommand) select.getQuery(QueryOptions.DEFAULT, FBUtilities.nowInSeconds());
+        RowFilter filter = RowFilter.create(true);
+        command.rowFilter().forEach(filter::add);
+        PartitionRangeReadCommand reconciled = PartitionRangeReadCommand.create(command.metadata(), command.nowInSec(), command.columnFilter(),
+                                                                                filter, command.limits(), command.dataRange());
+        return Util.getAll(reconciled).stream().map(p -> Int32Type.instance.compose(p.partitionKey().getKey())).collect(Collectors.toList());
     }
 }

@@ -333,7 +333,7 @@ public class KeyRangeIntersectionIterator extends KeyRangeIterator
             if (ranges.size() == 1)
             {
                 KeyRangeIterator single = ranges.get(0);
-                single.setOnClose(onClose);
+                single.addOnClose(onClose);
                 return single;
             }
 

@@ -41,8 +41,11 @@ import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.analyzer.AbstractAnalyzer;
 import org.apache.cassandra.index.sai.disk.v1.vector.PrimaryKeyWithScore;
+import org.apache.cassandra.index.sai.iterators.KeyRangeIntersectionIterator;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
+import org.apache.cassandra.index.sai.iterators.KeyRangeUnionIterator;
 import org.apache.cassandra.index.sai.utils.IndexTermType;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.utils.CloseableIterator;
 
@@ -342,12 +345,52 @@ public class Operation
      */
     static CloseableIterator<PrimaryKeyWithScore> buildIteratorForOrder(QueryController controller, QueryViewBuilder.QueryExpressionView view)
     {
-        if (controller.indexFilter().getExpressions().size() == 1)
-            // If we only have one expression, we just use the ANN index to order and limit.
+        // An IN is applied by the filter tree; if an index serves = on its column, it is also searched as the union of
+        // the = searches of its values.
+        List<KeyRangeIterator> iterators = new ArrayList<>();
+        KeyRangeIterator iterator;
+        try
+        {
+            boolean hasIndexedExpression = false;
+            for (RowFilter.Expression expression : controller.indexFilter().getExpressions())
+            {
+                if (expression.operator() == Operator.ANN)
+                    continue;
+
+                if (controller.indexFor(expression) != null)
+                {
+                    hasIndexedExpression = true;
+                }
+                else if (expression.operator() == Operator.IN)
+                {
+                    KeyRangeIterator in = controller.getInQueryResults(expression);
+                    if (in != null)
+                        iterators.add(in);
+                }
+            }
+
+            if (hasIndexedExpression)
+                iterators.add(buildIterator(controller));
+
+            // Without strict filtering the searches are combined as in QueryController#getIndexQueryResults, and the
+            // filter tree applies the restrictions.
+            KeyRangeIterator.Builder builder = controller.usesStrictFiltering()
+                                               ? KeyRangeIntersectionIterator.builder(iterators.size(), () -> {})
+                                               : KeyRangeUnionIterator.builder(iterators.size(), () -> {});
+            iterator = iterators.size() <= 1 ? Iterables.getFirst(iterators, null) : builder.add(iterators).build();
+        }
+        catch (Throwable t)
+        {
+            iterators.forEach(FileUtils::closeQuietly);
+            throw t;
+        }
+
+        if (iterator == null)
+            // If no other expression is served by an index, we just use the ANN index to order and limit, and the
+            // other expressions are applied to the ordered rows by the filter tree.
             return controller.getTopKRows(view);
 
         // Otherwise, we need to search first, then order.
-        KeyRangeIterator iterator = buildIterator(controller);
         return controller.getTopKRows(iterator, view);
     }
 

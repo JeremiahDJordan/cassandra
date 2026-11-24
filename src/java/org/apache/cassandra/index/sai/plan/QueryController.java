@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.index.sai.plan;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -32,6 +33,7 @@ import javax.annotation.Nullable;
 import com.google.common.collect.Lists;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.CellSourceIdentifier;
 import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
@@ -48,6 +50,7 @@ import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.guardrails.Guardrails;
+import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
@@ -335,6 +338,44 @@ public class QueryController
             throw t;
         }
         return builder;
+    }
+
+    /**
+     * Returns the union of the index searches for {@code =} with each value of an {@code IN} expression, or null if no
+     * queryable index serves {@code =} on its column, or if the column is static, as the keys of a static column's
+     * index don't match the rows an ANN index orders.
+     */
+    @Nullable
+    public KeyRangeIterator getInQueryResults(RowFilter.Expression in)
+    {
+        List<ByteBuffer> values = ListType.getInstance(in.column().type, false).unpack(in.getIndexValue());
+        if (values.isEmpty() || in.column().isStatic())
+            return null;
+
+        StorageAttachedIndex index = indexFor(equality(in, values.get(0)));
+        if (index == null || !cfs.indexManager.isIndexQueryable(index))
+            return null;
+
+        KeyRangeIterator.Builder builder = KeyRangeUnionIterator.builder(values.size());
+        try
+        {
+            for (ByteBuffer value : values)
+            {
+                List<RowFilter.Expression> equality = new ArrayList<>(List.of(equality(in, value)));
+                builder.add(getIndexQueryResults(Operation.buildIndexExpressions(this, equality).all()).build());
+            }
+        }
+        catch (Throwable t)
+        {
+            builder.cleanup();
+            throw t;
+        }
+        return builder.build();
+    }
+
+    private RowFilter.Expression equality(RowFilter.Expression in, ByteBuffer value)
+    {
+        return RowFilter.create(true, indexFilter.indexHints).add(in.column(), Operator.EQ, value);
     }
 
     void maybeTriggerGuardrails(QueryViewBuilder.QueryView queryView)
