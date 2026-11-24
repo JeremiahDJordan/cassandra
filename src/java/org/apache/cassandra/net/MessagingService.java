@@ -811,7 +811,8 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
     /**
      * Returns the endpoints for the given keyspace that are known to be alive and have a connection whose
      * messaging version is older than the given version. To be used for example when we want to be sure a message
-     * can be serialized to all endpoints, according to their negotiated version at connection time.
+     * can be serialized to all endpoints, according to the version their connections negotiated or, for those that
+     * aren't connected, the version they announced.
      *
      * @param keyspace a keyspace
      * @param version a messaging version
@@ -838,7 +839,15 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
         for (ConnectionType type : ConnectionType.MESSAGING_TYPES)
         {
             OutboundConnection connection = connections.connectionFor(type);
-            if (connection != null && connection.messagingVersion() < version)
+            if (connection == null)
+                continue;
+
+            // a connection that isn't connected keeps the version of its last connection, or the one known when it was
+            // created, until it connects again and negotiates its version: count it with the version the node announced
+            int connectionVersion = connection.isConnected() || !versions.knows(node)
+                                    ? connection.messagingVersion()
+                                    : versions.get(node);
+            if (connectionVersion < version)
                 return true;
         }
 
