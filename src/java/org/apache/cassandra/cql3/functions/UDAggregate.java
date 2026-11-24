@@ -293,7 +293,8 @@ public class UDAggregate extends UserFunction implements AggregateFunction
     {
         return name.equals(other.name)
             && argTypes.size() == other.argTypes.size()
-            && Objects.equal(initcond, other.initcond);
+            && Objects.equal(initcond, other.initcond)
+            && deterministic == other.deterministic;
     }
 
     @Override

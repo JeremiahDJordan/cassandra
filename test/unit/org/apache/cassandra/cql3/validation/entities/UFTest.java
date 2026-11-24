@@ -34,12 +34,16 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.functions.FunctionName;
+import org.apache.cassandra.cql3.functions.UDAggregate;
 import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaKeyspace;
+import org.apache.cassandra.schema.SchemaKeyspaceTables;
 import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.transport.Event.SchemaChange.Change;
@@ -914,6 +918,88 @@ public class UFTest extends CQLTester
                 "RETURNS text " +
                 "LANGUAGE java\n" +
                 "AS 'return \"foo bar\";';");
+    }
+
+    @Test
+    public void testReplaceChangingOnlyDeterminism() throws Throwable
+    {
+        String body = "(state double, input double) CALLED ON NULL INPUT RETURNS double %s LANGUAGE java AS 'return input;'";
+        String function = createFunction(KEYSPACE, "double, double", "CREATE FUNCTION %s " + String.format(body, "MONOTONIC ON state"));
+        execute("CREATE OR REPLACE FUNCTION " + function + ' ' + String.format(body, "MONOTONIC ON input"));
+        UDFunction f = (UDFunction) Schema.instance.getUserFunctions(parseFunctionName(function)).iterator().next();
+        Assert.assertEquals("input", f.monotonicOn().get(0).toString());
+
+        execute("CREATE OR REPLACE FUNCTION " + function + ' ' + String.format(body, "DETERMINISTIC MONOTONIC ON input"));
+        f = (UDFunction) Schema.instance.getUserFunctions(parseFunctionName(function)).iterator().next();
+        Assert.assertTrue(f.isDeterministic());
+
+        execute("CREATE OR REPLACE FUNCTION " + function + ' ' + String.format(body, "DETERMINISTIC MONOTONIC"));
+        f = (UDFunction) Schema.instance.getUserFunctions(parseFunctionName(function)).iterator().next();
+        Assert.assertTrue(f.isMonotonic());
+
+        // monotonic_on is empty with or without MONOTONIC for a function without arguments
+        String noArguments = "() CALLED ON NULL INPUT RETURNS double %s LANGUAGE java AS 'return 1.0;'";
+        String constant = createFunction(KEYSPACE, "", "CREATE FUNCTION %s " + String.format(noArguments, ""));
+        execute("CREATE OR REPLACE FUNCTION " + constant + ' ' + String.format(noArguments, "MONOTONIC"));
+        Assert.assertTrue(((UDFunction) Schema.instance.getUserFunctions(parseFunctionName(constant)).iterator().next()).isMonotonic());
+
+        String aggregate = createAggregate(KEYSPACE, "double", "CREATE AGGREGATE %s (double) SFUNC " + shortFunctionName(function) + " STYPE double");
+        execute("CREATE OR REPLACE AGGREGATE " + aggregate + " (double) SFUNC " + shortFunctionName(function) + " STYPE double DETERMINISTIC");
+        UDAggregate a = (UDAggregate) Schema.instance.getUserFunctions(parseFunctionName(aggregate)).iterator().next();
+        Assert.assertTrue(a.isDeterministic());
+    }
+
+    @Test
+    public void testReloadChangingOnlyDeterminism() throws Throwable
+    {
+        String function = createFunction(KEYSPACE, "double, double", "CREATE FUNCTION %s (state double, input double) CALLED ON NULL INPUT " +
+                                                                     "RETURNS double MONOTONIC ON state LANGUAGE java AS 'return input;'");
+        // rows as a schema mutation from another node writes them
+        String update = String.format("UPDATE %s.%s SET %%s WHERE keyspace_name = ? AND function_name = ? AND argument_types = ['double', 'double']",
+                                      SchemaConstants.SCHEMA_KEYSPACE_NAME, SchemaKeyspaceTables.FUNCTIONS);
+        QueryProcessor.executeInternal(String.format(update, "monotonic_on = ['input']"), KEYSPACE, shortFunctionName(function));
+        Schema.instance.reloadSchemaAndAnnounceVersion();
+        UDFunction f = (UDFunction) Schema.instance.getUserFunctions(parseFunctionName(function)).iterator().next();
+        Assert.assertEquals("input", f.monotonicOn().get(0).toString());
+
+        QueryProcessor.executeInternal(String.format(update, "deterministic = true"), KEYSPACE, shortFunctionName(function));
+        Schema.instance.reloadSchemaAndAnnounceVersion();
+        f = (UDFunction) Schema.instance.getUserFunctions(parseFunctionName(function)).iterator().next();
+        Assert.assertTrue(f.isDeterministic());
+
+        QueryProcessor.executeInternal(String.format(update, "monotonic = true"), KEYSPACE, shortFunctionName(function));
+        Schema.instance.reloadSchemaAndAnnounceVersion();
+        f = (UDFunction) Schema.instance.getUserFunctions(parseFunctionName(function)).iterator().next();
+        Assert.assertTrue(f.isMonotonic());
+    }
+
+    @Test
+    public void testReplaceWithoutDeterminismInCassandra4() throws Throwable
+    {
+        String body = "(state double, input double) CALLED ON NULL INPUT RETURNS double %s LANGUAGE java AS 'return input;'";
+        String function = createFunction(KEYSPACE, "double, double", "CREATE FUNCTION %s " + String.format(body, "DETERMINISTIC MONOTONIC"));
+        String aggregate = createAggregate(KEYSPACE, "double", "CREATE AGGREGATE %s (double) SFUNC " + shortFunctionName(function) + " STYPE double DETERMINISTIC");
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        try
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_4);
+            execute("CREATE OR REPLACE FUNCTION " + function + ' ' + String.format(body, ""));
+            execute("CREATE OR REPLACE AGGREGATE " + aggregate + " (double) SFUNC " + shortFunctionName(function) + " STYPE double");
+            UDFunction f = (UDFunction) Schema.instance.getKeyspaceMetadata(KEYSPACE).userFunctions.get(parseFunctionName(function)).iterator().next();
+            UDAggregate a = (UDAggregate) Schema.instance.getKeyspaceMetadata(KEYSPACE).userFunctions.get(parseFunctionName(aggregate)).iterator().next();
+            Assert.assertFalse(f.isDeterministic());
+            Assert.assertFalse(f.isMonotonic());
+            Assert.assertTrue(f.monotonicOn().isEmpty());
+            Assert.assertFalse(a.isDeterministic());
+            KeyspaceMetadata stored = SchemaKeyspace.fetchNonSystemKeyspaces().getNullable(KEYSPACE);
+            Assert.assertEquals(Schema.instance.getKeyspaceMetadata(KEYSPACE).userFunctions, stored.userFunctions);
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
+        KeyspaceMetadata stored = SchemaKeyspace.fetchNonSystemKeyspaces().getNullable(KEYSPACE);
+        Assert.assertEquals(Schema.instance.getKeyspaceMetadata(KEYSPACE).userFunctions, stored.userFunctions);
     }
 
     @Test
