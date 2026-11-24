@@ -21,6 +21,8 @@ import java.net.UnknownHostException;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 
+import javax.annotation.Nullable;
+
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
 
 import org.slf4j.Logger;
@@ -97,6 +99,16 @@ public class EndpointMessagingVersions
         if (v == null)
             throw new IllegalStateException("getRawVersion() was called without checking knowsVersion() result first");
         return v;
+    }
+
+    /**
+     * Returns the messaging-version exactly as announced by the given endpoint, {@code null} if it isn't known: a single
+     * lookup, unlike {@link #knows} then {@link #getRaw}, which can race with {@link #reset}.
+     */
+    @Nullable
+    public Integer getRawIfKnown(InetAddressAndPort endpoint)
+    {
+        return versions.get(endpoint);
     }
 
     public boolean knows(InetAddressAndPort endpoint)
