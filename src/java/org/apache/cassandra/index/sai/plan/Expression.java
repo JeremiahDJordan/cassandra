@@ -388,8 +388,8 @@ public class Expression
         // this covers EQ/RANGE with exclusions.
         for (ByteBuffer term : exclusions)
         {
-            if (TypeUtil.isLiteral(validator) && validateStringValue(value.raw, term) ||
-                TypeUtil.comparePostFilter(new Value(term, validator), value, validator) == 0)
+            if (TypeUtil.isLiteral(validator) ? holdsTerm(value.raw, term)
+                                              : TypeUtil.comparePostFilter(new Value(term, validator), value, validator) == 0)
                 return false;
         }
 
@@ -496,6 +496,28 @@ public class Expression
                 return !success;
         }
         return success;
+    }
+
+    /**
+     * Whether one of the terms of the given literal value is the given term, whatever the operation of this expression.
+     */
+    private boolean holdsTerm(ByteBuffer columnValue, ByteBuffer term)
+    {
+        AbstractAnalyzer analyzer = analyzerFactory.create();
+        analyzer.reset(columnValue);
+        try
+        {
+            while (analyzer.hasNext())
+            {
+                if (validator.compare(analyzer.next(), term) == 0)
+                    return true;
+            }
+            return false;
+        }
+        finally
+        {
+            analyzer.end();
+        }
     }
 
     private boolean validateStringValue(ByteBuffer columnValue, ByteBuffer requestedValue)
