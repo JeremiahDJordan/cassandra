@@ -70,6 +70,7 @@ public class VectorTopKProcessor
     private final float[] queryVector;
 
     private final int limit;
+    private final boolean enforceStrictLiveness;
 
     public VectorTopKProcessor(ReadCommand command)
     {
@@ -82,6 +83,7 @@ public class VectorTopKProcessor
         this.indexTermType = annIndexAndExpression.left().termType();
         this.queryVector = annIndexAndExpression.right;
         this.limit = command.limits().count();
+        this.enforceStrictLiveness = command.metadata().enforceStrictLiveness();
     }
 
     /**
@@ -104,6 +106,14 @@ public class VectorTopKProcessor
                 PartitionInfo partitionInfo = PartitionInfo.create(partition);
                 // compute key and static row score once per partition
                 float keyAndStaticScore = getScoreForRow(key, staticRow);
+
+                // a partition without rows takes part through its static row if the query returns its static content
+                if (!partition.hasNext() && command.selectsFullPartition())
+                {
+                    topK.add(Triple.of(partitionInfo, staticRow, keyAndStaticScore));
+                    if (topK.size() > limit)
+                        topK.poll();
+                }
 
                 while (partition.hasNext())
                 {
@@ -131,8 +141,11 @@ public class VectorTopKProcessor
 
         // reorder rows in partition/clustering order
         for (Triple<PartitionInfo, Row, Float> triple : topK)
-            unfilteredByPartition.computeIfAbsent(triple.getLeft(), k -> new TreeSet<>(command.metadata().comparator))
-                                 .add(triple.getMiddle());
+        {
+            TreeSet<Unfiltered> unfiltereds = unfilteredByPartition.computeIfAbsent(triple.getLeft(), k -> new TreeSet<>(command.metadata().comparator));
+            if (!triple.getMiddle().isStatic())
+                unfiltereds.add(triple.getMiddle());
+        }
 
         if (partitions instanceof PartitionIterator)
             return new InMemoryPartitionIterator(command, unfilteredByPartition);
@@ -165,8 +178,7 @@ public class VectorTopKProcessor
     }
 
     /**
-     * Filter given partitions and keep the rows with the highest scores. In case of {@link UnfilteredPartitionIterator},
-     * all tombstones will be kept.
+     * Filter given partitions and keep the rows with the highest scores. Rows without live data are left out.
      */
     public <U extends Unfiltered, R extends BaseRowIterator<U>, P extends BasePartitionIterator<R>> BasePartitionIterator<?> takeTopKThenSortByPrimaryKey(P partitions)
     {
@@ -188,28 +200,33 @@ public class VectorTopKProcessor
     }
 
     /**
-     * Processes a single partition, without scoring it.
+     * Processes a single partition, without scoring it. Only live rows are kept, and a partition without them is kept
+     * and counts as one row if the query returns its static content.
      */
     private int processSingleRowPartition(TreeMap<PartitionInfo, TreeSet<Unfiltered>> unfilteredByPartition,
                                           BaseRowIterator<?> partitionRowIterator,
                                           int reamining)
     {
-        if (!partitionRowIterator.hasNext())
-            return 0;
-
-        // Always include tombstones for coordinator. It relies on ReadCommand#withMetricsRecording to throw
-        // TombstoneOverwhelmingException to prevent OOM.
         PartitionInfo partitionInfo = PartitionInfo.create(partitionRowIterator);
-        TreeSet<Unfiltered> map = unfilteredByPartition.computeIfAbsent(partitionInfo, k -> new TreeSet<>(command.metadata().comparator));
-        int added = 0;
-        while (partitionRowIterator.hasNext() && added < reamining)
+        TreeSet<Unfiltered> rows = new TreeSet<>(command.metadata().comparator);
+        while (partitionRowIterator.hasNext() && rows.size() < reamining)
         {
             Unfiltered unfiltered = partitionRowIterator.next();
-            map.add(unfiltered);
-            if (unfiltered.isRow())
-                added++;
+            if (unfiltered.isRow() && ((Row) unfiltered).hasLiveData(command.nowInSec(), enforceStrictLiveness))
+                rows.add(unfiltered);
         }
-        return added;
+
+        if (rows.isEmpty())
+        {
+            if (!command.selectsFullPartition() || !partitionInfo.staticRow.hasLiveData(command.nowInSec(), enforceStrictLiveness))
+                return 0;
+
+            unfilteredByPartition.computeIfAbsent(partitionInfo, k -> new TreeSet<>(command.metadata().comparator));
+            return 1;
+        }
+
+        unfilteredByPartition.computeIfAbsent(partitionInfo, k -> new TreeSet<>(command.metadata().comparator)).addAll(rows);
+        return rows.size();
     }
 
     private Pair<StorageAttachedIndex, float[]> findTopKIndex()
