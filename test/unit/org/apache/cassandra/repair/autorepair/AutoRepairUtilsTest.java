@@ -38,6 +38,7 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.UUIDType;
+import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.distributed.test.log.ClusterMetadataTestHelper;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.repair.autorepair.AutoRepairConfig.RepairType;
@@ -597,7 +598,7 @@ public class AutoRepairUtilsTest extends CQLTester
     @Test
     public void testMyTurnToRunRepairShouldReturnMyTurnWhenRepairOngoing()
     {
-        UUID myID = UUID.randomUUID();
+        UUID myID = hostId;
         UUID otherID = UUID.randomUUID();
         DatabaseDescriptor.getAutoRepairConfig().setParallelRepairCount(repairType, 5);
         long currentMillis = System.currentTimeMillis();
@@ -607,6 +608,52 @@ public class AutoRepairUtilsTest extends CQLTester
         AutoRepairUtils.insertNewRepairHistory(repairType, otherID, currentMillis, currentMillis + 100);
 
         assertEquals(AutoRepairUtils.RepairTurn.MY_TURN, AutoRepairUtils.myTurnToRunRepair(repairType, myID));
+    }
+
+    @Test
+    public void testMyTurnToRunRepairIgnoresHostsThatLeft()
+    {
+        int parallelRepairCount = DatabaseDescriptor.getAutoRepairConfig().getParallelRepairCount(repairType);
+        DatabaseDescriptor.getAutoRepairConfig().setParallelRepairCount(repairType, 1);
+        try
+        {
+            long currentMillis = System.currentTimeMillis();
+            AutoRepairUtils.insertNewRepairHistory(repairType, hostId, currentMillis - 1000, currentMillis - 500);
+            // hosts that have left the cluster, one with the oldest finished repair and one with a repair in progress
+            AutoRepairUtils.insertNewRepairHistory(repairType, UUID.randomUUID(), currentMillis - 100_000, currentMillis - 90_000);
+            AutoRepairUtils.insertNewRepairHistory(repairType, UUID.randomUUID(), currentMillis - 1000, currentMillis - 200_000);
+
+            assertEquals(AutoRepairUtils.RepairTurn.MY_TURN, AutoRepairUtils.myTurnToRunRepair(repairType, hostId));
+        }
+        finally
+        {
+            DatabaseDescriptor.getAutoRepairConfig().setParallelRepairCount(repairType, parallelRepairCount);
+        }
+    }
+
+    @Test
+    public void testMyTurnToRunRepairIgnoresNodeThatLeft() throws UnknownHostException
+    {
+        InetAddressAndPort leftEndpoint = InetAddressAndPort.getByName("127.0.0.2");
+        ClusterMetadataTestHelper.addEndpoint(leftEndpoint, new Murmur3Partitioner.LongToken(1000));
+        UUID leftHostId = StorageService.instance.getHostIdForEndpoint(leftEndpoint);
+        ClusterMetadataTestHelper.removeEndpoint(leftEndpoint, true);
+        int parallelRepairCount = DatabaseDescriptor.getAutoRepairConfig().getParallelRepairCount(repairType);
+        DatabaseDescriptor.getAutoRepairConfig().setParallelRepairCount(repairType, 1);
+        try
+        {
+            long currentMillis = System.currentTimeMillis();
+            AutoRepairUtils.insertNewRepairHistory(repairType, hostId, currentMillis - 1000, currentMillis - 500);
+            // the node left with a repair in progress
+            AutoRepairUtils.insertNewRepairHistory(repairType, leftHostId, currentMillis - 1000, currentMillis - 200_000);
+
+            assertEquals(AutoRepairUtils.RepairTurn.MY_TURN, AutoRepairUtils.myTurnToRunRepair(repairType, hostId));
+        }
+        finally
+        {
+            DatabaseDescriptor.getAutoRepairConfig().setParallelRepairCount(repairType, parallelRepairCount);
+            ClusterMetadataTestHelper.unregister(leftEndpoint);
+        }
     }
 
     @Test
