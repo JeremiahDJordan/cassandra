@@ -481,6 +481,8 @@ public class IndexContext
     // 2. or includes everything minus the keys matching the expression
     // if the column type values cannot be truncated, i.e., matching the keys is always precise.
     // (not matching precisely will lead to false negatives)
+    // 3. or includes everything if the expression's value is an empty value that the index doesn't store, which
+    // matches no indexed value (see Expression#hasUnindexedEmptyValue).
     //
     // keys k such that row(k) not contains v = (all keys) \ (keys k such that row(k) contains v)
     //
@@ -491,7 +493,9 @@ public class IndexContext
     private KeyRangeIterator getNonEqIterator(QueryContext context, Collection<MemtableIndex> memtables, Expression expression, AbstractBounds<PartitionPosition> keyRange)
     {
         KeyRangeIterator allKeys = scanMemtable(keyRange, memtables);
-        if (TypeUtil.supportsRounding(expression.validator) || !version.onDiskFormat().indexFeatureSet().isRowAware())
+        if (TypeUtil.supportsRounding(expression.validator)
+            || !version.onDiskFormat().indexFeatureSet().isRowAware()
+            || expression.hasUnindexedEmptyValue())
         {
             return allKeys;
         }
