@@ -389,6 +389,18 @@ public class AutoRepairUtils
         return null;
     }
 
+    /**
+     * Repair histories of the hosts in the cluster. A host that has left the cluster can't take its turn, and its
+     * record stays until enough nodes vote to delete it.
+     */
+    private static List<AutoRepairHistory> getAutoRepairHistoryInCluster(RepairType repairType)
+    {
+        List<AutoRepairHistory> autoRepairHistories = getAutoRepairHistory(repairType);
+        if (autoRepairHistories != null)
+            autoRepairHistories.removeIf(history -> getBroadcastAddress(history.hostId) == null);
+        return autoRepairHistories;
+    }
+
     // A host may add itself in delete hosts for some other hosts due to restart or some temp gossip issue. If a node's record
     // delete_hosts is not growing for more than 2 hours, we consider it as a normal node so we clear the delete_hosts for that node
     public static void clearDeleteHosts(RepairType repairType, UUID hostId)
@@ -947,7 +959,7 @@ public class AutoRepairUtils
             }
 
             // refresh auto repair histories
-            autoRepairHistories = getAutoRepairHistory(repairType);
+            autoRepairHistories = getAutoRepairHistoryInCluster(repairType);
             if (autoRepairHistories == null)
             {
                 logger.error("No record found");
