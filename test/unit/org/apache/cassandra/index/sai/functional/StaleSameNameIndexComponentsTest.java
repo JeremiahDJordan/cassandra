@@ -161,7 +161,6 @@ public class StaleSameNameIndexComponentsTest extends SAITester
     private static final Set<Object> awaitedSSTables = ConcurrentHashMap.newKeySet();
     private static final List<String> awaitedNames = new CopyOnWriteArrayList<>();
     private static volatile String failingTable;
-    private static volatile boolean waitTimedOut;
 
     private boolean defaultImmutableSetting;
 
@@ -237,7 +236,6 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         awaitedNames.clear();
         failingTable = null;
         pausedIndex = INDEX;
-        waitTimedOut = false;
     }
 
     /**
@@ -2145,7 +2143,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
     @Test
     public void testNewIndexBuiltWhileRebuildOfDroppedIndexPreparesItsFiles() throws Throwable
     {
-        testNewIndexBuiltAcrossRebuildOfDroppedIndex(builderPoint("replaceListedComponentsOfName").atEntry(), "a", true, true);
+        testNewIndexBuiltAcrossRebuildOfDroppedIndex(builderPoint("listedComponentsOfName").atEntry(), "a", true, true);
     }
 
     /**
@@ -2160,13 +2158,13 @@ public class StaleSameNameIndexComponentsTest extends SAITester
     }
 
     /**
-     * Same, with the rebuild held before it takes the files of the SSTable: the new index is built first, and the
-     * rebuild of the dropped index then stops without touching them.
+     * Same, with the rebuild held before it takes the build lock and the files of the SSTable: the new index is built
+     * first, and the rebuild of the dropped index then stops without touching them.
      */
     @Test
     public void testNewIndexBuiltBeforeRebuildOfDroppedIndexTakesItsFiles() throws Throwable
     {
-        testNewIndexBuiltAcrossRebuildOfDroppedIndex(builderPoint("ownFiles").atEntry(), "a", false, false);
+        testNewIndexBuiltAcrossRebuildOfDroppedIndex(builderPoint("lockForBuild").atEntry(), "a", false, false);
     }
 
     private static InvokePointBuilder writerPoint(String method)
@@ -2181,8 +2179,9 @@ public class StaleSameNameIndexComponentsTest extends SAITester
 
     /**
      * A full rebuild of the stale index is held at the provided point; the index is dropped and created again on the
-     * provided column, and the rebuild is released once the build of the new index waits for it, or is done: the rebuild
-     * stops, the new index is built, and a restart builds nothing.
+     * provided column, and the rebuild is released once the build of the new index waits for it, the new index not
+     * queryable, or, when it doesn't wait, once the new index is built: the rebuild stops, the new index is built, and a
+     * restart builds nothing.
      *
      * @param newBuildWaits whether the build of the new index waits for the rebuild
      * @param holdNewBuild whether to check the state of the new index while its build is held after the rebuild stopped
@@ -2204,6 +2203,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         Injections.inject(rebuildHold);
         CompletableFuture<Void> rebuild = CompletableFuture.runAsync(() -> rebuildIndexes(INDEX));
         rebuildHold.awaitHeld();
+        // a full rebuild holds the build lock of the SSTable exclusively: the new build may wait for it there
         Injections.inject(waiterRecording(sstable.descriptor));
         Injections.Hold newBuildHold = Injections.newHold("new_build")
                                                  .add(builderPoint("shouldWritePerSSTableFiles").atEntry())
@@ -2212,12 +2212,11 @@ public class StaleSameNameIndexComponentsTest extends SAITester
             Injections.inject(newBuildHold);
         dropIndex("DROP INDEX %s." + INDEX);
         createIndexAsync("CREATE CUSTOM INDEX " + INDEX + " ON %s(" + newColumn + ") USING 'StorageAttachedIndex'");
-        // the new build waits for the rebuild; or, if it doesn't, it completes while the rebuild is held, and the rebuild
-        // leaves its files
+        // when the new build doesn't wait, it completes while the rebuild is held, and the rebuild leaves its files
         Map<String, Object> newFiles = null;
         if (newBuildWaits)
         {
-            waitForAssert(() -> assertThat(waitsForOwnersOfDroppedIndex(waiter)).isTrue(), 60, TimeUnit.SECONDS);
+            waitForAssert(() -> assertThat(waitsForDroppedIndex(waiter)).isTrue(), 60, TimeUnit.SECONDS);
             assertThat(cfs.indexManager.getIndexByName(INDEX)).isNotNull();
             assertThat(cfs.indexManager.isIndexQueryable(INDEX)).isFalse();
         }
@@ -2301,7 +2300,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         dropIndex("DROP INDEX %s." + INDEX);
         createIndexAsync("CREATE CUSTOM INDEX " + INDEX + " ON %s(a) USING 'StorageAttachedIndex'");
         // the build of the new index waits for the rebuild, which owns the files of the dropped index
-        waitForAssert(() -> assertThat(waitsForOwnersOfDroppedIndex(waiter)).isTrue(), 60, TimeUnit.SECONDS);
+        waitForAssert(() -> assertThat(waitsForDroppedIndex(waiter)).isTrue(), 60, TimeUnit.SECONDS);
         assertThat(getCurrentColumnFamilyStore().indexManager.getIndexByName(INDEX)).isNotNull();
         assertThat(getCurrentColumnFamilyStore().indexManager.isIndexQueryable(INDEX)).isFalse();
         failAbortArmed = true;
@@ -2574,7 +2573,8 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         dropIndex("DROP INDEX %s." + INDEX);
         assertThat(PerIndexFilesOwner.hasOwnerOfDroppedIndex(sstable.descriptor, INDEX)).isFalse();
         createIndex("CREATE CUSTOM INDEX " + INDEX + " ON %s(a) USING 'StorageAttachedIndex'");
-        waitForTableIndexesQueryable();
+        // the failed rebuild deleted the per-SSTable components, so the other index waits for a rebuild
+        waitForIndexQueryable(INDEX);
         assertBuiltFromData();
     }
 
@@ -2601,20 +2601,13 @@ public class StaleSameNameIndexComponentsTest extends SAITester
                                                                                         .when(StaleSameNameIndexComponentsTest.class.getName() + ".calledBy(\"completeSSTable\")"))
                                                  .build();
         Injections.inject(registerHold);
-        Injections.inject(Injections.newCustom("record_wait_timeout")
-                                    .add(InvokePointBuilder.newInvokePoint().onClass(PerIndexFilesOwner.class).onMethod("awaitOwnersOfDroppedIndex").atExit())
-                                    .add(ActionBuilder.newActionBuilder()
-                                                      .conditions()
-                                                      .when("$! == false")
-                                                      .actions()
-                                                      .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".recordWaitTimeout()"))
-                                    .build());
         CompletableFuture<Void> rebuild = CompletableFuture.runAsync(() -> rebuildIndexes(INDEX));
         registerHold.awaitHeld();
+        Injections.inject(waiterRecording());
         dropIndex("DROP INDEX %s." + INDEX);
         createIndexAsync("CREATE CUSTOM INDEX " + INDEX + " ON %s(a) USING 'StorageAttachedIndex'");
-        // the build of the new index has waited for the rebuild, or is done
-        waitForAssert(() -> assertThat(waitTimedOut || cfs.indexManager.isIndexQueryable(INDEX)).isTrue(), 60, TimeUnit.SECONDS);
+        // the build of the new index waits for the rebuild, or is done
+        waitForAssert(() -> assertThat(waitsForDroppedIndex(waiter) || cfs.indexManager.isIndexQueryable(INDEX)).isTrue(), 60, TimeUnit.SECONDS);
         registerHold.release();
         rebuild.handle((result, error) -> null).get(60, TimeUnit.SECONDS);
         Injections.deleteAll();
@@ -2622,12 +2615,6 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         waitForTableIndexesQueryable();
         assertBuiltFromData();
         assertTocListsOneBuild(sstable, false);
-    }
-
-    // called by Byteman
-    public static void recordWaitTimeout()
-    {
-        waitTimedOut = true;
     }
 
     /**
@@ -2658,7 +2645,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         Throwable failure;
         try
         {
-            waitForAssert(() -> assertThat(waiter).isNotNull(), 60, TimeUnit.SECONDS);
+            waitForAssert(() -> assertThat(waitsForDroppedIndex(waiter)).isTrue(), 60, TimeUnit.SECONDS);
             owner.close();
             failure = catchThrowable(() -> rebuild.get(60, TimeUnit.SECONDS));
         }
@@ -2798,23 +2785,28 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         assertBuiltFromData();
     }
 
-    /** Records the first thread that waits for the owners of the files of a dropped index. */
+    /**
+     * Records the first thread that waits for the owners of the files of a dropped index, or for the build lock of the
+     * SSTable, which a full rebuild of the dropped index holds exclusively.
+     */
     private static Injection waiterRecording()
     {
         return Injections.newCustom("record_waiter")
                          .add(InvokePointBuilder.newInvokePoint().onClass(PerIndexFilesOwner.class).onMethod("awaitOwnersOfDroppedIndex").atEntry())
+                         .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("lockForBuild").atEntry())
                          .add(ActionBuilder.newActionBuilder()
                                            .actions()
                                            .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".recordWaiter()"))
                          .build();
     }
 
-    /** Whether the thread waits for the owners of the files of a dropped index (see waiterRecording). */
-    private static boolean waitsForOwnersOfDroppedIndex(@Nullable Thread thread)
+    /** Whether the thread waits for a dropped index, in one of the waits that waiterRecording records. */
+    private static boolean waitsForDroppedIndex(@Nullable Thread thread)
     {
         return thread != null
                && thread.getState() == Thread.State.TIMED_WAITING
-               && Arrays.stream(thread.getStackTrace()).anyMatch(e -> e.getMethodName().equals("awaitOwnersOfDroppedIndex"));
+               && Arrays.stream(thread.getStackTrace()).anyMatch(e -> e.getMethodName().equals("awaitOwnersOfDroppedIndex")
+                                                                      || e.getMethodName().equals("lockForBuild"));
     }
 
     /**
@@ -2826,6 +2818,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         waitedSSTable = sstable;
         return Injections.newCustom("record_waiter_of_sstable")
                          .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("ownFiles").atEntry())
+                         .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("lockForBuild").atEntry())
                          .add(ActionBuilder.newActionBuilder()
                                            .actions()
                                            .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".recordWaiterOf($1, $0.sstables.get($1))"))

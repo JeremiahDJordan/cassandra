@@ -139,6 +139,11 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         this.componentsListedUpFront = componentsListedUpFront;
     }
 
+    public long rowCount()
+    {
+        return sstableRowId;
+    }
+
     @Override
     public void begin()
     {
