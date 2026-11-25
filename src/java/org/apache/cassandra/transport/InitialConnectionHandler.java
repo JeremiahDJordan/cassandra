@@ -107,53 +107,60 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
 
                     StartupMessage startup = (StartupMessage) Message.Decoder.decodeMessage(ctx.channel(), inbound);
                     InetAddress remoteAddress = ((InetSocketAddress) ctx.channel().remoteAddress()).getAddress();
-                    final ClientResourceLimits.Allocator allocator = ClientResourceLimits.getAllocatorForEndpoint(remoteAddress);
-
-                    ChannelPromise promise;
-                    if (inbound.header.version.isGreaterOrEqualTo(ProtocolVersion.V5))
-                    {
-                        // in this case we need to defer configuring the pipeline until after the response
-                        // has been sent, as the frame encoding specified in v5 should not be applied to
-                        // the STARTUP response.
-                        allocator.allocate(inbound.header.bodySizeInBytes);
-                        promise = AsyncChannelPromise.withListener(ctx, future -> {
-                            if (future.isSuccess())
-                            {
-                                logger.trace("Response to STARTUP sent, configuring pipeline for {}", inbound.header.version);
-                                configurator.configureModernPipeline(ctx, serverConnection, allocator, inbound.header.version, startup.options);
-                                allocator.release(inbound.header.bodySizeInBytes);
-                            }
-                            else
-                            {
-                                Throwable cause = future.cause();
-                                if (null == cause)
-                                    cause = new ServerError("Unexpected error establishing connection");
-                                logger.warn("Writing response to STARTUP failed, unable to configure pipeline", cause);
-                                ErrorMessage error = ErrorMessage.fromExceptionNoStreamId(cause);
-                                Envelope response = error.encode(inbound.header.version, inbound.header.streamId);
-                                ChannelPromise closeChannel = AsyncChannelPromise.withListener(ctx, f -> ctx.close());
-                                ctx.writeAndFlush(response, closeChannel);
-                                if (ctx.channel().isOpen())
-                                    ctx.channel().close();
-                            }
-                        });
-                    }
-                    else
+                    ProtocolVersion version = inbound.header.version;
+                    int streamId = inbound.header.streamId;
+                    long bodySizeInBytes = inbound.header.bodySizeInBytes;
+                    if (version.isSmallerThan(ProtocolVersion.V5))
                     {
                         // no need to configure the pipeline asynchronously in this case
                         // the capacity obtained from allocator for the STARTUP message
                         // is released when flushed by the legacy dispatcher/flusher so
                         // there's no need to explicitly release that here either.
-                        configurator.configureLegacyPipeline(ctx, allocator);
-                        promise = new VoidChannelPromise(ctx.channel(), false);
+                        configurator.configureLegacyPipeline(ctx, ClientResourceLimits.getAllocatorForEndpoint(remoteAddress));
                     }
 
-                    ProtocolVersion version = inbound.header.version;
-                    int streamId = inbound.header.streamId;
-                    Dispatcher.processInit((ServerConnection) connection, startup).addCallback((response, error) -> {
+                    Dispatcher.processInit(serverConnection, startup).addCallback((response, error) -> {
                         if (error == null)
                         {
                             Envelope encoded = response.encode(version, streamId);
+                            ChannelPromise promise;
+                            if (version.isGreaterOrEqualTo(ProtocolVersion.V5))
+                            {
+                                // in this case we need to defer configuring the pipeline until after the response
+                                // has been sent, as the frame encoding specified in v5 should not be applied to
+                                // the STARTUP response. The pipeline releases the allocator's reference when the
+                                // channel closes; if the response can't be written, no pipeline is configured, so
+                                // release it here.
+                                ClientResourceLimits.Allocator allocator = ClientResourceLimits.getAllocatorForEndpoint(remoteAddress);
+                                allocator.allocate(bodySizeInBytes);
+                                promise = AsyncChannelPromise.withListener(ctx, future -> {
+                                    if (future.isSuccess())
+                                    {
+                                        logger.trace("Response to STARTUP sent, configuring pipeline for {}", version);
+                                        configurator.configureModernPipeline(ctx, serverConnection, allocator, version, startup.options);
+                                        allocator.release(bodySizeInBytes);
+                                    }
+                                    else
+                                    {
+                                        Throwable cause = future.cause();
+                                        if (null == cause)
+                                            cause = new ServerError("Unexpected error establishing connection");
+                                        allocator.release(bodySizeInBytes);
+                                        allocator.release();
+                                        logger.warn("Writing response to STARTUP failed, unable to configure pipeline", cause);
+                                        ErrorMessage errorMessage = ErrorMessage.fromExceptionNoStreamId(cause);
+                                        Envelope errorEnvelope = errorMessage.encode(version, streamId);
+                                        ChannelPromise closeChannel = AsyncChannelPromise.withListener(ctx, f -> ctx.close());
+                                        ctx.writeAndFlush(errorEnvelope, closeChannel);
+                                        if (ctx.channel().isOpen())
+                                            ctx.channel().close();
+                                    }
+                                });
+                            }
+                            else
+                            {
+                                promise = new VoidChannelPromise(ctx.channel(), false);
+                            }
                             ctx.writeAndFlush(encoded, promise);
                             logger.debug("Configured pipeline: {}", ctx.pipeline());
                         }
