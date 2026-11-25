@@ -62,7 +62,12 @@ public class ApachePostingsWriter implements Closeable
 
     public ApachePostingsWriter(IndexComponents.ForWrite components) throws IOException
     {
-        this.dataOutput = components.addOrGet(IndexComponentType.POSTING_LISTS).openOutput(true);
+        this(components.addOrGet(IndexComponentType.POSTING_LISTS).openOutput(true));
+    }
+
+    public ApachePostingsWriter(IndexOutput dataOutput) throws IOException
+    {
+        this.dataOutput = dataOutput;
         this.startOffset = dataOutput.getFilePointer();
         this.inMemoryOutput = LuceneCompat.getResettableByteBuffersIndexOutput(dataOutput.order(), 1024, "blockOffsets", dataOutput.version());
         SAICodecUtils.writeHeader(dataOutput);

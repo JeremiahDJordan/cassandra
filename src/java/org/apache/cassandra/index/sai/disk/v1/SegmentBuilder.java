@@ -48,6 +48,8 @@ import org.apache.cassandra.index.sai.disk.PostingList;
 import org.apache.cassandra.index.sai.disk.RAMStringIndexer;
 import org.apache.cassandra.index.sai.disk.TermsIterator;
 import org.apache.cassandra.index.sai.disk.apache.ApacheLiteralIndexWriter;
+import org.apache.cassandra.index.sai.disk.apache.ApacheNumericIndexWriter;
+import org.apache.cassandra.index.sai.disk.apache.ApacheTermType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.Version;
@@ -102,6 +104,8 @@ public abstract class SegmentBuilder
     protected final IndexComponents.ForWrite components;
 
     final AbstractType<?> termComparator;
+    // orders the terms for the segment's bounds: Apache Cassandra doesn't reverse inet, varint, decimal and bigint
+    private final AbstractType<?> boundsComparator;
     final AbstractAnalyzer analyzer;
 
     // track memory usage for this segment so we can flush when it gets too big
@@ -244,6 +248,49 @@ public abstract class SegmentBuilder
                 var docLengths = ramIndexer.getDocLengths();
                 var metadataMap = writer.writeAll(metadataBuilder.intercept(termsWithPostings), docLengths);
                 metadataBuilder.setComponentsMetadata(metadataMap);
+            }
+        }
+
+        @Override
+        public boolean requiresFlush()
+        {
+            return ramIndexer.requiresFlush();
+        }
+    }
+
+    /**
+     * Builds the balanced tree segments of a numeric index in Apache Cassandra's format, from its terms sorted as Apache
+     * sorts them: its fixed-length byte-comparable values.
+     */
+    public static class ApacheNumericSegmentBuilder extends SegmentBuilder
+    {
+        final RAMStringIndexer ramIndexer = new RAMStringIndexer(false);
+        private final ApacheTermType termType = ApacheTermType.of(termComparator);
+
+        ApacheNumericSegmentBuilder(IndexComponents.ForWrite components, long rowIdOffset, NamedMemoryLimiter limiter)
+        {
+            super(components, rowIdOffset, limiter);
+            totalBytesAllocated = ramIndexer.estimatedBytesUsed();
+            totalBytesAllocatedConcurrent.add(totalBytesAllocated);
+        }
+
+        public boolean isEmpty()
+        {
+            return ramIndexer.isEmpty();
+        }
+
+        @Override
+        protected long addInternal(List<ByteBuffer> terms, int segmentRowId)
+        {
+            return ramIndexer.addAll(terms.stream().map(term -> new BytesRef(termType.toComparableBytes(term))).collect(Collectors.toList()), segmentRowId);
+        }
+
+        @Override
+        protected void flushInternal(SegmentMetadataBuilder metadataBuilder) throws IOException
+        {
+            try (TermsIterator terms = ramIndexer.getTermsWithPostings(minTerm, maxTerm, ApacheTermType.VERSION))
+            {
+                metadataBuilder.setComponentsMetadata(ApacheNumericIndexWriter.writeCompleteSegment(components, termType.fixedSizeOf(), terms));
             }
         }
 
@@ -454,6 +501,7 @@ public abstract class SegmentBuilder
         IndexContext context = Objects.requireNonNull(components.context(), "IndexContext must be set on segment builder");
         this.components = components;
         this.termComparator = context.getValidator();
+        this.boundsComparator = components.version().isApache() && !ApacheTermType.of(termComparator).isReversed() ? termComparator.unwrap() : termComparator;
         this.analyzer = context.getAnalyzerFactory().create();
         this.limiter = limiter;
         this.segmentRowIdOffset = rowIdOffset;
@@ -467,7 +515,8 @@ public abstract class SegmentBuilder
         assert !flushed;
         flushed = true;
 
-        if (getRowCount() == 0)
+        // the terms of a row can be split between segments, and the row counted in the last one only
+        if (totalTermCount == 0)
         {
             logger.warn(components.logMessage("No rows to index during flush of SSTable {}."), components.descriptor());
             return null;
@@ -535,8 +584,8 @@ public abstract class SegmentBuilder
         for (ByteBuffer term : terms)
         {
             assert term != null : "term must not be null";
-            minTerm = TypeUtil.min(term, minTerm, termComparator, components.version());
-            maxTerm = TypeUtil.max(term, maxTerm, termComparator, components.version());
+            minTerm = TypeUtil.min(term, minTerm, boundsComparator, components.version());
+            maxTerm = TypeUtil.max(term, maxTerm, boundsComparator, components.version());
         }
 
         assert minTerm != null : "minTerm should not be null at this point";
@@ -648,7 +697,7 @@ public abstract class SegmentBuilder
      */
     boolean exceedsSegmentLimit(long ssTableRowId)
     {
-        if (getRowCount() == 0)
+        if (totalTermCount == 0)
             return false;
 
         // To handle the case where there are many non-indexable rows. eg. rowId-1 and rowId-3B are indexable,

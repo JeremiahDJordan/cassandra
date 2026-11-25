@@ -239,8 +239,8 @@ public class ApacheOnDiskFormat extends V9OnDiskFormat
     public PerIndexWriter newPerIndexWriter(StorageAttachedIndex index, IndexDescriptor indexDescriptor, LifecycleNewTracker tracker, RowMapping rowMapping, long keyCount)
     {
         IndexContext context = index.getIndexContext();
-        if (context.isVector() || !TypeUtil.isLiteral(context.getValidator()))
-            throw new UnsupportedOperationException("Only literal indexes are written in the Apache Cassandra SAI format, not " + context.getIndexName());
+        if (context.isVector())
+            throw new UnsupportedOperationException("Vector indexes aren't written in the Apache Cassandra SAI format: " + context.getIndexName());
         return new SSTableIndexWriter(indexDescriptor.newPerIndexComponentsForWrite(context),
                                       SEGMENT_BUILD_MEMORY_LIMITER,
                                       index.isDropped(),

@@ -514,7 +514,7 @@ public class SegmentMetadata implements Comparable<SegmentMetadata>
             metas.put(indexComponentType, new ComponentMetadata(root, offset, length, additionalMap));
         }
 
-        public void write(IndexOutput output) throws IOException
+        private void write(IndexOutput output) throws IOException
         {
             output.writeInt(metas.size());
 

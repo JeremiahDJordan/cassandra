@@ -24,6 +24,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import com.google.common.base.Preconditions;
@@ -41,6 +42,7 @@ import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.PerIndexFilesOwner;
 import org.apache.cassandra.index.sai.disk.PerIndexWriter;
 import org.apache.cassandra.index.sai.disk.apache.ApacheSegmentMetadata;
+import org.apache.cassandra.index.sai.disk.apache.ApacheTermType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.v2.V2VectorIndexSearcher;
@@ -71,6 +73,9 @@ public class SSTableIndexWriter implements PerIndexWriter
 
     private final IndexComponents.ForWrite perIndexComponents;
     private final IndexContext indexContext;
+    // how Apache Cassandra encodes the terms, if the components are in its format
+    @Nullable
+    private final ApacheTermType apacheTermType;
     private final IndexMetrics indexMetrics;
     private final long nowInSec = FBUtilities.nowInSeconds();
     private final NamedMemoryLimiter limiter;
@@ -95,6 +100,7 @@ public class SSTableIndexWriter implements PerIndexWriter
     {
         this.perIndexComponents = perIndexComponents;
         this.indexContext = perIndexComponents.context();
+        this.apacheTermType = perIndexComponents.version().isApache() ? ApacheTermType.of(indexContext.getValidator()) : null;
         Preconditions.checkNotNull(indexContext, "Provided components %s are the per-sstable ones, expected per-index ones", perIndexComponents);
         this.indexMetrics = indexContext.getIndexMetrics().orElse(null);
         this.limiter = limiter;
@@ -140,7 +146,7 @@ public class SSTableIndexWriter implements PerIndexWriter
                 while (valueIterator.hasNext())
                 {
                     ByteBuffer value = valueIterator.next();
-                    addedRow = addTerm(indexTerm(value.duplicate()), key, sstableRowId, indexContext.getValidator());
+                    addedRow |= addTerm(indexTerm(value.duplicate()), key, sstableRowId, indexContext.getValidator());
                 }
             }
         }
@@ -159,9 +165,8 @@ public class SSTableIndexWriter implements PerIndexWriter
 
     private ByteBuffer indexTerm(ByteBuffer value)
     {
-        // Apache Cassandra indexes map entries and frozen values as written
-        return perIndexComponents.version().isApache() ? TypeUtil.asIndexBytesAsWritten(value, indexContext.getValidator())
-                                                       : indexContext.asIndexTerm(value);
+        // as Apache Cassandra does: map entries, frozen values and varints as written
+        return apacheTermType != null ? apacheTermType.asIndexBytes(value) : indexContext.asIndexTerm(value);
     }
 
     @Override
@@ -477,6 +482,10 @@ public class SSTableIndexWriter implements PerIndexWriter
         else if (indexContext.isLiteral())
         {
             builder = new SegmentBuilder.RAMStringSegmentBuilder(perIndexComponents, rowIdOffset, limiter);
+        }
+        else if (apacheTermType != null)
+        {
+            builder = new SegmentBuilder.ApacheNumericSegmentBuilder(perIndexComponents, rowIdOffset, limiter);
         }
         else
         {

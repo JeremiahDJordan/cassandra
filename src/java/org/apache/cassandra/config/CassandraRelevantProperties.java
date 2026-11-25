@@ -885,6 +885,12 @@ public enum CassandraRelevantProperties
     SAI_MAX_VECTOR_TERM_SIZE("cassandra.sai.max_vector_term_size_kb", "16"),
 
     /**
+     * The minimum number of leaves below an internal node of the balanced tree of a numeric index written in Apache
+     * Cassandra 5.0's format for the node to get a posting list, as Apache's property of that name.
+     */
+    SAI_MINIMUM_POSTINGS_LEAVES("cassandra.sai.minimum_postings_leaves", "64"),
+
+    /**
      * Whether to log SAI-specific detailed execution info when logging slow SAI queries.
      * This execution info includes the query metrics and the query plan of the slow queries.
      * For non-SAI queries, see {@link #MONITORING_EXECUTION_INFO_ENABLED}.
@@ -900,6 +906,12 @@ public enum CassandraRelevantProperties
     SAI_NUMERIC_VALUES_MONOTONIC_BLOCK_SIZE("dse.sai.numeric_values.monotonic_block_size", "16384"),
     /** Controls the number of rows read in a single batch when fetching rows for a partition key */
     SAI_PARTITION_ROW_BATCH_SIZE("cassandra.sai.partition_row_batch_size", "100"),
+
+    /**
+     * Every how many levels the internal nodes of the balanced tree of a numeric index written in Apache Cassandra 5.0's
+     * format can get a posting list, as Apache's property of that name.
+     */
+    SAI_POSTINGS_SKIP("cassandra.sai.postings_skip", "3"),
 
     /**
      * Whether to enable SAI per-query metrics for different kinds of query, such as filter-only queries, top-k-only

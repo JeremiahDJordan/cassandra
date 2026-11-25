@@ -20,6 +20,7 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import javax.annotation.Nullable;
@@ -56,7 +57,7 @@ public class ApacheSegmentMetadata
     /**
      * Apache's {@code IndexComponent} names, as written in the component metadata map, to our component types.
      */
-    private static final Map<String, IndexComponentType> COMPONENTS = new HashMap<>();
+    private static final Map<String, IndexComponentType> COMPONENTS = new LinkedHashMap<>(); // in Apache's order
     static
     {
         COMPONENTS.put("META", IndexComponentType.META);
@@ -98,8 +99,27 @@ public class ApacheSegmentMetadata
                 writeBytes(keyBytes(metadata.maxKey, comparator), output);
                 writeBytes(ByteBufferUtil.getArray(metadata.minTerm), output);
                 writeBytes(ByteBufferUtil.getArray(metadata.maxTerm), output);
-                metadata.componentMetadatas.write(output);
+                writeComponents(metadata.componentMetadatas, output);
             }
+        }
+    }
+
+    /**
+     * The component metadata map, in the order of Apache's {@code IndexComponent}, as its {@code EnumMap} writes it.
+     */
+    private static void writeComponents(SegmentMetadata.ComponentMetadataMap components, IndexOutput output) throws IOException
+    {
+        Map<String, SegmentMetadata.ComponentMetadata> written = new LinkedHashMap<>();
+        COMPONENTS.forEach((name, type) -> {
+            SegmentMetadata.ComponentMetadata component = components.getOptional(type);
+            if (component != null)
+                written.put(name, component);
+        });
+        output.writeInt(written.size());
+        for (Map.Entry<String, SegmentMetadata.ComponentMetadata> entry : written.entrySet())
+        {
+            output.writeString(entry.getKey());
+            entry.getValue().write(output);
         }
     }
 

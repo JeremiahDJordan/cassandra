@@ -22,6 +22,7 @@ import java.io.Closeable;
 import java.util.Arrays;
 import javax.annotation.concurrent.NotThreadSafe;
 
+import org.agrona.collections.IntArrayList;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.io.IndexInputReader;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
@@ -113,6 +114,43 @@ class BlockBalancedTreeWalker implements Closeable
     public void close()
     {
         FileUtils.closeQuietly(treeIndexFile);
+    }
+
+    /**
+     * Visits the leaves of the tree in order, with the path of internal nodes from the root to each.
+     */
+    void traverse(TraversalCallback callback)
+    {
+        traverse(newTraversalState(), callback, new IntArrayList());
+    }
+
+    private void traverse(TraversalState state, TraversalCallback callback, IntArrayList pathToRoot)
+    {
+        if (state.atLeafNode())
+        {
+            // In the unbalanced case it's possible the left most node only has one child:
+            if (state.nodeExists())
+                callback.onLeaf(state.nodeID, state.getLeafBlockFP(), pathToRoot);
+        }
+        else
+        {
+            IntArrayList currentPath = new IntArrayList();
+            currentPath.addAll(pathToRoot);
+            currentPath.add(state.nodeID);
+
+            state.pushLeft();
+            traverse(state, callback, currentPath);
+            state.pop();
+
+            state.pushRight();
+            traverse(state, callback, currentPath);
+            state.pop();
+        }
+    }
+
+    interface TraversalCallback
+    {
+        void onLeaf(int leafNodeID, long leafBlockFP, IntArrayList pathToRoot);
     }
 
     /**

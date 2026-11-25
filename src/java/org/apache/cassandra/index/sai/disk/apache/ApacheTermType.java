@@ -181,8 +181,16 @@ public class ApacheTermType
      */
     public byte[] asNumericTerm(ByteBuffer value)
     {
+        return toComparableBytes(asIndexBytes(value));
+    }
+
+    /**
+     * The term of a value of a numeric index, from its index bytes, as Apache's balanced tree holds it (Apache's
+     * {@code IndexTermType#toComparableBytes}).
+     */
+    public byte[] toComparableBytes(ByteBuffer indexBytes)
+    {
         byte[] bytes = new byte[fixedSizeOf()];
-        ByteBuffer indexBytes = asIndexBytes(value);
         AbstractType<?> baseType = indexType.unwrap();
         if (baseType instanceof InetAddressType || baseType instanceof IntegerType || baseType instanceof DecimalType)
             ByteBufferUtil.copyBytes(indexBytes, indexBytes.position(), bytes, 0, bytes.length);
@@ -191,7 +199,10 @@ public class ApacheTermType
         return bytes;
     }
 
-    private ByteBuffer asIndexBytes(ByteBuffer value)
+    /**
+     * The index bytes of a value, as Apache writes them in its segments (Apache's {@code IndexTermType#asIndexBytes}).
+     */
+    public ByteBuffer asIndexBytes(ByteBuffer value)
     {
         if (value == null || value.remaining() == 0)
             return value;

@@ -34,6 +34,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.disk.PerIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
+import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.memory.MemtableIndex;
 import org.apache.cassandra.index.sai.memory.RowMapping;
 import org.apache.cassandra.index.sai.utils.NamedMemoryLimiter;
@@ -141,6 +142,7 @@ public class IndexWriterAbortLoggingTest
     {
         IndexComponents.ForWrite components = mock(IndexComponents.ForWrite.class);
         when(components.context()).thenReturn(context);
+        when(components.version()).thenReturn(Version.LATEST);
         when(components.logMessage(anyString())).thenAnswer(invocation -> invocation.getArgument(0));
         return components;
     }
