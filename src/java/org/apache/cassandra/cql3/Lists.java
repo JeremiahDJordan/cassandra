@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3;
 
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
@@ -34,6 +35,7 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.marshal.VectorType;
@@ -268,14 +270,36 @@ public abstract class Lists
         {
             try
             {
-                // Collections have this small hack that validate cannot be called on a serialized object,
-                // but compose does the validation (so we're fine).
-                List<T> l = type.getSerializer().deserialize(value, ByteBufferAccessor.instance);
-                List<ByteBuffer> elements = new ArrayList<>(l.size());
-                for (T element : l)
+                int n = CollectionSerializer.readCollectionSize(value, ByteBufferAccessor.instance);
+                if (n < 0)
+                    throw new MarshalException("The data cannot be deserialized as a list");
+
+                AbstractType<T> elementsType = type.getElementsType();
+                int offset = CollectionSerializer.sizeOfCollectionSize();
+                List<ByteBuffer> elements = new ArrayList<>(Math.min(n, 256));
+                for (int i = 0; i < n; i++)
+                {
+                    ByteBuffer element = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset);
+                    offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance);
                     // elements can be null in lists that represent a set of IN values
-                    elements.add(element == null ? null : type.getElementsType().decompose(element));
+                    if (element != null)
+                    {
+                        elementsType.validate(element);
+                        // serializing a collection element again sorts and deduplicates the sets and maps in it
+                        if (elementsType.unwrap() instanceof CollectionType)
+                            element = elementsType.decompose(elementsType.compose(element));
+                    }
+                    elements.add(element);
+                }
+
+                if (!ByteBufferAccessor.instance.isEmptyFromOffset(value, offset))
+                    throw new MarshalException("Unexpected extraneous bytes after list value");
+
                 return new Value(elements);
+            }
+            catch (BufferUnderflowException | IndexOutOfBoundsException e)
+            {
+                throw new InvalidRequestException("Not enough bytes to read a list");
             }
             catch (MarshalException e)
             {
