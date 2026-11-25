@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3.validation.entities;
 
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -33,10 +34,13 @@ import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static java.lang.String.format;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.junit.Assert.assertEquals;
 
 public class FrozenCollectionsTest extends CQLTester
@@ -1410,6 +1414,24 @@ public class FrozenCollectionsTest extends CQLTester
             assertRows(execute("SELECT * FROM %s WHERE a = 0 AND b IN ({}, {2: 20})"), row(0, map(), set()));
             assertRows(execute("SELECT * FROM %s WHERE a = 0 AND b = {1: 10} AND c IN ({}, {1})"), row(0, map(1, 10), set(1)));
         });
+    }
+
+    @Test
+    public void testBoundUnsortedSetInDescendingClustering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<set<int>>, c frozen<list<frozen<set<int>>>>, d frozen<map<int, int>>, PRIMARY KEY (a, b, c, d)) WITH CLUSTERING ORDER BY (b DESC, c DESC, d DESC)");
+
+        // {2, 1, 2}, not sorted and with a duplicate
+        ByteBuffer set = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(1), bytes(2)), 3, ProtocolVersion.CURRENT);
+        ByteBuffer list = CollectionSerializer.pack(Arrays.asList(set), 1, ProtocolVersion.CURRENT);
+        // {2: 0, 1: 0}
+        ByteBuffer map = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(0), bytes(1), bytes(0)), 2, ProtocolVersion.CURRENT);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (0, ?, ?, ?)", set, list, map);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (0, {1, 2}, [{1, 2}], {1: 0, 2: 0})");
+        assertRowCount(execute("SELECT * FROM %s"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND b = ? AND c = ?", set, list), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) = ?", tuple(set, list)), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) IN ?", list(tuple(set, list))), 1);
     }
 
     private static String clean(String classname)

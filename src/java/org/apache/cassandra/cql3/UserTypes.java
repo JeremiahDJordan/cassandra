@@ -217,7 +217,10 @@ public abstract class UserTypes
         public static Value fromSerialized(ByteBuffer bytes, UserType type)
         {
             type.validate(bytes);
-            return new Value(type, type.split(ByteBufferAccessor.instance, bytes));
+            ByteBuffer[] fields = type.split(ByteBufferAccessor.instance, bytes);
+            for (int i = 0; i < fields.length; i++)
+                fields[i] = Terms.sortSetsAndMaps(type.fieldType(i), fields[i]);
+            return new Value(type, fields);
         }
 
         public ByteBuffer get(ProtocolVersion protocolVersion)

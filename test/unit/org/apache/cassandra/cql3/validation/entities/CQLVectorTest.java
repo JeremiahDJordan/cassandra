@@ -20,6 +20,7 @@ package org.apache.cassandra.cql3.validation.entities;
 
 import java.math.BigInteger;
 import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 
@@ -39,12 +40,14 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.schema.CQLTypeParser;
 import org.apache.cassandra.schema.Types;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 import org.assertj.core.api.Assertions;
 
 import static java.lang.String.format;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 public class CQLVectorTest extends CQLTester
 {
@@ -408,6 +411,17 @@ public class CQLVectorTest extends CQLTester
                                   InvalidRequestException.class,
                                   "INSERT INTO %s (pk, value) VALUES (0, ?)",
                                   vector(BigInteger.valueOf(Long.MAX_VALUE).add(BigInteger.ONE), BigInteger.ONE));
+    }
+
+    @Test
+    public void boundUnsortedSetElement()
+    {
+        createTable(KEYSPACE, "CREATE TABLE %s (pk vector<frozen<set<int>>, 1> primary key)");
+
+        // {2, 1, 2}, not sorted and with a duplicate
+        ByteBuffer set = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(1), bytes(2)), 3, ProtocolVersion.CURRENT);
+        execute("INSERT INTO %s (pk) VALUES (?)", vector(set));
+        assertRowCount(execute("SELECT * FROM %s WHERE pk = [{1, 2}]"), 1);
     }
 
     @Test
