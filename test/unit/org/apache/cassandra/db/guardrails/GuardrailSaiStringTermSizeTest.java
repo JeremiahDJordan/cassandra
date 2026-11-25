@@ -24,6 +24,7 @@ import java.util.Arrays;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
 import static java.nio.ByteBuffer.allocate;
@@ -104,6 +105,30 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
         testThreshold("s", "INSERT INTO %s (k, c, s, r) VALUES (0, 0, ?, 0)");
         testThreshold("s", "UPDATE %s SET s = ? WHERE k = 0");
         testThreshold("s", "UPDATE %s SET s = ?, r = 0 WHERE k = 0 AND c = 0");
+    }
+
+    @Test
+    public void testWarnThresholdDisabled() throws Throwable
+    {
+        guardrails().setSaiStringTermSizeThreshold(null, FAIL_THRESHOLD + "B");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+
+        assertValid("INSERT INTO %s (k, v) VALUES (0, ?)", allocate(FAIL_THRESHOLD));
+        assertFails("v", "INSERT INTO %s (k, v) VALUES (0, ?)", allocate(FAIL_THRESHOLD + 1));
+    }
+
+    @Test
+    public void testAnalyzedTermLargerThanValue() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        createIndex("CREATE INDEX ON %s (v) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        // 'Ⱥ' is 2 bytes and lower-cases to 3, so the terms are over the thresholds while the values are not
+        String query = "INSERT INTO %s (k, v) VALUES (0, ?)";
+        assertWarns("v", query, UTF8Type.instance.decompose("Ⱥ".repeat(WARN_THRESHOLD / 3) + "aa"));
+        guardrails().setSaiStringTermSizeThreshold(null, FAIL_THRESHOLD + "B");
+        assertFails("v", query, UTF8Type.instance.decompose("Ⱥ".repeat(FAIL_THRESHOLD / 3) + "aa"));
     }
 
     @Test
