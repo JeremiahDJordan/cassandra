@@ -29,6 +29,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.NavigableSet;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -60,10 +61,13 @@ import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.IndexHints;
 import org.apache.cassandra.db.filter.OptimizerOptions;
@@ -74,7 +78,10 @@ import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
+import org.apache.cassandra.db.rows.UnfilteredSource;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Bounds;
@@ -96,8 +103,10 @@ import org.apache.cassandra.index.sai.utils.PrimaryKeyWithSortKey;
 import org.apache.cassandra.index.sai.utils.RowWithSource;
 import org.apache.cassandra.index.sai.utils.RangeUtil;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.CloseableIterator;
@@ -131,6 +140,16 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     private final PrimaryKey firstPrimaryKey;
 
     private final NavigableSet<Clustering<?>> nextClusterings;
+
+    /** The most candidate rows of a partition read by their clusterings; with more, it is read from its start. */
+    static final int MAX_CANDIDATE_CLUSTERINGS = 128;
+
+    /** The most keys of a partition looked at to find its candidate rows; with more, the partition is read whole. */
+    public static final int MAX_CANDIDATE_KEYS_SCANNED = 4 * MAX_CANDIDATE_CLUSTERINGS;
+
+    /** The keys filter-then-sort orders by a partition key column of a table with clustering columns, if any. */
+    @Nullable
+    private List<PrimaryKey> filterThenSortKeys;
 
     final Plan.Factory planFactory;
 
@@ -343,8 +362,31 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         if (key == null)
             throw new IllegalArgumentException("non-null key required");
 
-        SinglePartitionReadCommand partition = getPartitionReadCommand(key, executionController);
+        return getPartition(getPartitionReadCommand(key, executionController), view, executionController);
+    }
 
+    /**
+     * Get an iterator over the rows of the partition with the given clusterings (and its static row). Restrict the
+     * search to the specified view.
+     */
+    public UnfilteredRowIterator getPartition(DecoratedKey partitionKey,
+                                              NavigableSet<Clustering<?>> clusterings,
+                                              ColumnFamilyStore.ViewFragment view,
+                                              ReadExecutionController executionController)
+    {
+        boolean reversed = command.clusteringIndexFilter(partitionKey).isReversed();
+        SinglePartitionReadCommand partition = SinglePartitionReadCommand.create(cfs.metadata(),
+                                                                                 command.nowInSec(),
+                                                                                 command.columnFilter(),
+                                                                                 RowFilter.none(),
+                                                                                 DataLimits.NONE,
+                                                                                 partitionKey,
+                                                                                 new ClusteringIndexNamesFilter(clusterings, reversed));
+        return getPartition(partition, view, executionController);
+    }
+
+    private UnfilteredRowIterator getPartition(SinglePartitionReadCommand partition, ColumnFamilyStore.ViewFragment view, ReadExecutionController executionController)
+    {
         // Class to transform the row to include its source table.
         Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer = (CellSourceIdentifier sourceTable) -> new Transformation<>()
         {
@@ -706,12 +748,13 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     {
         try
         {
-            var primaryKeys = materializeKeys(source);
+            var primaryKeys = expandPartitionKeys(materializeKeys(source));
             if (primaryKeys.isEmpty())
             {
                 FileUtils.closeQuietly(source);
                 return CloseableIterator.emptyIterator();
             }
+            keepFilterThenSortKeys(primaryKeys);
             var result = getTopKRows(primaryKeys, softLimit);
             // We cannot close the source iterator eagerly because it produces partially loaded PrimaryKeys
             // that might not be needed until a deeper search into the ordering index, which happens after
@@ -723,6 +766,59 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             FileUtils.closeQuietly(source);
             throw t;
         }
+    }
+
+    /**
+     * Keeps the keys of filter-then-sort on a partition key column of a table with clustering columns, so that each
+     * partition can be read by the clusterings of its candidate rows (see {@link #candidateClusterings}), not whole.
+     */
+    private void keepFilterThenSortKeys(List<PrimaryKey> keys)
+    {
+        if (orderer.context.getDefinition().isPartitionKey() && cfs.metadata().hasClustering())
+            filterThenSortKeys = keys;
+    }
+
+    /**
+     * @return the clusterings of the partition's candidate rows that the command's clustering filter selects, or null
+     * if the partition must be read whole: another plan, a key without a clustering, no candidate, or more than
+     * {@link #MAX_CANDIDATE_CLUSTERINGS} rows or {@link #MAX_CANDIDATE_KEYS_SCANNED} keys
+     */
+    @Nullable
+    public NavigableSet<Clustering<?>> candidateClusterings(DecoratedKey partitionKey)
+    {
+        List<PrimaryKey> keys = filterThenSortKeys;
+        if (keys == null)
+            return null;
+
+        // the keys of a partition are adjacent: find the first of them
+        int low = 0, high = keys.size();
+        while (low < high)
+        {
+            int mid = (low + high) >>> 1;
+            if (keys.get(mid).partitionKey().compareTo(partitionKey) < 0)
+                low = mid + 1;
+            else
+                high = mid;
+        }
+
+        NavigableSet<Clustering<?>> clusterings = null;
+        for (int i = low; i < keys.size(); i++)
+        {
+            PrimaryKey key = keys.get(i);
+            if (!key.partitionKey().equals(partitionKey))
+                break;
+            if (i - low >= MAX_CANDIDATE_KEYS_SCANNED || !key.hasClustering())
+                return null;
+            // a row outside the command's clustering restriction isn't read (the ordering doesn't read its key)
+            if (!selects(key))
+                continue;
+            if (clusterings == null)
+                clusterings = new TreeSet<>(cfs.metadata().comparator);
+            clusterings.add(key.clustering());
+            if (clusterings.size() > MAX_CANDIDATE_CLUSTERINGS)
+                return null;
+        }
+        return clusterings;
     }
 
     /**
@@ -751,6 +847,165 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             primaryKeys.add(next);
         }
         return primaryKeys;
+    }
+
+    /**
+     * The ordering indexes need a key per row, but a key without a clustering (of a static row, from an index on a
+     * static or partition key column) stands for its whole partition. This replaces the keys of every partition with
+     * such a key by the keys of its rows that have a value for the ordered column in the ordering index's memtables
+     * and sstables: for a primary key column, the keys of its live rows, or, for a partition key column and no live
+     * row, the clustering-less key, which the ordering answers with the static row. The keys of a partition are
+     * adjacent, since they are sorted by partition first.
+     */
+    private List<PrimaryKey> expandPartitionKeys(List<PrimaryKey> keys)
+    {
+        TableMetadata table = cfs.metadata();
+        ColumnMetadata orderedColumn = orderer.context.getDefinition();
+        // Only row-aware keys of the static rows of a table with clustering columns lack a clustering. (An index on a
+        // static column orders static rows, so their keys are the ones it needs.)
+        if (!indexFeatureSet.isRowAware()
+            || table.clusteringColumns().isEmpty()
+            || !table.hasStaticColumns()
+            || orderedColumn.isStatic())
+            return keys;
+
+        List<PrimaryKey> expanded = null;
+        ColumnFilter columnFilter = null;
+        int start = 0;
+        while (start < keys.size())
+        {
+            DecoratedKey partitionKey = keys.get(start).partitionKey();
+            boolean wholePartition = false;
+            int end = start;
+            while (end < keys.size() && keys.get(end).partitionKey().equals(partitionKey))
+                wholePartition |= !keys.get(end++).hasClustering();
+
+            if (wholePartition && expanded == null)
+            {
+                expanded = new ArrayList<>(keys.subList(0, start));
+                // every row has a value for a primary key column, which no cell holds
+                columnFilter = orderedColumn.isPrimaryKeyColumn()
+                               ? ColumnFilter.all(table)
+                               : ColumnFilter.selection(RegularAndStaticColumns.of(orderedColumn));
+            }
+
+            if (wholePartition && orderedColumn.isPrimaryKeyColumn())
+            {
+                // Every row has a value for a primary key column, so the key of a dead row is never stale by its
+                // value: decide from the merged partition. The keys of its live rows, or, if no row is live, the key
+                // of the static row, which answers for a partition without live rows with a partition key column.
+                if (!addLiveRowKeys(partitionKey, columnFilter, expanded) && orderedColumn.isPartitionKey())
+                {
+                    for (int i = start; i < end; i++)
+                    {
+                        if (!keys.get(i).hasClustering())
+                        {
+                            expanded.add(keys.get(i));
+                            break;
+                        }
+                    }
+                }
+            }
+            else if (wholePartition)
+            {
+                addRowKeys(partitionKey, orderedColumn, columnFilter, expanded);
+            }
+            else if (expanded != null)
+                expanded.addAll(keys.subList(start, end));
+            start = end;
+        }
+        return expanded == null ? keys : expanded;
+    }
+
+    private void addRowKeys(DecoratedKey partitionKey, ColumnMetadata orderedColumn, ColumnFilter columnFilter, List<PrimaryKey> keys)
+    {
+        QueryView view = getQueryView(orderer.context);
+        NavigableSet<Clustering<?>> clusterings = new TreeSet<>(cfs.metadata().comparator);
+        for (Memtable memtable : view.viewFragment.memtables)
+            addClusterings(memtable, partitionKey, orderedColumn, columnFilter, clusterings, queryContext);
+        for (SSTableReader sstable : view.viewFragment.sstables)
+            addClusterings(sstable, partitionKey, orderedColumn, columnFilter, clusterings, queryContext);
+
+        for (Clustering<?> clustering : clusterings)
+            keys.add(primaryKeyFactory().create(partitionKey, clustering));
+    }
+
+    /**
+     * Adds the keys of the live rows of the given partition, merged over the memtables and sstables of the ordering
+     * index's view.
+     *
+     * @return whether the partition has a live row
+     */
+    private boolean addLiveRowKeys(DecoratedKey partitionKey, ColumnFilter columnFilter, List<PrimaryKey> keys)
+    {
+        QueryView view = getQueryView(orderer.context);
+        List<UnfilteredRowIterator> sources = new ArrayList<>();
+        try
+        {
+            for (Memtable memtable : view.viewFragment.memtables)
+                addSource(memtable, partitionKey, columnFilter, sources);
+            for (SSTableReader sstable : view.viewFragment.sstables)
+                addSource(sstable, partitionKey, columnFilter, sources);
+        }
+        catch (Throwable t)
+        {
+            // UnfilteredRowIterators.merge closes the sources itself if it fails
+            Throwables.closeAndAddSuppressed(t, sources.toArray(new AutoCloseable[0]));
+            throw t;
+        }
+        if (sources.isEmpty())
+            return false;
+
+        boolean enforceStrictLiveness = cfs.metadata().enforceStrictLiveness();
+        boolean anyLive = false;
+        try (UnfilteredRowIterator rows = UnfilteredRowIterators.merge(sources))
+        {
+            while (rows.hasNext())
+            {
+                // reading a wide partition can take a while, so stop if the query timed out or was aborted
+                queryContext.checkpoint();
+                Unfiltered unfiltered = rows.next();
+                if (unfiltered.isRow() && ((Row) unfiltered).hasLiveData(command.nowInSec(), enforceStrictLiveness))
+                {
+                    keys.add(primaryKeyFactory().create(partitionKey, ((Row) unfiltered).clustering()));
+                    anyLive = true;
+                }
+            }
+        }
+        return anyLive;
+    }
+
+    private static void addSource(UnfilteredSource source, DecoratedKey partitionKey, ColumnFilter columnFilter, List<UnfilteredRowIterator> sources)
+    {
+        UnfilteredRowIterator rows = source.rowIterator(partitionKey, Slices.ALL, columnFilter, false, SSTableReadsListener.NOOP_LISTENER);
+        // a memtable returns null for a partition it doesn't have
+        if (rows != null)
+            sources.add(rows);
+    }
+
+    private static void addClusterings(UnfilteredSource source,
+                                       DecoratedKey partitionKey,
+                                       ColumnMetadata orderedColumn,
+                                       ColumnFilter columnFilter,
+                                       NavigableSet<Clustering<?>> clusterings,
+                                       QueryContext queryContext)
+    {
+        try (UnfilteredRowIterator rows = source.rowIterator(partitionKey, Slices.ALL, columnFilter, false, SSTableReadsListener.NOOP_LISTENER))
+        {
+            // a memtable returns null for a partition it doesn't have
+            while (rows != null && rows.hasNext())
+            {
+                // reading a wide partition can take a while, so stop if the query timed out or was aborted
+                queryContext.checkpoint();
+                Unfiltered unfiltered = rows.next();
+                if (!unfiltered.isRow())
+                    continue;
+                // Rows without a value for the ordered column in this source can't be ordered by it from this source.
+                Row row = (Row) unfiltered;
+                if (row.getCell(orderedColumn) != null)
+                    clusterings.add(row.clustering());
+            }
+        }
     }
 
     private CloseableIterator<PrimaryKeyWithSortKey> getTopKRows(List<PrimaryKey> sourceKeys, int softLimit)

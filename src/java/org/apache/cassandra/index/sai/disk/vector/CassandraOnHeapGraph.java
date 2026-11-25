@@ -26,6 +26,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.EnumMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
@@ -310,6 +311,16 @@ public class CassandraOnHeapGraph<T> implements Accountable
     public Collection<T> keysFromOrdinal(int node)
     {
         return postingsByOrdinal.get(node).getPostings();
+    }
+
+    /**
+     * @return the keys in the postings of the given vector, empty if the graph doesn't have the vector
+     */
+    @VisibleForTesting
+    public Collection<T> keysOf(ByteBuffer term)
+    {
+        VectorPostings<T> postings = postingsMap.get(vts.createFloatVector(serializer.deserializeFloatArray(term)));
+        return postings == null ? List.of() : postings.getPostings();
     }
 
     public VectorFloat<?> vectorForKey(T key)
