@@ -232,7 +232,7 @@ public abstract class Sets
                 Set<?> s = type.getSerializer().deserializeForNativeProtocol(value, ByteBufferAccessor.instance, version);
                 SortedSet<ByteBuffer> elements = new TreeSet<>(type.getElementsType());
                 for (Object element : s)
-                    elements.add(type.getElementsType().decompose(element));
+                    elements.add(Terms.sortSetsAndMaps(type.getElementsType(), type.getElementsType().decompose(element)));
                 return new Value(elements);
             }
             catch (MarshalException e)
