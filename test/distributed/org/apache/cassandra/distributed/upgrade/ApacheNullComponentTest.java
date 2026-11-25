@@ -40,7 +40,8 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
 {
     private static final int ROWS = 10;
     private static final String[][] VALUES = { { "frozen<tuple<int, int, int>>", "(1, null, 1)", "(1, 0, 1)" },
-                                               { "frozen<list<int>>", "[1, blobAsInt(0x), 1]", "[1, 0, 1]" } };
+                                               { "frozen<list<int>>", "[1, blobAsInt(0x), 1]", "[1, 0, 1]" },
+                                               { "frozen<udt>", "{a: 1, b: null, c: 1}", "{a: 1, b: 0, c: 1}" } };
     private static final String[] ORDERS = { "ASC", "DESC" };
 
     @Test
@@ -99,6 +100,7 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
     private static void createSchema(UpgradeableCluster cluster, int rf)
     {
         schemaChange(cluster, KEYSPACE, withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': " + rf + '}'));
+        schemaChange(cluster, KEYSPACE, withKeyspace("CREATE TYPE %s.udt (a int, b int, c int)"));
         for (int i = 0; i < VALUES.length; i++)
         {
             for (String order : ORDERS)
