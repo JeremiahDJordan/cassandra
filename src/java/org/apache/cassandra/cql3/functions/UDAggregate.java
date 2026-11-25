@@ -232,13 +232,13 @@ public class UDAggregate extends UserFunction implements AggregateFunction
                 // final function is traced in UDFunction
                 Tracing.trace("Executed UDA {}: {} call(s) to state function {} in {}\u03bcs", name(), stateFunctionCount, stateFunction.name(), stateFunctionDuration);
                 if (finalFunction == null)
-                    return UDFunction.decompose(stateTypeCodec, protocolVersion, state);
+                    return UDFunction.sortCollectionElements(stateType, UDFunction.decompose(stateTypeCodec, protocolVersion, state));
 
                 if (finalFunction instanceof UDFunction)
                 {
                     UDFunction udf = (UDFunction)finalFunction;
                     Object result = udf.executeForAggregate(protocolVersion, state, Collections.emptyList());
-                    return UDFunction.decompose(returnTypeCodec, protocolVersion, result);
+                    return UDFunction.sortCollectionElements(returnType(), UDFunction.decompose(returnTypeCodec, protocolVersion, result));
                 }
                 throw new UnsupportedOperationException("UDAs only support UDFs");
             }
