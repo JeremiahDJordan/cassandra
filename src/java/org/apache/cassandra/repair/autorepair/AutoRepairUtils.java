@@ -94,6 +94,7 @@ import org.apache.cassandra.tcm.compatibility.TokenRingUtils;
 import org.apache.cassandra.tcm.membership.Directory;
 import org.apache.cassandra.tcm.membership.NodeAddresses;
 import org.apache.cassandra.tcm.membership.NodeId;
+import org.apache.cassandra.tcm.membership.NodeState;
 import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
@@ -467,6 +468,26 @@ public class AutoRepairUtils
         }
         logger.info("No repair history found");
         return null;
+    }
+
+    /**
+     * Repair histories of the hosts in the cluster. A host that has left the cluster can't take its turn, and its
+     * record stays until enough nodes vote to delete it.
+     */
+    private static List<AutoRepairHistory> getAutoRepairHistoryInCluster(RepairType repairType)
+    {
+        List<AutoRepairHistory> autoRepairHistories = getAutoRepairHistory(repairType);
+        if (autoRepairHistories != null)
+        {
+            Directory directory = ClusterMetadata.current().directory;
+            autoRepairHistories.removeIf(history -> {
+                NodeId nodeId = NodeId.isValidNodeId(history.hostId) ? NodeId.fromUUID(history.hostId)
+                                                                     : directory.nodeIdFromHostId(history.hostId);
+                NodeState state = nodeId == null ? null : directory.peerState(nodeId);
+                return state == null || state == NodeState.LEFT;
+            });
+        }
+        return autoRepairHistories;
     }
 
     // A host may add itself in delete hosts for some other hosts due to restart or some temp gossip issue. If a node's record
@@ -1010,7 +1031,8 @@ public class AutoRepairUtils
             }
 
             // get updated current repair status
-            CurrentRepairStatus currentRepairStatus = getCurrentRepairStatus(repairType, getAutoRepairHistory(repairType), myId);
+            autoRepairHistories = getAutoRepairHistoryInCluster(repairType);
+            CurrentRepairStatus currentRepairStatus = getCurrentRepairStatus(repairType, autoRepairHistories, myId);
             if (currentRepairStatus != null)
             {
                 if (logger.isDebugEnabled())
@@ -1057,7 +1079,7 @@ public class AutoRepairUtils
                 else
                 {
                     // try to fetch again
-                    autoRepairHistories = getAutoRepairHistory(repairType);
+                    autoRepairHistories = getAutoRepairHistoryInCluster(repairType);
                     if (autoRepairHistories == null)
                     {
                         logger.error("No record found");
