@@ -17,7 +17,7 @@
 package org.apache.cassandra.index.sai;
 
 /**
- * A value that SAI writes but doesn't index, which the coordinator doesn't check.
+ * A value that SAI writes but doesn't index, which the coordinator accepts.
  */
 public final class NotIndexedValues
 {
@@ -26,10 +26,7 @@ public final class NotIndexedValues
     "{'index_analyzer': '{\"tokenizer\":{\"name\":\"keyword\"}, " +
     "\"filters\":[{\"name\":\"ngram\", \"args\":{\"minGramSize\":\"2\", \"maxGramSize\":\"8\"}}]}'}";
 
-    /**
-     * 512 letters: under the term size warning threshold, so the coordinator doesn't analyze them, but their grams add
-     * up to 17752 bytes, over the max analyzed size.
-     */
+    /** 512 letters, whose grams add up to 17752 bytes, over the max analyzed size. */
     public static final String NGRAM_VALUE = letters(512, 0);
 
     private NotIndexedValues()

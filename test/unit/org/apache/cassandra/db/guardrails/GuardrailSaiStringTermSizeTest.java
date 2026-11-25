@@ -25,6 +25,7 @@ import java.util.Collections;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
 import static java.nio.ByteBuffer.allocate;
@@ -121,6 +122,20 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
         testThreshold("s", "INSERT INTO %s (k, c, s, r) VALUES (0, 0, ?, 0)");
         testThreshold("s", "UPDATE %s SET s = ? WHERE k = 0");
         testThreshold("s", "UPDATE %s SET s = ?, r = 0 WHERE k = 0 AND c = 0");
+    }
+
+    @Test
+    public void testAnalyzedTermLargerThanValue() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': '{" +
+                    "\"tokenizer\": {\"name\": \"keyword\"}, \"filters\": [{\"name\": \"patternReplace\", " +
+                    "\"args\": {\"pattern\": \"a\", \"replacement\": \"aaaaaaaaaaaa\", \"replace\": \"all\"}}]}'}");
+
+        // each 'a' becomes 12 bytes, so the terms are over the thresholds while the values are under the warning one
+        String query = "INSERT INTO %s (k, v) VALUES (0, ?)";
+        assertWarns("v", query, UTF8Type.instance.decompose("a".repeat(WARN_THRESHOLD / 12) + "bbbbb"));
+        assertFails("v", query, UTF8Type.instance.decompose("a".repeat(FAIL_THRESHOLD / 12) + "bbbbb"));
     }
 
     @Test

@@ -360,18 +360,22 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
     }
 
     /**
-     * The same as {@link #testReplicaAnalyzedValueOverMaxAnalyzedSizeInternal}, for a client write applied locally.
+     * The same as {@link #testReplicaAnalyzedValueOverMaxAnalyzedSizeInternal}, for a client write applied locally that
+     * the coordinator doesn't check.
      */
     @Test
     public void testReplicaAnalyzedValueOverMaxAnalyzedSize() throws Throwable
     {
-        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
-        String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = " + NGRAM_ANALYZER);
+        try (WithProperties properties = new WithProperties().set(SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR, false))
+        {
+            createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+            String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = " + NGRAM_ANALYZER);
 
-        assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
-                              () -> execute("INSERT INTO %s (k, v) VALUES (0, ?)", ByteBufferUtil.bytes(NGRAM_VALUE)));
-        assertEquals(1, rows("SELECT k FROM %s WHERE k = 0"));
-        assertEquals(0, rows("SELECT k FROM %s WHERE v : 'ab'"));
+            assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                                  () -> execute("INSERT INTO %s (k, v) VALUES (0, ?)", ByteBufferUtil.bytes(NGRAM_VALUE)));
+            assertEquals(1, rows("SELECT k FROM %s WHERE k = 0"));
+            assertEquals(0, rows("SELECT k FROM %s WHERE v : 'ab'"));
+        }
     }
 
     /**

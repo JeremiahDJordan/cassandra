@@ -534,7 +534,7 @@ public class IndexContext
     {
         // Like any guardrail, these don't apply to superusers and internal writes, nor to the anonymous user when
         // authentication is disabled (whatever cassandra.enable_guardrails_for_anonymous_user says).
-        if (state != null && state.isSuper())
+        if (state != null && (state.isSuper() || state.isSystem()))
             return;
 
         if (isNonFrozenCollection())
@@ -606,7 +606,8 @@ public class IndexContext
         long maxTermSize = maxTermSize();
         boolean hasMaxTermSize = (isLiteral() || isVector()) && (state == null || state.isOrdinaryUser());
         boolean overMaxTermSize = hasMaxTermSize && !fitsMaxTermSize(cellBuffer, maxTermSize);
-        if (!overMaxTermSize && !termSizeGuardrail.triggersOn(cellBuffer.remaining(), state))
+        // an analyzer can make a term larger than the value, so its terms are checked whatever the size of the value
+        if (!isAnalyzed && !overMaxTermSize && !termSizeGuardrail.triggersOn(cellBuffer.remaining(), state))
             return;
 
         AbstractAnalyzer analyzer = getAnalyzerFactory().create();
