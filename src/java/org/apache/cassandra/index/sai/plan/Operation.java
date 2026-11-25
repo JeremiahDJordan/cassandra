@@ -152,7 +152,7 @@ public class Operation
                 {
                     if (!analyzer.hasNext())
                     {
-                        perColumn.add(new Expression(indexContext).add(e.operator(), ByteBuffer.allocate(0)));
+                        perColumn.add(Expression.withoutTerms(indexContext, e.operator()));
                     }
                     else if (e.operator() == Operator.NOT_CONTAINS || e.operator() == Operator.NOT_CONTAINS_KEY)
                     {

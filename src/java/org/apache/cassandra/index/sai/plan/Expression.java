@@ -210,6 +210,9 @@ public class Expression
     // Operation#analyzeGroup)
     RowFilter.Expression unindexed;
 
+    // Whether the query analyzer makes no terms of the value of this expression (see #withoutTerms)
+    private boolean withoutTerms;
+
     public Expression(IndexContext indexContext)
     {
         this.context = indexContext;
@@ -228,6 +231,17 @@ public class Expression
         Expression expression = new Expression(indexContext);
         expression.operation = Op.valueOf(unindexed.operator());
         expression.unindexed = unindexed;
+        return expression;
+    }
+
+    /**
+     * @return an expression of the given operator on a value that the query analyzer makes no terms of: like
+     * {@code Operator.ANALYZER_MATCHES#isSatisfiedByAnalyzed}, it matches no value, and its negation matches every value
+     */
+    static Expression withoutTerms(IndexContext indexContext, Operator operator)
+    {
+        Expression expression = new Expression(indexContext).add(operator, ByteBuffer.allocate(0));
+        expression.withoutTerms = true;
         return expression;
     }
 
@@ -358,6 +372,9 @@ public class Expression
     {
         if (columnValue == null)
             return false;
+
+        if (withoutTerms)
+            return operation.isNonEquality();
 
         // ORDER_BY is not indepently verifiable, so we always return true
         if (operation == Op.ORDER_BY)
@@ -812,7 +829,8 @@ public class Expression
                                     .append(lower).append(upper)
                                     .append(exclusions)
                                     .append(allTerms)
-                                    .append(unindexed).build();
+                                    .append(unindexed)
+                                    .append(withoutTerms).build();
     }
 
     public boolean equals(Object other)
@@ -833,13 +851,15 @@ public class Expression
                 && Objects.equals(upper, o.upper)
                 && exclusions.equals(o.exclusions)
                 && Objects.equals(allTerms, o.allTerms)
-                && Objects.equals(unindexed, o.unindexed);
+                && Objects.equals(unindexed, o.unindexed)
+                && withoutTerms == o.withoutTerms;
     }
 
     /**
      * Whether a bound of this expression is an empty value that the index doesn't store. Indexes on non-literal types
      * don't index empty values (see {@link TypeUtil#skipsEmptyValue}, CASSANDRA-20313), and their index structures
-     * can't encode an empty term, so such an expression must not be searched as it is.
+     * can't encode an empty term, so such an expression must not be searched as it is. Nor must the empty value of an
+     * expression without terms (see {@link #withoutTerms}), which matches no indexed value, not even the empty term.
      * See {@link #withoutUnindexedEmptyBounds()}.
      */
     public boolean hasUnindexedEmptyValue()
@@ -849,7 +869,7 @@ public class Expression
 
     private boolean isUnindexedEmpty(Bound bound)
     {
-        return bound != null && !bound.value.raw.hasRemaining() && TypeUtil.skipsEmptyValue(validator);
+        return bound != null && !bound.value.raw.hasRemaining() && (withoutTerms || TypeUtil.skipsEmptyValue(validator));
     }
 
     /**
@@ -868,6 +888,7 @@ public class Expression
         switch (operation)
         {
             case EQ:
+            case MATCH:
             case CONTAINS_KEY:
             case CONTAINS_VALUE:
                 return null;
