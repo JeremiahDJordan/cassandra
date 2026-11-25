@@ -107,6 +107,13 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - Non-analyzed storage-attached indexes (SAI) on text, varchar, ascii, boolean, frozen tuple and frozen UDT
+      columns, and on the elements of collections of those types, now index the empty value written by an update of
+      a row already in the memtable, e.g. UPDATE ... SET v = '' on a row that had another value or none. Earlier
+      versions skipped it, so restrictions such as v = '' missed the row, from the memtable and from the SSTable it
+      was flushed to. If you query such columns for the empty value, rebuild those indexes on each node after
+      upgrading it, with nodetool rebuild_index: the SSTables flushed before the upgrade keep missing such rows until
+      then, or until compacted.
 
 5.0.7
 ======
