@@ -35,7 +35,6 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
-import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.marshal.VectorType;
@@ -285,8 +284,9 @@ public abstract class Lists
                     if (element != null)
                     {
                         elementsType.validate(element);
-                        // serializing a collection element again sorts and deduplicates the sets and maps in it
-                        if (elementsType.unwrap() instanceof CollectionType)
+                        // serializing a collection or vector again sorts and deduplicates the sets and maps in it;
+                        // zero-length elements are kept as sent
+                        if (element.hasRemaining())
                             element = elementsType.decompose(elementsType.compose(element));
                     }
                     elements.add(element);
