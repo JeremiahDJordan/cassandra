@@ -38,7 +38,6 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_CH
 import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_COMPRESSION_SELECTOR_CLASS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SYSTEM_DISTRIBUTED_NTS_DC_OVERRIDE_PROPERTY;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SYSTEM_DISTRIBUTED_NTS_RF_OVERRIDE_PROPERTY;
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.config.CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION;
 import static org.apache.cassandra.schema.SchemaCompatibility.Target.APACHE_5_0;
 
@@ -55,13 +54,11 @@ public final class Cassandra5ModeChecks
     }
 
     /**
-     * Throws if {@link StorageCompatibilityMode#CASSANDRA_5} isn't available, or if a node, {@code daemon}, sets
-     * another messaging version than the one of the mode.
+     * Throws if a node, {@code daemon}, sets another messaging version than the one of
+     * {@link StorageCompatibilityMode#CASSANDRA_5}.
      */
     static void validateMode(boolean daemon)
     {
-        if (!TEST_CASSANDRA_5_MODE_ENABLED.getBoolean())
-            throw new ConfigurationException("storage_compatibility_mode " + StorageCompatibilityMode.CASSANDRA_5 + " isn't supported", false);
         if (daemon && DS_CURRENT_MESSAGING_VERSION.isPresent() && DS_CURRENT_MESSAGING_VERSION.getInt() != MessagingService.VERSION_50)
             throw new ConfigurationException(String.format("-D%s=%s isn't allowed in storage_compatibility_mode %s, which uses messaging version %d",
                                                            DS_CURRENT_MESSAGING_VERSION.getKey(), DS_CURRENT_MESSAGING_VERSION.getString(),

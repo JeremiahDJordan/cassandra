@@ -24,14 +24,12 @@ import org.junit.Test;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.IMessageFilters;
-import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.service.ApacheUpgradePath;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
@@ -48,8 +46,7 @@ public class ApacheUpgradePathBridgeTest extends TestBaseImpl
     @Test
     public void testSchemaExchange() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = start("CASSANDRA_5", "UPGRADING", "UPGRADING"))
+        try (Cluster cluster = start("CASSANDRA_5", "UPGRADING", "UPGRADING"))
         {
             // pushed: from node 2 to the mode node, and from the mode node to the nodes in UPGRADING
             IMessageFilters.Filter noPulls = cluster.filters().verbs(Verb.SCHEMA_PULL_REQ.id).drop();
@@ -83,8 +80,7 @@ public class ApacheUpgradePathBridgeTest extends TestBaseImpl
     @Test
     public void testRepair() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = start("CASSANDRA_5", "UPGRADING", "UPGRADING"))
+        try (Cluster cluster = start("CASSANDRA_5", "UPGRADING", "UPGRADING"))
         {
             cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int PRIMARY KEY, v int)"));
             String insert = withKeyspace("INSERT INTO %s.tbl (pk, v) VALUES (?, ?)");
@@ -109,8 +105,7 @@ public class ApacheUpgradePathBridgeTest extends TestBaseImpl
     @Test
     public void testRepairRefusedFromUnidentifiedPeer() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = start("CASSANDRA_5", "UPGRADING"))
+        try (Cluster cluster = start("CASSANDRA_5", "UPGRADING"))
         {
             cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int PRIMARY KEY, v int)"));
 

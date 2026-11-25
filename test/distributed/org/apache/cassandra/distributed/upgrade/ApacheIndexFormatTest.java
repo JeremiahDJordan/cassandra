@@ -30,6 +30,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -47,6 +48,7 @@ import java.util.stream.Stream;
 
 import com.google.common.collect.Maps;
 import org.apache.commons.lang3.ArrayUtils;
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -66,7 +68,6 @@ import org.apache.cassandra.utils.Hex;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MINIMUM_POSTINGS_LEAVES;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_TEST_LAST_VALID_SEGMENTS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VECTOR_ENABLE_NVQ;
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -240,8 +241,7 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
             }
         }
 
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = Cluster.build(1)
+        try (Cluster cluster = Cluster.build(1)
                                       .withConfig(config -> {
                                           config.set("storage_compatibility_mode", "CASSANDRA_5");
                                           oneDataDirectory(config);
@@ -288,6 +288,53 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
                     assertRows(node.executeInternal(withKeyspace("SELECT pk, ck FROM %s.built WHERE b = ?"), 10 * pk + ck), row(pk, ck));
             }
         }
+    }
+
+    @Test
+    public void testIndexCreatedOnApacheAfterRowsExpired() throws Throwable
+    {
+        Consumer<Consumer<String>> schema = schemaChange -> {
+            schemaChange.accept(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"));
+            schemaChange.accept(withKeyspace("CREATE TABLE %s.rollback (pk int, ck int, a int, b int, PRIMARY KEY (pk, ck))"));
+            schemaChange.accept(withKeyspace("CREATE INDEX rollback_a ON %s.rollback (a) USING 'sai'"));
+        };
+        // the first row in clustering order, written last, is numbered by the flush in the mode, and expires before the
+        // index on b is created after going back to Apache
+        Path files = writeInApacheFormat(schema, node -> {
+            for (int ck = 1; ck < 10; ck++)
+                node.executeInternal(withKeyspace("INSERT INTO %s.rollback (pk, ck, a, b) VALUES (0, ?, ?, ?)"), ck, ck, ck);
+            node.executeInternal(withKeyspace("INSERT INTO %s.rollback (pk, ck, a, b) VALUES (0, 0, 0, 0) USING TTL 5"));
+            node.flush(KEYSPACE);
+            assertRows(node.executeInternal(withKeyspace("SELECT ck FROM %s.rollback WHERE a = 0")), row(0));
+        }, "rollback");
+        loadOnApache(files, schema, (cluster, node, tableDirs) -> {
+            await().atMost(1, TimeUnit.MINUTES).until(() -> node.executeInternal(withKeyspace("SELECT ck FROM %s.rollback WHERE a = 0")).length == 0);
+            cluster.schemaChange(withKeyspace("CREATE INDEX rollback_b ON %s.rollback (b) USING 'sai'"));
+            await().atMost(1, TimeUnit.MINUTES).until(() -> node.callOnInstance(() -> {
+                ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore("rollback");
+                return cfs.indexManager.isIndexQueryable(cfs.indexManager.getIndexByName("rollback_b"));
+            }));
+
+            List<Integer> wrong = new ArrayList<>();
+            for (int ck = 1; ck < 10; ck++)
+            {
+                Object[][] rows = node.executeInternal(withKeyspace("SELECT ck FROM %s.rollback WHERE b = ?"), ck);
+                if (rows.length != 1 || !Integer.valueOf(ck).equals(rows[0][0]))
+                    wrong.add(ck);
+            }
+            // Apache's partial build numbers the rows by their liveness when it runs: wrong rows until the rewrite
+            if (apacheVersion().version.isLowerThanOrEqualTo("5.0.9"))
+                assertThat(wrong).isNotEmpty();
+            else
+                Assume.assumeFalse("Partial index builds number rows as flush does on " + apacheVersion().version, wrong.isEmpty());
+
+            node.nodetoolResult("upgradesstables", "-a", KEYSPACE, "rollback").asserts().success();
+            for (int ck = 1; ck < 10; ck++)
+            {
+                assertRows(node.executeInternal(withKeyspace("SELECT ck FROM %s.rollback WHERE a = ?"), ck), row(ck));
+                assertRows(node.executeInternal(withKeyspace("SELECT ck FROM %s.rollback WHERE b = ?"), ck), row(ck));
+            }
+        }, "rollback");
     }
 
     private static Path tableDir(IInstanceConfig config, String table) throws IOException
@@ -520,8 +567,7 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
     private Path writeInApacheFormat(Consumer<Consumer<String>> schema, Consumer<IInvokableInstance> write, String... tables) throws Throwable
     {
         Path files = temporaryFolder.newFolder().toPath();
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = Cluster.build(1)
+        try (Cluster cluster = Cluster.build(1)
                                       .withConfig(config -> {
                                           config.set("storage_compatibility_mode", "CASSANDRA_5");
                                           oneDataDirectory(config);
