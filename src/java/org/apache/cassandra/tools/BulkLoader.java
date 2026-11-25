@@ -32,6 +32,7 @@ import com.datastax.driver.core.AuthProvider;
 import com.datastax.driver.core.RemoteEndpointAwareJdkSSLOptions;
 import com.datastax.driver.core.SSLOptions;
 import com.datastax.shaded.netty.channel.socket.SocketChannel;
+import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.EncryptionOptions;
 import org.apache.cassandra.io.sstable.SSTableLoader;
@@ -47,6 +48,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.NativeSSTableLoaderClient;
 import org.apache.cassandra.utils.OutputHandler;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
@@ -60,7 +62,12 @@ public class BulkLoader
 
     public static void load(LoaderOptions options) throws BulkLoadException
     {
-        DatabaseDescriptor.clientInitialization();
+        // the storage compatibility mode of --conf-path decides the versions written, as for any client
+        DatabaseDescriptor.clientInitialization(true, () -> {
+            Config config = new Config();
+            config.storage_compatibility_mode = options.storageCompatibilityMode;
+            return config;
+        });
         OutputHandler handler = new OutputHandler.SystemOutput(options.verbose, options.debug);
         SSTableLoader loader = new SSTableLoader(
                 options.directory.toAbsolute(),
@@ -78,7 +85,9 @@ public class BulkLoader
         DatabaseDescriptor.setInterDCStreamThroughputOutboundBytesPerSec(options.interDcThrottleBytes);
         DatabaseDescriptor.setEntireSSTableStreamThroughputOutboundMebibytesPerSec(options.entireSSTableThrottleMebibytes);
         DatabaseDescriptor.setEntireSSTableInterDCStreamThroughputOutboundMebibytesPerSec(options.entireSSTableInterDcThrottleMebibytes);
-        DatabaseDescriptor.setStreamEntireSSTables(options.streamEntireSSTables);
+        // as in Apache Cassandra, a --conf-path file in one of its modes doesn't set the loader's stream_entire_sstables
+        if (DatabaseDescriptor.getStorageCompatibilityModeForWrites() == StorageCompatibilityMode.HCD_1)
+            DatabaseDescriptor.setStreamEntireSSTables(options.streamEntireSSTables);
         StreamResultFuture future;
 
         ProgressIndicator indicator = new ProgressIndicator();

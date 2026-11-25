@@ -34,6 +34,7 @@ import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Multimap;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.streaming.CassandraOutgoingFile;
@@ -168,7 +169,11 @@ public class SSTableLoader implements StreamEventHandler
 
                                                   long estimatedKeys = sstable.estimatedKeysForRanges(tokenRanges);
                                                   Ref<SSTableReader> ref = sstable.ref();
-                                                  CassandraOutgoingFile stream = new CassandraOutgoingFile(StreamOperation.BULK_LOAD, ref, sstableSections, tokenRanges, estimatedKeys);
+                                                  // sstableloader doesn't know the messaging versions of its targets, a node loading sstables does
+                                                  CassandraOutgoingFile.BtiDaReceiver receiver = DatabaseDescriptor.isClientInitialized()
+                                                                                               ? CassandraOutgoingFile.BtiDaReceiver.PARTITIONS
+                                                                                               : CassandraOutgoingFile.BtiDaReceiver.of(endpoint);
+                                                  CassandraOutgoingFile stream = new CassandraOutgoingFile(StreamOperation.BULK_LOAD, ref, sstableSections, tokenRanges, estimatedKeys, receiver);
                                                   streamingDetails.put(endpoint, stream);
                                               }
 

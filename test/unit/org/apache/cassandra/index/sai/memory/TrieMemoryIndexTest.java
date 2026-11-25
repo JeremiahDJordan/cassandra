@@ -94,7 +94,7 @@ public class TrieMemoryIndexTest
         while(iterator.hasNext())
         {
             var pair = iterator.next();
-            int value = ByteSourceInverse.getSignedInt(pair.left.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION));
+            int value = ByteSourceInverse.getSignedInt(TypeUtil.termBytes(pair.left));
             int idCount = 0;
             for (var pkf : pair.right)
             {
@@ -124,7 +124,7 @@ public class TrieMemoryIndexTest
         while(iterator.hasNext())
         {
             var pair = iterator.next();
-            String value = new String(ByteSourceInverse.readBytes(ByteSource.peekable(pair.left.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION))), StandardCharsets.UTF_8);
+            String value = new String(ByteSourceInverse.readBytes(ByteSource.peekable(TypeUtil.termBytes(pair.left))), StandardCharsets.UTF_8);
             int idCount = 0;
             for (var pkf : pair.right)
             {
@@ -346,7 +346,7 @@ public class TrieMemoryIndexTest
                                                           ? v -> ByteSource.preencoded(decompose.apply(rowId))
                                                           : version -> type.asComparableBytes(decompose.apply(rowId), version);
             final ByteComparable actualByteComparable = pair.left;
-            assertEquals("Mismatch at: " + i, 0, ByteComparable.compare(expectedByteComparable, actualByteComparable, TypeUtil.BYTE_COMPARABLE_VERSION));
+            assertEquals("Mismatch at: " + i, 0, ByteSource.compare(expectedByteComparable.asComparableBytes(TypeUtil.BYTE_COMPARABLE_VERSION), TypeUtil.termBytes(actualByteComparable)));
 
             i++;
         }

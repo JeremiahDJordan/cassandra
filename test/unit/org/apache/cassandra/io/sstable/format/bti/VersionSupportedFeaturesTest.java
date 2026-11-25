@@ -24,15 +24,21 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import com.google.common.collect.Streams;
+import org.junit.Assume;
 import org.junit.Test;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.distributed.shared.WithProperties;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.io.sstable.format.AbstractTestVersionSupportedFeatures;
 import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.assertj.core.api.SoftAssertions;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 public class VersionSupportedFeaturesTest extends AbstractTestVersionSupportedFeatures
 {
@@ -82,6 +88,73 @@ public class VersionSupportedFeaturesTest extends AbstractTestVersionSupportedFe
         // in particular, 'ab' sstables of encrypted tables have encrypted indexes and metadata
         assertThat(ab.indicesAreEncrypted()).isTrue();
         assertThat(ab.metadataIsEncrypted()).isTrue();
+    }
+
+    /**
+     * The version written is "cc" in storage compatibility mode HCD_1 and "da" in the others, unless
+     * -Dcassandra.trie_index_format_version sets it.
+     */
+    @Test
+    public void testLatestVersion()
+    {
+        String expected = CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.isPresent()
+                          ? CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.getString()
+                          : DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1 ? "cc" : "da";
+        assertThat(BtiFormat.getInstance().getLatestVersion().version).isEqualTo(expected);
+    }
+
+    @Test
+    public void testLatestVersionPerStorageCompatibilityMode()
+    {
+        Assume.assumeFalse(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.isPresent());
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        try
+        {
+            for (StorageCompatibilityMode compatibilityMode : StorageCompatibilityMode.values())
+            {
+                DatabaseDescriptor.setStorageCompatibilityMode(compatibilityMode);
+                BtiFormat format = new BtiFormat(null);
+                // HCD_1 writes the version its releases read, the other modes that of Apache Cassandra
+                String expected = compatibilityMode == StorageCompatibilityMode.HCD_1 ? "cc" : "da";
+                assertThat(format.getLatestVersion().version).describedAs(compatibilityMode.toString()).isEqualTo(expected);
+                assertThat(format.getVersion(expected).isLatestVersion()).describedAs(compatibilityMode.toString()).isTrue();
+                assertThat(format.getVersion("da").isCompatible()).describedAs(compatibilityMode.toString()).isTrue();
+                assertThat(format.getVersion("da").isNewerThanStorageCompatibilityMode()).describedAs(compatibilityMode.toString()).isEqualTo(expected.equals("cc"));
+            }
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
+    }
+
+    @Test
+    public void testExplicitVersion()
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        try (WithProperties properties = new WithProperties())
+        {
+            properties.set(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION, "da");
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.HCD_1);
+            BtiFormat format = new BtiFormat(null);
+            assertThat(format.getLatestVersion().version).isEqualTo("da");
+            assertThat(format.getLatestVersion().isNewerThanStorageCompatibilityMode()).isTrue();
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_4);
+            properties.set(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION, "cc");
+            assertThat(new BtiFormat(null).getLatestVersion().version).isEqualTo("cc");
+
+            for (String version : new String[]{ "ea", "db", "cd", "ab", "a", "b", "d", "aaa", "zzz", "" })
+            {
+                properties.set(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION, version);
+                assertThatThrownBy(() -> new BtiFormat(null)).describedAs(version)
+                                                             .isInstanceOf(ConfigurationException.class)
+                                                             .hasMessageContaining("the bti versions written are aa, ac, ad, ba, bb, ca, cb, cc, da");
+            }
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
     }
 
     /**

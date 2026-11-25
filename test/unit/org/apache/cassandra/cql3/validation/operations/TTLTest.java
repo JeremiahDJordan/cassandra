@@ -22,6 +22,7 @@ package org.apache.cassandra.cql3.validation.operations;
 import java.io.IOException;
 import java.util.Collections;
 
+import com.google.common.collect.Iterables;
 import org.junit.After;
 import org.junit.Assume;
 import org.junit.Before;
@@ -37,6 +38,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ExpirationDateOverflowHandling;
 import org.apache.cassandra.db.ExpirationDateOverflowHandling.ExpirationDateOverflowPolicy;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.CompactionController;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.marshal.Int32Type;
@@ -45,7 +47,9 @@ import org.apache.cassandra.db.rows.CellData;
 import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.io.sstable.IScrubber;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.sstable.format.Version;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileInputStreamPlus;
 import org.apache.cassandra.io.util.FileOutputStreamPlus;
@@ -248,6 +252,55 @@ public class TTLTest extends CQLTester
         int delta = (int) Math.max(1, (t1 - t0) / 1000);
         assertThat(ttlMemtable).isCloseTo(MAX_TTL, Offset.offset(delta));
         assertThat(ttlSSTable).isCloseTo(MAX_TTL, Offset.offset(delta));
+    }
+
+    @Test
+    public void testImprovedMaxTTLFullyExpiredSSTables() throws Throwable
+    {
+        Assume.assumeFalse(DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5));
+        SSTableFormat<?, ?> previousFormat = DatabaseDescriptor.getSelectedSSTableFormat();
+        try
+        {
+            for (SSTableFormat<?, ?> format : DatabaseDescriptor.getSSTableFormats().values())
+            {
+                DatabaseDescriptor.setSelectedSSTableFormat(format);
+                createTable("CREATE TABLE %s (k int, c int, v int, PRIMARY KEY (k, c))");
+                disableCompaction();
+                long t0 = Clock.Global.currentTimeMillis() / 1000;
+                execute("INSERT INTO %s (k, c, v) VALUES (1, 1, 1) USING TTL " + MAX_TTL);
+                flush();
+                execute("INSERT INTO %s (k, c, v) VALUES (1, 2, 2) USING TTL " + MAX_TTL);
+                flush();
+                ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+                for (SSTableReader flushed : cfs.getLiveSSTables())
+                    flushed.reloadSSTableMetadata();
+                compact();
+                long t1 = Clock.Global.currentTimeMillis() / 1000;
+
+                SSTableReader sstable = Iterables.getOnlyElement(cfs.getLiveSSTables());
+                sstable.reloadSSTableMetadata();
+                Version version = sstable.descriptor.version;
+                if (version.hasUIntDeletionTime())
+                    assertThat(sstable.getMaxLocalDeletionTime()).as(version.toFormatAndVersionString()).isBetween(t0 + MAX_TTL, t1 + MAX_TTL);
+                else
+                    assertThat(sstable.getMaxLocalDeletionTime()).as(version.toFormatAndVersionString()).isEqualTo(CellData.NO_DELETION_TIME);
+
+                long afterCap = CellData.MAX_DELETION_TIME_2038_LEGACY_CAP + 1L;
+                assertThat(CompactionController.getFullyExpiredSSTables(cfs, cfs.getLiveSSTables(), c -> Collections.emptySet(), afterCap))
+                .as(version.toFormatAndVersionString())
+                .isEmpty();
+                // versions without unsigned deletion times can't hold the max
+                assertThat(CompactionController.getFullyExpiredSSTables(cfs, cfs.getLiveSSTables(), c -> Collections.emptySet(), t1 + MAX_TTL + 1))
+                .as(version.toFormatAndVersionString())
+                .hasSize(version.hasUIntDeletionTime() ? 1 : 0);
+
+                assertRows(execute("SELECT c, v FROM %s WHERE k = 1"), row(1, 1), row(2, 2));
+            }
+        }
+        finally
+        {
+            DatabaseDescriptor.setSelectedSSTableFormat(previousFormat);
+        }
     }
 
     @Test

@@ -77,7 +77,9 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
     // the version written in the 4.x storage compatibility modes
     public static final String STORAGE_COMPATIBILITY_4_VERSION = "nb";
 
-    private final Version latestVersion = new BigVersion(this, BigVersion.current_version);
+    // the version written, "nb" in the 4.x storage compatibility modes and "oa" in the others
+    private final String currentVersion = DatabaseDescriptor.getStorageCompatibilityModeForWrites().isBefore(5) ? STORAGE_COMPATIBILITY_4_VERSION : "oa";
+    private final Version latestVersion = new BigVersion(this, currentVersion);
     private final BigTableReaderFactory readerFactory = new BigTableReaderFactory();
     private final BigTableWriterFactory writerFactory = new BigTableWriterFactory();
 
@@ -356,7 +358,6 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
 
     static class BigVersion extends Version
     {
-        public static final String current_version = DatabaseDescriptor.getStorageCompatibilityMode().isBefore(5) ? STORAGE_COMPATIBILITY_4_VERSION : "oa";
         public static final String earliest_supported_version = "ma";
         // the newest version read except in storage compatibility mode CASSANDRA_4, whatever version is written
         public static final String latest_supported_version = "oa";
@@ -403,16 +404,19 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
          * have no 'static' bits caused by using the same upper bits for both bloom filter and token distribution.
          */
         private final boolean hasOldBfFormat;
+        // the version its format writes
+        private final String currentVersion;
 
         BigVersion(BigFormat format, String version)
         {
             super(format, version);
 
+            currentVersion = format.currentVersion;
             boolean oOrLater = version.compareTo("o") >= 0;
             boolean nOrLater = oOrLater || version.compareTo("n") >= 0;
             boolean mOrLater = nOrLater || version.compareTo("m") >= 0;
 
-            isLatestVersion = version.compareTo(current_version) == 0;
+            isLatestVersion = version.compareTo(currentVersion) == 0;
 
             // Note that, we probably forgot to change that to 40 for N version, and therefore we cannot do it now.
             correspondingMessagingVersion = version.compareTo("oa") >= 0 ? MessagingService.VERSION_50 : MessagingService.VERSION_30;
@@ -589,7 +593,7 @@ public class BigFormat extends AbstractSSTableFormat<BigTableReader, BigTableWri
         @Override
         public boolean isCompatibleForStreaming()
         {
-            return isCompatible() && version.charAt(0) == current_version.charAt(0);
+            return isCompatible() && version.charAt(0) == currentVersion.charAt(0);
         }
 
         @Override

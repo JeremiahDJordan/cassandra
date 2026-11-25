@@ -17,17 +17,29 @@
  */
 package org.apache.cassandra.io.sstable;
 
+import java.util.List;
+
 import org.junit.After;
+import org.junit.Assume;
 import org.junit.Before;
+import org.junit.Test;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.config.ParameterizedClass;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.rows.CellData;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.big.BigFormat;
+import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
 import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 public class CQLSSTableWriterClientTest extends CQLSSTableWriterTest
 {
@@ -48,6 +60,45 @@ public class CQLSSTableWriterClientTest extends CQLSSTableWriterTest
         CassandraRelevantProperties.FORCE_LOAD_LOCAL_KEYSPACES.setBoolean(true);
         oldPartitioner = DatabaseDescriptor.setPartitionerUnsafe(ByteOrderedPartitioner.instance);
         Keyspace.setInitialized();
+    }
+
+    /**
+     * A client whose configuration doesn't set storage_compatibility_mode writes the versions of HCD_1.
+     */
+    @Test
+    public void testVersionsWithoutConfiguredMode() throws Exception
+    {
+        Assume.assumeFalse(CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION.isPresent());
+        assertEquals(StorageCompatibilityMode.NONE, DatabaseDescriptor.getStorageCompatibilityMode());
+
+        for (SSTableFormat<?, ?> format : List.of(BtiFormat.getInstance(), BigFormat.getInstance()))
+        {
+            File dir = new File(dataDir, format.name());
+            assertTrue(dir.tryCreateDirectories());
+            try (CQLSSTableWriter writer = CQLSSTableWriter.builder()
+                                                           .inDirectory(dir)
+                                                           .forTable("CREATE TABLE client_versions." + table + " (k int PRIMARY KEY, v int)")
+                                                           .withFormat(format)
+                                                           .using("INSERT INTO client_versions." + table + " (k, v) VALUES (?, ?)")
+                                                           .build())
+            {
+                writer.addRow(1, 1);
+            }
+            String expected = BtiFormat.is(format) ? BtiFormat.STORAGE_COMPATIBILITY_HCD_1_VERSION : BigFormat.STORAGE_COMPATIBILITY_4_VERSION;
+            File[] dataFiles = dir.tryList(file -> file.name().endsWith("Data.db"));
+            assertTrue(dataFiles.length > 0);
+            for (File dataFile : dataFiles)
+                assertEquals(dataFile.toString(), expected, Descriptor.fromFile(dataFile).version.version);
+        }
+    }
+
+    /**
+     * A client whose configuration doesn't set storage_compatibility_mode limits expirations to 2038, as HCD_1 does.
+     */
+    @Test
+    public void testMaxExpirationWithoutConfiguredMode()
+    {
+        assertEquals(CellData.MAX_DELETION_TIME_2038_LEGACY_CAP, CellData.getVersionedMaxDeletiontionTime());
     }
 
     @After

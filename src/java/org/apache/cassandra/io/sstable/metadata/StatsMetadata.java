@@ -462,7 +462,9 @@ public class StatsMetadata extends MetadataComponent
             {
                 int mld = component.minLocalDeletionTime == Long.MAX_VALUE ? Integer.MAX_VALUE : (int)min(component.minLocalDeletionTime, (long)Integer.MAX_VALUE - 1);
                 out.writeInt(mld);
-                mld = component.maxLocalDeletionTime == Long.MAX_VALUE ? Integer.MAX_VALUE : (int)min(component.maxLocalDeletionTime, (long)Integer.MAX_VALUE - 1);
+                // a max at the 2038 cap may stand for a later time, so it is written as no deletion time: an sstable
+                // whose data expires after 2038 must not be taken for fully expired once the cap is past
+                mld = component.maxLocalDeletionTime >= Cell.MAX_DELETION_TIME_2038_LEGACY_CAP ? Integer.MAX_VALUE : (int) component.maxLocalDeletionTime;
                 out.writeInt(mld);
             }
             out.writeInt(component.minTTL);
@@ -641,8 +643,9 @@ public class StatsMetadata extends MetadataComponent
                 if (minLocalDeletionTime == Integer.MAX_VALUE)
                     minLocalDeletionTime = Cell.NO_DELETION_TIME;
 
+                // earlier releases wrote a later max as the cap, see serialize()
                 maxLocalDeletionTime = in.readInt();
-                if (maxLocalDeletionTime == Integer.MAX_VALUE)
+                if (maxLocalDeletionTime >= Cell.MAX_DELETION_TIME_2038_LEGACY_CAP)
                     maxLocalDeletionTime = Cell.NO_DELETION_TIME;
             }
             int minTTL = in.readInt();

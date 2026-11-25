@@ -684,6 +684,16 @@ public class StreamSession
      */
     public void onInitializationComplete()
     {
+        try
+        {
+            checkTransfersCanBeSent();
+        }
+        catch (RuntimeException e)
+        {
+            onError(e);
+            return;
+        }
+
         // send prepare message
         state(State.PREPARING);
         PrepareSynMessage prepare = new PrepareSynMessage();
@@ -797,6 +807,7 @@ public class StreamSession
         if (StreamOperation.REPAIR == streamOperation())
             checkAvailableDiskSpaceAndCompactions(summaries);
         processStreamRequests(requests);
+        checkTransfersCanBeSent();
         for (StreamSummary summary : summaries)
             prepareReceiving(summary);
 
@@ -819,6 +830,16 @@ public class StreamSession
             completePreview();
         else
             maybeCompleted();
+    }
+
+    // fails the session before anything is sent if a stream can't be sent to the peer; previews send nothing
+    private void checkTransfersCanBeSent()
+    {
+        if (isPreview())
+            return;
+        for (StreamTransferTask task : transfers.values())
+            for (OutgoingStreamMessage message : task.getFileMessages())
+                message.stream.checkCanSend();
     }
 
     private void prepareSynAck(PrepareSynAckMessage msg)

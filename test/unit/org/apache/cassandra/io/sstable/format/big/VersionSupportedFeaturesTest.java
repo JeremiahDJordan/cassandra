@@ -20,8 +20,14 @@ package org.apache.cassandra.io.sstable.format.big;
 
 import java.util.stream.Stream;
 
+import org.junit.Test;
+
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.sstable.format.AbstractTestVersionSupportedFeatures;
 import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class VersionSupportedFeaturesTest extends AbstractTestVersionSupportedFeatures
 {
@@ -29,6 +35,28 @@ public class VersionSupportedFeaturesTest extends AbstractTestVersionSupportedFe
     protected Version getVersion(String v)
     {
         return BigFormat.getInstance().getVersion(v);
+    }
+
+    @Test
+    public void testLatestVersionPerStorageCompatibilityMode()
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        try
+        {
+            for (StorageCompatibilityMode compatibilityMode : StorageCompatibilityMode.values())
+            {
+                DatabaseDescriptor.setStorageCompatibilityMode(compatibilityMode);
+                BigFormat format = new BigFormat(null);
+                String expected = compatibilityMode.isBefore(5) ? BigFormat.STORAGE_COMPATIBILITY_4_VERSION : "oa";
+                assertThat(format.getLatestVersion().version).describedAs(compatibilityMode.toString()).isEqualTo(expected);
+                assertThat(format.getVersion(expected).isLatestVersion()).describedAs(compatibilityMode.toString()).isTrue();
+                assertThat(format.getVersion("oa").isCompatible()).describedAs(compatibilityMode.toString()).isEqualTo(compatibilityMode != StorageCompatibilityMode.CASSANDRA_4);
+            }
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
     }
 
     @Override
