@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -38,6 +39,7 @@ import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.DurationType;
 import org.apache.cassandra.db.marshal.TupleType;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.utils.AbstractTypeGenerators;
 import org.apache.cassandra.utils.AbstractTypeGenerators.TypeSupport;
 import org.quicktheories.core.Gen;
@@ -46,6 +48,7 @@ import org.quicktheories.generators.SourceDSL;
 import static org.apache.cassandra.db.SchemaCQLHelper.toCqlType;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.getTypeSupport;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.tupleTypeGen;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.cassandra.utils.FailingConsumer.orFail;
 import static org.apache.cassandra.utils.Generators.filter;
 import static org.quicktheories.QuickTheory.qt;
@@ -100,6 +103,43 @@ public class TupleTypeTest extends CQLTester
 
         execute("INSERT INTO %s (t) VALUES (?)", tuple(3, "foo"));
         assertAllRows(row(tuple(3, "foo")));
+    }
+
+    @Test
+    public void testBoundTupleWithUnsortedSetField() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, t frozen<tuple<int, frozen<set<int>>>>, v frozen<tuple<int, frozen<set<int>>>>, PRIMARY KEY (k, t)) WITH CLUSTERING ORDER BY (t DESC)");
+
+        // {2, 1, 2}, not sorted and with a duplicate
+        ByteBuffer set = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(1), bytes(2)), 3);
+        ByteBuffer tuple = TupleType.buildValue(bytes(0), set);
+        execute("INSERT INTO %s (k, t) VALUES (0, ?)", tuple);
+        execute("INSERT INTO %s (k, t) VALUES (0, (0, {1, 2}))");
+        assertRowCount(execute("SELECT * FROM %s"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE k = 0 AND t IN ?", list(tuple)), 1);
+
+        execute("UPDATE %s SET v = ? WHERE k = 0 AND t = (0, {1, 2})", tuple);
+        assertRows(execute("SELECT k FROM %s WHERE v = (0, {1, 2}) ALLOW FILTERING"), row(0));
+    }
+
+    @Test
+    public void testBoundCollectionsWithUnsortedSetInTupleElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, l frozen<list<frozen<tuple<int, frozen<set<int>>>>>>, s set<frozen<tuple<int, frozen<set<int>>>>>, m map<frozen<tuple<int, frozen<set<int>>>>, frozen<tuple<int, frozen<set<int>>>>>, PRIMARY KEY (k, l))");
+
+        // {2, 1, 2}, not sorted and with a duplicate
+        ByteBuffer set = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(1), bytes(2)), 3);
+        ByteBuffer tuple = TupleType.buildValue(bytes(0), set);
+        ByteBuffer sortedTuple = TupleType.buildValue(bytes(0), CollectionSerializer.pack(Arrays.asList(bytes(1), bytes(2)), 2));
+        ByteBuffer elements = CollectionSerializer.pack(Arrays.asList(tuple), 1);
+        execute("INSERT INTO %s (k, l, s, m) VALUES (0, ?, ?, ?)", elements, elements, CollectionSerializer.pack(Arrays.asList(tuple, tuple), 1));
+        execute("INSERT INTO %s (k, l) VALUES (0, [(0, {1, 2})])");
+        assertRowCount(execute("SELECT * FROM %s"), 1);
+        assertRows(execute("SELECT m FROM %s"), row(CollectionSerializer.pack(Arrays.asList(sortedTuple, sortedTuple), 1)));
+
+        execute("UPDATE %s SET s = s - {(0, {1, 2})} WHERE k = 0 AND l = [(0, {1, 2})]");
+        execute("DELETE m[(0, {1, 2})] FROM %s WHERE k = 0 AND l = [(0, {1, 2})]");
+        assertRows(execute("SELECT s, m FROM %s"), row(null, null));
     }
 
     @Test
