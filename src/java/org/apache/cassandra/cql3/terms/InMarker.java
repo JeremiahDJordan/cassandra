@@ -29,9 +29,10 @@ import org.apache.cassandra.cql3.FunctionContext;
 import org.apache.cassandra.cql3.VariableSpecifications;
 import org.apache.cassandra.cql3.functions.Function;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.marshal.MultiElementType;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -78,19 +79,28 @@ public final class InMarker extends Terms.NonTerminals
                                       ListType<T> type,
                                       java.util.function.Function<ByteBuffer, Term.Terminal> terminalConverter)
     {
-        List<T> elements;
+        AbstractType<T> elementsType = type.getElementsType();
+        List<Term.Terminal> terminals;
         try
         {
-            elements = type.getSerializer().deserialize(value, ByteBufferAccessor.instance);
+            List<ByteBuffer> elements = type.unpack(value);
+            terminals = new ArrayList<>(elements.size());
+            for (ByteBuffer element : elements)
+            {
+                if (element != null)
+                {
+                    elementsType.validate(element);
+                    // serializing a collection or vector element again sorts and deduplicates the sets and maps in it
+                    AbstractType<?> unwrapped = elementsType.unwrap();
+                    if (unwrapped instanceof CollectionType || unwrapped instanceof VectorType)
+                        element = elementsType.decompose(elementsType.compose(element));
+                }
+                terminals.add(element == null ? null : terminalConverter.apply(element));
+            }
         }
         catch (MarshalException e)
         {
             throw new InvalidRequestException(e.getMessage(), e);
-        }
-        List<Term.Terminal> terminals = new ArrayList<>(elements.size());
-        for (T element : elements)
-        {
-            terminals.add(element == null ? null : terminalConverter.apply(type.getElementsType().decompose(element)));
         }
         return Terminals.of(terminals);
     }
