@@ -108,7 +108,6 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
 
                     StartupMessage startup = (StartupMessage) Message.Decoder.decodeMessage(ctx.channel(), inbound);
                     InetAddress remoteAddress = ((InetSocketAddress) ctx.channel().remoteAddress()).getAddress();
-                    final ClientResourceLimits.Allocator allocator = ClientResourceLimits.getAllocatorForEndpoint(remoteAddress);
 
                     boolean modernPipeline = inbound.header.version.isGreaterOrEqualTo(ProtocolVersion.V5);
                     ChannelPromise promise = null;
@@ -118,11 +117,12 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                         // the capacity obtained from allocator for the STARTUP message
                         // is released when flushed by the legacy dispatcher/flusher so
                         // there's no need to explicitly release that here either.
-                        configurator.configureLegacyPipeline(ctx, allocator);
+                        configurator.configureLegacyPipeline(ctx, ClientResourceLimits.getAllocatorForEndpoint(remoteAddress));
                         promise = new VoidChannelPromise(ctx.channel(), false);
                     }
 
                     final Message.Response response = Dispatcher.processRequest(ctx.channel(), startup, Overload.NONE, Dispatcher.RequestTime.forImmediateExecution());
+                    outbound = response.encode(inbound.header.version, inbound.header.streamId);
 
                     if (modernPipeline && response instanceof ErrorMessage)
                     {
@@ -136,7 +136,9 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                     {
                         // in this case we need to defer configuring the pipeline until after the response
                         // has been sent, as the frame encoding specified in v5 should not be applied to
-                        // the STARTUP response.
+                        // the STARTUP response. The pipeline releases the allocator's reference when the channel
+                        // closes; if the response can't be written, no pipeline is configured, so release it here.
+                        ClientResourceLimits.Allocator allocator = ClientResourceLimits.getAllocatorForEndpoint(remoteAddress);
                         allocator.allocate(inbound.header.bodySizeInBytes);
                         promise = AsyncChannelPromise.withListener(ctx, future -> {
                             if (future.isSuccess())
@@ -150,6 +152,8 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                                 Throwable cause = future.cause();
                                 if (null == cause)
                                     cause = new ServerError("Unexpected error establishing connection");
+                                allocator.release(inbound.header.bodySizeInBytes);
+                                allocator.release();
                                 logger.warn("Writing response to STARTUP failed, unable to configure pipeline", cause);
                                 ErrorMessage error = ErrorMessage.fromExceptionNoStreamId(cause);
                                 Envelope errorEnvelope = error.encode(inbound.header.version, inbound.header.streamId);
@@ -161,7 +165,6 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                         });
                     }
 
-                    outbound = response.encode(inbound.header.version, inbound.header.streamId);
                     ctx.writeAndFlush(outbound, promise);
                     logger.trace("Configured pipeline: {}", ctx.pipeline());
                     break;

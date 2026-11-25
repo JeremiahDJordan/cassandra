@@ -80,6 +80,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -397,6 +398,45 @@ public class CQLConnectionTest
         // Once the write completes, the deferred close fires.
         stall.writePromise.setSuccess();
         assertFalse("channel should close after the error frame is flushed", channel.isOpen());
+    }
+
+    @Test
+    public void releasesStartupAllocationWhenResponseWriteFails() throws Exception
+    {
+        // processing the STARTUP records client metrics
+        ClientMetrics.instance.init(Collections.emptyList());
+        // no other test connects from this address
+        InetAddress peer = InetAddress.getByName("127.0.0.2");
+        EmbeddedChannel channel = new EmbeddedChannel()
+        {
+            @Override
+            protected SocketAddress remoteAddress0()
+            {
+                return new InetSocketAddress(peer, 9042);
+            }
+        };
+        FailingOutboundHandler failing = new FailingOutboundHandler();
+        channel.pipeline().addLast(failing);
+        channel.pipeline().addLast(new InitialConnectionHandler(new Envelope.Decoder(StartupMessage.maxEncodedSize()),
+                                                                (ch, version) -> new ServerConnection(ch, version, new NoOpTracker()),
+                                                                ServerConfigurator.builder().build()));
+
+        // held across the STARTUP, so the connection allocates from this instance
+        ClientResourceLimits.Allocator allocator = ClientResourceLimits.getAllocatorForEndpoint(peer);
+        Map<String, String> options = new HashMap<>();
+        options.put(StartupMessage.CQL_VERSION, QueryProcessor.CQL_VERSION.toString());
+        Envelope startup = new StartupMessage(options).encode(ProtocolVersion.V5, 0);
+        channel.writeInbound(Unpooled.wrappedBuffer(startup.encodeHeader(), startup.body));
+
+        assertEquals(Message.Type.READY, failing.written.get(0));
+        assertFalse(channel.isOpen());
+        assertEquals(0, allocator.endpointUsing());
+
+        // releasing the last reference removes the allocator, so the next lookup creates a new one
+        allocator.release();
+        ClientResourceLimits.Allocator next = ClientResourceLimits.getAllocatorForEndpoint(peer);
+        next.release();
+        assertNotSame(allocator, next);
     }
 
     @Test
@@ -784,6 +824,20 @@ public class CQLConnectionTest
             // Capture the write but neither complete nor forward it: simulates a socket that cannot drain
             // synchronously. The handler's own finally releases the payload, so we don't touch msg.
             writePromise = promise;
+        }
+    }
+
+    private static class FailingOutboundHandler extends ChannelOutboundHandlerAdapter
+    {
+        final List<Message.Type> written = new ArrayList<>();
+
+        @Override
+        public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
+        {
+            Envelope envelope = (Envelope) msg;
+            written.add(envelope.header.type);
+            envelope.release();
+            promise.setFailure(new IOException("write failed"));
         }
     }
 
