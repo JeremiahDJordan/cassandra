@@ -49,6 +49,7 @@ import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
+import org.apache.lucene.index.CorruptIndexException;
 
 /**
  * Multiple {@link SegmentMetadata} are stored in {@link IndexComponentType#META} file, each corresponds to an on-disk
@@ -175,6 +176,11 @@ public class SegmentMetadata implements Comparable<SegmentMetadata>
             final PrimaryKey min, max;
             try (var pkm = sstableContext.primaryKeyMapFactory().newPerSSTablePrimaryKeyMap())
             {
+                // Row IDs beyond the per-SSTable components: these per-index components were built on other ones.
+                if (minSSTableRowId < 0 || maxSSTableRowId >= pkm.count())
+                    throw new CorruptIndexException(String.format("Segment of index %s has row IDs [%d, %d], but the per-SSTable index components have %d rows",
+                                                                  context.getIndexName(), minSSTableRowId, maxSSTableRowId, pkm.count()),
+                                                    String.valueOf(sstableContext.descriptor()));
                 // We need to load eagerly to allow us to close the partition key map.
                 min = pkm.primaryKeyFromRowId(minSSTableRowId).loadDeferred();
                 max = pkm.primaryKeyFromRowId(maxSSTableRowId).loadDeferred();
