@@ -20,10 +20,12 @@ package org.apache.cassandra.db.guardrails;
 
 import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Collections;
 
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
 import static java.nio.ByteBuffer.allocate;
@@ -75,6 +77,22 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
+    public void testCompositePartitionKeyWithStaticColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k1 int, k2 text, c int, s int STATIC, v int, PRIMARY KEY((k1, k2), c))");
+        createIndex("CREATE INDEX ON %s (k2) USING 'sai'");
+
+        testThreshold("k2", "INSERT INTO %s (k1, k2, s) VALUES (0, ?, 0)");
+        testThreshold("k2", "UPDATE %s SET s = 1 WHERE k1 = 0 AND k2 = ?");
+        testThreshold("k2", "INSERT INTO %s (k1, k2, c, s, v) VALUES (0, ?, 0, 0, 0)");
+
+        // a static-only delete isn't checked, also for a key over the threshold that is already there
+        ByteBuffer key = allocate(FAIL_THRESHOLD + 1);
+        execute(superClientState, "INSERT INTO %s (k1, k2, s) VALUES (1, ?, 0)", Collections.singletonList(key));
+        assertValid("DELETE s FROM %s WHERE k1 = 1 AND k2 = ?", key);
+    }
+
+    @Test
     public void testSimpleClustering() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, c text, v int, PRIMARY KEY(k, c))");
@@ -104,6 +122,30 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
         testThreshold("s", "INSERT INTO %s (k, c, s, r) VALUES (0, 0, ?, 0)");
         testThreshold("s", "UPDATE %s SET s = ? WHERE k = 0");
         testThreshold("s", "UPDATE %s SET s = ?, r = 0 WHERE k = 0 AND c = 0");
+    }
+
+    @Test
+    public void testWarnThresholdDisabled() throws Throwable
+    {
+        guardrails().setSaiStringTermSizeThreshold(null, FAIL_THRESHOLD + "B");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        createIndex("CREATE INDEX ON %s (v) USING 'sai'");
+
+        assertValid("INSERT INTO %s (k, v) VALUES (0, ?)", allocate(FAIL_THRESHOLD));
+        assertFails("v", "INSERT INTO %s (k, v) VALUES (0, ?)", allocate(FAIL_THRESHOLD + 1));
+    }
+
+    @Test
+    public void testAnalyzedTermLargerThanValue() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        createIndex("CREATE INDEX ON %s (v) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        // 'Ⱥ' is 2 bytes and lower-cases to 3, so the terms are over the thresholds while the values are not
+        String query = "INSERT INTO %s (k, v) VALUES (0, ?)";
+        assertWarns("v", query, UTF8Type.instance.decompose("Ⱥ".repeat(WARN_THRESHOLD / 3) + "aa"));
+        guardrails().setSaiStringTermSizeThreshold(null, FAIL_THRESHOLD + "B");
+        assertFails("v", query, UTF8Type.instance.decompose("Ⱥ".repeat(FAIL_THRESHOLD / 3) + "aa"));
     }
 
     @Test
@@ -211,5 +253,21 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
         // verify that the oversized term isn't written on initial index build
         assertEquals(((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", oversizedTerm)).result.size(), 0);
         assertEquals(((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", smallTerm)).result.size(), 1);
+    }
+
+    @Test
+    public void testAnalyzedTermsOnBuild()
+    {
+        // the Kelvin sign is 3 bytes and lower-cases to 'k', 1 byte; 'Ⱥ' is 2 bytes and lower-cases to 3
+        ByteBuffer smallerTerm = UTF8Type.instance.decompose("\u212A".repeat(FAIL_THRESHOLD / 3 + 1));
+        ByteBuffer largerTerm = UTF8Type.instance.decompose("Ⱥ".repeat(FAIL_THRESHOLD / 3) + "aa");
+
+        createTable(KEYSPACE, "CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        execute("INSERT INTO %s (k, v) VALUES (0, ?)", smallerTerm);
+        execute("INSERT INTO %s (k, v) VALUES (1, ?)", largerTerm);
+        createIndex("CREATE INDEX ON %s(v) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        assertEquals(1, ((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", smallerTerm)).result.size());
+        assertEquals(0, ((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", largerTerm)).result.size());
     }
 }
