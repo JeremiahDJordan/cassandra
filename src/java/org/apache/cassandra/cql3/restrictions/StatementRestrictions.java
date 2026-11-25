@@ -1443,12 +1443,14 @@ public class StatementRestrictions
         // The general rationale is that if some rows are specifically selected by the query (have clustering or
         // regular columns restrictions), we ignore partitions that are empty outside of static content, but if it's
         // a full partition query, then we include that content, if its static row alone can satisfy the restrictions
-        // nested in disjunctions.
+        // nested in disjunctions, as the row filter and the limits see it
+        // (RowFilter#canKeepPartitionsWithOnlyStaticData).
         return queriesFullPartitions() && isSatisfiableByStaticRow();
     }
 
     /**
-     * Whether the static row of a partition without rows can satisfy these restrictions on its own.
+     * Whether the static row of a partition without rows can satisfy these restrictions on its own (see
+     * {@link org.apache.cassandra.db.filter.RowFilter.FilterElement#isSatisfiableByStaticRow()}).
      */
     private boolean isSatisfiableByStaticRow()
     {

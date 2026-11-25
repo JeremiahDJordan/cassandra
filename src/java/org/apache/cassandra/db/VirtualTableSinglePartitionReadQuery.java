@@ -90,7 +90,7 @@ public class VirtualTableSinglePartitionReadQuery extends VirtualTableReadQuery 
     @Override
     public boolean selectsFullPartition()
     {
-        return clusteringIndexFilter.selectsAllPartition() && !rowFilter().hasExpressionOnClusteringOrRegularColumns();
+        return clusteringIndexFilter.selectsAllPartition() && rowFilter().canKeepPartitionsWithOnlyStaticData();
     }
 
     @Override

@@ -1192,7 +1192,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         if (metadata().isStaticCompactTable())
             return true;
 
-        return clusteringIndexFilter.selectsAllPartition() && !rowFilter().hasExpressionOnClusteringOrRegularColumns();
+        return clusteringIndexFilter.selectsAllPartition() && rowFilter().canKeepPartitionsWithOnlyStaticData();
     }
 
     @Override

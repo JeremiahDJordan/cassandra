@@ -74,8 +74,9 @@ public class FilterTree
     /**
      * Whether the static row of a partition without other matching rows satisfies this tree, as the only row of the
      * partition: an expression on a regular or clustering column is never satisfied, since that row has no value for
-     * them. Evaluated on the static row, a negation on such a column, like {@code v != 2}, would be satisfied by the
-     * missing value, and the partition would be returned for its static row although none of its rows matches.
+     * them, as in {@link org.apache.cassandra.db.filter.RowFilter.FilterElement#isSatisfiedByStaticRow}. Evaluated on
+     * the static row, a negation on such a column, like {@code r NOT CONTAINS 2}, would be satisfied by the missing
+     * value, and the partition would be returned for its static row although none of its rows matches.
      */
     public boolean isSatisfiedByStaticRow(DecoratedKey key, Row staticRow)
     {
