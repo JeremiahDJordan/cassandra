@@ -36,7 +36,13 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
+import org.apache.cassandra.distributed.api.IInvokableInstance;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.repair.autorepair.AutoRepairConfig;
+import org.apache.cassandra.repair.autorepair.AutoRepairUtils;
+import org.apache.cassandra.service.AutoRepairService;
+import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.Assert.assertEquals;
@@ -170,6 +176,110 @@ public class AutoRepairUpgradeTest extends UpgradeTestBase
                        postRepairPriorityIds.isEmpty());
         })
         .run();
+    }
+
+    @Test
+    public void testPriorityAndReplicaChecksUseUpgradedHostIds() throws Throwable
+    {
+        System.setProperty("cassandra.autorepair.enable", "true"); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+
+        new TestCase()
+        .nodes(3)
+        .singleUpgradeToCurrentFrom(v50)
+        .withConfig(cfg -> cfg.with(Feature.NETWORK, Feature.GOSSIP)
+                              .set("auto_repair",
+                                   ImmutableMap.of(
+                                   "repair_type_overrides",
+                                   ImmutableMap.of(AutoRepairConfig.RepairType.FULL.getConfigName(),
+                                                   ImmutableMap.of(
+                                                   "initial_scheduler_delay", "1h",
+                                                   "enabled", "true",
+                                                   "parallel_repair_count", "3",
+                                                   "allow_parallel_replica_repair", "false"))))
+                              .set("auto_repair.enabled", "true")
+                              .set("auto_repair.repair_check_interval", "1h"))
+        .setup(cluster -> {})
+        .runAfterClusterUpgrade(cluster -> {
+            IInvokableInstance node1 = (IInvokableInstance) cluster.get(1);
+            cluster.coordinator(1).execute(
+                String.format("INSERT INTO system_distributed.auto_repair_priority (repair_type, repair_priority) VALUES ('%s', {%s})",
+                              AutoRepairConfig.RepairType.FULL.toString(), hostId(node1, 3)),
+                ConsistencyLevel.ALL);
+            assertEquals(Set.of("/127.0.0.3:7012"),
+                         node1.callOnInstance(() -> AutoRepairUtils.getPriorityHosts(AutoRepairConfig.RepairType.FULL)
+                                                                   .stream()
+                                                                   .map(Object::toString)
+                                                                   .collect(Collectors.toSet())));
+
+            node1.nodetoolResult("cms", "initialize").asserts().success();
+
+            node1.runOnInstance(() -> AutoRepairService.instance.setRepairPriorityForHosts(AutoRepairConfig.RepairType.FULL.toString(), "127.0.0.2"));
+            await().atMost(1, TimeUnit.MINUTES)
+                   .untilAsserted(() -> assertEquals(Set.of(hostId(node1, 2), hostId(node1, 3)), capturePriorityHostIds(cluster)));
+
+            // node3 is repairing and node1 has the oldest finished repair
+            cluster.coordinator(1).execute("TRUNCATE system_distributed.auto_repair_priority", ConsistencyLevel.ALL);
+            long now = System.currentTimeMillis();
+            insertHistory(cluster, hostId(node1, 1), now - 300_000, now - 290_000);
+            insertHistory(cluster, hostId(node1, 2), now - 200_000, now - 190_000);
+            insertHistory(cluster, hostId(node1, 3), now - 1_000, now - 100_000);
+            assertEquals("NOT_MY_TURN", myTurnToRunRepair(node1));
+
+            // with every keyspace at RF 1, node1 shares no range with node3
+            for (String keyspace : new String[]{ "system_distributed", "system_auth", KEYSPACE })
+                cluster.schemaChange("ALTER KEYSPACE " + keyspace + " WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
+            assertEquals("MY_TURN", myTurnToRunRepair(node1));
+        })
+        .run();
+    }
+
+    @Test
+    public void testMigrationKeepsForceRepair() throws Throwable
+    {
+        System.setProperty("cassandra.autorepair.enable", "true"); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+
+        new TestCase()
+        .nodes(3)
+        .singleUpgradeToCurrentFrom(v50)
+        .withConfig(cfg -> cfg.with(Feature.NETWORK, Feature.GOSSIP)
+                              .set("auto_repair.enabled", "true"))
+        .setup(cluster -> {
+            Object node2HostId = cluster.get(2).executeInternal("SELECT host_id FROM system.local")[0][0];
+            long now = System.currentTimeMillis();
+            cluster.coordinator(1).execute(
+                String.format("INSERT INTO system_distributed.auto_repair_history (repair_type, host_id, repair_start_ts, repair_finish_ts, force_repair) VALUES ('%s', %s, %d, %d, true)",
+                              AutoRepairConfig.RepairType.FULL.toString(), node2HostId, now - 2000, now - 1000),
+                ConsistencyLevel.ALL);
+        })
+        .runAfterClusterUpgrade(cluster -> {
+            Object[][] rows = cluster.coordinator(1).execute(
+                String.format("SELECT force_repair FROM system_distributed.auto_repair_history WHERE repair_type = '%s' AND host_id = %s",
+                              AutoRepairConfig.RepairType.FULL.toString(), hostId((IInvokableInstance) cluster.get(1), 2)),
+                ConsistencyLevel.ALL);
+            assertEquals(1, rows.length);
+            assertEquals(true, rows[0][0]);
+        })
+        .run();
+    }
+
+    private static String myTurnToRunRepair(IInvokableInstance instance)
+    {
+        return instance.callOnInstance(() -> AutoRepairUtils.myTurnToRunRepair(AutoRepairConfig.RepairType.FULL,
+                                                                               StorageService.instance.getHostIdForEndpoint(FBUtilities.getBroadcastAddressAndPort()))
+                                                            .name());
+    }
+
+    private static String hostId(IInvokableInstance instance, int node)
+    {
+        return instance.callOnInstance(() -> StorageService.instance.getHostIdForEndpoint(InetAddressAndPort.getByNameUnchecked("127.0.0." + node)).toString());
+    }
+
+    private static void insertHistory(UpgradeableCluster cluster, String hostId, long startTs, long finishTs)
+    {
+        cluster.coordinator(1).execute(
+            String.format("INSERT INTO system_distributed.auto_repair_history (repair_type, host_id, repair_start_ts, repair_finish_ts) VALUES ('%s', %s, %d, %d)",
+                          AutoRepairConfig.RepairType.FULL.toString(), hostId, startTs, finishTs),
+            ConsistencyLevel.ALL);
     }
 
     private void waitForNEntries(UpgradeableCluster cluster, int expected)

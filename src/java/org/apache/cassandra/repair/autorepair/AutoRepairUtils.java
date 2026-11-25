@@ -299,13 +299,22 @@ public class AutoRepairUtils
                         if (entry.hostId.equals(oldHostId))
                         {
                             // Insert new entry with the post-upgrade host ID, preserving timestamps
-                            insertNewRepairHistory(repairType, newHostId, entry.lastRepairStartTime, entry.lastRepairFinishTime);
-                            // Update start timestamp and repair turn to match the original entry
-                            if (entry.repairTurn != null)
-                                updateStartAutoRepairHistory(repairType, newHostId, entry.lastRepairStartTime, RepairTurn.valueOf(entry.repairTurn));
-                            // Delete the old entry
-                            deleteAutoRepairHistory(repairType, oldHostId);
-                            logger.info("Migrated auto_repair_history for repair type {} from {} to {}", repairType, oldHostId, newHostId);
+                            if (insertNewRepairHistory(repairType, newHostId, entry.lastRepairStartTime, entry.lastRepairFinishTime))
+                            {
+                                // Update start timestamp and repair turn to match the original entry
+                                if (entry.repairTurn != null)
+                                    updateStartAutoRepairHistory(repairType, newHostId, entry.lastRepairStartTime, RepairTurn.valueOf(entry.repairTurn));
+                                if (entry.forceRepair)
+                                    setForceRepair(repairType, newHostId);
+                                // Delete the old entry
+                                deleteAutoRepairHistory(repairType, oldHostId);
+                                logger.info("Migrated auto_repair_history for repair type {} from {} to {}", repairType, oldHostId, newHostId);
+                            }
+                            else
+                            {
+                                logger.warn("Could not migrate auto_repair_history for repair type {} from {} to {}, a restart retries it while the old record exists",
+                                            repairType, oldHostId, newHostId);
+                            }
                             break;
                         }
                     }
@@ -315,13 +324,13 @@ public class AutoRepairUtils
                 Set<UUID> priorityIds = getPriorityHostIds(repairType);
                 if (priorityIds.contains(oldHostId))
                 {
-                    removePriorityStatus(repairType, oldHostId);
                     SetSerializer<UUID> serializer = SetSerializer.getInstance(UUIDSerializer.instance, UTF8Type.instance.comparatorSet);
                     addPriorityHost.execute(QueryState.forInternalCalls(),
                                            QueryOptions.forInternalCalls(internalQueryCL,
                                                                          Lists.newArrayList(serializer.serialize(Collections.singleton(newHostId)),
                                                                                             ByteBufferUtil.bytes(repairType.toString()))),
                                            Dispatcher.RequestTime.forImmediateExecution());
+                    removePriorityStatus(repairType, oldHostId);
                     logger.info("Migrated auto_repair_priority for repair type {} from {} to {}", repairType, oldHostId, newHostId);
                 }
             }
@@ -662,18 +671,7 @@ public class AutoRepairUtils
     @Nullable
     private static InetAddressAndPort getBroadcastAddress(UUID hostId)
     {
-        Directory directory = ClusterMetadata.current().directory;
-
-        NodeId nodeId = directory.nodeIdFromHostId(hostId);
-        if (nodeId != null)
-        {
-            NodeAddresses nodeAddresses = directory.getNodeAddresses(nodeId);
-            if (nodeAddresses != null)
-            {
-                return nodeAddresses.broadcastAddress;
-            }
-        }
-        return null;
+        return StorageService.instance.getEndpointForHostId(hostId);
     }
 
     /**
@@ -1168,7 +1166,10 @@ public class AutoRepairUtils
         logger.info("Auto repair finished for {}", myId);
     }
 
-    public static void insertNewRepairHistory(RepairType repairType, UUID hostId, long startTime, long finishTime)
+    /**
+     * @return true if the record was inserted or already existed, false if the insert failed
+     */
+    public static boolean insertNewRepairHistory(RepairType repairType, UUID hostId, long startTime, long finishTime)
     {
         try
         {
@@ -1196,10 +1197,12 @@ public class AutoRepairUtils
             {
                 logger.info("Record exists, no need to insert again for host id: {}", hostId);
             }
+            return true;
         }
         catch (Exception e)
         {
             logger.error("Exception in inserting new repair history:", e);
+            return false;
         }
     }
 
@@ -1227,15 +1230,14 @@ public class AutoRepairUtils
         for (InetAddressAndPort host : hosts)
         {
             //find hostId from IP address
-            UUID hostId = ClusterMetadata.current().directory.hostId(ClusterMetadata.current().directory.peerId(host));
+            UUID hostId = StorageService.instance.getHostIdForEndpoint(host);
+            if (hostId == null)
+                throw new IllegalArgumentException("Unknown host " + host);
             hostIds.add(hostId);
-            if (hostId != null)
-            {
-                logger.info("Add host {} to the priority list", hostId);
-            }
         }
         if (!hostIds.isEmpty())
         {
+            logger.info("Add hosts {} to the priority list", hostIds);
             SetSerializer<UUID> serializer = SetSerializer.getInstance(UUIDSerializer.instance, UTF8Type.instance.comparatorSet);
             addPriorityHost.execute(QueryState.forInternalCalls(),
                                     QueryOptions.forInternalCalls(internalQueryCL,
