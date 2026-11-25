@@ -136,6 +136,11 @@ Upgrading
       non-queryable on the node. An index build that finds per-SSTable files whose row count doesn't match the rows it
       numbered fails, and the index stays non-queryable: then rebuild all the SAI indexes of the table in one command,
       nodetool rebuild_index <keyspace> <table> <index> [<index> ...].
+    - A query that combines a static column and a regular column in an OR, e.g. WHERE v = 1 OR s = 2, now returns
+      the rows that satisfy either side, with or without indexes, including the static row of a partition without
+      other rows if it satisfies the OR. Before, it only returned rows that satisfied both sides without indexes,
+      and with SAI it could return fewer rows with LIMIT or paging than without. Run such queries only once every
+      node runs this release, because each replica filters the rows it returns.
 
 Deprecation
 ---------
