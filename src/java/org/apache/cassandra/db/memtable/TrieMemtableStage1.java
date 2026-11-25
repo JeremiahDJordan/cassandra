@@ -334,6 +334,15 @@ public class TrieMemtableStage1 extends AbstractAllocatorMemtable
     }
 
     @Override
+    public int getMinLocalDeletionTime()
+    {
+        int min = Integer.MAX_VALUE;
+        for (MemtableShard shard : shards)
+            min = EncodingStats.mergeMinLocalDeletionTime(min, shard.stats);
+        return min;
+    }
+
+    @Override
     public DecoratedKey minPartitionKey()
     {
         for (int i = 0; i < shards.length; i++)
@@ -557,6 +566,9 @@ public class TrieMemtableStage1 extends AbstractAllocatorMemtable
             }
             try
             {
+                // The stats give the minimum local deletion time, which goes down before the update is visible, for the
+                // reads that purge the tombstones older than it
+                stats = stats.mergeWith(update.stats());
                 try
                 {
                     // Add the initial trie size on the first operation. This technically isn't correct (other shards
@@ -588,7 +600,6 @@ public class TrieMemtableStage1 extends AbstractAllocatorMemtable
                     updateCurrentOperations(update.operationCount());
 
                     columns = columns.mergeTo(update.columns());
-                    stats = stats.mergeWith(update.stats());
                 }
             }
             finally

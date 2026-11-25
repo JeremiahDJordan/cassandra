@@ -330,6 +330,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         return min != EncodingStats.NO_STATS.minTimestamp ? min : NO_MIN_TIMESTAMP;
     }
 
+    @Override
     public int getMinLocalDeletionTime()
     {
         int min = Integer.MAX_VALUE;
@@ -655,6 +656,9 @@ public class TrieMemtable extends AbstractAllocatorMemtable
             }
             try
             {
+                // The stats give the minimum local deletion time, which goes down before the update is visible, for the
+                // reads that purge the tombstones older than it
+                stats = stats.mergeWith(update.stats());
                 try
                 {
                     indexer.start();
@@ -687,7 +691,6 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                     updateCurrentOperations(update.operationCount());
 
                     columns = columns.mergeTo(update.columns());
-                    stats = stats.mergeWith(update.stats());
                 }
             }
             finally
