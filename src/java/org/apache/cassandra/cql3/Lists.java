@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3;
 
+import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
@@ -250,18 +251,44 @@ public abstract class Lists
             this.elements = elements;
         }
 
-        public static Value fromSerialized(ByteBuffer value, ListType type, ProtocolVersion version) throws InvalidRequestException
+        public static <T> Value fromSerialized(ByteBuffer value, ListType<T> type, ProtocolVersion version) throws InvalidRequestException
         {
             try
             {
-                // Collections have this small hack that validate cannot be called on a serialized object,
-                // but compose does the validation (so we're fine).
-                List<?> l = type.getSerializer().deserializeForNativeProtocol(value, ByteBufferAccessor.instance, version);
-                List<ByteBuffer> elements = new ArrayList<>(l.size());
-                for (Object element : l)
+                int n = CollectionSerializer.readCollectionSize(value, ByteBufferAccessor.instance, version);
+                if (n < 0)
+                    throw new MarshalException("The data cannot be deserialized as a list");
+
+                AbstractType<T> elementsType = type.getElementsType();
+                int offset = CollectionSerializer.sizeOfCollectionSize(n, version);
+                List<ByteBuffer> elements = new ArrayList<>(Math.min(n, 256));
+                for (int i = 0; i < n; i++)
+                {
+                    ByteBuffer element = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset, version);
+                    offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance, version);
                     // elements can be null in lists that represent a set of IN values
-                    elements.add(element == null ? null : Terms.sortSetsAndMaps(type.getElementsType(), type.getElementsType().decompose(element)));
+                    if (element != null)
+                    {
+                        elementsType.validate(element);
+                        // deserializing rejects zero-length sets and maps, which validate accepts; serializing a
+                        // collection or vector again sorts and deduplicates the sets and maps in it; zero-length
+                        // elements are kept as sent
+                        T composed = elementsType.compose(element);
+                        if (element.hasRemaining())
+                            element = elementsType.decompose(composed);
+                        element = Terms.sortSetsAndMaps(elementsType, element);
+                    }
+                    elements.add(element);
+                }
+
+                if (!ByteBufferAccessor.instance.isEmptyFromOffset(value, offset))
+                    throw new MarshalException("Unexpected extraneous bytes after list value");
+
                 return new Value(elements);
+            }
+            catch (BufferUnderflowException | IndexOutOfBoundsException e)
+            {
+                throw new InvalidRequestException("Not enough bytes to read a list");
             }
             catch (MarshalException e)
             {
