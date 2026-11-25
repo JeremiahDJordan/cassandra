@@ -43,6 +43,7 @@ import java.util.stream.Stream;
 
 import javax.annotation.concurrent.GuardedBy;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -80,6 +81,10 @@ import org.apache.cassandra.io.util.PathUtils;
 import org.apache.cassandra.net.Verb;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Isolated;
+import org.apache.cassandra.utils.NativeLibraryDarwin;
+import org.apache.cassandra.utils.NativeLibraryLinux;
+import org.apache.cassandra.utils.NativeLibraryWindows;
+import org.apache.cassandra.utils.NativeLibraryWrapper;
 import org.apache.cassandra.utils.Shared;
 import org.apache.cassandra.utils.concurrent.SimpleCondition;
 import org.reflections.Reflections;
@@ -135,6 +140,15 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
                s.startsWith("org.jboss.byteman") ||
                s.startsWith("software.amazon.awssdk.crt.");
     };
+
+    // The versions the upgrade tests load from dtest jars can have another NativeLibraryWrapper (3.x and Apache 4.0
+    // return int where this one returns void), so only the instances of this build share the native library classes
+    private static final Set<String> NATIVE_LIBRARY_CLASSES =
+        ImmutableSet.of(NativeLibraryWrapper.class.getName(), NativeLibraryWrapper.NativeError.class.getName(),
+                        NativeLibraryLinux.class.getName(), NativeLibraryDarwin.class.getName(),
+                        NativeLibraryWindows.class.getName());
+    private static final Predicate<String> OTHER_VERSION_SHARED_PREDICATE =
+        s -> !NATIVE_LIBRARY_CLASSES.contains(s) && SHARED_PREDICATE.test(s);
 
     private final UUID clusterId = UUID.randomUUID();
     private final File root;
@@ -225,7 +239,8 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
 
         private IInvokableInstance newInstance(int generation)
         {
-            ClassLoader classLoader = new InstanceClassLoader(generation, config.num(), version.classpath, sharedClassLoader, SHARED_PREDICATE);
+            Predicate<String> sharedClasses = version == CURRENT_VERSION ? SHARED_PREDICATE : OTHER_VERSION_SHARED_PREDICATE;
+            ClassLoader classLoader = new InstanceClassLoader(generation, config.num(), version.classpath, sharedClassLoader, sharedClasses);
             if (instanceInitializer != null)
                 instanceInitializer.accept(classLoader, config.num());
             return Instance.transferAdhoc((SerializableBiFunction<IInstanceConfig, ClassLoader, Instance>)Instance::new, classLoader)

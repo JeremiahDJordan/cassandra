@@ -30,7 +30,8 @@ import com.sun.jna.Pointer;
 //       the call indicated an error (i.e., -1 from most system calls; -1
 //       or NULL from most library functions); ***a function that succeeds is
 //       allowed to change errno.***
-interface NativeLibraryWrapper
+@Shared
+public interface NativeLibraryWrapper
 {
     /**
      * Checks if the library has been successfully linked.
@@ -52,6 +53,7 @@ interface NativeLibraryWrapper
      * This is a checked exception because the correct handling of the error is almost
      * always to log it and move on, not to propagate it up the stack.
      */
+    @Shared
     class NativeError extends Exception
     {
         private final int errno;
