@@ -41,6 +41,8 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -74,6 +76,7 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.ExecutorUtils;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.SyncUtil;
@@ -170,6 +173,16 @@ public class Nodes
     {
         local.awaitInflightUpdateCompletion();
         peers.awaitInflightUpdateCompletion();
+    }
+
+    /**
+     * Stops the persistence executor after it runs the submitted updates. Only used by tests that stop an in-JVM
+     * instance, so that its thread doesn't keep the instance's class loader reachable.
+     */
+    @VisibleForTesting
+    public void shutdownAndWait(long timeout, TimeUnit unit) throws InterruptedException, TimeoutException
+    {
+        ExecutorUtils.shutdownAndWait(timeout, unit, updateExecutor);
     }
 
     public void syncToDisk()
