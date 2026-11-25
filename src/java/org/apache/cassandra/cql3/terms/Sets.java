@@ -153,8 +153,8 @@ public final class Sets
 
             // We've parsed empty maps as a set literal to break the ambiguity so
             // handle that case now
-            if (receiver.type instanceof MapType && elements.isEmpty())
-                return new MultiElements.Value(((MapType<?, ?>) receiver.type), Collections.emptyList());
+            if (receiver.type.unwrap() instanceof MapType && elements.isEmpty())
+                return new MultiElements.Value(((MapType<?, ?>) receiver.type.unwrap()), Collections.emptyList());
 
             ColumnSpecification valueSpec = Sets.valueSpecOf(receiver);
             List<Term> values = new ArrayList<>(elements.size());
