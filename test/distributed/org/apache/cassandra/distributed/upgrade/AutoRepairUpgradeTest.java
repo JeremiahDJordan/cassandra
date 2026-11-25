@@ -233,6 +233,35 @@ public class AutoRepairUpgradeTest extends UpgradeTestBase
         .run();
     }
 
+    @Test
+    public void testMigrationKeepsForceRepair() throws Throwable
+    {
+        System.setProperty("cassandra.autorepair.enable", "true"); // checkstyle: suppress nearby 'blockSystemPropertyUsage'
+
+        new TestCase()
+        .nodes(3)
+        .singleUpgradeToCurrentFrom(v50)
+        .withConfig(cfg -> cfg.with(Feature.NETWORK, Feature.GOSSIP)
+                              .set("auto_repair.enabled", "true"))
+        .setup(cluster -> {
+            Object node2HostId = cluster.get(2).executeInternal("SELECT host_id FROM system.local")[0][0];
+            long now = System.currentTimeMillis();
+            cluster.coordinator(1).execute(
+                String.format("INSERT INTO system_distributed.auto_repair_history (repair_type, host_id, repair_start_ts, repair_finish_ts, force_repair) VALUES ('%s', %s, %d, %d, true)",
+                              AutoRepairConfig.RepairType.FULL.toString(), node2HostId, now - 2000, now - 1000),
+                ConsistencyLevel.ALL);
+        })
+        .runAfterClusterUpgrade(cluster -> {
+            Object[][] rows = cluster.coordinator(1).execute(
+                String.format("SELECT force_repair FROM system_distributed.auto_repair_history WHERE repair_type = '%s' AND host_id = %s",
+                              AutoRepairConfig.RepairType.FULL.toString(), hostId((IInvokableInstance) cluster.get(1), 2)),
+                ConsistencyLevel.ALL);
+            assertEquals(1, rows.length);
+            assertEquals(true, rows[0][0]);
+        })
+        .run();
+    }
+
     private static String myTurnToRunRepair(IInvokableInstance instance)
     {
         return instance.callOnInstance(() -> AutoRepairUtils.myTurnToRunRepair(AutoRepairConfig.RepairType.FULL,
