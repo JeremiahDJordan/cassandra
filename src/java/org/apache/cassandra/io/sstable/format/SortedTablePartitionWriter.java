@@ -39,6 +39,8 @@ import org.apache.cassandra.io.sstable.format.trieindex.TrieIndexSSTableWriter;
 import org.apache.cassandra.io.util.SequentialWriter;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static com.google.common.base.Preconditions.checkState;
+
 /**
  * Partition writer used by {@link TrieIndexSSTableWriter}.
  *
@@ -152,6 +154,7 @@ public abstract class SortedTablePartitionWriter implements AutoCloseable
         }
 
         assert state == State.AWAITING_ROWS;
+        checkState(!unfiltered.isRow() || !((Row) unfiltered).isStatic(), "Static row after other content of the partition");
 
         long pos = currentPosition();
 
