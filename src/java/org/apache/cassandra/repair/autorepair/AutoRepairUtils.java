@@ -662,18 +662,7 @@ public class AutoRepairUtils
     @Nullable
     private static InetAddressAndPort getBroadcastAddress(UUID hostId)
     {
-        Directory directory = ClusterMetadata.current().directory;
-
-        NodeId nodeId = directory.nodeIdFromHostId(hostId);
-        if (nodeId != null)
-        {
-            NodeAddresses nodeAddresses = directory.getNodeAddresses(nodeId);
-            if (nodeAddresses != null)
-            {
-                return nodeAddresses.broadcastAddress;
-            }
-        }
-        return null;
+        return StorageService.instance.getEndpointForHostId(hostId);
     }
 
     /**
@@ -1227,15 +1216,14 @@ public class AutoRepairUtils
         for (InetAddressAndPort host : hosts)
         {
             //find hostId from IP address
-            UUID hostId = ClusterMetadata.current().directory.hostId(ClusterMetadata.current().directory.peerId(host));
+            UUID hostId = StorageService.instance.getHostIdForEndpoint(host);
+            if (hostId == null)
+                throw new IllegalArgumentException("Unknown host " + host);
             hostIds.add(hostId);
-            if (hostId != null)
-            {
-                logger.info("Add host {} to the priority list", hostId);
-            }
         }
         if (!hostIds.isEmpty())
         {
+            logger.info("Add hosts {} to the priority list", hostIds);
             SetSerializer<UUID> serializer = SetSerializer.getInstance(UUIDSerializer.instance, UTF8Type.instance.comparatorSet);
             addPriorityHost.execute(QueryState.forInternalCalls(),
                                     QueryOptions.forInternalCalls(internalQueryCL,
