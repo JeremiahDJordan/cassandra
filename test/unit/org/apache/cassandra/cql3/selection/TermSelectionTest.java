@@ -457,6 +457,31 @@ public class TermSelectionTest extends CQLTester
     }
 
     @Test
+    public void testSelectLiteralWithReversedTypeHint() throws Throwable
+    {
+        String type = createType("CREATE TYPE %s(a int, b text)");
+        createTable("CREATE TABLE %s (pk int, s frozen<set<int>>, l frozen<list<int>>, m frozen<map<int, text>>, t frozen<tuple<int, text>>, u frozen<" + type + ">, v vector<int, 2>, " +
+                    "PRIMARY KEY (pk, s, l, m, t, u, v)) WITH CLUSTERING ORDER BY (s DESC, l DESC, m DESC, t DESC, u DESC, v DESC)");
+        execute("INSERT INTO %s (pk, s, l, m, t, u, v) VALUES (0, {0}, [0], {0: ''}, (0, ''), {a: 0}, [0, 0])");
+
+        assertRows(execute("SELECT (" + typeHintOf("s") + "){1, 2} FROM %s"), row(set(1, 2)));
+        assertRows(execute("SELECT (" + typeHintOf("s") + "){} FROM %s"), row(set()));
+        assertRows(execute("SELECT (" + typeHintOf("l") + ")[1, 2] FROM %s"), row(list(1, 2)));
+        assertRows(execute("SELECT (" + typeHintOf("m") + "){1: 'foo'} FROM %s"), row(map(1, "foo")));
+        assertRows(execute("SELECT (" + typeHintOf("m") + "){} FROM %s"), row(map()));
+        assertRows(execute("SELECT (" + typeHintOf("t") + ")(1, 'foo') FROM %s"), row(tuple(1, "foo")));
+        assertRows(execute("SELECT (" + typeHintOf("u") + "){a: 1, b: 'foo'} FROM %s"), row(userType("a", 1, "b", "foo")));
+        assertRows(execute("SELECT (" + typeHintOf("v") + ")[1, 2] FROM %s"), row(vector(1, 2)));
+
+        assertInvalidMessage("Cannot assign value", "SELECT (" + typeHintOf("m") + "){1, 2} FROM %s");
+    }
+
+    private String typeHintOf(String column)
+    {
+        return "'" + currentTableMetadata().getColumn(ColumnIdentifier.getInterned(column, false)).type + "'";
+    }
+
+    @Test
     public void testInvalidSelect() throws Throwable
     {
         // Creates a table just so we can reference it in the (invalid) SELECT below
