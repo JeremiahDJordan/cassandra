@@ -660,6 +660,30 @@ public class VectorTypeTest extends VectorTester
     }
 
     @Test
+    public void testSomeStaticColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, x int, s int static, s2 int static, v vector<float, 2>, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        for (int pk = 0; pk < 3; pk++)
+        {
+            execute("INSERT INTO %s (pk, s, s2) VALUES (?, ?, ?)", pk, pk, pk);
+            for (int ck = 0; ck < 2; ck++)
+                execute("INSERT INTO %s (pk, ck, x, v) VALUES (?, ?, ?, ?)", pk, ck, ck, vector((float) (pk * 2 + ck), (float) (pk * 2 + ck)));
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRowsNet(executeNet("SELECT pk, ck, s2 FROM %s ORDER BY v ANN OF [0, 0] LIMIT 3"),
+                          row(0, 0, 0), row(0, 1, 0), row(1, 0, 1));
+            assertRowsNet(executeNet("SELECT pk, ck, s2 FROM %s WHERE x = 1 ORDER BY v ANN OF [0, 0] LIMIT 3"),
+                          row(0, 1, 0), row(1, 1, 1), row(2, 1, 2));
+            assertRowsNet(executeNet("SELECT pk, ck, s2 FROM %s WHERE pk = 1 AND x = 1 ORDER BY v ANN OF [0, 0] LIMIT 3"),
+                          row(1, 1, 1));
+        });
+    }
+
+    @Test
     public void multiPartitionUpdateMultiIndexTest()
     {
         createTable("CREATE TABLE %s (pk int, row_v vector<float, 2>, metadata map<text, text>, PRIMARY KEY(pk))");
