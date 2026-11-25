@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3.validation.entities;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -35,9 +36,12 @@ import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.junit.Assert.assertEquals;
 
 public class FrozenCollectionsTest extends CQLTester
@@ -760,6 +764,75 @@ public class FrozenCollectionsTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE a=?", 4),
                    row(4, map(set(7, 8, 9), list(1, 2, 3)), null)
         );
+    }
+
+    @Test
+    public void testBoundListWithEmptyElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<list<int>>, c list<int>, PRIMARY KEY (a, b))");
+
+        ByteBuffer list = CollectionSerializer.pack(Arrays.asList(bytes(1), EMPTY_BYTE_BUFFER, bytes(1)), 3);
+        execute("INSERT INTO %s (a, b) VALUES (0, ?)", list);
+        assertRows(execute("SELECT b FROM %s WHERE a = 0"), row(list));
+        execute("UPDATE %s SET c = ? WHERE a = 0 AND b = ?", list, list);
+        execute("INSERT INTO %s (a, b, c) VALUES (1, [1, blobAsInt(0x), 1], [1, blobAsInt(0x), 1])");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT * FROM %s"),
+                       row(0, list, list),
+                       row(1, list, list));
+            assertRows(execute("SELECT * FROM %s WHERE a = 0 AND b = ?", list),
+                       row(0, list, list));
+        });
+    }
+
+    @Test
+    public void testBoundListWithUnsortedSetElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<set<int>>, c list<frozen<set<int>>>, PRIMARY KEY (a, b))");
+
+        ByteBuffer unsorted = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(1), bytes(2)), 3);
+        ByteBuffer sorted = CollectionSerializer.pack(Arrays.asList(bytes(1), bytes(2)), 2);
+        ByteBuffer list = CollectionSerializer.pack(Arrays.asList(unsorted), 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (0, {1, 2}, ?)", list);
+
+        assertRows(execute("SELECT c FROM %s WHERE a = 0"), row(CollectionSerializer.pack(Arrays.asList(sorted), 1)));
+        assertRows(execute("SELECT a, b FROM %s WHERE a = 0 AND b IN ?", list), row(0, set(1, 2)));
+    }
+
+    @Test
+    public void testBoundListWithUnsortedSetInVectorElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b vector<frozen<set<int>>, 1>, c list<vector<frozen<set<int>>, 1>>, " +
+                    "PRIMARY KEY (a, b))");
+
+        VectorType<?> type = VectorType.getInstance(SetType.getInstance(Int32Type.instance, false), 1);
+        ByteBuffer unsortedSet = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(1), bytes(2)), 3);
+        ByteBuffer sortedSet = CollectionSerializer.pack(Arrays.asList(bytes(1), bytes(2)), 2);
+        ByteBuffer unsorted = type.decomposeRaw(Arrays.asList(unsortedSet));
+        ByteBuffer sorted = type.decomposeRaw(Arrays.asList(sortedSet));
+        ByteBuffer list = CollectionSerializer.pack(Arrays.asList(unsorted), 1);
+        execute("INSERT INTO %s (a, b, c) VALUES (0, [{1, 2}], ?)", list);
+
+        assertRows(execute("SELECT c FROM %s WHERE a = 0"), row(CollectionSerializer.pack(Arrays.asList(sorted), 1)));
+        assertRows(execute("SELECT a, b FROM %s WHERE a = 0 AND b IN ?", list), row(0, sorted));
+    }
+
+    @Test
+    public void testBoundInListWithEmptyElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, PRIMARY KEY (a, b))");
+        execute("INSERT INTO %s (a, b, c) VALUES (0, blobAsInt(0x), 0)");
+        execute("INSERT INTO %s (a, b, c) VALUES (0, 1, blobAsInt(0x))");
+        execute("INSERT INTO %s (a, b) VALUES (0, 2)");
+
+        ByteBuffer list = CollectionSerializer.pack(Arrays.asList(EMPTY_BYTE_BUFFER), 1);
+        assertRows(execute("SELECT b FROM %s WHERE a = 0 AND b IN ?", list), row(EMPTY_BYTE_BUFFER));
+        assertRows(execute("SELECT b FROM %s WHERE c IN ? ALLOW FILTERING", list), row(1));
+        assertRows(execute("UPDATE %s SET c = 3 WHERE a = 0 AND b = 2 IF c IN ?", list), row(false, null));
+        assertRows(execute("UPDATE %s SET c = 3 WHERE a = 0 AND b = 1 IF c IN ?", list), row(true));
+        execute("DELETE FROM %s WHERE a = 0 AND b IN ?", list);
+        assertRows(execute("SELECT b, c FROM %s WHERE a = 0"), row(1, 3), row(2, null));
     }
 
     @Test
