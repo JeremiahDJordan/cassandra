@@ -23,6 +23,7 @@ import java.io.IOException;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import org.junit.Assert;
 import org.junit.BeforeClass;
@@ -33,6 +34,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.shared.WithProperties;
+import org.apache.cassandra.transport.ClientResourceLimits;
 import org.apache.cassandra.transport.Message;
 import org.apache.cassandra.transport.ProtocolException;
 import org.apache.cassandra.transport.ProtocolVersion;
@@ -47,6 +49,7 @@ import static org.apache.cassandra.config.DatabaseDescriptor.getNativeTransportP
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+import static org.awaitility.Awaitility.await;
 
 
 public class StartupMessageValidationTest extends TestBaseImpl
@@ -149,6 +152,10 @@ public class StartupMessageValidationTest extends TestBaseImpl
                 response = client.execute(new QueryMessage("SELECT key FROM system.local", QueryOptions.DEFAULT));
                 Assert.assertTrue("Expected rows but received: " + response, response instanceof ResultMessage.Rows);
             }
+
+            // Once the client disconnects, no reference to the allocator of its address remains.
+            await().atMost(1, TimeUnit.MINUTES)
+                   .until(() -> cluster.get(1).callOnInstance(() -> ClientResourceLimits.ipUsageReservoir().size()) == 0);
         }
     }
 
