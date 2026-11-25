@@ -210,7 +210,10 @@ public interface ReadQuery
     public int nowInSec();
 
     /**
-     * Checks if this {@code ReadQuery} selects full partitions, that is it has no filtering on clustering or regular columns.
+     * Checks if this {@code ReadQuery} selects full partitions, that is it doesn't restrict the clustering and its row
+     * filter can keep the partitions with only static data (see
+     * {@link org.apache.cassandra.db.filter.RowFilter#canKeepPartitionsWithOnlyStaticData()}), which the limits then
+     * count as a row each.
      * @return {@code true} if this {@code ReadQuery} selects full partitions, {@code false} otherwise.
      */
     public boolean selectsFullPartition();

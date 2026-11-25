@@ -345,6 +345,12 @@ public abstract class DefaultGuardrail implements Guardrail
                          triggerFail(accumulated, failValue, what.get(), containsUserData);
                }
 
+               public void checkIncrement(long increment)
+               {
+                    if (accumulated + increment > failValue)
+                         add(increment);
+               }
+
                /**
                 * Trigger the warn if the currently accumulated counter value crosses warning threshold and the failure
                 * has not been triggered yet.
