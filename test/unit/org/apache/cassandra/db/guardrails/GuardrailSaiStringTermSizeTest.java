@@ -24,6 +24,7 @@ import java.util.Arrays;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
 import static java.nio.ByteBuffer.allocate;
@@ -211,5 +212,21 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
         // verify that the oversized term isn't written on initial index build
         assertEquals(((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", oversizedTerm)).result.size(), 0);
         assertEquals(((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", smallTerm)).result.size(), 1);
+    }
+
+    @Test
+    public void testAnalyzedTermsOnBuild()
+    {
+        // the Kelvin sign is 3 bytes and lower-cases to 'k', 1 byte; 'Ⱥ' is 2 bytes and lower-cases to 3
+        ByteBuffer smallerTerm = UTF8Type.instance.decompose("\u212A".repeat(FAIL_THRESHOLD / 3 + 1));
+        ByteBuffer largerTerm = UTF8Type.instance.decompose("Ⱥ".repeat(FAIL_THRESHOLD / 3) + "aa");
+
+        createTable(KEYSPACE, "CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        execute("INSERT INTO %s (k, v) VALUES (0, ?)", smallerTerm);
+        execute("INSERT INTO %s (k, v) VALUES (1, ?)", largerTerm);
+        createIndex("CREATE INDEX ON %s(v) USING 'sai' WITH OPTIONS = { 'case_sensitive' : false }");
+
+        assertEquals(1, ((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", smallerTerm)).result.size());
+        assertEquals(0, ((ResultMessage.Rows) execute("SELECT * FROM %s WHERE v = ?", largerTerm)).result.size());
     }
 }
