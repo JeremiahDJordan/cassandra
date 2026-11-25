@@ -31,6 +31,7 @@ import java.util.Objects;
 import java.util.PriorityQueue;
 import java.util.Queue;
 import java.util.function.Supplier;
+import java.util.function.UnaryOperator;
 import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
@@ -57,6 +58,7 @@ import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.RequestTimeoutException;
@@ -84,6 +86,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
     private static final int PARTITION_ROW_BATCH_SIZE = CassandraRelevantProperties.SAI_PARTITION_ROW_BATCH_SIZE.getInt();
 
     private final ReadCommand command;
+    private final ColumnFamilyStore cfs;
     private final QueryController controller;
     private final QueryContext queryContext;
     private Plan plan;
@@ -104,6 +107,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
                                         IndexFeatureSet indexFeatureSet)
     {
         this.command = command;
+        this.cfs = cfs;
         this.queryContext = new QueryContext(command);
         this.controller = new QueryController(cfs, command, orderer, indexFeatureSet, queryContext, tableQueryMetrics);
     }
@@ -236,6 +240,12 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         private final PrimaryKey.Factory keyFactory;
         private final int partitionRowBatchSize;
         private final CountFetchedTransformation fetchedRowsCounter;
+        // the partition whose deletions computeNext holds or drops, and the tombstones it holds for it
+        private DecoratedKey currentHeldPartition;
+        private long heldTombstones;
+        // the purge that the read applies before it counts tombstones (ReadCommand#withoutPurgeableTombstones)
+        private final UnaryOperator<UnfilteredRowIterator> purge;
+        private final boolean hasStaticExpression;
 
         private PrimaryKey lastKey;
 
@@ -255,6 +265,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             this.queryContext = queryContext;
             this.keyFactory = controller.primaryKeyFactory();
             this.fetchedRowsCounter = new CountFetchedTransformation(queryContext, command.nowInSec());
+            this.purge = command.partitionPurger(cfs, executionController);
+            this.hasStaticExpression = command.rowFilter().hasStaticExpression();
 
             this.firstPrimaryKey = controller.firstPrimaryKey();
 
@@ -285,10 +297,62 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             // saying this iterator must not return the same partition twice.
             skipToNextPartition();
 
-            UnfilteredRowIterator iterator = nextRowIterator(this::nextSelectedKeysInRange);
-            return iterator != null
-                   ? iteratePartition(iterator)
-                   : endOfData();
+            while (true)
+            {
+                UnfilteredRowIterator iterator = nextRowIterator(this::nextSelectedKeysInRange);
+                if (iterator == null)
+                    return endOfData();
+
+                UnfilteredRowIterator partition = iteratePartition(iterator);
+
+                // A partition whose static row doesn't satisfy the filter on its own is only a match if one of its
+                // live rows is: its rows without live data are held over all its batches of keys, and the partition
+                // is dropped if no live row matches, so a reconciling coordinator reads it again here.
+                if (!hasStaticExpression
+                    || filterTree.isSatisfiedByStaticRow(partition.partitionKey(), partition.staticRow()))
+                    return partition;
+
+                // The read purges what SAI returns before it counts its tombstones, so what it would purge is neither
+                // held nor counted here: purging only removes what isn't live, which doesn't change what matches.
+                DecoratedKey key = partition.partitionKey();
+                partition = purge.apply(partition);
+                if (partition == null)
+                {
+                    skipToNextPartition();
+                    continue;
+                }
+
+                currentHeldPartition = key;
+                heldTombstones = 0;
+                Row staticRow = partition.staticRow();
+                partition = UnfilteredRowIterators.withLiveRowsOrNull(partition,
+                                                                       true,
+                                                                       command.nowInSec(),
+                                                                       command.metadata().enforceStrictLiveness(),
+                                                                       this::hold,
+                                                                       this::drop);
+                if (partition != null)
+                    return partition;
+
+                // the static row is dropped with the partition
+                if (!staticRow.isEmpty())
+                    drop(staticRow);
+                skipToNextPartition();
+            }
+        }
+
+        /** Counts a held deletion, failing the read once what it counted and what is held cross the threshold. */
+        private void hold(Unfiltered held)
+        {
+            int tombstones = ReadCommand.countedTombstones(held, command.nowInSec(), command.metadata().enforceStrictLiveness());
+            for (int i = 0; i < tombstones; i++)
+                executionController.scannedTombstones().checkHeld(currentHeldPartition, held, ++heldTombstones);
+        }
+
+        /** Counts a dropped deletion in the read's tombstones (for the warning, the metrics and the trace). */
+        private void drop(Unfiltered dropped)
+        {
+            executionController.scannedTombstones().countDropped(currentHeldPartition, dropped);
         }
 
         /**
@@ -863,7 +927,13 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
     }
 
     /**
-     * Filters the rows in the partition so that only non-static rows that match given filter are returned.
+     * Filters the rows of a batch of keys of a partition so that only the non-static rows that match the given filter
+     * are returned.
+     * <p>
+     * The rows without live data that satisfy the filter aren't matches on their own, but whether the partition is
+     * returned for them is decided for the whole partition, over all its batches (see
+     * {@link ResultRetriever#computeNext}): a batch that only has such rows can be followed by one with a live match,
+     * and the partition must then be returned with all of them.
      */
     private static class FilteringPartitionIterator extends AbstractUnfilteredRowIterator
     {
@@ -891,7 +961,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
 
         public boolean matchesStaticRow()
         {
-            return filter.isSatisfiedBy(key, staticRow, staticRow);
+            return filter.isSatisfiedByStaticRow(key, staticRow);
         }
 
         @Override

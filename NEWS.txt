@@ -60,6 +60,11 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - A query that combines a static column and a regular column in an OR, e.g. WHERE v = 1 OR s = 2, now returns
+      the rows that satisfy either side, with or without indexes, including the static row of a partition without
+      other rows if it satisfies the OR. Before, it only returned rows that satisfied both sides without indexes,
+      and with SAI it could return fewer rows with LIMIT or paging than without. Run such queries only once every
+      node runs this release, because each replica filters the rows it returns.
 
 Deprecation
 ---------
