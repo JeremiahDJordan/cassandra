@@ -255,6 +255,32 @@ public class MigrationCoordinatorTest
     }
 
 
+    /**
+     * A version reported by an endpoint we can't pull from is received once merging another endpoint's schema makes it
+     * the local version
+     */
+    @Test
+    public void versionBecomingLocalIsReceived() throws UnknownHostException
+    {
+        Wrapper wrapper = new Wrapper();
+        wrapper.configureMocksForEndpoint(EP2, validEndpointState, null, false);
+
+        getUnchecked(wrapper.coordinator.reportEndpointVersion(EP1, V1));
+        getUnchecked(wrapper.coordinator.reportEndpointVersion(EP2, V2));
+        Pair<InetAddressAndPort, RequestCallback<Collection<Mutation>>> request = wrapper.requests.remove();
+        Assert.assertEquals(EP1, request.left);
+        Assert.assertTrue(wrapper.requests.isEmpty());
+
+        WaitQueue.Signal signal = wrapper.coordinator.getVersionInfoUnsafe(V2).register();
+        Assert.assertFalse(signal.isSignalled());
+
+        wrapper.localSchemaVersion = V2;
+        wrapper.coordinator.announce(V2);
+        Assert.assertTrue(signal.isSignalled());
+        request.right.onResponse(Message.remoteResponse(request.left, Verb.SCHEMA_PULL_RSP, Message.NO_PARAMS, Collections.emptyList()));
+        Assert.assertTrue(wrapper.coordinator.awaitSchemaRequests(1));
+    }
+
     private static void assertNoContact(Wrapper wrapper, InetAddressAndPort endpoint, UUID version, boolean startupShouldBeUnblocked)
     {
         Assert.assertTrue(wrapper.requests.isEmpty());
