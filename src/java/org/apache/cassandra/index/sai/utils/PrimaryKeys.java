@@ -81,19 +81,45 @@ public class PrimaryKeys implements Iterable<MemoryIndex.PkWithFrequency>
      */
     public long addAndResetFrequency(PrimaryKey key)
     {
-        Object prev = keys.put(key, 1);
-        return prev == null ? MAP_ENTRY_OVERHEAD : 0;
+        return keys.put(key, 1) == null ? MAP_ENTRY_OVERHEAD : 0;
     }
 
     /**
-     * Removes the specified {@link PrimaryKey}.
+     * Removes the specified {@link PrimaryKey}, whatever its frequency.
      *
-     * @param key the key to remove
-     * @return
+     * @param key a primary key
+     * @return the (negative) bytes released if the key was removed, 0 otherwise
      */
     public long remove(PrimaryKey key)
     {
         return keys.remove(key) != null ? -MAP_ENTRY_OVERHEAD : 0;
+    }
+
+    /**
+     * Removes an occurrence of the specified {@link PrimaryKey}, decrementing its frequency, and removes the key with
+     * its last occurrence.
+     *
+     * @param key a primary key
+     * @return the (negative) bytes released if the key was removed, 0 otherwise
+     */
+    public long decrementFrequency(PrimaryKey key)
+    {
+        // Compare and set, rather than computeIfPresent, so as not to allocate a capturing lambda per removed term
+        while (true)
+        {
+            Integer frequency = keys.get(key);
+            if (frequency == null)
+                return 0;
+            if (frequency > 1)
+            {
+                if (keys.replace(key, frequency, frequency - 1))
+                    return 0;
+            }
+            else if (keys.remove(key, frequency))
+            {
+                return -MAP_ENTRY_OVERHEAD;
+            }
+        }
     }
 
     public SortedSet<PrimaryKey> keys()

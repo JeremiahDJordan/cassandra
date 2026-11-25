@@ -89,7 +89,6 @@ public class TrieMemoryIndex extends MemoryIndex
     private final LongAdder primaryKeysHeapAllocations;
     private final PrimaryKeysAccumulator primaryKeysAccumulator;
     private final PrimaryKeysRemover primaryKeysRemover;
-    private final boolean analyzerTransformsValue;
     private final Map<PrimaryKey, Integer> docLengths = new HashMap<>();
     private volatile int indexedRows = 0;
     private volatile long totalTermCount = 0;
@@ -123,7 +122,6 @@ public class TrieMemoryIndex extends MemoryIndex
         this.primaryKeysHeapAllocations = new LongAdder();
         this.primaryKeysAccumulator = new PrimaryKeysAccumulator(primaryKeysHeapAllocations);
         this.primaryKeysRemover = new PrimaryKeysRemover(primaryKeysHeapAllocations);
-        this.analyzerTransformsValue = indexContext.getAnalyzerFactory().create().transformValue();
         this.data = InMemoryTrie.longLived(TypeUtil.byteComparableVersionForTermsData(indexContext.version()), TrieMemtable.BUFFER_TYPE, indexContext.columnFamilyStore().readOrdering());
         this.memtable = memtable;
     }
@@ -157,7 +155,8 @@ public class TrieMemoryIndex extends MemoryIndex
                                  LongConsumer offHeapAllocationsTracker)
     {
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
-        applyTransformer(primaryKey, value, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+        int tokenCount = applyTransformer(primaryKey, value, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+        recordAddedDocLength(primaryKey, tokenCount, onHeapAllocationsTracker);
     }
 
     public synchronized void update(DecoratedKey key,
@@ -168,29 +167,32 @@ public class TrieMemoryIndex extends MemoryIndex
                                     LongConsumer offHeapAllocationsTracker)
     {
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
+
+        // A row has one value here: add the terms of the new value, resetting the frequency of each the first time it
+        // is seen, then remove the row from the old value's terms that the new value doesn't hold. Add before removing
+        // so the row is never missing from the index.
+        Set<PrimaryKeys> seenPrimaryKeys = new HashSet<>();
+        primaryKeysAccumulator.seenPrimaryKeys = seenPrimaryKeys;
+        primaryKeysRemover.seenPrimaryKeys = seenPrimaryKeys;
         try
         {
-            if (analyzerTransformsValue)
-            {
-                // Because an update can add and remove the same term, we collect the set of the seen PrimaryKeys
-                // objects touched by the new values and pass it to the remover to prevent removing the PrimaryKey from
-                // the PrimaryKeys object if it was updated during the add part of this update.
-                var seenPrimaryKeys = new HashSet<PrimaryKeys>();
-                primaryKeysAccumulator.setSeenPrimaryKeys(seenPrimaryKeys);
-                primaryKeysRemover.setSeenPrimaryKeys(seenPrimaryKeys);
-            }
-
-            // Add before removing to prevent a period where the value is not available in the index
-            if (newValue != null && newValue.hasRemaining())
-                applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
-            if (oldValue != null && oldValue.hasRemaining())
+            boolean indexesNewValue = TypeUtil.indexesValue(newValue, indexContext.getValidator());
+            int newTokenCount = indexesNewValue
+                                ? applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator)
+                                : 0;
+            if (TypeUtil.indexesValue(oldValue, indexContext.getValidator()))
                 applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+
+            // The document length is that of the new value, or none if the update indexes no new value
+            if (indexesNewValue)
+                recordUpdatedDocLength(primaryKey, newTokenCount, onHeapAllocationsTracker);
+            else
+                forgetDocLength(primaryKey);
         }
         finally
         {
-            // Return the accumulator and remover to their default state.
-            primaryKeysAccumulator.setSeenPrimaryKeys(null);
-            primaryKeysRemover.setSeenPrimaryKeys(null);
+            primaryKeysAccumulator.seenPrimaryKeys = null;
+            primaryKeysRemover.seenPrimaryKeys = null;
         }
     }
 
@@ -202,43 +204,37 @@ public class TrieMemoryIndex extends MemoryIndex
                                     LongConsumer offHeapAllocationsTracker)
     {
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
-        try
+
+        // Add before removing so the row is never missing. Each term counts the occurrences of the row, so removing an
+        // old element releases only its own occurrence.
+        while (newValues != null && newValues.hasNext())
         {
-            // Because an update can add and remove the same term, we collect the set of the seen PrimaryKeys
-            // objects touched by the new values and pass it to the remover to prevent removing the PrimaryKey from
-            // the PrimaryKeys object if it was updated during the add part of this update.
-            var seenPrimaryKeys = new HashSet<PrimaryKeys>();
-            primaryKeysAccumulator.setSeenPrimaryKeys(seenPrimaryKeys);
-            primaryKeysRemover.setSeenPrimaryKeys(seenPrimaryKeys);
-
-            // Add before removing to prevent a period where the values are not available in the index
-            while (newValues != null && newValues.hasNext())
+            ByteBuffer newValue = newValues.next();
+            if (TypeUtil.indexesValue(newValue, indexContext.getValidator()))
             {
-                ByteBuffer newValue = newValues.next();
-                if (newValue != null && newValue.hasRemaining())
-                    applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
-            }
-
-            while (oldValues != null && oldValues.hasNext())
-            {
-                ByteBuffer oldValue = oldValues.next();
-                if (oldValue != null && oldValue.hasRemaining())
-                    applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+                int tokenCount = applyTransformer(primaryKey, newValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysAccumulator);
+                recordAddedDocLength(primaryKey, tokenCount, onHeapAllocationsTracker);
             }
         }
-        finally
+
+        while (oldValues != null && oldValues.hasNext())
         {
-            // Return the accumulator and remover to their default state.
-            primaryKeysAccumulator.setSeenPrimaryKeys(null);
-            primaryKeysRemover.setSeenPrimaryKeys(null);
+            ByteBuffer oldValue = oldValues.next();
+            if (TypeUtil.indexesValue(oldValue, indexContext.getValidator()))
+            {
+                int tokenCount = applyTransformer(primaryKey, oldValue, onHeapAllocationsTracker, offHeapAllocationsTracker, primaryKeysRemover);
+                if (docLengths.containsKey(primaryKey))
+                    totalTermCount -= tokenCount;
+            }
         }
     }
 
-    private void applyTransformer(PrimaryKey primaryKey,
-                                  ByteBuffer value,
-                                  LongConsumer onHeapAllocationsTracker,
-                                  LongConsumer offHeapAllocationsTracker,
-                                  InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey> transformer)
+    // Adds or removes the terms of a value of the row with the transformer, and returns the number of terms
+    private int applyTransformer(PrimaryKey primaryKey,
+                                 ByteBuffer value,
+                                 LongConsumer onHeapAllocationsTracker,
+                                 LongConsumer offHeapAllocationsTracker,
+                                 InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey> transformer)
     {
         AbstractAnalyzer analyzer = indexContext.getAnalyzerFactory().create();
         try
@@ -273,36 +269,60 @@ public class TrieMemoryIndex extends MemoryIndex
                 }
             }
 
-            Object prev = docLengths.put(primaryKey, tokenCount);
-            if (prev != null)
-            {
-                // An update first transforms with Accumulator to the new value,
-                // then transforms with Remover from the old value.
-                if (transformer instanceof PrimaryKeysAccumulator)
-                    totalTermCount += tokenCount;
-                if (transformer instanceof PrimaryKeysRemover)
-                    totalTermCount -= tokenCount;
-                // heap used for doc lengths
-                long heapUsed = RamUsageEstimator.HASHTABLE_RAM_BYTES_PER_ENTRY
-                                + primaryKey.ramBytesUsed() // TODO do we count these bytes?
-                                + Integer.BYTES;
-                onHeapAllocationsTracker.accept(heapUsed);
-            }
-            else
-            {
-                indexedRows++;
-                totalTermCount += tokenCount;
-            }
-
             // memory used by the trie
             onHeapAllocationsTracker.accept((data.usedSizeOnHeap() - initialSizeOnHeap) +
                                             (primaryKeysHeapAllocations.longValue() - initialPrimaryKeysHeapAllocations));
             offHeapAllocationsTracker.accept(data.usedSizeOffHeap() - initialSizeOffHeap);
+            return tokenCount;
         }
         finally
         {
             analyzer.end();
         }
+    }
+
+    // A row with several values (collection elements) has the document length of the last; only BM25 uses it
+    private void recordAddedDocLength(PrimaryKey primaryKey, int tokenCount, LongConsumer onHeapAllocationsTracker)
+    {
+        Integer previous = docLengths.put(primaryKey, tokenCount);
+        totalTermCount += tokenCount;
+        if (previous == null)
+            indexedRows++;
+        else
+            onHeapAllocationsTracker.accept(docLengthHeapSize(primaryKey));
+    }
+
+    // Only the new value of an update sets the document length
+    private void recordUpdatedDocLength(PrimaryKey primaryKey, int tokenCount, LongConsumer onHeapAllocationsTracker)
+    {
+        Integer previous = docLengths.put(primaryKey, tokenCount);
+        if (previous == null)
+        {
+            indexedRows++;
+            totalTermCount += tokenCount;
+        }
+        else
+        {
+            totalTermCount += tokenCount - previous;
+            onHeapAllocationsTracker.accept(docLengthHeapSize(primaryKey));
+        }
+    }
+
+    private void forgetDocLength(PrimaryKey primaryKey)
+    {
+        Integer previous = docLengths.remove(primaryKey);
+        if (previous != null)
+        {
+            indexedRows--;
+            totalTermCount -= previous;
+        }
+    }
+
+    private static long docLengthHeapSize(PrimaryKey primaryKey)
+    {
+        return RamUsageEstimator.HASHTABLE_RAM_BYTES_PER_ENTRY
+               + primaryKey.ramBytesUsed() // TODO do we count these bytes?
+               + Integer.BYTES;
     }
 
     @Override
@@ -547,27 +567,17 @@ public class TrieMemoryIndex extends MemoryIndex
     }
 
     /**
-     * Accumulator that adds a primary key to the primary keys set.
+     * Accumulator that adds an occurrence of a primary key to the primary keys set; its frequency counts them.
      */
     static class PrimaryKeysAccumulator implements InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey>
     {
         private final LongAdder heapAllocations;
-        private HashSet<PrimaryKeys> seenPrimaryKeys;
+        // the terms of the new single value seen so far during an update (under the lock of the TrieMemoryIndex)
+        private Set<PrimaryKeys> seenPrimaryKeys;
 
         PrimaryKeysAccumulator(LongAdder heapAllocations)
         {
             this.heapAllocations = heapAllocations;
-        }
-
-        /**
-         * Set the PrimaryKeys set to check for each PrimaryKeys object updated by this transformer.
-         * Warning: This method is not thread-safe and should only be called from within the synchronized block
-         * of the TrieMemoryIndex class.
-         * @param seenPrimaryKeys the set of PrimaryKeys objects updated so far
-         */
-        private void setSeenPrimaryKeys(HashSet<PrimaryKeys> seenPrimaryKeys)
-        {
-            this.seenPrimaryKeys = seenPrimaryKeys;
         }
 
         @Override
@@ -579,42 +589,24 @@ public class TrieMemoryIndex extends MemoryIndex
                 heapAllocations.add(PrimaryKeys.unsharedHeapSize());
             }
 
-            // If we are tracking PrimaryKeys via the seenPrimaryKeys set, then we need to reset the
-            // counter on the first time seeing each PrimaryKeys object since an update means that the
-            // frequency should be reset.
-            boolean shouldResetFrequency = false;
-            if (seenPrimaryKeys != null)
-                shouldResetFrequency = seenPrimaryKeys.add(existing);
-
-            long bytesAdded = shouldResetFrequency ? existing.addAndResetFrequency(neww)
-                                                   : existing.addAndIncrementFrequency(neww);
-            heapAllocations.add(bytesAdded);
+            boolean reset = seenPrimaryKeys != null && seenPrimaryKeys.add(existing);
+            heapAllocations.add(reset ? existing.addAndResetFrequency(neww) : existing.addAndIncrementFrequency(neww));
             return existing;
         }
     }
 
     /**
-     * Transformer that removes a primary key from the primary keys set, if present.
+     * Transformer that removes an occurrence of a primary key, or the key from the terms a new single value lacks.
      */
     static class PrimaryKeysRemover implements InMemoryTrie.UpsertTransformer<PrimaryKeys, PrimaryKey>
     {
         private final LongAdder heapAllocations;
+        // the terms of the new single value, which keep the key, during an update (under the TrieMemoryIndex lock)
         private Set<PrimaryKeys> seenPrimaryKeys;
 
         PrimaryKeysRemover(LongAdder heapAllocations)
         {
             this.heapAllocations = heapAllocations;
-        }
-
-        /**
-         * Set the set of seenPrimaryKeys.
-         * Warning: This method is not thread-safe and should only be called from within the synchronized block
-         * of the TrieMemoryIndex class.
-         * @param seenPrimaryKeys
-         */
-        private void setSeenPrimaryKeys(Set<PrimaryKeys> seenPrimaryKeys)
-        {
-            this.seenPrimaryKeys = seenPrimaryKeys;
         }
 
         @Override
@@ -623,12 +615,13 @@ public class TrieMemoryIndex extends MemoryIndex
             if (existing == null)
                 return null;
 
-            // This PrimaryKeys object was already seen during the add part of this update,
-            // so we skip removing the PrimaryKey from the PrimaryKeys class.
-            if (seenPrimaryKeys != null && seenPrimaryKeys.contains(existing))
+            if (seenPrimaryKeys != null)
+            {
+                if (!seenPrimaryKeys.contains(existing))
+                    heapAllocations.add(existing.remove(neww));
                 return existing;
-
-            heapAllocations.add(existing.remove(neww));
+            }
+            heapAllocations.add(existing.decrementFrequency(neww));
             return existing;
         }
     }
