@@ -380,7 +380,7 @@ public abstract class UDFunction extends UserFunction implements ScalarFunction
                                 : executeUserDefined(protocolVersion, parameters);
 
             Tracing.trace("Executed UDF {} in {}\u03bcs", name(), (System.nanoTime() - tStart) / 1000);
-            return result;
+            return sortCollectionElements(returnType, result);
         }
         catch (InvalidRequestException e)
         {
@@ -660,6 +660,20 @@ public abstract class UDFunction extends UserFunction implements ScalarFunction
     protected static ByteBuffer decompose(TypeCodec<Object> codec, ProtocolVersion protocolVersion, Object value)
     {
         return value == null ? null : UDHelper.serialize(codec, protocolVersion, value);
+    }
+
+    /**
+     * The codecs write the elements of a Java set or map in its iteration order. Serializing a collection again with
+     * its Cassandra type sorts them, as for a set or map literal.
+     */
+    @SuppressWarnings("unchecked")
+    protected static ByteBuffer sortCollectionElements(AbstractType<?> type, ByteBuffer value)
+    {
+        if (value == null || !type.isCollection())
+            return value;
+
+        AbstractType<Object> collectionType = (AbstractType<Object>) type;
+        return collectionType.decompose(collectionType.compose(value));
     }
 
     @Override
