@@ -42,6 +42,7 @@ import javax.annotation.Nullable;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Iterables;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -608,7 +609,16 @@ public class StorageAttachedIndex implements Index
 
         DecoratedKey key = update.partitionKey();
 
-        if (indexTermType.columnMetadata().isStatic())
+        if (indexTermType.columnMetadata().isPartitionKey())
+        {
+            // the same term for every row, and for the static row of an update without rows, unless it only deletes
+            Row row = Iterables.getFirst(update, null);
+            if (row == null && update.staticRow().hasLiveData(FBUtilities.nowInSeconds(), false))
+                row = update.staticRow();
+            if (row != null)
+                validateTermSizeForRow(key, row, true, state);
+        }
+        else if (indexTermType.columnMetadata().isStatic())
             validateTermSizeForRow(key, update.staticRow(), true, state);
         else
             for (Row row : update)
