@@ -33,7 +33,6 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VERSIO
 import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_CHECKSUM_TYPE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_COMPRESSION_SELECTOR_CLASS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SYSTEM_DISTRIBUTED_NTS_RF_OVERRIDE_PROPERTY;
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.config.CassandraRelevantProperties.TRIE_INDEX_FORMAT_VERSION;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -47,26 +46,15 @@ public class Cassandra5ModeChecksTest
     }
 
     @Test
-    public void testModeNeedsTestProperty()
-    {
-        assertThatThrownBy(() -> Cassandra5ModeChecks.validateMode(true)).hasMessageContaining("storage_compatibility_mode CASSANDRA_5 isn't supported");
-
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true))
-        {
-            Cassandra5ModeChecks.validateMode(true);
-        }
-    }
-
-    @Test
     public void testMessagingVersionProperty()
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true).set(DS_CURRENT_MESSAGING_VERSION, 111))
+        try (WithProperties properties = new WithProperties().set(DS_CURRENT_MESSAGING_VERSION, 111))
         {
             assertThatThrownBy(() -> Cassandra5ModeChecks.validateMode(true)).hasMessageContaining("-Dds.current_messaging_version=111 isn't allowed");
             Cassandra5ModeChecks.validateMode(false);
         }
 
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true).set(DS_CURRENT_MESSAGING_VERSION, 13))
+        try (WithProperties properties = new WithProperties().set(DS_CURRENT_MESSAGING_VERSION, 13))
         {
             Cassandra5ModeChecks.validateMode(true);
         }

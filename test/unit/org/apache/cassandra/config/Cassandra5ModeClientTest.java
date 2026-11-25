@@ -18,11 +18,9 @@ package org.apache.cassandra.config;
 
 import org.junit.Test;
 
-import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.junit.Assert.assertEquals;
 
 /**
@@ -33,14 +31,11 @@ public class Cassandra5ModeClientTest
     @Test
     public void testClientWritesForMode()
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true))
-        {
-            Config config = new Config();
-            config.storage_compatibility_mode = StorageCompatibilityMode.CASSANDRA_5;
-            DatabaseDescriptor.clientInitialization(true, () -> config);
+        Config config = new Config();
+        config.storage_compatibility_mode = StorageCompatibilityMode.CASSANDRA_5;
+        DatabaseDescriptor.clientInitialization(true, () -> config);
 
-            assertEquals(StorageCompatibilityMode.CASSANDRA_5, DatabaseDescriptor.getStorageCompatibilityModeForWrites());
-            assertEquals(MessagingService.VERSION_DS_21, MessagingService.current_version);
-        }
+        assertEquals(StorageCompatibilityMode.CASSANDRA_5, DatabaseDescriptor.getStorageCompatibilityModeForWrites());
+        assertEquals(MessagingService.VERSION_DS_21, MessagingService.current_version);
     }
 }

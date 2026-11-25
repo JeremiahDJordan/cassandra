@@ -2411,6 +2411,12 @@ drop_compact_storage_enabled: false
 # Possible values are:
 #
 # ** HCD_1: Stays compatible with the 4.x line in features, formats and component versions.
+# ** CASSANDRA_5: Writes only what Apache Cassandra 5.0 reads (sstables, commit logs, hints, batches, Paxos state,
+#                 schema and SAI index files) and talks to the other nodes as Apache Cassandra 5.0 does, so that
+#                 Apache Cassandra 5.0 nodes can run in the cluster and every node can go back to Apache Cassandra
+#                 5.0.9 or later, as NEWS.txt describes. DataStax-only features stay unavailable until the upgrade
+#                 from Apache Cassandra is finished. Use it to upgrade from Apache Cassandra 5.0, then move to
+#                 UPGRADING and NONE.
 # ** UPGRADING:   The cluster monitors the version of each node during this interim stage. This has a cost but ensures
 #                all new features, formats, versions, etc. are enabled safely.
 # ** NONE:        Start with all the new features and formats enabled.

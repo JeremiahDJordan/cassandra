@@ -94,6 +94,59 @@ HCD_1:
       Cassandra 4.x, which can't read the column. Nodes that already have it enabled, such as Cassandra 5.0.8 nodes
       being upgraded, keep it enabled (see the 5.0.8 upgrading notes).
 
+UPGRADING FROM APACHE CASSANDRA 5.0: STORAGE COMPATIBILITY MODE CASSANDRA_5
+===========================================================================
+
+In storage_compatibility_mode CASSANDRA_5 a node writes only what Apache Cassandra 5.0 reads (sstables, commit logs,
+hints, batches, Paxos state, schema and SAI indexes in Apache's `aa` format) and talks to its peers at messaging version
+13, so Apache Cassandra 5.0 nodes can run in the cluster and every node can go back to Apache Cassandra 5.0.9 or later.
+It is tested against Apache Cassandra 5.0.9 and the latest 5.0.x at release time.
+    - Before the first DataStax node joins, the cluster must run Apache Cassandra 5.0.9 or later in
+      storage_compatibility_mode NONE (5.0.9's default is CASSANDRA_4: finish its CASSANDRA_4 -> UPGRADING -> NONE
+      first), with no DataStax node in it. Don't start a node that has run an earlier DataStax release in CASSANDRA_5.
+    - The path: roll the Apache nodes to DataStax in CASSANDRA_5, then to UPGRADING, then to NONE. While any node still
+      runs Apache or CASSANDRA_5, start new and replacement nodes in CASSANDRA_5. Upgrading directly from Apache to
+      UPGRADING has no rollback, and needs a DDL freeze until every node runs UPGRADING.
+    - The path ends when the last node at messaging version 13 leaves it. DataStax-only features, DDL and schema columns
+      then turn on cluster-wide, and a node no longer starts in CASSANDRA_5. A node in CASSANDRA_5 also doesn't start
+      beside a DataStax peer above messaging version 13 that isn't in UPGRADING after CASSANDRA_5.
+    - On the path, DDL that Apache 5.0 can't apply is refused, and coordinators in UPGRADING refuse all DDL while an
+      Apache node is in the cluster, or a member's mode isn't known yet. OR filters, LIKE and analyzed `=`, SAI-filtered
+      `!=` and `NOT IN`, CONTAINS on frozen collections in some filters, blob indexes, ANN options, index hints,
+      optimizer options, replica warnings and grouped range reads are unavailable. Nodes with more than one data
+      directory refuse new vector indexes, as Apache does, and report existing ones at startup; those keep working.
+    - A node in the mode refuses settings that write or send what Apache can't read, such as BTI versions other than
+      `da`, checksums other than CRC32, adaptive flush compression, DataStax compressors, compaction options and sstable
+      formats, -Dcassandra.sai.immutable_components=true, -Dcassandra.sai.version.selector.class,
+      -Dcassandra.sai.read_apache_format=false and a -Dds.current_messaging_version other than 13. `nodetool import` and
+      `refresh` refuse files Apache can't read.
+    - Going back by replacement: bootstrap an Apache node, then decommission the DataStax node with hint transfer
+      enabled, stopping writes first where a write may be on one replica only, and repair afterwards. Bootstrapping,
+      replacing or resetting the schema of an Apache node needs a live Apache or CASSANDRA_5 node with the current
+      schema, so keep one running throughout.
+    - Going back in place: a node that has run in UPGRADING or NONE first restarts in CASSANDRA_5, which warns at
+      startup of what keeps it from going back: SAI indexes without complete `aa` groups (run `nodetool upgradesstables
+      -a`), and hints, batches or Paxos state of DataStax versions not yet delivered, replayed or purged (Paxos state
+      as paxos_state_purging sets). Once a restart shows none, or for a node that has only run in CASSANDRA_5,
+      `nodetool drain`, stop, and install Apache 5.0.9 or later. Start from Apache's cassandra.yaml, keeping the
+      cluster name, data paths, tokens and topology, with storage_compatibility_mode NONE,
+      uuid_sstable_identifiers_enabled: true and the memtable configurations the schema uses. Delete
+      `*-Statistics.hints` and the `metadata_directory`, and start.
+    - An sstable whose SAI indexes are still in a DataStax version, after a return to CASSANDRA_5 from UPGRADING, keeps
+      that version for new indexes until `nodetool upgradesstables -a`.
+    - A flush builds each vector index graph again from the flushed rows, which takes more heap and CPU than in the
+      other modes. Cosine vectors from Apache at or below DataStax's near-zero threshold are left out of the index when
+      an sstable is rewritten in the mode: normalise or replace them first.
+    - A rebuild of an index rebuilds every SAI index of the sstables. If it fails, rebuild all of them in one command,
+      `nodetool rebuild_index <keyspace> <table> <index> [<index> ...]`. After recreating an index under a name it had
+      before, rebuild it on the nodes that were down or streaming then, as on Apache 5.0.
+    - Apache 5.0.9 numbers rows wrongly when it builds an index on an sstable whose rows have expired since its flush,
+      or that has a static row with only tombstones: after going back, such an index gives wrong results until the
+      table's sstables are rewritten with `nodetool upgradesstables -a <keyspace> <table>`.
+    - CQLSSTableWriter and the other clients write for the mode, `aa` included, only with a Config that sets it.
+    - Commit log replay follows commit_failure_policy as on Apache; skipped mutations are lost. Index status values over
+      65535 bytes aren't gossiped at messaging version 13.
+
 UPGRADING FROM HCD 1.2 (HCD-632)
 ================================
 

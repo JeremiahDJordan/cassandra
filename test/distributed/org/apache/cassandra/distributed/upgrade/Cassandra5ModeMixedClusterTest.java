@@ -16,20 +16,24 @@
 
 package org.apache.cassandra.distributed.upgrade;
 
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
 
 import org.junit.Test;
 
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.IMessageFilters;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
-import org.apache.cassandra.distributed.shared.WithProperties;
+import org.apache.cassandra.io.sstable.ApacheReadability;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.Verb;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.ONE;
 import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
@@ -39,6 +43,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.awaitility.Awaitility.await;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -54,8 +59,7 @@ public class Cassandra5ModeMixedClusterTest extends ApacheMixedClusterTestBase
     @SuppressWarnings("unchecked")
     public void testModeNodeBesideApacheNode() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             UpgradeableCluster cluster = startCluster(2,
+        try (UpgradeableCluster cluster = startCluster(2,
                                                        config -> {
                                                            config.set("user_defined_functions_enabled", true)
                                                                  .set("hinted_handoff_enabled", false);
@@ -144,8 +148,7 @@ public class Cassandra5ModeMixedClusterTest extends ApacheMixedClusterTestBase
     @Test
     public void testApacheNodeBootstrapsFromModeNode() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             UpgradeableCluster cluster = startCluster(3,
+        try (UpgradeableCluster cluster = startCluster(3,
                                                        config -> {
                                                            if (config.num() == 2)
                                                                config.set("storage_compatibility_mode", "CASSANDRA_5");
@@ -174,5 +177,72 @@ public class Cassandra5ModeMixedClusterTest extends ApacheMixedClusterTestBase
                 assertEquals(100, cluster.coordinator(node).execute(withKeyspace("SELECT pk FROM %s.plain"), ONE).length);
             }
         }
+    }
+
+    @Test
+    public void testSchemaFromApacheNode() throws Throwable
+    {
+        try (UpgradeableCluster cluster = startCluster(3,
+                                                       config -> {
+                                                           if (config.num() > 1)
+                                                               config.set("storage_compatibility_mode", "CASSANDRA_5");
+                                                       },
+                                                       apacheVersion(), CURRENT_VERSION))
+        {
+            cluster.schemaChange(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"), false, cluster.get(1));
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int PRIMARY KEY, v int)"), false, cluster.get(1));
+
+            // a node in the mode bootstraps beside the Apache node and the mode node
+            IUpgradeableInstance bootstrapped = bootstrapNode(cluster, CURRENT_VERSION);
+            assertSchemaAgreement(cluster);
+
+            // node 2, in UPGRADING after CASSANDRA_5, gets a change it missed from the Apache node alone
+            IUpgradeableInstance upgrading = cluster.get(2);
+            upgrading.shutdown().get();
+            bootstrapped.shutdown().get();
+            cluster.schemaChange(withKeyspace("ALTER TABLE %s.tbl WITH comment = 'from Apache'"), true, cluster.get(1));
+            upgrading.config().set("storage_compatibility_mode", "UPGRADING");
+            upgrading.startup();
+            await().atMost(1, TimeUnit.MINUTES)
+                   .until(() -> "from Apache".equals(upgrading.executeInternal("SELECT comment FROM system_schema.tables WHERE keyspace_name = ? AND table_name = 'tbl'", KEYSPACE)[0][0]));
+        }
+    }
+
+    @Test
+    public void testDecommissionOfNodeInUpgradingToApacheNode() throws Throwable
+    {
+        try (UpgradeableCluster cluster = startCluster(3,
+                                                       config -> config.set("storage_compatibility_mode", "CASSANDRA_5"),
+                                                       CURRENT_VERSION, CURRENT_VERSION))
+        {
+            cluster.schemaChange(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"), false, cluster.get(1));
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.indexed (pk int PRIMARY KEY, v text)"), false, cluster.get(1));
+            cluster.schemaChange(withKeyspace("CREATE INDEX indexed_v ON %s.indexed (v) USING 'sai'"), false, cluster.get(1));
+
+            // node 2 has left the mode, and its rows have indexes of our formats
+            IUpgradeableInstance departing = cluster.get(2);
+            departing.shutdown().get();
+            departing.config().set("storage_compatibility_mode", "UPGRADING");
+            departing.startup();
+            for (int pk = 0; pk < 100; pk++)
+                cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.indexed (pk, v) VALUES (?, 'v')"), ALL, pk);
+            departing.flush(KEYSPACE);
+            assertTrue(((IInvokableInstance) departing).callOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore("indexed").getLiveSSTables().stream()
+                                                                                    .anyMatch(sstable -> !ApacheReadability.hasCompleteAaGroups(sstable))));
+            Set<Integer> departingKeys = keys(departing.executeInternal(withKeyspace("SELECT pk FROM %s.indexed WHERE v = 'v'")));
+            assertFalse(departingKeys.isEmpty());
+
+            // an Apache node takes node 2's range when node 2 is decommissioned
+            IUpgradeableInstance apache = bootstrapNode(cluster, apacheVersion());
+            Set<Integer> expected = keys(apache.executeInternal(withKeyspace("SELECT pk FROM %s.indexed")));
+            expected.addAll(departingKeys);
+            departing.nodetoolResult("decommission", "--force").asserts().success();
+            assertEquals(expected, keys(apache.executeInternal(withKeyspace("SELECT pk FROM %s.indexed WHERE v = 'v'"))));
+        }
+    }
+
+    private static Set<Integer> keys(Object[][] rows)
+    {
+        return Arrays.stream(rows).map(row -> (Integer) row[0]).collect(Collectors.toCollection(HashSet::new));
     }
 }

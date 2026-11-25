@@ -24,10 +24,8 @@ import java.util.Collections;
 import org.junit.Test;
 
 import org.apache.cassandra.distributed.Cluster;
-import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.service.ApacheUpgradePath;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.assertj.core.api.Assertions.assertThat;
@@ -44,8 +42,7 @@ public class ApacheUpgradePathJoinTest extends TestBaseImpl
     @Test
     public void testModeNodeRefusesNodeOutsidePath() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = Cluster.build(4)
+        try (Cluster cluster = Cluster.build(4)
                                       .withConfig(config -> config.with(NETWORK, GOSSIP)
                                                                   .set("storage_compatibility_mode", MODES[config.num() - 1]))
                                       .createWithoutStarting())

@@ -29,7 +29,7 @@ set -o pipefail
 [ "x${DIST_DIR}" != "x" ] || DIST_DIR="${CASSANDRA_DIR}/build"
 
 # target types
-TARGET_TYPES="build_dtest_jars stress-test fqltool-test microbench microbench-test test-burn long-test cqlsh-test simulator-dtest test test-cdc test-compression test-oa test-system-keyspace-directory test-latest jvm-dtest jvm-dtest-upgrade jvm-dtest-novnode jvm-dtest-upgrade-novnode"
+TARGET_TYPES="build_dtest_jars stress-test fqltool-test microbench microbench-test test-burn long-test cqlsh-test simulator-dtest test test-cdc test-compression test-oa test-system-keyspace-directory test-latest jvm-dtest jvm-dtest-upgrade jvm-dtest-novnode jvm-dtest-upgrade-novnode jvm-dtest-apache-5.0.9 jvm-dtest-apache-latest"
 
 error() {
   echo >&2 $2;
@@ -203,6 +203,32 @@ _is_valid_jar() {
   jar tf "${1}" >/dev/null 2>&1 && return 0
   echo "WARNING: ${1} is not a readable jar, rebuilding it"
   return 1
+}
+
+# the latest Apache Cassandra 5.0.x release tag
+_latest_apache_50_tag() {
+    git ls-remote --tags --refs https://github.com/apache/cassandra.git 'cassandra-5.0.*' | sed 's;.*refs/tags/;;' | grep -E '^cassandra-5\.0\.[0-9]+$' | sort -V | tail -1
+}
+
+# builds the dtest jar of the provided apache/cassandra tag alone in a directory, and prints the directory
+_build_apache_dtest_jar() {
+    local -r tag="$1"
+    local -r version="${tag#cassandra-}"
+    local -r dir="${DIST_DIR}/apache-dtest-jars/${tag}"
+    if ! _is_valid_jar "${dir}/dtest-${version}.jar" >&2 ; then
+        local -r src="${TMP_DIR}/cassandra-apache-dtest-jar"
+        local attempt
+        for attempt in 1 2 3 ; do
+            rm -fR "${src}"
+            git clone --quiet --depth 1 --branch "${tag}" https://github.com/apache/cassandra.git "${src}" >&2 && break
+            echo "git clone of ${tag} failed (attempt ${attempt} of 3)" >&2
+            [ ${attempt} -lt 3 ] || return 1
+        done
+        ( cd "${src}" && ant jar dtest-jar -Dbuild.dir="${src}/build" ) >&2 || return 1
+        rm -fR "${dir}" && mkdir -p "${dir}" || return 1
+        cp "${src}/build/dtest-${version}.jar" "${dir}/" || return 1
+    fi
+    echo "${dir}"
 }
 
 _build_all_dtest_jars() {
@@ -409,7 +435,7 @@ _main() {
   # check split_chunk is compatible with target (if not a regexp)
   if [[ "${split_chunk}" =~ ^[0-9]+/[0-9]+$ ]] && [[ "1/1" != "${split_chunk}" ]] ; then
     case ${target} in
-      "stress-test" | "fqltool-test" | "cqlsh-test" | "simulator-dtest")
+      "stress-test" | "fqltool-test" | "cqlsh-test" | "simulator-dtest" | "jvm-dtest-apache-5.0.9" | "jvm-dtest-apache-latest")
           error 1 "Target ${target} does not support splits."
           ;;
         *)
@@ -461,6 +487,7 @@ _main() {
   #  also recreate some of the non-build files we need
   ant -quiet -silent resolver-dist-lib _createVersionPropFile
 
+  local test_status=0
   case ${target} in
     "stress-test")
       # hard fail on test compilation, but dont fail the test run as unstable test reports are processed
@@ -532,6 +559,24 @@ _main() {
       fi
       _run_testlist "distributed" "testclasslist" "${test_name_regexp}" "" "$(_timeout_for 'test.distributed.timeout')" "${repeat_count}"
       ;;
+    "jvm-dtest-apache-5.0.9" | "jvm-dtest-apache-latest")
+      # the tests of clusters that mix this build with Apache Cassandra nodes, against an Apache Cassandra 5.0
+      # release: the release CI job runs them for 5.0.9 and for the latest 5.0.x, and fails if any test fails
+      [ "${java_version}" -eq 11 ] || error 1 "${target} runs on JDK 11, found ${java_version}"
+      apache_tag="cassandra-5.0.9"
+      [ "jvm-dtest-apache-latest" != "${target}" ] || apache_tag="$(_latest_apache_50_tag)"
+      [ -n "${apache_tag}" ] || error 1 "No Apache Cassandra 5.0 release tag found"
+      apache_dir="$(_build_apache_dtest_jar "${apache_tag}")" || error 1 "Could not build the dtest jar of ${apache_tag}"
+      testlist=$( grep -rl 'extends ApacheMixedClusterTestBase' test/distributed | sed "s;^test/distributed/;;" | sort )
+      [ -z "${test_name_regexp}" ] || testlist=$( echo "${testlist}" | _split_tests "${test_name_regexp}" || true )
+      [ -n "${testlist}" ] || error 1 "No tests found for ${target} ${test_name_regexp}"
+      set +o errexit
+      ant testclasslist -Dtest.classlistprefix=distributed -Dtest.classlistfile=<(echo "${testlist}") \
+          -Dtest.timeout="$(_timeout_for 'test.distributed.timeout')" ${ANT_TEST_OPTS} \
+          -Dtest.jvm.args=-Dcassandra.test.apache_dtest_jar_dir=${apache_dir}
+      test_status=$?
+      set -o errexit
+      ;;
     "cqlsh-test")
       ./pylib/cassandra-cqlsh-tests.sh $(pwd)
       ;;
@@ -551,6 +596,7 @@ _main() {
         -Dbuild.test.report.dir="${DIST_DIR}/test/reports"
       ;;
   esac
+  [ ${test_status} -eq 0 ] || error ${test_status} "${target} failed against Apache Cassandra ${apache_tag}"
 
   popd  >/dev/null
 }

@@ -25,9 +25,7 @@ import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
 import org.apache.cassandra.distributed.shared.Versions.Version;
-import org.apache.cassandra.distributed.shared.WithProperties;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
@@ -71,10 +69,7 @@ public class ApacheNullComponentTest extends ApacheMixedClusterTestBase
     public void testEntireSSTableStreamingToApache() throws Throwable
     {
         // whole sstables go to an Apache node from a node with the same schema version, in CASSANDRA_5
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true))
-        {
-            testEntireSSTableStreaming(CURRENT_VERSION, apacheVersion(), "CASSANDRA_5");
-        }
+        testEntireSSTableStreaming(CURRENT_VERSION, apacheVersion(), "CASSANDRA_5");
     }
 
     private static void testEntireSSTableStreaming(Version from, Version to, String mode) throws Throwable

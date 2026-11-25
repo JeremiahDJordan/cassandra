@@ -23,11 +23,9 @@ import org.junit.Test;
 import org.apache.cassandra.db.commitlog.CommitLogDescriptor;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
-import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -43,8 +41,7 @@ public class Cassandra5ModeTest extends TestBaseImpl
     @Test
     public void testVersionsPerNode() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = Cluster.build(2)
+        try (Cluster cluster = Cluster.build(2)
                                       .withConfig(config -> config.set("storage_compatibility_mode", config.num() == 1 ? "CASSANDRA_5" : "UPGRADING"))
                                       .start())
         {

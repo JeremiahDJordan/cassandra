@@ -20,9 +20,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
-import org.apache.cassandra.distributed.shared.WithProperties;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
 import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -37,8 +35,7 @@ public class ApacheUpgradePathSchemaTest extends ApacheMixedClusterTestBase
     @Test
     public void testSchemaVersionsAgree() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             UpgradeableCluster cluster = startCluster(2,
+        try (UpgradeableCluster cluster = startCluster(2,
                                                        config -> {
                                                            config.set("user_defined_functions_enabled", true);
                                                            if (config.num() == 2)

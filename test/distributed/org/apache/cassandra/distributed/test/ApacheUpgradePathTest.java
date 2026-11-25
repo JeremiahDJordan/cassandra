@@ -21,18 +21,19 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Stream;
 
 import org.junit.Test;
 
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.TokenSupplier;
-import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.ApacheUpgradePath;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
+import static org.apache.cassandra.distributed.api.ConsistencyLevel.ONE;
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
@@ -53,8 +54,7 @@ public class ApacheUpgradePathTest extends TestBaseImpl
     @Test
     public void testRoll() throws Throwable
     {
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = init(Cluster.build(2)
+        try (Cluster cluster = init(Cluster.build(2)
                                            .withConfig(config -> config.with(NETWORK, GOSSIP)
                                                                        .set("user_defined_functions_enabled", true)
                                                                        .set("storage_compatibility_mode", "CASSANDRA_5"))
@@ -105,8 +105,7 @@ public class ApacheUpgradePathTest extends TestBaseImpl
     {
         // the replacement, node 4, takes node 3's token
         TokenSupplier tokens = TokenSupplier.evenlyDistributedTokens(3);
-        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
-             Cluster cluster = init(Cluster.build(3)
+        try (Cluster cluster = init(Cluster.build(3)
                                            .withTokenSupplier(node -> tokens.token(Math.min(node, 3)))
                                            .withConfig(config -> config.with(NETWORK, GOSSIP)
                                                                        .set("user_defined_functions_enabled", true)
@@ -123,6 +122,40 @@ public class ApacheUpgradePathTest extends TestBaseImpl
             assertThatThrownBy(() -> replacement.coordinator().execute(withKeyspace("CREATE FUNCTION %s.f (a int) CALLED ON NULL INPUT RETURNS int " +
                                                                                      "DETERMINISTIC LANGUAGE java AS 'return a;'"), ALL))
             .hasMessageContaining("DETERMINISTIC");
+        }
+    }
+
+    @Test
+    public void testUndrainedRestartInUpgrading() throws Throwable
+    {
+        try (Cluster cluster = init(Cluster.build(2)
+                                           .withConfig(config -> config.with(NETWORK, GOSSIP)
+                                                                       .set("hints_flush_period", "100ms")
+                                                                       .set("storage_compatibility_mode", "CASSANDRA_5"))
+                                           .start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int PRIMARY KEY, v int)"));
+            restart(cluster.get(1), "UPGRADING");
+            restart(cluster.get(2), "UPGRADING");
+
+            // a hint for node 2, which is down, and a write node 1 hasn't flushed
+            cluster.get(2).shutdown().get();
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.tbl (pk, v) VALUES (1, 1)"), ONE);
+            Path hints = Paths.get(cluster.get(1).config().getString("hints_directory"));
+            await().atMost(1, TimeUnit.MINUTES).until(() -> {
+                try (Stream<Path> files = Files.list(hints))
+                {
+                    return files.anyMatch(file -> file.toString().endsWith(".hints"));
+                }
+            });
+            assertThat(cluster.get(1).callOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore("tbl").getLiveSSTables().isEmpty())).isTrue();
+
+            cluster.get(1).shutdown(false).get();
+            cluster.get(1).startup();
+            assertRows(cluster.get(1).executeInternal(withKeyspace("SELECT v FROM %s.tbl WHERE pk = 1")), row(1));
+            cluster.get(2).startup();
+            await().atMost(1, TimeUnit.MINUTES).until(() -> cluster.get(2).executeInternal(withKeyspace("SELECT v FROM %s.tbl WHERE pk = 1")).length == 1);
+            assertRows(cluster.get(2).executeInternal(withKeyspace("SELECT v FROM %s.tbl WHERE pk = 1")), row(1));
         }
     }
 
