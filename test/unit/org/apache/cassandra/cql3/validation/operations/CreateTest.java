@@ -35,7 +35,6 @@ import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.memtable.TrieMemtableStage1;
 import org.apache.cassandra.db.memtable.TrieMemtableStage2;
 import org.apache.cassandra.db.memtable.TrieMemtableStage3;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.cql3.Duration;
 import org.apache.cassandra.db.Mutation;
@@ -645,9 +644,9 @@ public class CreateTest extends CQLTester
         assertSame(MemtableParams.DEFAULT.factory(), getCurrentColumnFamilyStore().metadata().params.memtable.factory());
         Class<? extends Memtable> defaultClass = getCurrentColumnFamilyStore().getTracker().getView().getCurrentMemtable().getClass();
 
-        if (mode.isBefore(CassandraVersion.CASSANDRA_5_0.major))
+        if (mode == StorageCompatibilityMode.HCD_1)
         {
-            // In CC4/HCD_1 mode, memtable is stored as frozen<map<text,text>> in schema
+            // In HCD_1 mode, memtable is stored as frozen<map<text,text>> in schema
             assertMemtableOptionVersion4(null, null);
 
             testMemtableConfigVersion4("skiplist", map("class", "SkipListMemtable"), SkipListMemtable.FACTORY, SkipListMemtable.class);

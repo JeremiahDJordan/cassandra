@@ -313,10 +313,9 @@ public class Flushing
                                             false,
                                             new IntervalSet<>(flushSet.commitLogLowerBound(),
                                                               flushSet.commitLogUpperBound()),
-                                            new SerializationHeader(true,
-                                                                    flushSet.metadata(),
-                                                                    flushSet.columns(),
-                                                                    flushSet.encodingStats()),
+                                            SerializationHeader.make(flushSet.metadata(),
+                                                                     flushSet.columns(),
+                                                                     flushSet.encodingStats()),
                                             txn);
     }
 }

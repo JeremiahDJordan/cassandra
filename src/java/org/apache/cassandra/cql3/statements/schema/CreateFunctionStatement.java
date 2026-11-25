@@ -30,6 +30,7 @@ import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.FunctionResource;
 import org.apache.cassandra.auth.IResource;
 import org.apache.cassandra.auth.Permission;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Constants;
@@ -42,6 +43,7 @@ import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.schema.UserFunctions.FunctionsDiff;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.transport.Event.SchemaChange;
@@ -114,6 +116,10 @@ public final class CreateFunctionStatement extends AlterSchemaStatement
 
         if (!argumentNamesSet.containsAll(monotonicOn))
             throw ire("Monotony should be declared on one of the arguments, '%s' is not an argument", monotonicOn.get(0));
+
+        if ((deterministic || monotonic || !monotonicOn.isEmpty()) && !SchemaKeyspace.hasDeterminismColumns())
+            throw ire("DETERMINISTIC and MONOTONIC functions are not supported while storage_compatibility_mode is %s; " +
+                      "set storage_compatibility_mode to UPGRADING or NONE", DatabaseDescriptor.getStorageCompatibilityMode());
 
         rawArgumentTypes.stream()
                         .filter(raw -> !raw.isImplicitlyFrozen() && raw.isFrozen())

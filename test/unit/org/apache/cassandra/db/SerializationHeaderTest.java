@@ -20,9 +20,11 @@ package org.apache.cassandra.db;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.function.BiFunction;
@@ -64,6 +66,7 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -179,6 +182,38 @@ public class SerializationHeaderTest
                 readerWithRegular.selfRef().close();
             FileUtils.deleteRecursive(dir);
         }
+    }
+
+    @Test
+    public void testWithoutDeprecatedSystemColumns()
+    {
+        TableMetadata system = TableMetadata.builder(SchemaConstants.SCHEMA_KEYSPACE_NAME, "tab")
+                                            .addPartitionKeyColumn("k", Int32Type.instance)
+                                            .addRegularColumn("v", Int32Type.instance)
+                                            .recordDeprecatedSystemColumn("old", Int32Type.instance)
+                                            .build();
+        assertThat(columnNames(system)).containsExactly("v");
+
+        // a user table keeps the column whatever the drop time
+        TableMetadata user = TableMetadata.builder(KEYSPACE, "tab")
+                                          .addPartitionKeyColumn("k", Int32Type.instance)
+                                          .addRegularColumn("v", Int32Type.instance)
+                                          .recordColumnDrop(ColumnMetadata.regularColumn(KEYSPACE, "tab", "old", Int32Type.instance), Long.MAX_VALUE)
+                                          .build();
+        assertThat(columnNames(user)).containsExactly("old", "v");
+    }
+
+    private static List<String> columnNames(TableMetadata metadata)
+    {
+        RegularAndStaticColumns columns = RegularAndStaticColumns.builder()
+                                                                 .add(metadata.getColumn(ByteBufferUtil.bytes("v")))
+                                                                 .add(metadata.getDroppedColumn(ByteBufferUtil.bytes("old")))
+                                                                 .build();
+        SerializationHeader header = SerializationHeader.make(metadata, columns, EncodingStats.NO_STATS);
+        List<String> names = new ArrayList<>();
+        for (ColumnMetadata column : header.columns())
+            names.add(column.name.toString());
+        return names;
     }
 
     @Test

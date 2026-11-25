@@ -59,9 +59,9 @@ import org.apache.cassandra.schema.ColumnMetadata.ClusteringOrder;
 import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.service.reads.repair.ReadRepairStrategy;
 import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.CassandraVersion;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Simulate;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static java.lang.String.format;
 
@@ -153,7 +153,7 @@ public final class SchemaKeyspace
               + "PRIMARY KEY ((keyspace_name), table_name))");
 
     // CC5 schema with memtable as text
-    // Used when storage_compatibility_mode is NONE (no downgrade support)
+    // Used when storage_compatibility_mode is not HCD_1
     private static final TableMetadata Tables =
         parse(TABLES,
               "table definitions",
@@ -364,6 +364,43 @@ public final class SchemaKeyspace
               + "deterministic boolean,"
               + "PRIMARY KEY ((keyspace_name), aggregate_name, argument_types))");
 
+    // Cassandra 4.x and 5.0 schema, without the deterministic and monotonic columns
+    // Used when storage_compatibility_mode is CASSANDRA_4 to support downgrade to Cassandra. The columns are recorded
+    // as dropped, so cells written in other modes are ignored instead of failing deserialization
+    private static final TableMetadata FunctionsCassandra4 =
+        builder(FUNCTIONS,
+                "user defined function definitions",
+                "CREATE TABLE %s ("
+                + "keyspace_name text,"
+                + "function_name text,"
+                + "argument_types frozen<list<text>>,"
+                + "argument_names frozen<list<text>>,"
+                + "body text,"
+                + "language text,"
+                + "return_type text,"
+                + "called_on_null_input boolean,"
+                + "PRIMARY KEY ((keyspace_name), function_name, argument_types))")
+        .recordDeprecatedSystemColumn("deterministic", BooleanType.instance)
+        .recordDeprecatedSystemColumn("monotonic", BooleanType.instance)
+        .recordDeprecatedSystemColumn("monotonic_on", ListType.getInstance(UTF8Type.instance, false))
+        .build();
+
+    private static final TableMetadata AggregatesCassandra4 =
+        builder(AGGREGATES,
+                "user defined aggregate definitions",
+                "CREATE TABLE %s ("
+                + "keyspace_name text,"
+                + "aggregate_name text,"
+                + "argument_types frozen<list<text>>,"
+                + "final_func text,"
+                + "initcond text,"
+                + "return_type text,"
+                + "state_func text,"
+                + "state_type text,"
+                + "PRIMARY KEY ((keyspace_name), aggregate_name, argument_types))")
+        .recordDeprecatedSystemColumn("deterministic", BooleanType.instance)
+        .build();
+
     /**
      * Returns the list of schema table metadata based on current storage compatibility mode.
      */
@@ -378,41 +415,88 @@ public final class SchemaKeyspace
                                 DroppedColumns,
                                 viewsTableMetadata(),
                                 Types,
-                                Functions,
-                                Aggregates,
+                                functionsTableMetadata(),
+                                aggregatesTableMetadata(),
                                 Indexes);
     }
 
     /**
      * Returns the appropriate Tables schema table metadata based on current storage compatibility mode.
-     * Uses TablesLegacy ({@code frozen<map>} for memtable) in CC4 mode, Tables (text for memtable) otherwise.
+     * Uses TablesLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, Tables (text for memtable) otherwise.
      */
     private static TableMetadata tablesTableMetadata()
     {
-        return DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major)
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                ? TablesLegacy
                : Tables;
     }
 
     /**
      * Returns the appropriate Views schema table metadata based on current storage compatibility mode.
-     * Uses ViewsLegacy ({@code frozen<map>} for memtable) in CC4 mode, Views (text for memtable) otherwise.
+     * Uses ViewsLegacy ({@code frozen<map>} for memtable) in HCD_1 mode, Views (text for memtable) otherwise.
      */
     private static TableMetadata viewsTableMetadata()
     {
-        return DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major)
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1
                ? ViewsLegacy
                : Views;
     }
 
+    /**
+     * Returns the appropriate Functions schema table metadata based on current storage compatibility mode.
+     * Uses FunctionsCassandra4 (no deterministic and monotonic columns) in CASSANDRA_4 mode, Functions otherwise.
+     */
+    private static TableMetadata functionsTableMetadata()
+    {
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_4
+               ? FunctionsCassandra4
+               : Functions;
+    }
+
+    /**
+     * Returns the appropriate Aggregates schema table metadata based on current storage compatibility mode.
+     * Uses AggregatesCassandra4 (no deterministic column) in CASSANDRA_4 mode, Aggregates otherwise.
+     */
+    private static TableMetadata aggregatesTableMetadata()
+    {
+        return DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.CASSANDRA_4
+               ? AggregatesCassandra4
+               : Aggregates;
+    }
+
+    /**
+     * Whether the Functions and Aggregates schema tables of the current storage compatibility mode have the
+     * deterministic and monotonic columns.
+     */
+    public static boolean hasDeterminismColumns()
+    {
+        return isWritable(functionsTableMetadata(), "deterministic");
+    }
+
+    /**
+     * Whether the column can be written to the schema table: the table of the current storage compatibility mode has
+     * it, and so does the table the node started with.
+     */
+    private static boolean isWritable(TableMetadata schemaTable, String name)
+    {
+        if (schemaTable.getColumn(ByteBufferUtil.bytes(name)) == null)
+            return false;
+        TableMetadata current = Schema.instance.getTableMetadata(schemaTable.id);
+        return current == null || current.getColumn(ByteBufferUtil.bytes(name)) != null;
+    }
+
     private static TableMetadata parse(String name, String description, String cql)
+    {
+        return builder(name, description, cql).build();
+    }
+
+    private static TableMetadata.Builder builder(String name, String description, String cql)
     {
         return CreateTableStatement.parse(format(cql, name), SchemaConstants.SCHEMA_KEYSPACE_NAME)
                                    .id(TableId.forSystemTable(SchemaConstants.SCHEMA_KEYSPACE_NAME, name))
                                    .gcGraceSeconds((int) TimeUnit.DAYS.toSeconds(7))
                                    .memtableFlushPeriod((int) TimeUnit.HOURS.toMillis(1))
-                                   .comment(description)
-                                   .build();
+                                   .comment(description);
     }
 
     public static KeyspaceMetadata metadata()
@@ -723,10 +807,10 @@ public final class SchemaKeyspace
 
         // As above, only add the memtable column if the table uses a non-default memtable configuration to avoid RTE
         // in mixed operation with pre-4.1 versioned node during upgrades.
-        // Write in CC4 format (map) or CC5 format (text) based on storage compatibility mode
+        // Write in CC4 format (map) in HCD_1 mode, CC5 format (text) otherwise
         if (params.memtable != MemtableParams.DEFAULT)
         {
-            if (DatabaseDescriptor.getStorageCompatibilityMode().isBefore(CassandraVersion.CASSANDRA_5_0.major))
+            if (DatabaseDescriptor.getStorageCompatibilityMode() == StorageCompatibilityMode.HCD_1)
                 builder.add("memtable", params.memtable.asSchemaValueMap());
             else
                 builder.add("memtable", params.memtable.asSchemaValueText());
@@ -1013,16 +1097,23 @@ public final class SchemaKeyspace
 
     private static void addFunctionToSchemaMutation(UDFunction function, Mutation.SimpleBuilder builder)
     {
-        builder.update(Functions)
-               .row(function.name().name, function.argumentsList())
-               .add("body", function.body())
-               .add("language", function.language())
-               .add("return_type", function.returnType().asCQL3Type().toSchemaString())
-               .add("called_on_null_input", function.isCalledOnNullInput())
-               .add("argument_names", function.argNames().stream().map((c) -> bbToString(c.bytes)).collect(toList()))
-               .add("deterministic", function.isDeterministic())
-               .add("monotonic", function.isMonotonic())
-               .add("monotonic_on", function.monotonicOn().stream().map((c) -> bbToString(c.bytes)).collect(toList()));
+        TableMetadata schemaTable = functionsTableMetadata();
+        boolean withDeterminism = isWritable(schemaTable, "deterministic");
+        Row.SimpleBuilder rowBuilder = builder.update(schemaTable).row(function.name().name, function.argumentsList());
+        // the row may have deterministic and monotonic cells of an earlier definition
+        if (!withDeterminism)
+            rowBuilder.deletePrevious();
+        rowBuilder.add("body", function.body())
+                  .add("language", function.language())
+                  .add("return_type", function.returnType().asCQL3Type().toSchemaString())
+                  .add("called_on_null_input", function.isCalledOnNullInput())
+                  .add("argument_names", function.argNames().stream().map((c) -> bbToString(c.bytes)).collect(toList()));
+        if (withDeterminism)
+        {
+            rowBuilder.add("deterministic", function.isDeterministic())
+                      .add("monotonic", function.isMonotonic())
+                      .add("monotonic_on", function.monotonicOn().stream().map((c) -> bbToString(c.bytes)).collect(toList()));
+        }
     }
 
     private static String bbToString(ByteBuffer bb)
@@ -1039,27 +1130,32 @@ public final class SchemaKeyspace
 
     private static void addDropFunctionToSchemaMutation(UDFunction function, Mutation.SimpleBuilder builder)
     {
-        builder.update(Functions).row(function.name().name, function.argumentsList()).delete();
+        builder.update(functionsTableMetadata()).row(function.name().name, function.argumentsList()).delete();
     }
 
     private static void addAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
     {
-        builder.update(Aggregates)
-               .row(aggregate.name().name, aggregate.argumentsList())
-               .add("return_type", aggregate.returnType().asCQL3Type().toSchemaString())
-               .add("state_func", aggregate.stateFunction().name().name)
-               .add("state_type", aggregate.stateType().asCQL3Type().toSchemaString())
-               .add("final_func", aggregate.finalFunction() != null ? aggregate.finalFunction().name().name : null)
-               .add("deterministic", aggregate.isDeterministic())
-               .add("initcond", aggregate.initialCondition() != null
-                                // must use the frozen state type here, as 'null' for unfrozen collections may mean 'empty'
-                                ? aggregate.stateType().freeze().asCQL3Type().toCQLLiteral(aggregate.initialCondition())
-                                : null);
+        TableMetadata schemaTable = aggregatesTableMetadata();
+        boolean withDeterminism = isWritable(schemaTable, "deterministic");
+        Row.SimpleBuilder rowBuilder = builder.update(schemaTable).row(aggregate.name().name, aggregate.argumentsList());
+        // the row may have a deterministic cell of an earlier definition
+        if (!withDeterminism)
+            rowBuilder.deletePrevious();
+        rowBuilder.add("return_type", aggregate.returnType().asCQL3Type().toSchemaString())
+                  .add("state_func", aggregate.stateFunction().name().name)
+                  .add("state_type", aggregate.stateType().asCQL3Type().toSchemaString())
+                  .add("final_func", aggregate.finalFunction() != null ? aggregate.finalFunction().name().name : null)
+                  .add("initcond", aggregate.initialCondition() != null
+                                   // must use the frozen state type here, as 'null' for unfrozen collections may mean 'empty'
+                                   ? aggregate.stateType().freeze().asCQL3Type().toCQLLiteral(aggregate.initialCondition())
+                                   : null);
+        if (withDeterminism)
+            rowBuilder.add("deterministic", aggregate.isDeterministic());
     }
 
     private static void addDropAggregateToSchemaMutation(UDAggregate aggregate, Mutation.SimpleBuilder builder)
     {
-        builder.update(Aggregates).row(aggregate.name().name, aggregate.argumentsList()).delete();
+        builder.update(aggregatesTableMetadata()).row(aggregate.name().name, aggregate.argumentsList()).delete();
     }
 
     /*

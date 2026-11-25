@@ -65,6 +65,29 @@ restore snapshots created with the previous major version using the
 'sstableloader' tool. You can upgrade the file format of your snapshots
 using the provided 'sstableupgrade' tool.
 
+SCHEMA TABLES IN STORAGE COMPATIBILITY MODE CASSANDRA_4
+=======================================================
+
+With storage_compatibility_mode CASSANDRA_4, system_schema.functions and system_schema.aggregates have the columns of
+Cassandra 4.x and 5.0, without the deterministic, monotonic and monotonic_on columns of the other modes, and the
+memtable column of system_schema.tables and system_schema.views is text, as in Cassandra 4.1 and 5.0, not the map of
+HCD_1:
+    - CREATE FUNCTION with DETERMINISTIC or MONOTONIC, and CREATE AGGREGATE with DETERMINISTIC, are refused.
+    - Functions and aggregates created in another mode, or by an earlier release, are neither deterministic nor
+      monotonic, so GROUP BY on a monotonic user function fails.
+    - Nodes that use different definitions of the function tables report different schema versions as soon as a
+      function or aggregate exists: during a rolling upgrade in CASSANDRA_4 from an earlier release, which uses the
+      other definitions, and while some nodes are in CASSANDRA_4 and others in another mode. Avoid schema changes
+      until every node runs the same release in the same mode.
+    - Earlier releases wrote the three function columns in CASSANDRA_4 too, and Cassandra 4.x can't read sstables
+      that have them. Before a rollback to Cassandra 4.x, run
+      `nodetool upgradesstables -a system_schema functions aggregates` on every node in CASSANDRA_4, then drain it.
+    - Earlier releases also wrote the memtable option as a map in CASSANDRA_4, which Cassandra 4.1 reads as an invalid
+      memtable configuration, or fails to read. Before a rollback, once every node runs this release, rewrite the
+      schema of each table and view with a non-default memtable by changing one of its options, for example its
+      comment, and set its memtable option in the same statement if DESCRIBE doesn't show the intended configuration;
+      setting the memtable option to its current value alone doesn't rewrite it. Then drain the nodes.
+
 UPGRADING FROM HCD 1.2 (HCD-632)
 ================================
 
