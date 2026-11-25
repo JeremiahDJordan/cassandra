@@ -222,6 +222,38 @@ public class SSTableIterationTest extends CQLTester
         testIteratorMerge(15);
     }
 
+    /**
+     * A deletion that opens at the start of a partition in one sstable and the static row of the partition in another.
+     */
+    @Test
+    public void testIteratorMergeStaticRowAndDeletionFromPartitionStart() throws Throwable
+    {
+        String tableName = createTable("CREATE TABLE %s (a int, b int, d int, s int static, PRIMARY KEY (a, b))");
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(tableName);
+        cfs.disableAutoCompaction();
+        execute("DELETE FROM %s USING TIMESTAMP 1 WHERE a = 0 AND b <= 1");
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+        execute("INSERT INTO %s (a, s) VALUES (0, 2) USING TIMESTAMP 2");
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+
+        Set<SSTableReader> sstables = cfs.getLiveSSTables();
+        SSTableCursor mergedCursor = new SSTableCursorMerger(sstables.stream()
+                                                                     .map(SortedStringTableCursor::new)
+                                                                     .collect(Collectors.toList()),
+                                                             cfs.metadata());
+        try (UnfilteredPartitionIterator mergedScanner = UnfilteredPartitionIterators.merge(sstables.stream()
+                                                                                                    .map(SSTableReader::getScanner)
+                                                                                                    .collect(Collectors.toList()),
+                                                                                            UnfilteredPartitionIterators.MergeListener.NOOP);
+             UnfilteredPartitionIterator fromCursor = new IteratorFromCursor(cfs.metadata(), mergedCursor))
+        {
+            assertIteratorsEqual(mergedScanner, fromCursor, false);
+        }
+
+        compact();
+        assertRows(execute("SELECT a, b, s FROM %s"), row(0, null, 2));
+    }
+
     public void testIteratorMerge(int sstableCount) throws Throwable
     {
         String tableName = createTable("CREATE TABLE %s (a int, b int, c int, d text, s text static, cc set<int>, PRIMARY KEY (a, b, c))");
