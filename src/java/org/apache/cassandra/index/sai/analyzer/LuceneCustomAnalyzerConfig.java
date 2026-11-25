@@ -21,6 +21,8 @@ package org.apache.cassandra.index.sai.analyzer;
 import java.util.List;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
+import org.apache.lucene.analysis.ngram.NGramFilterFactory;
+import org.apache.lucene.analysis.ngram.NGramTokenizerFactory;
 
 public class LuceneCustomAnalyzerConfig
 {
@@ -57,12 +59,12 @@ public class LuceneCustomAnalyzerConfig
      */
     public boolean isNGram()
     {
-        if (getTokenizer().getName().equals("ngram"))
+        if (getTokenizer() != null && NGramTokenizerFactory.NAME.equalsIgnoreCase(getTokenizer().getName()))
             return true;
 
         for (LuceneClassNameAndArgs filter : getFilters())
         {
-            if (filter.getName().equals("ngram"))
+            if (NGramFilterFactory.NAME.equalsIgnoreCase(filter.getName()))
                 return true;
         }
 
