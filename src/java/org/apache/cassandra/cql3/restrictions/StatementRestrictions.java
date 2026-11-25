@@ -1498,8 +1498,39 @@ public class StatementRestrictions
 
         // The general rationale is that if some rows are specifically selected by the query (have clustering or
         // regular columns restrictions), we ignore partitions that are empty outside of static content, but if it's
-        // a full partition query, then we include that content.
-        return queriesFullPartitions();
+        // a full partition query, then we include that content, if its static row alone can satisfy the restrictions
+        // nested in disjunctions, as the row filter and the limits see it
+        // (RowFilter#canKeepPartitionsWithOnlyStaticData).
+        return queriesFullPartitions() && isSatisfiableByStaticRow();
+    }
+
+    /**
+     * Whether the static row of a partition without rows can satisfy these restrictions on its own (see
+     * {@link org.apache.cassandra.db.filter.RowFilter.FilterElement#isSatisfiableByStaticRow()}).
+     */
+    private boolean isSatisfiableByStaticRow()
+    {
+        boolean hasRowLevelRestrictions = !clusteringColumnsRestrictions.isEmpty()
+                                          || nonPrimaryKeyRestrictions.hasRestrictionFor(ColumnMetadata.Kind.REGULAR)
+                                          || nonPrimaryKeyRestrictions.hasRestrictionFor(ColumnMetadata.Kind.CLUSTERING);
+        if (isDisjunction)
+        {
+            // a disjunction has no partition key restriction: those must be at the top level, which is a conjunction
+            if (nonPrimaryKeyRestrictions.hasRestrictionFor(ColumnMetadata.Kind.STATIC))
+                return true;
+            for (StatementRestrictions child : children)
+                if (child.isSatisfiableByStaticRow())
+                    return true;
+            // an empty disjunction is always satisfied
+            return !hasRowLevelRestrictions && children.isEmpty();
+        }
+
+        if (hasRowLevelRestrictions)
+            return false;
+        for (StatementRestrictions child : children)
+            if (!child.isSatisfiableByStaticRow())
+                return false;
+        return true;
     }
 
     @Override
