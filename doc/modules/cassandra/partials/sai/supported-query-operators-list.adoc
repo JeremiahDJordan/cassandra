@@ -1,9 +1,22 @@
-// LLP CHECK FOR C* 5.0
-ifeval::["{evalproduct}" == "dse"]
-* Numerics: `=`, `<`, `>`, `<=`, `>=`, `AND`
-* Strings: `=`, `CONTAINS`, `CONTAINS KEY`, `AND`
-endif::[]
-ifeval::["{evalproduct}" != "dse"]
-* Numerics: `=`, `<`, `>`, `<=`, `>=`, `AND`
-* Strings: `=`, `CONTAINS`, `CONTAINS KEY`, `AND`
-endif::[]
+* Numerics (`tinyint`, `smallint`, `int`, `bigint`, `varint`, `float`, `double`, `decimal`), `date`, `time`,
+`timestamp`, `timeuuid` and `inet`: `=`, `!=`, `<`, `>`, `<=`, `>=`, `IN`, `NOT IN`
+* Strings (`text`, `varchar`, `ascii`): `=`, `IN`, and, without an `index_analyzer` or `query_analyzer`, `LIKE` with
+the `%` and `_` wildcards (for example `LIKE 'ab%'`, `LIKE '%bc'` or `LIKE '%b%'`)
+* Strings indexed with `'case_sensitive': false`, `'normalize': true`, `'ascii': true` or an `index_analyzer`: also
+`:`, which matches the rows whose value has every term the analyzer makes of the query value (not on clustering
+columns), and, on regular columns and from SAI format version EC, `ORDER BY ... BM25 OF`. On a column that isn't a
+clustering column, `=` behaves as `:` on such an index, unless the index sets
+`'equals_behaviour_when_analyzed': 'unsupported'`.
+* `boolean` and `uuid`: `=`, `IN`
+* Frozen collections indexed with `FULL`: `=`, and `IN` with a single value, such as `IN ([1])` or `IN (?)`, which is
+an `=`
+* Frozen tuples and user-defined types: `=`, `!=`, `IN`, `NOT IN`
+* Non-frozen lists and sets: `CONTAINS`, `NOT CONTAINS`
+* Non-frozen maps: `CONTAINS KEY`, `NOT CONTAINS KEY` (`KEYS` index), `CONTAINS`, `NOT CONTAINS` (`VALUES` index),
+and `map[key] = value`, `!=`, `<`, `>`, `<=`, `>=` (`ENTRIES` index)
+* Vectors: `ORDER BY ... ANN OF`, and, on a `vector<float, 2>` with the `euclidean` similarity function,
+`GEO_DISTANCE(column, [latitude, longitude]) <` or `<=`
+* `ORDER BY ... ASC` and `DESC` on a regular column with a non-analyzed index, except vectors, `decimal`, `varint`,
+`inet` and collections. Queries that order by ANN, BM25 or values need a `LIMIT` no greater than the top-k maximum
+(`cassandra.sai.vector_search.max_top_k`, 1000 by default).
+* `AND`, `OR` and parentheses to combine these restrictions; a partition key restriction can't be nested under `OR`
