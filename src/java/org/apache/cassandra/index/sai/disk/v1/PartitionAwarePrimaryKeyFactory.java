@@ -134,11 +134,11 @@ public class PartitionAwarePrimaryKeyFactory implements PrimaryKey.Factory
             if (isPrefix)
             {
                 if (keyComparable == null)
-                    return ByteSource.withTerminator(terminator, tokenComparable);
+                    return ByteSource.withTerminator(version, terminator, tokenComparable);
                 else
-                    return ByteSource.withTerminator(terminator, tokenComparable, keyComparable);
+                    return ByteSource.withTerminator(version, terminator, tokenComparable, keyComparable);
             }
-            return ByteSource.withTerminator(terminator, tokenComparable, keyComparable, null);
+            return ByteSource.withTerminator(version, terminator, tokenComparable, keyComparable, null);
         }
 
         @Override

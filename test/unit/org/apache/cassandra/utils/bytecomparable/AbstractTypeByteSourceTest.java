@@ -53,6 +53,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.LengthPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TypeSerializer;
@@ -933,6 +934,50 @@ public class AbstractTypeByteSourceTest
             }
         }
         testValuesForType(tt, tuplesData.toArray(new ByteBuffer[0]));
+    }
+
+    @Test
+    public void testNullComponentMarker()
+    {
+        // The OSS50 bytes are those of Apache Cassandra 5.0.9; OSS41 and LEGACY mark null components with 0x3f.
+        // Empty elements of collections decode as nulls.
+        ByteBuffer zero = Int32Type.instance.decompose(0);
+        ByteBuffer one = Int32Type.instance.decompose(1);
+        ByteBuffer empty = ByteBufferUtil.EMPTY_BYTE_BUFFER;
+        TupleType tuple = new TupleType(Arrays.asList(Int32Type.instance, Int32Type.instance, Int32Type.instance));
+        ByteBuffer tupleValue = TupleType.buildValue(one, null, one);
+        assertNullComponentMarker(tuple, tupleValue, tupleValue,
+                                  "40800000013e408000000138", "40800000013f4080000001");
+        assertNullComponentMarker(ReversedType.getInstance(tuple), tupleValue, tupleValue,
+                                  "bf7ffffffec1bf7ffffffec7", "bf7ffffffec0bf7ffffffe");
+        ListType<Integer> list = ListType.getInstance(Int32Type.instance, false);
+        ByteBuffer listValue = CollectionSerializer.pack(Arrays.asList(one, empty, one), 3);
+        assertNullComponentMarker(list, listValue, CollectionSerializer.pack(Arrays.asList(one, null, one), 3),
+                                  "40800000013e408000000138", "40800000013f408000000138");
+        assertNullComponentMarker(MapType.getInstance(Int32Type.instance, Int32Type.instance, false),
+                                  CollectionSerializer.pack(Arrays.asList(zero, one, one, empty), 2),
+                                  CollectionSerializer.pack(Arrays.asList(zero, one, one, null), 2),
+                                  "4080000000408000000140800000013e38", "4080000000408000000140800000013f38");
+        CompositeType composite = CompositeType.getInstance(Int32Type.instance, Int32Type.instance, Int32Type.instance);
+        ByteBuffer compositeValue = composite.decompose(1, null, 1);
+        assertNullComponentMarker(composite, compositeValue, compositeValue,
+                                  "40408000000140803e40804080000001408038", "40408000000140803f40804080000001408038");
+
+        Assert.assertEquals("40800000013f4080000001", toHex(tuple, tupleValue, ByteComparable.Version.LEGACY));
+        Assert.assertEquals("40800000013f408000000100", toHex(list, listValue, ByteComparable.Version.LEGACY));
+    }
+
+    private void assertNullComponentMarker(AbstractType<?> type, ByteBuffer value, ByteBuffer decoded, String oss50, String oss41)
+    {
+        Assert.assertEquals(version == ByteComparable.Version.OSS50 ? oss50 : oss41, toHex(type, value, version));
+        ByteSource.Peekable bytes = ByteSource.peekable(type.asComparableBytes(value, version));
+        Assert.assertEquals(ByteBufferUtil.bytesToHex(decoded), ByteBufferUtil.bytesToHex(type.fromComparableBytes(bytes, version)));
+    }
+
+    private static String toHex(AbstractType<?> type, ByteBuffer value, ByteComparable.Version version)
+    {
+        byte[] bytes = ByteSourceInverse.readBytes(type.asComparableBytes(value, version));
+        return ByteBufferUtil.bytesToHex(ByteBuffer.wrap(bytes));
     }
 
     @Test

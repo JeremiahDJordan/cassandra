@@ -286,6 +286,20 @@ Upgrading
       of DESC bigint clustering columns into the SAI indexes of its "da" sstables, so that queries on those columns
       can miss rows. This release writes them correctly; once every node runs it, rebuild those indexes with nodetool
       rebuild_index.
+    - In the row and partition indexes of bti "da" sstables, earlier releases marked a null component inside a tuple,
+      user type, frozen collection, CompositeType or DynamicCompositeType value differently from Apache Cassandra 5.0.
+      Such a component is a null tuple or user type field followed by a non-null field, or an empty field, element,
+      map key or map value of a type that stores an empty value as null, such as int, bigint or varint
+      (blobAsInt(0x)), at any depth of nesting. The indexes of secondary indexes (not SAI) also hold such a component
+      for an empty indexed value of such a type. This release marks them as Apache Cassandra 5.0 does, so that the
+      "da" sstables of Apache Cassandra 5.0, after an upgrade, entire-sstable streaming or nodetool import, and the
+      "da" sstables of this release read by Apache Cassandra 5.0, return the right rows. A node that ran an earlier
+      release with -Dcassandra.trie_index_format_version=da wrote such values in its "da" sstables with the old
+      marker, and queries for them can miss rows or return rows outside the requested slice: once every node runs this
+      release, run nodetool upgradesstables -a on the tables with a clustering column of such a type, and on the
+      tables with a secondary index whose indexed values (those of the column, or the keys, values or entries of a
+      collection column) are of such a type or of a type that stores an empty value as null; upgradesstables also
+      rewrites the tables of their secondary indexes. BTI "cc" and earlier sstables and SAI indexes are not affected.
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
       return the same value as the address column. This avoids the risk of client connections overwhelming
       DNS. (CASSANDRA-21539)

@@ -505,7 +505,8 @@ public class TrieBackedRow extends AbstractRow
 
     public static ByteSource cellPathKey(ColumnMetadata column, CellPath path, ByteComparable.Version version)
     {
-        return ByteSource.withTerminator(ByteSource.TERMINATOR,
+        return ByteSource.withTerminator(version,
+                                         ByteSource.TERMINATOR,
                                          getCellPathType(column).asComparableBytes(path.get(0), version));
     }
 
