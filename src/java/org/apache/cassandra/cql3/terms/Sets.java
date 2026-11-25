@@ -73,10 +73,11 @@ public final class Sets
     public static AssignmentTestable.TestResult testSetAssignment(ColumnSpecification receiver,
                                                                   List<? extends AssignmentTestable> elements)
     {
-        if (!(receiver.type instanceof SetType))
+        AbstractType<?> type = receiver.type.unwrap();
+        if (!(type instanceof SetType))
         {
             // We've parsed empty maps as a set literal to break the ambiguity so handle that case now
-            if (receiver.type instanceof MapType && elements.isEmpty())
+            if (type instanceof MapType && elements.isEmpty())
                 return AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
 
             return AssignmentTestable.TestResult.NOT_ASSIGNABLE;

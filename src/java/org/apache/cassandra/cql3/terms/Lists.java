@@ -93,7 +93,7 @@ public abstract class Lists
     public static AssignmentTestable.TestResult testListAssignment(ColumnSpecification receiver,
                                                                    List<? extends AssignmentTestable> elements)
     {
-        if (!(receiver.type instanceof ListType))
+        if (!(receiver.type.unwrap() instanceof ListType))
             return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
 
         // If there is no elements, we can't say it's an exact match (an empty list if fundamentally polymorphic).

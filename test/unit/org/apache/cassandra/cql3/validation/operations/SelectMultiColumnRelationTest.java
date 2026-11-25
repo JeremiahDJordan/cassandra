@@ -945,6 +945,27 @@ public class SelectMultiColumnRelationTest extends CQLTester
     }
 
     @Test
+    public void testMultipleClusteringReversedComponentsWithLiterals()
+    {
+        String type = createType("CREATE TYPE %s (f int)");
+        createTable("CREATE TABLE %s (a int, b frozen<map<int, int>>, c frozen<set<int>>, d frozen<list<int>>, e frozen<" + type + ">, f vector<int, 2>, " +
+                    "PRIMARY KEY (a, b, c, d, e, f)) WITH CLUSTERING ORDER BY (b DESC, c DESC, d DESC, e DESC, f DESC)");
+
+        execute("INSERT INTO %s (a, b, c, d, e, f) VALUES (0, {1: 10}, {1}, [1], {f: 1}, [1, 1])");
+        execute("INSERT INTO %s (a, b, c, d, e, f) VALUES (0, {}, {}, [], {f: 0}, [0, 0])");
+
+        Object[] row1 = row(0, map(1, 10), set(1), list(1), userType("f", 1), vector(1, 1));
+        Object[] row0 = row(0, map(), set(), list(), userType("f", 0), vector(0, 0));
+
+        assertRows(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) = ({1: 10}, {1})"), row1);
+        assertRows(execute("SELECT * FROM %s WHERE a = 0 AND (b, c, d, e, f) = ({1: 10}, {1}, [1], {f: 1}, [1, 1])"), row1);
+        assertRows(execute("SELECT * FROM %s WHERE a = 0 AND (b, c, d, e, f) = ({}, {}, [], {f: 0}, [0, 0])"), row0);
+        assertRows(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) IN (({1: 10}, {1}), ({}, {}))"), row1, row0);
+        assertRows(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) > ({}, {})"), row1);
+        assertRows(execute("SELECT * FROM %s WHERE a = 0 AND (b, c, d, e, f) < ({1: 10}, {1}, [1], {f: 1}, [1, 1])"), row0);
+    }
+
+    @Test
     public void testMultipleClusteringWithIndex()
     {
         Util.assumeLegacySecondaryIndex();
