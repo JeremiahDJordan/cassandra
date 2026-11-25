@@ -59,10 +59,11 @@ public final class UserTypes
     public static <T extends AssignmentTestable> void validateUserTypeAssignableTo(ColumnSpecification receiver,
                                                                                    Map<FieldIdentifier, T> entries)
     {
-        if (!receiver.type.isUDT())
+        AbstractType<?> type = receiver.type.unwrap();
+        if (!type.isUDT())
             throw new InvalidRequestException(String.format("Invalid user type literal for %s of type %s", receiver, receiver.type.asCQL3Type()));
 
-        UserType ut = (UserType) receiver.type;
+        UserType ut = (UserType) type;
         for (int i = 0; i < ut.size(); i++)
         {
             FieldIdentifier field = ut.fieldName(i);

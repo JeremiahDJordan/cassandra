@@ -103,9 +103,10 @@ public final class Vectors
         @Override
         public TestResult testAssignment(String keyspace, ColumnSpecification receiver)
         {
-            if (!receiver.type.isVector())
+            AbstractType<?> unwrapped = receiver.type.unwrap();
+            if (!unwrapped.isVector())
                 return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
-            VectorType<?> type = (VectorType<?>) receiver.type;
+            VectorType<?> type = (VectorType<?>) unwrapped;
             if (elements.size() != type.dimension)
                 return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
             ColumnSpecification valueSpec = valueSpecOf(receiver);
