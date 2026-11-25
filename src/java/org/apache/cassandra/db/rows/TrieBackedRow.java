@@ -138,14 +138,33 @@ public class TrieBackedRow extends AbstractRow
     private final Deletion deletion;
 
     /// Create a trie-backed version of a row, using the column definitions of the given table metadata.
+    /// Data of a dropped column that has no id in the given metadata is not included.
     public static TrieBackedRow from(TableMetadata metadata, Row row)
     {
         Builder builder = builder(metadata, row.clustering());
         builder.addPrimaryKeyLivenessInfo(row.primaryKeyLivenessInfo());
         builder.addRowDeletion(row.deletion());
+        boolean hasDroppedColumns = !metadata.droppedColumns.isEmpty(); // keeps the lookup off the common write path
         for (ColumnData cd : row)
+        {
+            if (hasDroppedColumns && isDroppedColumn(builder.columnIds, metadata, cd.column()))
+                continue;
             builder.addColumn(cd);
+        }
         return builder.build();
+    }
+
+    /// Whether the cells of this row are keyed with the column ids of the given version of the table's metadata.
+    public boolean usesColumnIdsOf(TableMetadata metadata)
+    {
+        Columns expected = isStatic() ? metadata.staticColumns() : metadata.regularColumns();
+        return columns == expected || columns.equals(expected);
+    }
+
+    private static boolean isDroppedColumn(Object2IntHashMap<ColumnIdentifier> columnIds, TableMetadata metadata, ColumnMetadata column)
+    {
+        return columnId(columnIds, column) == COLUMN_NOT_PRESENT
+               && metadata.getDroppedColumn(column.name.bytes, column.isStatic()) != null;
     }
 
     /// Returns false if the given object is a level marker with no meaning of its own. Used to drop unproductive
@@ -782,7 +801,9 @@ public class TrieBackedRow extends AbstractRow
     {
         Map<ByteBuffer, DroppedColumn> droppedColumns = droppedColumnsSource.droppedColumns;
 
-        boolean mayFilterColumns = filter != null && (!filter.fetchesAllColumns(isStatic()) || !filter.allFetchedColumnsAreQueried());
+        // The row can hold data of a dropped column that is not fetched even when all columns are, see
+        // TrieMemtable.withDroppedColumns.
+        boolean mayFilterColumns = filter != null && (!droppedColumns.isEmpty() || !filter.fetchesAllColumns(isStatic()) || !filter.allFetchedColumnsAreQueried());
         // When merging sstable data in Row.Merger#merge(), rowDeletion is removed if it doesn't supersede activeDeletion.
         boolean mayHaveDeleted = activeDeletion.supersedes(deletion.time());
         if (!mayFilterColumns && !mayHaveDeleted && droppedColumns.isEmpty())
@@ -1461,6 +1482,7 @@ public class TrieBackedRow extends AbstractRow
                 return;
 
             ByteComparable key = columnKey(columnIds, column);
+            Preconditions.checkArgument(key != MISSING_COLUMN_KEY, "Column %s not present in row columns set.", column);
             try
             {
                 mutator.delete(deletionTrie(key, deletion, TrieTombstoneMarker.Kind.COLUMN));

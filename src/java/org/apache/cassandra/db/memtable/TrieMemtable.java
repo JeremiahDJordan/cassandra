@@ -84,6 +84,7 @@ import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.metrics.TrieMemtableMetricsView;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.DroppedColumn;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -148,11 +149,17 @@ public class TrieMemtable extends AbstractShardedMemtable
     @Unmetered
     private final TableMetadata actualMetadata;
 
+    /// The table's metadata when this memtable was created, i.e. `actualMetadata` without the dropped columns put
+    /// back. Writes are usually built with this same object, which is how `predatesColumnsOf` recognizes them.
+    @Unmetered
+    private final TableMetadata tableMetadataAtCreation;
+
     TrieMemtable(AtomicReference<CommitLogPosition> commitLogLowerBound, TableMetadataRef metadataRef, Owner owner, Integer shardCountOption)
     {
         super(commitLogLowerBound, metadataRef, owner, shardCountOption);
         this.metrics = TrieMemtableMetricsView.getOrCreate(metadataRef.keyspace, metadataRef.name);
-        this.actualMetadata = metadataRef.get();
+        this.tableMetadataAtCreation = metadataRef.get();
+        this.actualMetadata = withDroppedColumns(tableMetadataAtCreation);
         this.shards = generatePartitionShards(boundaries.shardCount(), actualMetadata, metrics, owner.readOrdering());
         this.mergedTrie = makeMergedTrie(shards);
         logger.trace("Created memtable with {} shards", this.shards.length);
@@ -181,6 +188,28 @@ public class TrieMemtable extends AbstractShardedMemtable
         return DeletionAwareTrie.mergeDistinct(tries);
     }
 
+    /// The given metadata with the dropped columns that are not columns of the table any more put back as columns, so
+    /// that late writes of cells newer than the drop have a column id in this memtable. Reads and flushes filter the
+    /// dropped columns' data by drop time using the table's current metadata.
+    static TableMetadata withDroppedColumns(TableMetadata metadata)
+    {
+        if (metadata.droppedColumns.isEmpty())
+            return metadata;
+
+        TableMetadata.Builder builder = null;
+        for (DroppedColumn dropped : metadata.droppedColumns.values())
+        {
+            // re-added, or the name is now used by another column
+            if (metadata.getColumn(dropped.column.name) != null)
+                continue;
+            if (builder == null)
+                builder = metadata.unbuild();
+            ColumnMetadata column = dropped.column;
+            builder.addColumn(new ColumnMetadata(column.ksName, column.cfName, column.name, column.type, ColumnMetadata.NO_POSITION, column.kind, null, false));
+        }
+        return builder == null ? metadata : builder.build();
+    }
+
     @Override
     public TableMetadata metadata()
     {
@@ -195,7 +224,54 @@ public class TrieMemtable extends AbstractShardedMemtable
         if (reason != ColumnFamilyStore.FlushReason.SCHEMA_CHANGE)
             return false;
         // If the columns definition changes, we need to flush as we would need to remap column indexes.
-        return !actualMetadata.regularAndStaticColumns().equals(metadata.get().regularAndStaticColumns());
+        return !actualMetadata.regularAndStaticColumns().equals(withDroppedColumns(metadata.get()).regularAndStaticColumns());
+    }
+
+    /// Cells are keyed with the ids of the columns of this memtable's metadata, so a cell of a column that was added
+    /// to the table later cannot be stored. Such a cell reaches this memtable when its write is built after the
+    /// table's metadata reference is updated and applied before `ColumnFamilyStore.reload` switches the memtable.
+    @Override
+    public boolean predatesColumnsOf(PartitionUpdate update)
+    {
+        // The usual case, at the cost of one comparison: the update is built with the metadata this memtable was
+        // created with.
+        if (update.metadata() == tableMetadataAtCreation)
+            return false;
+
+        // If the table's metadata has not changed since, a memtable created now would have the same columns.
+        TableMetadata current = metadata.get();
+        if (current == tableMetadataAtCreation)
+            return false;
+
+        RegularAndStaticColumns columns = update.columns();
+        return predatesAnyOf(columns.statics, current) || predatesAnyOf(columns.regulars, current);
+    }
+
+    /// Whether this memtable has no id for one of the given columns while a memtable created now would take it:
+    ///
+    /// - the table has the column now, so a memtable created now has an id for it.
+    /// - the table has dropped the column, and this memtable does not know it even as a dropped column (the node got
+    ///   the ADD and the DROP in one schema change): this memtable rejects the cell, a memtable created now has an id
+    ///   for it as a dropped column.
+    ///
+    /// A column that the table never had is not a reason to switch: every memtable rejects it.
+    private boolean predatesAnyOf(Columns columns, TableMetadata current)
+    {
+        for (ColumnMetadata column : columns)
+        {
+            ColumnMetadata own = actualMetadata.getColumn(column.name);
+            if (own != null && own.isStatic() == column.isStatic())
+                continue;
+
+            ColumnMetadata now = current.getColumn(column.name);
+            if (now != null && now.isStatic() == column.isStatic())
+                return true;
+
+            if (actualMetadata.getDroppedColumn(column.name.bytes, column.isStatic()) == null
+                && current.getDroppedColumn(column.name.bytes, column.isStatic()) != null)
+                return true;
+        }
+        return false;
     }
 
     @Override
@@ -736,8 +812,9 @@ public class TrieMemtable extends AbstractShardedMemtable
 
         public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
         {
-            // If the update is not TriePartitionUpdate, convert it to one before taking the lock.
-            DeletionAwareTrie<Object, TrieTombstoneMarker> mergableTrie = TriePartitionUpdate.asMergableTrie(update);
+            // If the update is not TriePartitionUpdate, convert it to one before taking the lock. The cells are keyed
+            // with the column ids of this memtable's metadata, which the update may not have been built with.
+            DeletionAwareTrie<Object, TrieTombstoneMarker> mergableTrie = TriePartitionUpdate.asMergableTrie(update, metadata);
 
             boolean locked = writeLock.tryLock();
             if (locked)
