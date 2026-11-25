@@ -747,9 +747,30 @@ public class FBUtilities
      */
     public static <T> Class<T> classForName(String classname, String readable) throws ConfigurationException
     {
+        return classForName(classname, true, readable);
+    }
+
+    /**
+     * Loads the given class and checks it is a {@code type}, without initializing it (so that a class listed by
+     * mistake does not run its static initializers).
+     * @param classname Fully qualified classname.
+     * @param type The type the class must implement or extend.
+     * @param readable Descriptive noun for the role the class plays.
+     * @throws ConfigurationException If the class cannot be found or is not a {@code type}.
+     */
+    public static <T> Class<? extends T> classForName(String classname, Class<T> type, String readable) throws ConfigurationException
+    {
+        Class<?> cls = classForName(classname, false, readable);
+        if (!type.isAssignableFrom(cls))
+            throw new ConfigurationException(String.format("%s class '%s' is not a %s", readable, classname, type.getName()));
+        return cls.asSubclass(type);
+    }
+
+    private static <T> Class<T> classForName(String classname, boolean initialize, String readable) throws ConfigurationException
+    {
         try
         {
-            return (Class<T>)Class.forName(classname);
+            return (Class<T>)Class.forName(classname, initialize, FBUtilities.class.getClassLoader());
         }
         catch (ClassNotFoundException | NoClassDefFoundError e)
         {
