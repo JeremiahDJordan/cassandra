@@ -239,7 +239,7 @@ public abstract class Sets
                 Set<T> s = type.getSerializer().deserialize(value, ByteBufferAccessor.instance);
                 SortedSet<ByteBuffer> elements = new TreeSet<>(type.getElementsType());
                 for (T element : s)
-                    elements.add(type.getElementsType().decomposeUntyped(element));
+                    elements.add(Terms.sortSetsAndMaps(type.getElementsType(), type.getElementsType().decomposeUntyped(element)));
                 return new Value(elements);
             }
             catch (MarshalException e)

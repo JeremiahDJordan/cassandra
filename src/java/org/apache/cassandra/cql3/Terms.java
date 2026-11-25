@@ -268,4 +268,46 @@ public interface Terms
         Term.Raw rawTerm = CQLFragmentParser.parseAny(CqlParser::term, term, "CQL term");
         return rawTerm.prepare(keyspace, receiver).bindAndGet(QueryOptions.DEFAULT);
     }
+
+    /**
+     * Returns the specified valid value with the sets and maps in it, at any depth, sorted and deduplicated as they
+     * are in a literal.
+     */
+    public static ByteBuffer sortSetsAndMaps(AbstractType<?> type, ByteBuffer value)
+    {
+        type = type.unwrap();
+        if (value == null || !value.hasRemaining() || !containsSetOrMap(type))
+            return value;
+
+        if (type instanceof ListType)
+            return Lists.Value.fromSerialized(value, (ListType<?>) type).get(ProtocolVersion.CURRENT);
+        if (type instanceof SetType)
+            return Sets.Value.fromSerialized(value, (SetType<?>) type).get(ProtocolVersion.CURRENT);
+        if (type instanceof MapType)
+            return Maps.Value.fromSerialized(value, (MapType<?, ?>) type).get(ProtocolVersion.CURRENT);
+        if (type instanceof TupleType)
+            return Tuples.Value.fromSerialized(value, (TupleType) type).get(ProtocolVersion.CURRENT);
+        if (type instanceof VectorType)
+        {
+            VectorType<?> vectorType = (VectorType<?>) type;
+            List<ByteBuffer> elements = vectorType.split(value);
+            elements.replaceAll(element -> sortSetsAndMaps(vectorType.getElementsType(), element));
+            return vectorType.decomposeRaw(elements);
+        }
+        return value;
+    }
+
+    private static boolean containsSetOrMap(AbstractType<?> type)
+    {
+        type = type.unwrap();
+        if (type instanceof SetType || type instanceof MapType)
+            return true;
+
+        for (AbstractType<?> subType : type.subTypes())
+        {
+            if (containsSetOrMap(subType))
+                return true;
+        }
+        return false;
+    }
 }
