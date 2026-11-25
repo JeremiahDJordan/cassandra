@@ -1485,6 +1485,24 @@ public class FrozenCollectionsTest extends CQLTester
         });
     }
 
+    @Test
+    public void testBoundUnsortedSetInDescendingClustering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<set<int>>, c frozen<list<frozen<set<int>>>>, d frozen<map<int, int>>, PRIMARY KEY (a, b, c, d)) WITH CLUSTERING ORDER BY (b DESC, c DESC, d DESC)");
+
+        // {2, 1, 2}, not sorted and with a duplicate
+        ByteBuffer set = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(1), bytes(2)), 3);
+        ByteBuffer list = CollectionSerializer.pack(Arrays.asList(set), 1);
+        // {2: 0, 1: 0}
+        ByteBuffer map = CollectionSerializer.pack(Arrays.asList(bytes(2), bytes(0), bytes(1), bytes(0)), 2);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (0, ?, ?, ?)", set, list, map);
+        execute("INSERT INTO %s (a, b, c, d) VALUES (0, {1, 2}, [{1, 2}], {1: 0, 2: 0})");
+        assertRowCount(execute("SELECT * FROM %s"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND b = ? AND c = ?", set, list), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) = ?", tuple(set, list)), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) IN ?", list(tuple(set, list))), 1);
+    }
+
     private static String clean(String classname)
     {
         return StringUtils.remove(classname, "org.apache.cassandra.db.marshal.");

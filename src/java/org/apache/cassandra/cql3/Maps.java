@@ -265,7 +265,8 @@ public abstract class Maps
                 // We depend on Maps to be properly sorted by their keys, so use a sorted map implementation here.
                 SortedMap<ByteBuffer, ByteBuffer> map = new TreeMap<>(type.getKeysType());
                 for (Map.Entry<K, V> entry : m.entrySet())
-                    map.put(type.getKeysType().decompose(entry.getKey()), type.getValuesType().decompose(entry.getValue()));
+                    map.put(Terms.sortSetsAndMaps(type.getKeysType(), type.getKeysType().decompose(entry.getKey())),
+                            Terms.sortSetsAndMaps(type.getValuesType(), type.getValuesType().decompose(entry.getValue())));
                 return new Value(map);
             }
             catch (MarshalException e)

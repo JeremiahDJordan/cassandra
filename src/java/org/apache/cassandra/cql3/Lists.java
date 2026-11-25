@@ -288,6 +288,7 @@ public abstract class Lists
                         // zero-length elements are kept as sent
                         if (element.hasRemaining())
                             element = elementsType.decompose(elementsType.compose(element));
+                        element = Terms.sortSetsAndMaps(elementsType, element);
                     }
                     elements.add(element);
                 }

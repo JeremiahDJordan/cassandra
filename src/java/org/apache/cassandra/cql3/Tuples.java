@@ -155,14 +155,19 @@ public class Tuples
 
         public static Value fromSerialized(ByteBuffer bytes, TupleType type)
         {
-            ByteBuffer[] values = type.split(ByteBufferAccessor.instance, bytes);
-            if (values.length > type.size())
+            try
             {
-                throw new InvalidRequestException(String.format(
-                        "Tuple value contained too many fields (expected %s, got %s)", type.size(), values.length));
+                type.validate(bytes);
+            }
+            catch (MarshalException e)
+            {
+                throw new InvalidRequestException(e.getMessage());
             }
 
-            return new Value(type.split(ByteBufferAccessor.instance, bytes));
+            ByteBuffer[] values = type.split(ByteBufferAccessor.instance, bytes);
+            for (int i = 0; i < values.length; i++)
+                values[i] = Terms.sortSetsAndMaps(type.type(i), values[i]);
+            return new Value(values);
         }
 
         public ByteBuffer get(ProtocolVersion version)
@@ -270,13 +275,12 @@ public class Tuples
                 assert type.getElementsType() instanceof TupleType;
                 TupleType tupleType = Tuples.getTupleType(type.getElementsType());
 
-                // type.split(bytes)
                 List<List<ByteBuffer>> elements = new ArrayList<>(l.size());
                 for (T element : l)
                 {
                     // a null element is handled as a tuple whose elements are all null
                     elements.add(element == null ? Collections.nCopies(tupleType.size(), null)
-                                                 : Arrays.asList(tupleType.split(ByteBufferAccessor.instance, type.getElementsType().decompose(element))));
+                                                 : Arrays.asList(Value.fromSerialized(type.getElementsType().decompose(element), tupleType).elements));
                 }
                 return new InValue(elements);
             }
