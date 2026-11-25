@@ -259,6 +259,7 @@ import static org.apache.cassandra.config.CassandraRelevantProperties.BOOTSTRAP_
 import static org.apache.cassandra.config.CassandraRelevantProperties.CONSISTENT_RANGE_MOVEMENT;
 import static org.apache.cassandra.config.CassandraRelevantProperties.CONSISTENT_SIMULTANEOUS_MOVES_ALLOW;
 import static org.apache.cassandra.config.CassandraRelevantProperties.DRAIN_EXECUTOR_TIMEOUT_MS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DTEST_IS_IN_JVM_DTEST;
 import static org.apache.cassandra.config.CassandraRelevantProperties.JOIN_RING;
 import static org.apache.cassandra.config.CassandraRelevantProperties.LOAD_RING_STATE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.OVERRIDE_DECOMMISSION;
@@ -1152,6 +1153,10 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     private void registerSignalHandlers()
     {
+        // The handlers are JVM-wide and chain to the previous one, so in-JVM dtests would keep every instance reachable
+        if (DTEST_IS_IN_JVM_DTEST.getBoolean())
+            return;
+
         registerSignalHandlersInternal(new String[]{"TERM", "INT", "HUP"});
     }
 
