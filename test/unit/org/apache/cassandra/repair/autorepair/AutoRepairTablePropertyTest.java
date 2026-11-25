@@ -23,18 +23,25 @@ import java.util.Map;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SimpleBuilders;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.schema.AutoRepairParams;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspace;
 import org.apache.cassandra.schema.SchemaKeyspaceTables;
+import org.apache.cassandra.schema.SchemaTransformation;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.tcm.ClusterMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 
@@ -54,6 +61,31 @@ public class AutoRepairTablePropertyTest extends CQLTester
     public void testSchedulerEnabledShouldReturnColumnReturned()
     {
         helperTestTableProperty(true);
+    }
+
+    @Test
+    public void testCreateTableReplayedWithSchedulerDisabled()
+    {
+        DatabaseDescriptor.getAutoRepairConfig().setAutoRepairSchedulingEnabled(false);
+
+        String table = createTableName();
+        CQLStatement create = QueryProcessor.getStatement(formatQuery(KEYSPACE, "CREATE TABLE %s (k int PRIMARY KEY, v int) WITH auto_repair = {'full_enabled': 'false'}"),
+                                                          ClientState.forInternalCalls());
+        ((SchemaTransformation) create).apply(ClusterMetadata.current());
+        assertFalse(replayed(((SchemaTransformation) create).cql(), table).repairEnabled(AutoRepairConfig.RepairType.FULL));
+
+        schemaChange(formatQuery(KEYSPACE, "CREATE TABLE %s (k int PRIMARY KEY, v int) WITH auto_repair = {'full_enabled': 'false'}"));
+        String copy = createTableName();
+        assertFalse(replayed(String.format("CREATE TABLE %s.%s LIKE %s.%s", KEYSPACE, copy, KEYSPACE, table), copy).repairEnabled(AutoRepairConfig.RepairType.FULL));
+    }
+
+    /**
+     * Applies the statement as a node replaying it from the metadata log does.
+     */
+    private static AutoRepairParams replayed(String logged, String table)
+    {
+        SchemaTransformation statement = (SchemaTransformation) QueryProcessor.getStatement(logged, ClientState.forInternalCalls());
+        return statement.apply(ClusterMetadata.current()).getNullable(KEYSPACE).getTableNullable(table).params.autoRepair;
     }
 
     public void helperTestTableProperty(boolean autoRepairOn)

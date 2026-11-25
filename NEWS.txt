@@ -173,6 +173,15 @@ Upgrading
       such as ALTER TABLE ... ADD, it rejects the change for any table that sets the option. Before downgrading,
       remove the option from those tables with ALTER TABLE ... WITH compaction = {...} listing the other options
       only. (CASSANDRA-21615)
+    - Cluster metadata snapshots written at a metadata serialization version before V11 (by 6.0-alpha2 or earlier,
+      by 6.0-alpha3 development builds before this change, or while any node in the cluster still runs such a
+      version) do not contain the auto_repair table options. A node that starts or catches up from such a snapshot
+      gives those tables the default auto_repair options, unless it replays a later ALTER TABLE that sets them. Once
+      the cluster's metadata serialization version is V11 or later, for each table that sets auto_repair options, run
+      ALTER TABLE ... WITH auto_repair = {...} twice: first with options that differ from both the intended and the
+      default ones (for example another priority), then with the intended options. Every node then applies both
+      changes and ends with the same table definition; a single ALTER would only change the nodes that lost the
+      options. Then take a new snapshot with nodetool cms snapshot. (CASSANDRA-XXXXX)
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.

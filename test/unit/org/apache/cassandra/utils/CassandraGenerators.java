@@ -114,6 +114,7 @@ import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.NoPayload;
 import org.apache.cassandra.net.PingRequest;
 import org.apache.cassandra.net.Verb;
+import org.apache.cassandra.schema.AutoRepairParams;
 import org.apache.cassandra.schema.CachingParams;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.CompactionParams;
@@ -817,6 +818,8 @@ public final class CassandraGenerators
         private Gen<TransactionalMode> transactionalMode = null;
         @Nullable
         private Gen<FastPathStrategy> fastPathStrategy = null;
+        @Nullable
+        private Gen<AutoRepairParams> autoRepairParamsGen = null;
 
         public TableParamsBuilder withKnownMemtables()
         {
@@ -924,6 +927,19 @@ public final class CassandraGenerators
             return this;
         }
 
+        public TableParamsBuilder withAutoRepair()
+        {
+            autoRepairParamsGen = rnd -> {
+                Map<String, String> options = new HashMap<>();
+                options.put(AutoRepairParams.Option.FULL_ENABLED.toString(), Boolean.toString(SourceDSL.booleans().all().generate(rnd)));
+                options.put(AutoRepairParams.Option.INCREMENTAL_ENABLED.toString(), Boolean.toString(SourceDSL.booleans().all().generate(rnd)));
+                options.put(AutoRepairParams.Option.PREVIEW_REPAIRED_ENABLED.toString(), Boolean.toString(SourceDSL.booleans().all().generate(rnd)));
+                options.put(AutoRepairParams.Option.PRIORITY.toString(), Integer.toString(SourceDSL.integers().between(0, 100).generate(rnd)));
+                return AutoRepairParams.fromMap(options);
+            };
+            return this;
+        }
+
         public Gen<TableParams> build()
         {
             return rnd -> {
@@ -940,6 +956,8 @@ public final class CassandraGenerators
                     params.transactionalMode(transactionalMode.generate(rnd));
                 if (fastPathStrategy != null)
                     params.fastPath(fastPathStrategy.generate(rnd));
+                if (autoRepairParamsGen != null)
+                    params.automatedRepair(autoRepairParamsGen.generate(rnd));
                 return params.build();
             };
         }
