@@ -22,14 +22,17 @@ import java.io.Serializable;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -46,6 +49,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.streaming.StreamSession;
 import org.apache.cassandra.streaming.messages.StreamMessage;
 
+import static java.util.concurrent.TimeUnit.MINUTES;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRow;
 import static org.apache.cassandra.streaming.StreamSession.State.PREPARING;
@@ -57,6 +61,7 @@ import static org.apache.cassandra.streaming.messages.StreamMessage.Type.PREPARE
 import static org.apache.cassandra.streaming.messages.StreamMessage.Type.RECEIVED;
 import static org.apache.cassandra.streaming.messages.StreamMessage.Type.STREAM;
 import static org.apache.cassandra.streaming.messages.StreamMessage.Type.STREAM_INIT;
+import static org.awaitility.Awaitility.await;
 
 public class StreamingTest extends TestBaseImpl
 {
@@ -86,6 +91,7 @@ public class StreamingTest extends TestBaseImpl
             registerSink(cluster, nodes);
 
             cluster.get(nodes).runOnInstance(() -> StorageService.instance.rebuild(null, KEYSPACE, null, null));
+            verifySinks(cluster);
             {
                 Object[][] results = cluster.get(nodes).executeInternal(String.format("SELECT k, c1, c2 FROM %s.cf;", KEYSPACE));
                 Assert.assertEquals(rowCount, results.length);
@@ -163,6 +169,7 @@ public class StreamingTest extends TestBaseImpl
 
             registerSink(cluster, 2);
             cluster.get(2).runOnInstance(() -> StorageService.instance.rebuild(null, keyspace, null, null));
+            verifySinks(cluster);
 
             Object[][] results = cluster.get(2).executeInternal(String.format("SELECT k, c1, c2 FROM %s.cf;", keyspace));
             Assert.assertEquals(rowCount, results.length);
@@ -217,6 +224,20 @@ public class StreamingTest extends TestBaseImpl
         cluster.get(initiatorNodeId).runOnInstance(() -> StreamSession.sink = initiatorSink);
     }
 
+    public static void verifySinks(Cluster cluster)
+    {
+        for (int node = 1; node <= cluster.size(); node++)
+        {
+            IInvokableInstance instance = cluster.get(node);
+            await().atMost(1, MINUTES).until(() -> instance.callOnInstance(() -> ((MessageStateSinkImpl) StreamSession.sink).allClosed()));
+            List<String> failures = instance.callOnInstance(() -> new ArrayList<>(((MessageStateSinkImpl) StreamSession.sink).failures));
+            Assert.assertTrue("Node " + node + ": " + failures, failures.isEmpty());
+        }
+    }
+
+    /**
+     * Records mismatches instead of throwing them, as a throw from inside the stream session leaves it unfinished.
+     */
     @VisibleForTesting
     public static class MessageStateSinkImpl implements StreamSession.MessageStateSink, Serializable
     {
@@ -224,26 +245,27 @@ public class StreamingTest extends TestBaseImpl
         // InstanceClassLoader#sharedClassNames are shareable between server jvm and test jvm
         public final Map<InetAddress, Queue<Integer>> messageSink = new ConcurrentHashMap<>();
         public final Map<InetAddress, Queue<Integer>> stateTransitions = new ConcurrentHashMap<>();
+        public final List<String> failures = new CopyOnWriteArrayList<>();
+        private final Set<InetAddress> closed = ConcurrentHashMap.newKeySet();
 
         public void messages(InetSocketAddress peer, List<StreamMessage.Type> messages)
         {
-            messageSink.put(peer.getAddress(), messages.stream().map(Enum::ordinal).collect(Collectors.toCollection(LinkedList::new)));
+            messageSink.put(peer.getAddress(), messages.stream().map(Enum::ordinal).collect(Collectors.toCollection(ConcurrentLinkedQueue::new)));
         }
 
         public void states(InetSocketAddress peer, List<StreamSession.State> states)
         {
-            stateTransitions.put(peer.getAddress(), states.stream().map(Enum::ordinal).collect(Collectors.toCollection(LinkedList::new)));
+            stateTransitions.put(peer.getAddress(), states.stream().map(Enum::ordinal).collect(Collectors.toCollection(ConcurrentLinkedQueue::new)));
         }
 
         @Override
         public void recordState(InetAddressAndPort from, StreamSession.State state)
         {
-            Queue<Integer> states = stateTransitions.get(from.getAddress());
-            if (states.peek() == null)
-                Assert.fail("Unexpected state " + state);
-
-            int expected = states.poll();
-            Assert.assertEquals(StreamSession.State.values()[expected], state);
+            Integer expected = stateTransitions.get(from.getAddress()).poll();
+            if (expected == null)
+                failures.add("Unexpected state " + state + " from " + from);
+            else if (expected != state.ordinal())
+                failures.add("Expected state " + StreamSession.State.values()[expected] + " but was " + state + " from " + from);
         }
 
         @Override
@@ -252,22 +274,30 @@ public class StreamingTest extends TestBaseImpl
             if (message == StreamMessage.Type.KEEP_ALIVE)
                 return;
 
-            Queue<Integer> messages = messageSink.get(from.getAddress());
-            if (messages.peek() == null)
-                Assert.fail("Unexpected message " + message);
-
-            int expected = messages.poll();
-            Assert.assertEquals(StreamMessage.Type.values()[expected], message);
+            Integer expected = messageSink.get(from.getAddress()).poll();
+            if (expected == null)
+                failures.add("Unexpected message " + message + " from " + from);
+            else if (expected != message.ordinal())
+                failures.add("Expected message " + StreamMessage.Type.values()[expected] + " but was " + message + " from " + from);
         }
 
         @Override
         public void onClose(InetAddressAndPort from)
         {
             Queue<Integer> states = stateTransitions.get(from.getAddress());
-            Assert.assertTrue("Missing states: " + states, states.isEmpty());
+            if (!states.isEmpty())
+                failures.add("Missing states " + states + " from " + from);
 
             Queue<Integer> messages = messageSink.get(from.getAddress());
-            Assert.assertTrue("Missing messages: " + messages, messages.isEmpty());
+            if (!messages.isEmpty())
+                failures.add("Missing messages " + messages + " from " + from);
+
+            closed.add(from.getAddress());
+        }
+
+        public boolean allClosed()
+        {
+            return closed.containsAll(stateTransitions.keySet());
         }
     }
 }
