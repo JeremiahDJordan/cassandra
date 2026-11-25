@@ -196,7 +196,14 @@ public final class UDFDataType
         if (!toJavaClass().isAssignableFrom(value.getClass()))
             throw new InvalidTypeException("Invalid value for CQL type " + toDataType().getName());
 
-        return ((TypeCodec<Object>) typeCodec).serialize(value, protocolVersion);
+        ByteBuffer serialized = ((TypeCodec<Object>) typeCodec).serialize(value, protocolVersion);
+        if (!abstractType.isCollection())
+            return serialized;
+
+        // The codec writes the elements of a Java set or map in its iteration order. Serializing the collection
+        // again with the Cassandra type sorts them, as for a set or map literal.
+        AbstractType<Object> type = (AbstractType<Object>) abstractType;
+        return type.decompose(type.compose(serialized));
     }
 
     /**
