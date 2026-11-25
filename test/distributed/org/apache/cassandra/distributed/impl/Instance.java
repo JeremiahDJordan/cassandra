@@ -105,6 +105,7 @@ import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.PathUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.net.Message;
@@ -873,6 +874,17 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
             error = parallelRun(error, executor, () -> Nodes.nodes().shutdownAndWait(1L, MINUTES));
             
             error = parallelRun(error, executor, this::stopJmx);
+
+            // Make sure any shutdown hooks registered for DeleteOnExit are released to prevent
+            // references to the instance class loaders from being held
+            if (graceful)
+            {
+                PathUtils.runOnExitThreadsAndClear();
+            }
+            else
+            {
+                PathUtils.clearOnExitThreads();
+            }
 
             Throwables.maybeFail(error);
         }).apply(isolatedExecutor);
