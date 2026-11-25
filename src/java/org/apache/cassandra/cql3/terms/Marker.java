@@ -83,8 +83,9 @@ public final class Marker extends Term.NonTerminal
             if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                 return Constants.UNSET_VALUE;
 
-            if (receiver.type instanceof MultiElementType<?>)
-                return MultiElements.Value.fromSerialized(bytes, (MultiElementType<?>) receiver.type);
+            AbstractType<?> type = receiver.type.unwrap();
+            if (type instanceof MultiElementType<?>)
+                return MultiElements.Value.fromSerialized(bytes, (MultiElementType<?>) type);
 
             receiver.type.validate(bytes);
             return new Constants.Value(bytes);
@@ -108,9 +109,10 @@ public final class Marker extends Term.NonTerminal
             if (bytes == ByteBufferUtil.UNSET_BYTE_BUFFER)
                 return ByteBufferUtil.UNSET_BYTE_BUFFER;
 
-            if (receiver.type instanceof MultiElementType<?>)
+            AbstractType<?> type = receiver.type.unwrap();
+            if (type instanceof MultiElementType<?>)
             {
-                return MultiElements.Value.fromSerialized(bytes, (MultiElementType<?>) receiver.type).get();
+                return MultiElements.Value.fromSerialized(bytes, (MultiElementType<?>) type).get();
             }
 
             receiver.type.validate(bytes);
@@ -142,10 +144,11 @@ public final class Marker extends Term.NonTerminal
             if (bytes == ByteArrayUtil.UNSET_BYTE_ARRAY)
                 return ByteArrayUtil.UNSET_BYTE_ARRAY;
 
-            if (receiver.type instanceof MultiElementType<?>)
+            AbstractType<?> type = receiver.type.unwrap();
+            if (type instanceof MultiElementType<?>)
             {
-                MultiElementType<?> type = (MultiElementType<?>) receiver.type;
-                return type.pack(type.filterSortAndValidateElementsFromArrays(type.unpack(bytes)), ByteArrayAccessor.instance);
+                MultiElementType<?> multiElementType = (MultiElementType<?>) type;
+                return multiElementType.pack(multiElementType.filterSortAndValidateElementsFromArrays(multiElementType.unpack(bytes)), ByteArrayAccessor.instance);
             }
             receiver.type.validate(bytes, ByteArrayAccessor.instance);
             return bytes;

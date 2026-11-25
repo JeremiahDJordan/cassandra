@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3.validation.entities;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -30,6 +31,7 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.marshal.MapType;
@@ -42,6 +44,7 @@ import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.junit.Assert.assertEquals;
 
 public class FrozenCollectionsTest extends CQLTester
@@ -1352,6 +1355,92 @@ public class FrozenCollectionsTest extends CQLTester
         assertRows(execute("SELECT * FROM %s WHERE k = 1"),
                 row(1, list(set(7, 8, 9)))
         );
+    }
+
+    @Test
+    public void testBoundListWithUnsortedSetElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<list<frozen<set<int>>>>, c list<frozen<set<int>>>, PRIMARY KEY (a, b))");
+
+        ByteBuffer list = pack(unsortedSet());
+        execute("INSERT INTO %s (a, b, c) VALUES (0, ?, ?)", list, list);
+        execute("INSERT INTO %s (a, b) VALUES (0, [{1, 2}])");
+
+        assertRowCount(execute("SELECT * FROM %s"), 1);
+        assertRows(execute("SELECT a FROM %s WHERE c CONTAINS {1, 2} ALLOW FILTERING"), row(0));
+
+        execute("UPDATE %s SET c = c - [{1, 2}] WHERE a = 0 AND b = [{1, 2}]");
+        assertRows(execute("SELECT c FROM %s"), row((Object) null));
+    }
+
+    @Test
+    public void testBoundSetWithUnsortedSetElement() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, s set<frozen<set<int>>>, fs frozen<set<frozen<set<int>>>>)");
+
+        execute("INSERT INTO %s (k, s, fs) VALUES (0, ?, ?)", pack(unsortedSet()), pack(sortedSet(), unsortedSet()));
+        assertEquals(pack(sortedSet()), execute("SELECT fs FROM %s").one().getBytes("fs"));
+
+        execute("UPDATE %s SET s = s - {{1, 2}} WHERE k = 0");
+        assertRows(execute("SELECT s FROM %s"), row((Object) null));
+    }
+
+    @Test
+    public void testBoundMapWithUnsortedSetKeyAndValue() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, m map<frozen<set<int>>, frozen<set<int>>>)");
+
+        execute("INSERT INTO %s (k, m) VALUES (0, ?)", packMap(unsortedSet(), unsortedSet()));
+        assertEquals(packMap(sortedSet(), sortedSet()), execute("SELECT m FROM %s").one().getBytes("m"));
+
+        execute("DELETE m[{1, 2}] FROM %s WHERE k = 0");
+        assertRows(execute("SELECT m FROM %s"), row((Object) null));
+    }
+
+    @Test
+    public void testBoundMapWithUnsortedSetKeyInPartitionKey() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k frozen<map<frozen<set<int>>, int>> PRIMARY KEY)");
+
+        execute("INSERT INTO %s (k) VALUES (?)", packMap(unsortedSet(), bytes(1)));
+        assertRows(execute("SELECT * FROM %s WHERE k = {{1, 2}: 1}"), row(map(set(1, 2), 1)));
+        assertRows(execute("SELECT * FROM %s WHERE k = ?", packMap(unsortedSet(), bytes(1))), row(map(set(1, 2), 1)));
+    }
+
+    @Test
+    public void testBoundUnsortedSetInDescendingClustering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<set<int>>, c frozen<list<frozen<set<int>>>>, PRIMARY KEY (a, b, c)) WITH CLUSTERING ORDER BY (b DESC, c DESC)");
+
+        execute("INSERT INTO %s (a, b, c) VALUES (0, ?, ?)", unsortedSet(), pack(unsortedSet()));
+        execute("INSERT INTO %s (a, b, c) VALUES (0, {1, 2}, [{1, 2}])");
+        assertRowCount(execute("SELECT * FROM %s"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND b = ? AND c = ?", unsortedSet(), pack(unsortedSet())), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) = ?", tuple(unsortedSet(), pack(unsortedSet()))), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE a = 0 AND (b, c) IN ?", list(tuple(unsortedSet(), pack(unsortedSet())))), 1);
+    }
+
+    /**
+     * {2, 1, 2} as sent by a client that doesn't sort or deduplicate a set.
+     */
+    private static ByteBuffer unsortedSet()
+    {
+        return pack(bytes(2), bytes(1), bytes(2));
+    }
+
+    private static ByteBuffer sortedSet()
+    {
+        return pack(bytes(1), bytes(2));
+    }
+
+    private static ByteBuffer pack(ByteBuffer... elements)
+    {
+        return ListType.getInstance(BytesType.instance, false).pack(Arrays.asList(elements));
+    }
+
+    private static ByteBuffer packMap(ByteBuffer... keysAndValues)
+    {
+        return MapType.getInstance(BytesType.instance, BytesType.instance, false).pack(Arrays.asList(keysAndValues));
     }
 
     @Test

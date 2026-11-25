@@ -695,7 +695,7 @@ public class UserType extends TupleType implements SchemaElement
                 continue;
             if (!isMultiCell() && buffer == unsetValue)
                 throw new MarshalException(String.format("Invalid unset value for field '%s' of user defined type %s", fieldNameAsString(i), getNameAsString()));
-            type(i).validate(buffer, valueAccessor);
+            buffers.set(i, validateElement(type(i), buffer, valueAccessor));
         }
 
         return buffers;

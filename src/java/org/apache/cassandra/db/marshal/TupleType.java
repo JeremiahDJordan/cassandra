@@ -415,7 +415,7 @@ public class TupleType extends MultiElementType<ByteBuffer>
                 continue;
             if (buffer == unsetValue)
                 throw new InvalidRequestException(String.format("Invalid unset value for tuple field number %d", i));
-            type(i).validate(buffer, valueAccessor);
+            buffers.set(i, validateElement(type(i), buffer, valueAccessor));
         }
 
         return buffers;

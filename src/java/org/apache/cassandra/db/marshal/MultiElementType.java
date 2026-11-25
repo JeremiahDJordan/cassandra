@@ -99,12 +99,35 @@ public abstract class MultiElementType<T> extends AbstractType<T>
      * Filter and sort the elements, if needed, before validating them.
      * <p>
      * This method takes as input a list of elements, eliminates duplicates and reorders them if needed (e.g. {@code SetType} and {@code MapType}) and validate them.
+     * The elements of the specified list may be replaced.
      * @param buffers the elements of this type
      * @return the elements filtered and sorted as they are used for serialization.
      */
     public abstract List<ByteBuffer> filterSortAndValidateElements(List<ByteBuffer> buffers);
 
     public abstract List<byte[]> filterSortAndValidateElementsFromArrays(List<byte[]> buffers);
+
+    /**
+     * Validates an element of the specified type. If the element is itself a multi-element value, its own elements
+     * are filtered and sorted, so that a set or map nested in a bound value is serialized as it is from a literal.
+     *
+     * @return the element as it is used for serialization.
+     */
+    @SuppressWarnings("unchecked")
+    protected static <V> V validateElement(AbstractType<?> type, V element, ValueAccessor<V> accessor)
+    {
+        type.validate(element, accessor);
+        AbstractType<?> unwrapped = type.unwrap();
+        if (!(unwrapped instanceof MultiElementType<?>) || accessor.isEmpty(element))
+            return element;
+
+        MultiElementType<?> multiElementType = (MultiElementType<?>) unwrapped;
+        List<V> elements = multiElementType.unpack(element, accessor);
+        elements = accessor == ByteBufferAccessor.instance
+                   ? (List<V>) multiElementType.filterSortAndValidateElements((List<ByteBuffer>) elements)
+                   : (List<V>) multiElementType.filterSortAndValidateElementsFromArrays((List<byte[]>) elements);
+        return multiElementType.pack(elements, accessor);
+    }
 
     /**
      * Compares the multicell value represensted by the column data with the specified elements.

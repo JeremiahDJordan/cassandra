@@ -280,23 +280,23 @@ public class ListType<T> extends CollectionType<List<T>>
     @Override
     public List<ByteBuffer> filterSortAndValidateElements(List<ByteBuffer> buffers)
     {
-        for (ByteBuffer buffer: buffers)
-        {
-            if (buffer == null)
-                throw new MarshalException("null is not supported inside collections");
-            elements.validate(buffer);
-        }
-        return buffers;
+        return filterSortAndValidateElements(buffers, ByteBufferAccessor.instance);
     }
 
     @Override
     public List<byte[]> filterSortAndValidateElementsFromArrays(List<byte[]> buffers)
     {
-        for (byte[] buffer: buffers)
+        return filterSortAndValidateElements(buffers, ByteArrayAccessor.instance);
+    }
+
+    private <V> List<V> filterSortAndValidateElements(List<V> buffers, ValueAccessor<V> valueAccessor)
+    {
+        for (int i = 0; i < buffers.size(); i++)
         {
+            V buffer = buffers.get(i);
             if (buffer == null)
                 throw new MarshalException("null is not supported inside collections");
-            elements.validate(buffer, ByteArrayAccessor.instance);
+            buffers.set(i, validateElement(elements, buffer, valueAccessor));
         }
         return buffers;
     }

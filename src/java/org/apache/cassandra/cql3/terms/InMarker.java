@@ -97,8 +97,9 @@ public final class InMarker extends Terms.NonTerminals
 
     public static java.util.function.Function<ByteBuffer, Term.Terminal> terminalConverter(AbstractType<?> type)
     {
-        if (type instanceof MultiElementType<?>)
-            return e -> MultiElements.Value.fromSerialized(e, (MultiElementType<?>) type);
+        AbstractType<?> unwrapped = type.unwrap();
+        if (unwrapped instanceof MultiElementType<?>)
+            return e -> MultiElements.Value.fromSerialized(e, (MultiElementType<?>) unwrapped);
 
         return Constants.Value::new;
     }
