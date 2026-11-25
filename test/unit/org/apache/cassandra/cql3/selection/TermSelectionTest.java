@@ -1168,6 +1168,31 @@ public class TermSelectionTest extends CQLTester
     }
 
     @Test
+    public void testFunctionArgsFromDescendingColumns() throws Throwable
+    {
+        String innerType = createType("CREATE TYPE %s (y int)");
+        String type = createType("CREATE TYPE %s (x int, sub frozen<" + innerType + ">)");
+        for (String order : new String[]{ "ASC", "DESC" })
+        {
+            createTable(String.format("CREATE TABLE %%s (pk int, ck int, t text, u frozen<%1$s>, m frozen<map<int, int>>, l frozen<list<int>>, v vector<float, 2>, " +
+                                      "PRIMARY KEY (pk, ck, t, u, m, l, v)) " +
+                                      "WITH CLUSTERING ORDER BY (ck %2$s, t %2$s, u %2$s, m %2$s, l %2$s, v %2$s)", type, order));
+            execute("INSERT INTO %s (pk, ck, t, u, m, l, v) VALUES (1, 2, 'a', {x: 3, sub: {y: 4}}, {1: 5}, [6, 7], [1.0, 0.0])");
+
+            assertRows(execute("SELECT sum(u.x), max(u.x), sum(m[1]), max(m[1]) FROM %s"),
+                       row(3, 3, 5, 5));
+            assertRows(execute("SELECT u.x + 1, CAST(u.x AS bigint), toJson(u.x), [u.x], (u.sub).y, m[1] + 1, toJson(m[1..2]), CAST(t AS text) FROM %s"),
+                       row(4, 3L, "3", list(3), 4, 6, "{\"1\": 5}", "a"));
+            assertRows(execute("SELECT map_keys(m), collection_sum(l), similarity_cosine(v, [2.0, 0.0]), toJson({ck, pk}) FROM %s"),
+                       row(set(1), 13, 1.0f, "[1, 2]"));
+
+            execute("INSERT INTO %s (pk, ck, t, u, m, l, v) VALUES (1, 1, 'b', {x: 3, sub: {y: 4}}, {1: 5}, [6, 7], [1.0, 0.0])");
+            assertRows(execute("SELECT max((ck, pk)), min((ck, pk)) FROM %s"),
+                       row(tuple(2, 1), tuple(1, 1)));
+        }
+    }
+
+    @Test
     public void testInsertUpdateDelete() throws Throwable
     {
         String fIntMax = createFunction(KEYSPACE,

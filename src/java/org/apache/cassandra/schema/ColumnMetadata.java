@@ -694,7 +694,7 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
 
     public AbstractType<?> getExactTypeIfKnown(String keyspace)
     {
-        return type;
+        return type.unwrap();
     }
 
     /**

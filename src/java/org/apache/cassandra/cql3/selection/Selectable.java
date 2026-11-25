@@ -514,7 +514,7 @@ public interface Selectable extends AssignmentTestable
             Selector.Factory factory = factories.get(0);
 
             // If the user is trying to cast a type on its own type we simply ignore it.
-            if (type.getType().equals(factory.getReturnType()))
+            if (type.getType().equals(factory.getReturnType().unwrap()))
                 return factory;
 
             FunctionName name = FunctionName.nativeFunction(CastFcts.getFunctionName(type));
