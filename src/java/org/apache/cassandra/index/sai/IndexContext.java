@@ -521,6 +521,8 @@ public class IndexContext
     // 2. or includes everything minus the keys matching the expression
     // if the column type values cannot be truncated, i.e., matching the keys is always precise.
     // (not matching precisely will lead to false negatives)
+    // 3. or includes everything if the expression is of a value without terms, which matches no indexed value
+    // (see Expression#isWithoutTerms).
     // The negations on a collection index (NOT CONTAINS, NOT CONTAINS KEY and m[k] != v) include everything, because
     // the index can match keys whose collection no longer holds the value (see IndexContext#canSubtractMatches).
     //
@@ -538,7 +540,8 @@ public class IndexContext
         KeyRangeIterator allKeys = scanMemtable(keyRange, memtables);
         if (TypeUtil.supportsRounding(expression.validator)
             || !version.onDiskFormat().indexFeatureSet().isRowAware()
-            || !canSubtractMatches(expression))
+            || !canSubtractMatches(expression)
+            || expression.isWithoutTerms())
         {
             return allKeys;
         }

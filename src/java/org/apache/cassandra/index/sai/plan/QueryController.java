@@ -662,6 +662,8 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
                 if (expression.getOp() == Expression.Op.NOT_EQ)
                     builder.add(buildInequalityPlan(expression));
+                else if (expression.isWithoutTerms() && !expression.getOp().isNonEquality())
+                    builder.add(planFactory.nothing);
                 else
                 {
                     long expectedMatchingRowCount = Math.min(estimateMatchingRowCount(expression), planFactory.tableMetrics.rows);
@@ -1079,6 +1081,10 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      */
     private long estimateMatchingRowCount(Expression predicate)
     {
+        // a value without terms matches no indexed value, so its negation matches all the keys
+        if (predicate.isWithoutTerms())
+            return predicate.getOp().isNonEquality() ? planFactory.tableMetrics.rows : 0;
+
         switch (predicate.getOp())
         {
             case EQ:
