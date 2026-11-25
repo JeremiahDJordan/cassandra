@@ -107,6 +107,24 @@ Upgrading
     - memtable_offheap_space: 0 is now rejected at startup when memtable_allocation_type is
     offheap_buffers or offheap_objects. Set a positive memtable_offheap_space, or an allocation
     type that does not allocate off-heap. See CASSANDRA-21019.
+    - Storage-attached indexes (SAI) on DESC clustering columns of type inet, varint or decimal now index their values
+      in non-reversed order, as Apache Cassandra 5.0 does, so range queries through them return the right rows, and
+      flushing an inet or varint index and querying a flushed decimal one work (CASSANDRA-20100). The
+      sstable indexes of a DESC decimal column flushed by an earlier version can't be read: the initial build of the
+      index on restart, imports and nodetool rebuild_index rebuild them, and an index that finds one in any other way
+      is not queryable until it is rebuilt. Entire-SSTable streaming of such an sstable fails, as the receiver
+      validates the streamed index; stream_entire_sstables: false on the sending nodes avoids that. Such an sstable
+      index whose min and max terms are both raw decimals of exactly 24 bytes (a 20-byte unscaled value) is not
+      detected and gives incomplete results: rebuild the indexes of DESC decimal columns holding such values with
+      nodetool rebuild_index after upgrading.
+    - Storage-attached indexes (SAI) on a clustering column ordered DESC now behave as on the same column ordered ASC,
+      as Apache Cassandra 5.0's do. An index on a DESC text, varchar, ascii or boolean clustering column, or on a DESC
+      frozen tuple or UDT clustering column, indexes the empty value, so c = '' or c IN ('', 'a') find the rows whose
+      clustering value is empty. Indexes built by earlier DataStax versions lack those entries until they are rebuilt
+      or their SSTables compacted: if you query such columns for the empty value, rebuild those indexes on each node
+      after upgrading it, with nodetool rebuild_index. The index on a DESC text, varchar, ascii, boolean or uuid
+      clustering column doesn't serve != and NOT IN, nor range restrictions on uuid, like the index on an ASC column:
+      such queries need ALLOW FILTERING or another index.
 
 5.0.7
 ======

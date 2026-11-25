@@ -34,6 +34,7 @@ import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.SSTableContext;
 import org.apache.cassandra.index.sai.disk.SearchableIndex;
+import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.iterators.KeyRangeConcatIterator;
 import org.apache.cassandra.index.sai.iterators.KeyRangeIterator;
@@ -78,6 +79,40 @@ public class V1SearchableIndex implements SearchableIndex
     private final long approximateTermCount;
     private PerIndexFiles indexFiles;
 
+    /**
+     * Whether the segments of an index on a DESC decimal clustering column hold raw decimal terms (flushed without
+     * {@link TypeUtil#encodeDecimal}, before CASSANDRA-20100), which can't be searched, so they must be rebuilt.
+     * Encoded terms are always {@link TypeUtil#DECIMAL_APPROXIMATION_BYTES} long.
+     */
+    public static boolean hasObsoleteDescDecimalTerms(List<SegmentMetadata> metadatas, IndexContext context)
+    {
+        if (!TypeUtil.isReversedDecimal(context.getValidator()))
+            return false;
+
+        for (SegmentMetadata metadata : metadatas)
+        {
+            if (metadata.minTerm.remaining() != TypeUtil.DECIMAL_APPROXIMATION_BYTES
+                || metadata.maxTerm.remaining() != TypeUtil.DECIMAL_APPROXIMATION_BYTES)
+                return true;
+        }
+        return false;
+    }
+
+    public static boolean hasObsoleteDescDecimalTerms(IndexComponents.ForRead perIndexComponents) throws IOException
+    {
+        IndexContext context = perIndexComponents.context();
+        if (context == null || !TypeUtil.isReversedDecimal(context.getValidator()))
+            return false;
+
+        // An empty index (completion marker only, e.g. for an sstable without any row with a value for the column)
+        // has no segments, so nothing to rebuild.
+        if (perIndexComponents.isEmpty() || !perIndexComponents.has(IndexComponentType.META))
+            return false;
+
+        MetadataSource source = MetadataSource.loadMetadata(perIndexComponents);
+        return hasObsoleteDescDecimalTerms(SegmentMetadata.loadWithoutFullResolutionBounds(source, context), context);
+    }
+
     public V1SearchableIndex(SSTableContext sstableContext, IndexComponents.ForRead perIndexComponents)
     {
         this.indexContext = perIndexComponents.context();
@@ -106,8 +141,8 @@ public class V1SearchableIndex implements SearchableIndex
             this.maxKey = metadatas.get(metadatas.size() - 1).maxKey.partitionKey();
 
             var version = perIndexComponents.version();
-            this.minTerm = metadatas.stream().map(m -> m.minTerm).min(TypeUtil.comparator(indexContext.getValidator(), version)).orElse(null);
-            this.maxTerm = metadatas.stream().map(m -> m.maxTerm).max(TypeUtil.comparator(indexContext.getValidator(), version)).orElse(null);
+            this.minTerm = metadatas.stream().map(m -> m.minTerm).reduce((a, b) -> TypeUtil.min(a, b, indexContext.getValidator(), version)).orElse(null);
+            this.maxTerm = metadatas.stream().map(m -> m.maxTerm).reduce((a, b) -> TypeUtil.max(a, b, indexContext.getValidator(), version)).orElse(null);
 
             this.numRows = metadatas.stream().mapToLong(m -> m.numRows).sum();
 

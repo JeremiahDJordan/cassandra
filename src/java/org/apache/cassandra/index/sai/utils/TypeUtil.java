@@ -22,7 +22,6 @@ import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.stream.Stream;
@@ -200,7 +199,7 @@ public class TypeUtil
 
     public static ByteBuffer fromComparableBytes(ByteComparable value, AbstractType<?> type, ByteComparable.Version version)
     {
-        if (type instanceof InetAddressType || type instanceof IntegerType || type instanceof DecimalType)
+        if (isInetAddress(type) || isBigInteger(type) || isBigDecimal(type))
             return ByteBuffer.wrap(ByteSourceInverse.readBytes(value.asComparableBytes(version)));
 
         return type.fromComparableBytes(ByteSource.peekable(value.asComparableBytes(version)), version);
@@ -213,7 +212,9 @@ public class TypeUtil
 
     public static ByteSource asComparableBytes(ByteBuffer value, AbstractType<?> type, ByteComparable.Version version)
     {
-        if (type instanceof InetAddressType || type instanceof IntegerType || type instanceof DecimalType)
+        // These types are indexed in their non-reversed form even on DESC clustering columns (see #isIndexedUnreversed),
+        // so this must also hold for a ReversedType, as it does in the on-disk balanced tree (see #toComparableBytes).
+        if (isInetAddress(type) || isBigInteger(type) || isBigDecimal(type))
             return ByteSource.optionalFixedLength(ByteBufferAccessor.instance, value);
         // The LongType.asComparableBytes uses variableLengthInteger which doesn't play well with
         // the balanced tree because it is expecting fixed length data. So for SAI we use a optionalSignedFixedLengthNumber
@@ -269,7 +270,7 @@ public class TypeUtil
             return encodeInetAddress(value);
         else if (isBigInteger(type))
             return encodeBigInteger(value);
-        else if (type instanceof DecimalType)
+        else if (isBigDecimal(type))
             return encodeDecimal(value);
         return value;
     }
@@ -288,7 +289,7 @@ public class TypeUtil
             return decodeInetAddress(value);
         else if (isBigInteger(type))
             return decodeBigInteger(value);
-        else if (type instanceof DecimalType)
+        else if (isBigDecimal(type))
             return decodeDecimal(value);
         return value;
     }
@@ -320,6 +321,10 @@ public class TypeUtil
     {
         if (isInetAddress(type))
             return compareInet(requestedValue.encoded, columnValue.encoded);
+        // varint and decimal values are indexed in their non-reversed form, and Expression doesn't swap their bounds
+        // on DESC clustering columns (see #isIndexedUnreversed), so they must be compared with the base type
+        else if (isBigInteger(type) || isBigDecimal(type))
+            return baseType(type).compare(requestedValue.raw, columnValue.raw);
         // Override comparisons for frozen collections
         else if (isFrozen(type))
             return FastByteOperations.compareUnsigned(requestedValue.raw, columnValue.raw);
@@ -343,16 +348,6 @@ public class TypeUtil
             stream = stream.sorted((c1, c2) -> compareInet(encodeInetAddress(c1), encodeInetAddress(c2)));
 
         return stream.iterator();
-    }
-
-    public static Comparator<ByteBuffer> comparator(AbstractType<?> type, Version version)
-    {
-        // Override the comparator for BigInteger, frozen collections (not including composite types) and
-        // composite types before DB version to maintain a consistent order between the in-memory index and the on-disk index.
-        if (useFastByteOperations(type, version))
-            return FastByteOperations::compareUnsigned;
-
-        return type;
     }
 
     private static boolean useFastByteOperations(AbstractType<?> type, Version version)
@@ -589,6 +584,26 @@ public class TypeUtil
     }
 
     /**
+     * Returns {@code true} if the values of the type are indexed unreversed even as a DESC clustering column: inet,
+     * varint and decimal, whose index encodings are compared as unsigned bytes and written to the balanced tree without
+     * the reversal (see {@link #toComparableBytes}), so queries must treat the type as non-reversed. A DESC
+     * {@link LongType} column is indexed reversed.
+     */
+    public static boolean isIndexedUnreversed(AbstractType<?> type)
+    {
+        return isInetAddress(type) || isBigInteger(type) || isBigDecimal(type);
+    }
+
+    /**
+     * Returns {@code true} if the given type is a {@link org.apache.cassandra.db.marshal.ReversedType} of
+     * {@link DecimalType}, the type of a DESC decimal clustering column.
+     */
+    public static boolean isReversedDecimal(AbstractType<?> type)
+    {
+        return type.isReversed() && isBigDecimal(type);
+    }
+
+    /**
      * Returns <code>true</code> if given {@link AbstractType} is included in the types.
      */
     public static boolean isIn(AbstractType<?> type, Set<AbstractType<?>> types)
@@ -635,10 +650,11 @@ public class TypeUtil
 
     /**
      * @return {@code true} if the empty values of the given type should be excluded from indexing, {@code false} otherwise.
+     * The answer is the same for a reversed type (a {@code DESC} clustering column) as for its base type.
      */
     public static boolean skipsEmptyValue(AbstractType<?> type)
     {
-        return !type.allowsEmpty() || !isLiteral(type);
+        return !baseType(type).allowsEmpty() || !isLiteral(type);
     }
 
     /**

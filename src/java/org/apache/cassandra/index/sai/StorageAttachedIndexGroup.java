@@ -449,10 +449,14 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                     IndexComponents.ForRead perIndexComponents = indexDescriptor.perIndexComponents(index.getIndexContext());
 
                     logger.debug("Per-index components complete for {}: {}", index.getIndexContext().getIndexName(), perIndexComponents.isComplete());
-                    if (perIndexComponents.isComplete())
+                    // Complete components with an obsolete encoding can't be read, so they must be rebuilt like
+                    // incomplete ones (see IndexDescriptor#hasObsoleteEncoding).
+                    if (perIndexComponents.isComplete() && !IndexDescriptor.hasObsoleteEncoding(perIndexComponents))
                         perIndexComponents.validateComponents(sstable, baseCfs.getTracker(), validateChecksum, true);
                     else if (throwOnIncomplete)
-                        throw new IllegalStateException(indexDescriptor.logMessage("Incomplete per-column index build for SSTable " + sstable.descriptor));
+                        throw new IllegalStateException(
+                            indexDescriptor.logMessage("Incomplete or obsolete per-column index build for SSTable " +
+                                                       sstable.descriptor));
                     else
                         complete = false;
                 }

@@ -155,6 +155,9 @@ public class Expression
     public final IndexContext context;
     public final AbstractType<?> validator;
 
+    // whether the bounds are swapped: a DESC clustering column indexed reversed (see TypeUtil#isIndexedUnreversed)
+    private final boolean reversed;
+
     @VisibleForTesting
     protected Op operation;
 
@@ -198,6 +201,9 @@ public class Expression
         this.context = indexContext;
         this.analyzerFactory = indexContext.getAnalyzerFactory();
         this.validator = indexContext.getValidator();
+        this.reversed = indexContext.getDefinition() != null
+                        && indexContext.getDefinition().isReversedType()
+                        && !TypeUtil.isIndexedUnreversed(validator);
     }
 
     public boolean isLiteral()
@@ -261,7 +267,7 @@ public class Expression
                 break;
 
             case LTE:
-                if (context.getDefinition().isReversedType())
+                if (reversed)
                 {
                     this.lowerInclusive = true;
                     lowerInclusive = true;
@@ -273,14 +279,14 @@ public class Expression
                 }
             case LT:
                 operation = Op.RANGE;
-                if (context.getDefinition().isReversedType())
+                if (reversed)
                     lower = new Bound(value, validator, lowerInclusive);
                 else
                     upper = new Bound(value, validator, upperInclusive);
                 break;
 
             case GTE:
-                if (context.getDefinition().isReversedType())
+                if (reversed)
                 {
                     this.upperInclusive = true;
                     upperInclusive = true;
@@ -292,7 +298,7 @@ public class Expression
                 }
             case GT:
                 operation = Op.RANGE;
-                if (context.getDefinition().isReversedType())
+                if (reversed)
                     upper = new Bound(value, validator,  upperInclusive);
                 else
                     lower = new Bound(value, validator, lowerInclusive);

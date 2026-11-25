@@ -50,6 +50,7 @@ import org.apache.cassandra.index.sai.disk.io.IndexFileUtils;
 import org.apache.cassandra.index.sai.disk.io.IndexInput;
 import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
 import org.apache.cassandra.index.sai.disk.oldlucene.EndiannessReverserChecksumIndexInput;
+import org.apache.cassandra.index.sai.disk.v1.V1SearchableIndex;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTable;
@@ -338,6 +339,9 @@ public class IndexDescriptor
 
     /**
      * Returns true if the per-column index components of the provided sstable have been built and are valid.
+     * <p>
+     * Complete components written with an obsolete encoding (see {@link #hasObsoleteEncoding}) are not built, so they
+     * are rebuilt.
      *
      * @param sstable The sstable to check
      * @param context The {@link IndexContext} for the index
@@ -346,8 +350,27 @@ public class IndexDescriptor
     public static boolean isIndexBuildCompleteOnDisk(SSTableReader sstable, IndexContext context)
     {
         IndexDescriptor descriptor = IndexDescriptor.load(sstable, Set.of(context));
+        IndexComponents.ForRead perIndexComponents = descriptor.perIndexComponents(context);
         return descriptor.perSSTableComponents().isComplete()
-               && descriptor.perIndexComponents(context).isComplete();
+               && perIndexComponents.isComplete()
+               && !hasObsoleteEncoding(perIndexComponents);
+    }
+
+    /**
+     * Whether complete per-index components were written with an encoding this version can't read any more (see
+     * {@link V1SearchableIndex#hasObsoleteDescDecimalTerms}); false if their metadata can't be read.
+     */
+    public static boolean hasObsoleteEncoding(IndexComponents.ForRead perIndexComponents)
+    {
+        try
+        {
+            return V1SearchableIndex.hasObsoleteDescDecimalTerms(perIndexComponents);
+        }
+        catch (IOException | RuntimeException e)
+        {
+            logger.debug("Could not read the metadata of {} to check its encoding", perIndexComponents, e);
+            return false;
+        }
     }
 
     public boolean isIndexEmpty(IndexContext context)
