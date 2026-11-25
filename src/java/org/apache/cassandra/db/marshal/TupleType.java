@@ -228,7 +228,7 @@ public class TupleType extends MultiCellCapableType<ByteBuffer>
 
         // Because we stop early when there are trailing nulls, there needs to be an explicit terminator to make the
         // type prefix-free.
-        return ByteSource.withTerminator(ByteSource.TERMINATOR, srcs);
+        return ByteSource.withTerminator(version, ByteSource.TERMINATOR, srcs);
     }
 
     @Override

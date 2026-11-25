@@ -79,9 +79,9 @@ public final class TokenOnlyPrimaryKey implements PrimaryKey
         ByteSource tokenComparable = token.asComparableBytes(version);
         // prefix doesn't include null components
         if (isPrefix)
-            return ByteSource.withTerminator(terminator, tokenComparable);
+            return ByteSource.withTerminator(version, terminator, tokenComparable);
         else
-            return ByteSource.withTerminator(terminator, tokenComparable, null, null);
+            return ByteSource.withTerminator(version, terminator, tokenComparable, null, null);
     }
 
     @Override

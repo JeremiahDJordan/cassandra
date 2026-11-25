@@ -281,7 +281,7 @@ public abstract class Token implements RingPosition<Token>, Serializable
         public ByteSource asComparableBytes(Version version)
         {
             int terminator = isMinimumBound ? ByteSource.LT_NEXT_COMPONENT : ByteSource.GT_NEXT_COMPONENT;
-            return ByteSource.withTerminator(terminator, token.asComparableBytes(version));
+            return ByteSource.withTerminator(version, terminator, token.asComparableBytes(version));
         }
 
         @Override
