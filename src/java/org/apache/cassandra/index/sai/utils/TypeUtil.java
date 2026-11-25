@@ -22,7 +22,6 @@ import java.math.BigInteger;
 import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
-import java.util.Comparator;
 import java.util.Iterator;
 import java.util.Set;
 import java.util.stream.Stream;
@@ -337,16 +336,6 @@ public class TypeUtil
         return stream.iterator();
     }
 
-    public static Comparator<ByteBuffer> comparator(AbstractType<?> type, Version version)
-    {
-        // Override the comparator for BigInteger, frozen collections (not including composite types) and
-        // composite types before DB version to maintain a consistent order between the in-memory index and the on-disk index.
-        if (useFastByteOperations(type, version))
-            return FastByteOperations::compareUnsigned;
-
-        return type;
-    }
-
     private static boolean useFastByteOperations(AbstractType<?> type, Version version)
     {
         // BigInteger types, BigDecimal types, frozen types and composite types (map entries) use compareUnsigned to
@@ -618,10 +607,11 @@ public class TypeUtil
 
     /**
      * @return {@code true} if the empty values of the given type should be excluded from indexing, {@code false} otherwise.
+     * The answer is the same for a reversed type (a {@code DESC} clustering column) as for its base type.
      */
     public static boolean skipsEmptyValue(AbstractType<?> type)
     {
-        return !type.allowsEmpty() || !isLiteral(type);
+        return !baseType(type).allowsEmpty() || !isLiteral(type);
     }
 
     /**
