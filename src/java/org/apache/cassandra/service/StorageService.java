@@ -229,6 +229,7 @@ import static java.util.stream.Collectors.toMap;
 import static org.apache.cassandra.config.CassandraRelevantProperties.BOOTSTRAP_SCHEMA_DELAY_MS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.BOOTSTRAP_SKIP_SCHEMA_CHECK;
 import static org.apache.cassandra.config.CassandraRelevantProperties.DRAIN_EXECUTOR_TIMEOUT_MS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.DTEST_IS_IN_JVM_DTEST;
 import static org.apache.cassandra.config.CassandraRelevantProperties.REPLACEMENT_ALLOW_EMPTY;
 import static org.apache.cassandra.index.SecondaryIndexManager.getIndexName;
 import static org.apache.cassandra.index.SecondaryIndexManager.isIndexColumnFamily;
@@ -1032,6 +1033,10 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     private void registerSignalHandlers()
     {
+        // The handlers are JVM-wide and chain to the previous one, so in-JVM dtests would keep every instance reachable
+        if (DTEST_IS_IN_JVM_DTEST.getBoolean())
+            return;
+
         registerSignalHandlersInternal(new String[]{"TERM", "INT", "HUP"});
     }
 
