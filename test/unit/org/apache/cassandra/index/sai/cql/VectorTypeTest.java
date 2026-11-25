@@ -678,6 +678,40 @@ public class VectorTypeTest extends VectorTester
     }
 
     @Test
+    public void testStaticVectorColumnPartitionWithoutRows() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, x int, s int static, sv vector<float, 2> static, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(sv) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        execute("INSERT INTO %s (pk, s, sv) VALUES (0, 1, [0, 0])");
+        execute("INSERT INTO %s (pk, ck, x, s, sv) VALUES (1, 1, 1, 1, [1, 1])");
+        execute("INSERT INTO %s (pk, s, sv) VALUES (2, 2, [2, 2])");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 1"), row(0, null));
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null), row(1, 1), row(2, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY sv ANN OF [0, 0] LIMIT 1"), row(0, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null), row(1, 1));
+            assertRowsNet(executeNet("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null), row(1, 1), row(2, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 0 AND ck > 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"));
+        });
+
+        // partition 0 then has only deleted rows
+        execute("INSERT INTO %s (pk, ck, x) VALUES (0, 1, 1)");
+        execute("INSERT INTO %s (pk, ck, x) VALUES (0, 2, 1)");
+        flush();
+        execute("DELETE FROM %s WHERE pk = 0 AND ck = 1");
+        execute("DELETE FROM %s WHERE pk = 0 AND ck = 2");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 2"), row(0, null), row(1, 1));
+            assertRowsNet(executeNet("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 2"), row(0, null), row(1, 1));
+        });
+    }
+
+    @Test
     public void testStaticVectorColumnIndex() throws Throwable
     {
         createTable("CREATE TABLE %s (pk int, ck int, val vector<float, 2> static, PRIMARY KEY(pk, ck))");
