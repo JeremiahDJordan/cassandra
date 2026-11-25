@@ -345,6 +345,12 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
         metric.rangeRequests.inc();
     }
 
+    @Override
+    protected void updateMinOldestUnrepairedTombstone(ColumnFamilyStore cfs, ReadExecutionController controller)
+    {
+        controller.updateMinOldestUnrepairedTombstone(cfs.select(View.selectLive(dataRange().keyRange())));
+    }
+
     public UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController controller)
     {
         ColumnFamilyStore.ViewFragment view = cfs.select(View.selectLive(dataRange().keyRange()));
@@ -362,7 +368,7 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
             {
                 UnfilteredPartitionIterator iter = memtable.partitionIterator(columnFilter(), dataRange(), readCountUpdater);
                 if (useMinLocalDeletionTime)
-                    controller.updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+                    controller.updateMinOldestUnrepairedTombstone(memtable, true);
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
             }
 
@@ -441,6 +447,10 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
 
     private UnfilteredPartitionIterator checkCacheFilter(UnfilteredPartitionIterator iter, final ColumnFamilyStore cfs)
     {
+        // The purge takes its bound from the scanned sources, which a partition cached later may not match
+        if (cfs.onlyPurgeRepairedTombstones())
+            return iter;
+
         class CacheFilter extends Transformation<BaseRowIterator<?>>
         {
             @Override

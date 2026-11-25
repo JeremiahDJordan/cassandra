@@ -757,6 +757,9 @@ public class TrieMemtable extends AbstractShardedMemtable
             {
                 // Merge columns before applying the update, because a reader may otherwise miss a column.
                 columns = columns.mergeTo(update.columns());
+                // The stats give the minimum local deletion time, which goes down before the update is visible, for the
+                // reads that purge the tombstones older than it
+                stats = stats.mergeWith(update.stats());
 
                 try
                 {
@@ -775,8 +778,6 @@ public class TrieMemtable extends AbstractShardedMemtable
                     updateMinTimestamp(update.stats().minTimestamp);
                     updateLiveDataSize(updater.dataSize);
                     updateCurrentOperations(update.operationCount());
-
-                    stats = stats.mergeWith(update.stats());
                 }
                 this.cellDataBufferManager.opOrderGroup = null;
             }

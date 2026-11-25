@@ -419,6 +419,12 @@ public abstract class ReadCommand extends AbstractReadQuery
     public abstract UnfilteredPartitionIterator queryStorage(ColumnFamilyStore cfs, ReadExecutionController executionController);
 
     /**
+     * Lowers the oldest unrepaired tombstone of the controller to the min local deletion time of the memtables and
+     * unrepaired sstables that may hold the data this command reads.
+     */
+    protected abstract void updateMinOldestUnrepairedTombstone(ColumnFamilyStore cfs, ReadExecutionController executionController);
+
+    /**
      * Whether the underlying {@code ClusteringIndexFilter} is reversed or not.
      *
      * @return whether the underlying {@code ClusteringIndexFilter} is reversed or not.
@@ -531,6 +537,11 @@ public abstract class ReadCommand extends AbstractReadQuery
 
             // Prepare the monitorable execution info, which will be null if it's deferred to the index
             ReadCommandExecutionInfo executionInfo = setupExecutionInfo(searcher);
+
+            // Searchers lower the controller's value as they read the base table through it. It starts from the sources
+            // of the queried partition or range, for searchers that read the base table another way
+            if (null != searcher && cfs.onlyPurgeRepairedTombstones())
+                updateMinOldestUnrepairedTombstone(cfs, executionController);
 
             var storageTarget = (null == searcher) ? queryStorage(cfs, executionController)
                                                    : searchStorage(searcher, executionController);
@@ -1039,6 +1050,13 @@ public abstract class ReadCommand extends AbstractReadQuery
                 super(nowInSec(), cfs.gcBefore(nowInSec()), controller.oldestUnrepairedTombstone(),
                       cfs.onlyPurgeRepairedTombstones(),
                       iterator.metadata().enforceStrictLiveness());
+            }
+
+            // Index searches, and writes to the memtables the read opened, lower the controller's value after this is created
+            @Override
+            protected long oldestUnrepairedTombstone()
+            {
+                return controller.oldestUnrepairedTombstone();
             }
 
             protected LongPredicate getPurgeEvaluator()
