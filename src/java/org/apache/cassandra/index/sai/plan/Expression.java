@@ -157,6 +157,10 @@ public class Expression
 
     final List<ByteBuffer> exclusions = new ArrayList<>();
 
+    // The terms of an analyzed CONTAINS, CONTAINS KEY, NOT CONTAINS or NOT CONTAINS KEY value of several terms, of
+    // which the lower bound is one: an element or key holds the value if it holds all of them (see #addAllTerms)
+    private List<ByteBuffer> allTerms;
+
     public Expression(IndexContext indexContext)
     {
         this.context = indexContext;
@@ -450,6 +454,9 @@ public class Expression
 
     private boolean validateStringValue(ByteBuffer columnValue, ByteBuffer requestedValue)
     {
+        if (allTerms != null)
+            return holdsAllTerms(columnValue) != operation.isNonEquality();
+
         AbstractAnalyzer analyzer = analyzerFactory.create();
         analyzer.reset(columnValue);
         try
@@ -499,6 +506,56 @@ public class Expression
         }
     }
 
+    /**
+     * Makes this expression of an analyzed value of several terms (CONTAINS, CONTAINS KEY, NOT CONTAINS or
+     * NOT CONTAINS KEY) about all the given terms together: an element or key holds the value if it holds all of
+     * them, as the coordinator's recheck decides (see {@code RowFilter.SimpleExpression#contains}). CONTAINS keeps one
+     * such expression per term, NOT CONTAINS a single one (see Operation).
+     */
+    public Expression addAllTerms(List<ByteBuffer> terms)
+    {
+        assert operation == Op.NOT_CONTAINS_VALUE || operation == Op.NOT_CONTAINS_KEY
+               || operation == Op.CONTAINS_VALUE || operation == Op.CONTAINS_KEY : operation;
+        assert terms.contains(lower.value.raw);
+        allTerms = terms;
+        return this;
+    }
+
+    /**
+     * @return whether the terms of the given value include all of {@link #allTerms}
+     */
+    private boolean holdsAllTerms(ByteBuffer columnValue)
+    {
+        List<ByteBuffer> terms = new ArrayList<>();
+        AbstractAnalyzer analyzer = analyzerFactory.create();
+        analyzer.reset(columnValue);
+        try
+        {
+            while (analyzer.hasNext())
+                terms.add(analyzer.next());
+        }
+        finally
+        {
+            analyzer.end();
+        }
+
+        for (ByteBuffer required : allTerms)
+        {
+            boolean found = false;
+            for (ByteBuffer term : terms)
+            {
+                if (validator.compare(term, required) == 0)
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found)
+                return false;
+        }
+        return true;
+    }
+
     public Op getOp()
     {
         return operation;
@@ -545,14 +602,15 @@ public class Expression
 
     public String toString(boolean redact)
     {
-        return String.format("Expression{name: %s, op: %s, lower: (%s, %s), upper: (%s, %s), exclusions: %s}",
+        return String.format("Expression{name: %s, op: %s, lower: (%s, %s), upper: (%s, %s), exclusions: %s%s}",
                              context.getColumnName(),
                              operation,
                              lower == null ? "null" : validator.getString(lower.value.raw, redact),
                              lower != null && lower.inclusive,
                              upper == null ? "null" : validator.getString(upper.value.raw, redact),
                              upper != null && upper.inclusive,
-                             Iterators.toString(Iterators.transform(exclusions.iterator(), x -> validator.getString(x, redact))));
+                             Iterators.toString(Iterators.transform(exclusions.iterator(), x -> validator.getString(x, redact))),
+                             allTerms == null ? "" : ", all terms: " + Iterators.toString(Iterators.transform(allTerms.iterator(), x -> validator.getString(x, redact))));
     }
 
     public String getIndexName()
@@ -566,7 +624,8 @@ public class Expression
                                     .append(operation)
                                     .append(validator)
                                     .append(lower).append(upper)
-                                    .append(exclusions).build();
+                                    .append(exclusions)
+                                    .append(allTerms).build();
     }
 
     public boolean equals(Object other)
@@ -584,7 +643,8 @@ public class Expression
                 && operation == o.operation
                 && Objects.equals(lower, o.lower)
                 && Objects.equals(upper, o.upper)
-                && exclusions.equals(o.exclusions);
+                && exclusions.equals(o.exclusions)
+                && Objects.equals(allTerms, o.allTerms);
     }
 
     /**
@@ -592,6 +652,9 @@ public class Expression
      */
     public Expression negated()
     {
+        // The negation of an expression of several terms isn't an index search: the rows the index matches for one
+        // term are a superset of those with an element holding all the terms, so subtracting them would lose rows
+        assert allTerms == null : "Can't negate an expression of several terms: " + this;
         Expression result = new Expression(context);
         result.lower = lower;
         result.upper = upper;

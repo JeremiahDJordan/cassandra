@@ -1258,7 +1258,7 @@ public class IndexHintsTest extends CQLTester
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Johann' WITH included_indexes={analyzed}", row1, row2).selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Richard' WITH included_indexes={analyzed}", row2).selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Debussy' WITH included_indexes={analyzed}").selects(analyzed).doesntWarn();
-        assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss' WITH included_indexes={analyzed}").selects(analyzed).doesntWarn();
+        assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss' WITH included_indexes={analyzed}", row1).selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Strauss' WITH included_indexes={analyzed}").selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann' WITH included_indexes={analyzed}").selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard' WITH included_indexes={analyzed}", row1).selects(analyzed).doesntWarn();
@@ -1284,7 +1284,7 @@ public class IndexHintsTest extends CQLTester
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Johann' WITH excluded_indexes={literal}").selects(legacy).warns(warning);
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Richard' WITH excluded_indexes={literal}").selects(legacy).warns(warning);
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v CONTAINS 'Debussy' WITH excluded_indexes={literal}").selects(legacy).warns(warning);
-        assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss' WITH excluded_indexes={literal}").selects(analyzed).doesntWarn();
+        assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard Strauss' WITH excluded_indexes={literal}", row1).selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Strauss' WITH excluded_indexes={literal}").selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Johann' WITH excluded_indexes={literal}").selects(analyzed).doesntWarn();
         assertThatIndexQueryPlanFor("SELECT * FROM %s WHERE v NOT CONTAINS 'Richard' WITH excluded_indexes={literal}", row1).selects(analyzed).doesntWarn();
