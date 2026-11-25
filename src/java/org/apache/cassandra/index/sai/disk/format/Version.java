@@ -32,6 +32,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.disk.apache.ApacheOnDiskFormat;
 import org.apache.cassandra.index.sai.disk.v1.V1OnDiskFormat;
@@ -47,6 +48,7 @@ import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.io.sstable.format.bti.BtiFormat;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
 import static com.google.common.base.Preconditions.checkArgument;
@@ -87,7 +89,8 @@ public class Version implements Comparable<Version>
     public static final Version GA = new Version("ga", V9OnDiskFormat.instance, (c, i, g) -> stargazerFileNameFormat(c, i, g, "ga"));
 
     /**
-     * The format Apache Cassandra 5.0 writes; nothing selects it for new components yet. Not in {@link #ALL} ("aa" parses as DSE 6.8's {@link #AA}),
+     * The format Apache Cassandra 5.0 writes, which new components take in storage_compatibility_mode CASSANDRA_5 (see
+     * {@link #forNewComponents(String)}). Not in {@link #ALL} ("aa" parses as DSE 6.8's {@link #AA}),
      * and ordered before every DataStax version, so a DataStax build of a group of components is always preferred.
      */
     public static final Version APACHE_AA = new Version("aa", ApacheOnDiskFormat.instance, ApacheOnDiskFormat::fileNameFormat, true);
@@ -151,6 +154,18 @@ public class Version implements Comparable<Version>
         if (version.isApache())
             throw new IllegalStateException("The SAI version selector selected " + version + " for keyspace " + keyspace + ", which isn't selected for new components");
         return version;
+    }
+
+    /**
+     * @param keyspace the keyspace of the sstables, assumed to belong to an existing keyspace.
+     * @return the version to write new SSTables' components in: Apache Cassandra's in storage_compatibility_mode
+     * CASSANDRA_5, otherwise the current version of the keyspace.
+     */
+    public static Version forNewComponents(String keyspace)
+    {
+        return DatabaseDescriptor.getStorageCompatibilityModeForWrites() == StorageCompatibilityMode.CASSANDRA_5
+               ? APACHE_AA
+               : current(keyspace);
     }
 
     /**

@@ -24,11 +24,14 @@ import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+import javax.annotation.Nullable;
+
 import com.google.common.base.Stopwatch;
 import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
@@ -36,6 +39,7 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.format.Version;
@@ -71,6 +75,8 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
     private final boolean componentsListedUpFront;
     // Apache Cassandra's row ids leave out rows without live data
     private final boolean skipRowsWithoutLiveData;
+    @Nullable
+    private final PrimaryKeyMap existingRowIds;
     private final long nowInSeconds = FBUtilities.nowInSeconds();
 
     private DecoratedKey currentKey;
@@ -91,7 +97,7 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                       long keyCount,
                                       TableMetrics tableMetrics) throws IOException
     {
-        this(indexDescriptor, tableMetadata, indices, indices, lifecycleNewTracker, keyCount, false, true, tableMetrics);
+        this(indexDescriptor, tableMetadata, indices, indices, lifecycleNewTracker, keyCount, false, true, null, tableMetrics);
     }
 
     /**
@@ -105,7 +111,7 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                       boolean perIndexComponentsOnly,
                                       TableMetrics tableMetrics) throws IOException
     {
-        this(indexDescriptor, tableMetadata, indices, indices, lifecycleNewTracker, keyCount, perIndexComponentsOnly, tableMetrics);
+        this(indexDescriptor, tableMetadata, indices, indices, lifecycleNewTracker, keyCount, perIndexComponentsOnly, null, tableMetrics);
     }
 
     /**
@@ -113,6 +119,8 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
      *
      * @param nonQueryableOnAbort the indexes to make non-queryable if the write is aborted because of an index error
      *                            (see {@link #abort(Throwable, boolean)}), usually all the indexes written
+     * @param existingRowIds the primary key map of the existing per-SSTable components that per-index components only
+     *                       are written for, to take the row IDs from, or null to number the rows as they come
      */
     public StorageAttachedIndexWriter(IndexDescriptor indexDescriptor,
                                       TableMetadata tableMetadata,
@@ -121,9 +129,10 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                       LifecycleNewTracker lifecycleNewTracker,
                                       long keyCount,
                                       boolean perIndexComponentsOnly,
+                                      @Nullable PrimaryKeyMap existingRowIds,
                                       TableMetrics tableMetrics) throws IOException
     {
-        this(indexDescriptor, tableMetadata, indices, nonQueryableOnAbort, lifecycleNewTracker, keyCount, perIndexComponentsOnly, false, tableMetrics);
+        this(indexDescriptor, tableMetadata, indices, nonQueryableOnAbort, lifecycleNewTracker, keyCount, perIndexComponentsOnly, false, existingRowIds, tableMetrics);
     }
 
     private StorageAttachedIndexWriter(IndexDescriptor indexDescriptor,
@@ -134,11 +143,14 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                        long keyCount,
                                        boolean perIndexComponentsOnly,
                                        boolean componentsListedUpFront,
+                                       @Nullable PrimaryKeyMap existingRowIds,
                                        TableMetrics tableMetrics) throws IOException
     {
+        assert existingRowIds == null || perIndexComponentsOnly;
         this.nonQueryableOnAbort = nonQueryableOnAbort;
-        // We always use the version of the existing per-sstable components, if any, or the configured current version
-        // if there are no previously existing per-sstable components.
+        this.existingRowIds = existingRowIds;
+        // The version of the existing per-sstable components, if any, or that of new components (see
+        // IndexDescriptor#versionForNewComponents).
         Version version = indexDescriptor.versionForNewComponents();
         OnDiskFormat onDiskFormat = version.onDiskFormat();
         this.skipRowsWithoutLiveData = version.isApache();
@@ -168,7 +180,7 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
 
     public long rowCount()
     {
-        return sstableRowId;
+        return existingRowIds == null ? sstableRowId : existingRowIds.count();
     }
 
     @Override
@@ -230,6 +242,9 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         if (aborted) return;
 
         if (staticRow.isEmpty())
+            return;
+        // Rows aren't indexed once they have expired, whether or not the existing components number them
+        if (existingRowIds != null && !staticRow.hasLiveData(nowInSeconds, false))
             return;
 
         try
@@ -440,14 +455,27 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
         // and ApproximateTime.nanoTime() precision is 2 milliseconds
         long now = Clock.Global.nanoTime();
         PrimaryKey primaryKey = primaryKeyFactory.create(currentKey, row.clustering());
+        long rowId = sstableRowId++;
+        if (existingRowIds != null)
+        {
+            // The rows that have expired since the existing components were written have row IDs there
+            rowId = existingRowIds.exactRowIdOrInvertedCeiling(primaryKey);
+            // a static key matches the first row of its partition, which is a regular row if the static row isn't numbered
+            if (rowId >= 0 && row.isStatic()
+                && !existingRowIds.primaryKeyFromRowId(rowId).loadDeferred().clustering().equals(Clustering.STATIC_CLUSTERING))
+                rowId = -1;
+            if (rowId < 0)
+                throw new IllegalStateException(indexDescriptor.logMessage(String.format("The per-SSTable index components of %s don't number the row %s. %s",
+                                                                                         indexDescriptor.descriptor, primaryKey,
+                                                                                         StorageAttachedIndexBuilder.REBUILD_ALL_INDEXES)));
+        }
         perSSTableWriter.nextRow(primaryKey);
-        rowMapping.add(primaryKey, sstableRowId);
+        rowMapping.add(primaryKey, rowId);
 
         for (PerIndexWriter w : perIndexWriters)
         {
-            w.addRow(primaryKey, row, sstableRowId);
+            w.addRow(primaryKey, row, rowId);
         }
-        sstableRowId++;
 
         totalTimeSpent += (Clock.Global.nanoTime() - now);
     }

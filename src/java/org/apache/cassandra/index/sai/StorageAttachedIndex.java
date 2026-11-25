@@ -89,6 +89,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.dht.OrderPreservingPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.gms.DataStaxFeatureSupport;
 import org.apache.cassandra.index.Index;
@@ -410,6 +411,8 @@ public class StorageAttachedIndex implements Index
     // rebuild_index) doesn't read it, and builds every SSTable from the data, deleting the files of the index's names
     // first.
     private volatile String cannotBuildReason = null;
+    // set for an index added to an existing table until its initial build is over (see onAddedToExistingTable)
+    private volatile boolean addedToExistingTable = false;
 
     // SSTables added without this index while it was being built, which its initial build must build before it
     // completes (see StorageAttachedIndexGroup#checkSSTableAttachedIndexesAfterAdding).
@@ -610,8 +613,8 @@ public class StorageAttachedIndex implements Index
                 StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
                 if (indexGroup != null)
                 {
-                    Version version = indexGroup.getMinVersion();
-                    if (!version.onOrAfter(Version.JVECTOR_EARLIEST))
+                    Version version = indexGroup.versionWithoutJVector();
+                    if (version != null)
                         throw new InvalidRequestException(vectorUnsupportedByExistingVersionError(version));
                 }
             }
@@ -673,6 +676,31 @@ public class StorageAttachedIndex implements Index
         return false;
     }
 
+    private static boolean isStorageAttachedIndexClass(String className)
+    {
+        // Subclasses run StorageAttachedIndex#onAddedToExistingTable too. Not finding the class only means deleting
+        // the files of the dropped index.
+        try
+        {
+            FBUtilities.classForNameWithoutInitialization(className, "Index", StorageAttachedIndex.class);
+            return true;
+        }
+        catch (ConfigurationException | LinkageError e)
+        {
+            return false;
+        }
+    }
+
+    /**
+     * Whether the table has a storage-attached index of the provided name.
+     */
+    static boolean hasStorageAttachedIndexNamed(TableMetadata metadata, String name)
+    {
+        return metadata.indexes.get(name)
+                               .map(index -> isStorageAttachedIndexClass(index.getIndexClassName()))
+                               .orElse(false);
+    }
+
     /**
      * Discards the per-index components named after this index that are already on disk for the table's SSTables and
      * weren't built for its definition, so that it is built from the data: in particular, components written before
@@ -688,6 +716,7 @@ public class StorageAttachedIndex implements Index
     @Override
     public void onAddedToExistingTable()
     {
+        addedToExistingTable = true;
         synchronized (SAME_NAME_FILES_LOCK)
         {
             // The live SSTables, and the sources a running compaction has written out of the live set: it restores them
@@ -720,6 +749,10 @@ public class StorageAttachedIndex implements Index
             indexContext.setUsesApacheComponents(false);
             if (!StorageAttachedIndexGroup.discardApacheIndexComponents(baseCfs, indexContext.getIndexName(), sstables, filesOnDisk))
                 cannotBuildReason = "could not delete the Apache Cassandra components of an index of the same name";
+            // Those of an index of the same name are gone: the components in Apache Cassandra's format that flushes and
+            // builds write from now on in storage_compatibility_mode CASSANDRA_5 are this index's
+            if (cannotBuildReason == null && Version.forNewComponents(baseCfs.keyspace.getName()).isApache())
+                indexContext.setUsesApacheComponents(true);
 
             // A descriptor cached for another index of the table may still describe the deleted components, which
             // the new index would otherwise try to load
@@ -963,10 +996,11 @@ public class StorageAttachedIndex implements Index
 
         // If we are starting up and the index is already built for every live SSTable, mark it queryable right away,
         // before gossip starts, so peers never see this node UP with a non-queryable index (CASSANDRA-20732).
-        // Not for an index added to an existing table (see onAddedToExistingTable), which must build from the data: it
-        // doesn't use the components already on disk until its initial build is over, and fails that build if
-        // components of a same-name index stand in the way (see checkCanBuild).
-        if (isStarting && !decision.skipped() && cannotBuildReason == null && indexContext.usesApacheComponents())
+        // Not for an index added to an existing table (see onAddedToExistingTable) until its initial build is over, as
+        // it must build from the data: it doesn't use the components that were on disk before it, and fails its initial
+        // build if components of a same-name index stand in the way (see checkCanBuild).
+        if (isStarting && !decision.skipped() && cannotBuildReason == null
+            && indexContext.usesApacheComponents() && !addedToExistingTable)
         {
             try
             {
@@ -999,6 +1033,7 @@ public class StorageAttachedIndex implements Index
             {
                 // The components written by Apache Cassandra of the SSTables that arrive from now on are this index's.
                 indexContext.setUsesApacheComponents(true);
+                addedToExistingTable = false;
             }
         };
     }
@@ -1086,9 +1121,9 @@ public class StorageAttachedIndex implements Index
             return vectorUnsupportedByCurrentVersionError(currentVersion);
 
         // Also, any pre-existing indexes must be in a version compatible with vectors
-        Version minVersion = indexGroup.getMinVersion();
-        if (minVersion.compareTo(Version.JVECTOR_EARLIEST) < 0)
-            return vectorUnsupportedByExistingVersionError(minVersion);
+        Version withoutJVector = indexGroup.versionWithoutJVector();
+        if (withoutJVector != null)
+            return vectorUnsupportedByExistingVersionError(withoutJVector);
 
         return null;
     }

@@ -217,4 +217,9 @@ public interface OnDiskFormat
      * @return the JVector file format version that this on-disk format uses.
      */
     int jvectorFileFormatVersion();
+
+    /**
+     * @return whether this on-disk format writes vector indexes as jvector graphs, the only vector indexes written.
+     */
+    boolean supportsJVector();
 }

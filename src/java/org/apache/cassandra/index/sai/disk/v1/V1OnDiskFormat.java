@@ -408,4 +408,10 @@ public class V1OnDiskFormat implements OnDiskFormat
     {
         throw new UnsupportedOperationException("JVector is not supported in V2OnDiskFormat");
     }
+
+    @Override
+    public boolean supportsJVector()
+    {
+        return false;
+    }
 }

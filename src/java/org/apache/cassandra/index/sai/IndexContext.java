@@ -1168,7 +1168,9 @@ public class IndexContext
     /**
      * @return whether this index uses the components that Apache Cassandra wrote for an index of its name on an
      * SSTable (see {@link IndexDescriptor}): not before the initial build of an index added to an existing table is
-     * over, as those components may belong to a dropped index of the same name; the initial build replaces them.
+     * over, as those components may belong to a dropped index of the same name; the initial build replaces them. In
+     * storage_compatibility_mode CASSANDRA_5, from when the components of a same-name index have been discarded, as
+     * the components in that format are then this index's.
      */
     public boolean usesApacheComponents()
     {

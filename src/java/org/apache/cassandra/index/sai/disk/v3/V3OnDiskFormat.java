@@ -122,4 +122,10 @@ public class V3OnDiskFormat extends V2OnDiskFormat
     {
         return JVECTOR_VERSION;
     }
+
+    @Override
+    public boolean supportsJVector()
+    {
+        return true;
+    }
 }

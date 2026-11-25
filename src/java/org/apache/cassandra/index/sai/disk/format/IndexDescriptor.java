@@ -109,7 +109,7 @@ public class IndexDescriptor
     private IndexDescriptor(Descriptor descriptor, ClusteringComparator comparator)
     {
         this.descriptor = descriptor;
-        this.emptyGroupMarker = ComponentsBuildId.of(Version.current(descriptor.ksname), -1);
+        this.emptyGroupMarker = ComponentsBuildId.of(Version.forNewComponents(descriptor.ksname), -1);
         this.comparator = comparator;
         this.hasClustering = comparator.size() > 0;
     }
@@ -128,7 +128,12 @@ public class IndexDescriptor
     public IndexComponents.ForWrite perIndexComponentsOfBuild(IndexContext context, ComponentsBuildId buildId, Set<IndexComponentType> types)
     {
         IndexComponentsImpl components = new IndexComponentsImpl(context, buildId);
-        types.forEach(components::addIfExists);
+        for (IndexComponentType type : types)
+        {
+            // Apache Cassandra's format has no files of some types
+            if (!buildId.version().isApache() || ApacheOnDiskFormat.hasFileName(type))
+                components.addIfExists(type);
+        }
         components.sealed = true;
         return components;
     }
@@ -358,15 +363,15 @@ public class IndexDescriptor
 
     /**
      * Returns the version that should be used for new components for the sstable of this descriptor.
-     * It is the version of the per-sstable components, which is either the version of the existing per-sstable
-     * components if any, or the current version if there is no existing components or if they were written by
-     * Apache Cassandra (nothing selects its format for new components yet).
+     * It is the version of the existing per-sstable components if any, or {@link Version#forNewComponents(String)}
+     * if there are none, or if they were written in Apache Cassandra's format outside storage_compatibility_mode
+     * CASSANDRA_5.
      */
     public Version versionForNewComponents()
     {
         Version version = perSSTableComponents().version();
-        // New components for an sstable with Apache Cassandra's replace them, in the current version.
-        return version.isApache() ? Version.current(descriptor.ksname) : version;
+        // Outside the mode, new components for an sstable with Apache Cassandra's replace them, in the current version.
+        return version.isApache() ? Version.forNewComponents(descriptor.ksname) : version;
     }
 
     public IndexComponents.ForRead perSSTableComponents()
@@ -734,6 +739,10 @@ public class IndexDescriptor
         @Override
         public void forceDeleteAllComponents()
         {
+            // the completion marker first: the group is incomplete as soon as any of its files is gone
+            IndexComponentImpl marker = components.remove(completionMarkerComponent());
+            if (marker != null)
+                marker.delete();
             components.values().forEach(IndexComponentImpl::delete);
             components.clear();
         }

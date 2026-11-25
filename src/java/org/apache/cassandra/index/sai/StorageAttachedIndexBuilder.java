@@ -79,6 +79,7 @@ import org.apache.cassandra.io.sstable.KeyReader;
 import org.apache.cassandra.io.sstable.SSTableIdentityIterator;
 import org.apache.cassandra.io.sstable.SSTableWatcher;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.schema.DroppedColumn;
 import org.apache.cassandra.schema.TableMetadata;
@@ -136,7 +137,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         private int users;
     }
 
-    private static final String REBUILD_ALL_INDEXES = "Rebuild all the SAI indexes of the table in one command, " +
+    public static final String REBUILD_ALL_INDEXES = "Rebuild all the SAI indexes of the table in one command, " +
                                                       "nodetool rebuild_index <keyspace> <table> <index> [<index> ...], " +
                                                       "which rewrites those components.";
 
@@ -496,6 +497,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         Map<StorageAttachedIndex, PerIndexFilesOwner> owners = new HashMap<>();
         registered = false;
         boolean succeeded = false;
+        PrimaryKeyMap.Factory existingRowIdsFactory = null;
+        PrimaryKeyMap existingRowIds = null;
 
         try
         {
@@ -515,6 +518,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 boolean unreadableComponents;
                 boolean orphanedComponents;
                 boolean numberingMayChange;
+                boolean numbersLiveRows;
                 long existingRows;
                 IndexComponents.ForRead validatedPerSSTable = null;
                 // the complete per-index components of the other indexes before we try to take the per-SSTable latch
@@ -581,7 +585,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                     // Rewriting the existing per-SSTable components may also change the numbering if the build can't read
                     // some of the rows they number: rows whose only cells belong to a column dropped since they were
                     // written.
-                    numberingMayChange = existingComponents && (numberEmptyStaticRows || unreadableComponents || mayHaveDroppedColumnCells(sstable));
+                    // Apache Cassandra's components number the rows that were live when they were written, some of which
+                    // may have expired since.
+                    numbersLiveRows = existingComponents && perSSTable.version().isApache();
+                    numberingMayChange = existingComponents && (numberEmptyStaticRows || unreadableComponents || numbersLiveRows
+                                                                || mayHaveDroppedColumnCells(sstable));
                     // A full rebuild that finds no complete per-SSTable components (a failed rebuild deleted them, or they
                     // were invalidated) can't tell how they numbered the rows. The other indexes that still have components
                     // on the SSTable were built on that numbering, so they are rebuilt too.
@@ -659,7 +667,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                     String reason = orphanedComponents ? "the components they replace are missing"
                                                        : unreadableComponents ? "the components they replace can't be read"
                                                        : numberEmptyStaticRows ? "they number the empty static rows of partitions"
-                                                                               : "a column was dropped since it was written";
+                                                       : numbersLiveRows ? "they number the rows that were live when they were written"
+                                                                         : "a column was dropped since it was written";
                     numberEmptyStaticRows = false;
                     indexes = new HashSet<>(indexes);
                     indexes.addAll(group.getIndexes());
@@ -722,9 +731,19 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 // add it (a stream or an import), and the indexes, which don't serve it, are fine. That includes the
                 // failures the writer handles itself (adding a row, completing a segment), which abort it as failures
                 // of the index.
+                // Apache Cassandra's per-SSTable components number the rows that were live when they were written: the
+                // indexes built on them take their row IDs from them, as some of those rows may have expired since
+                IndexComponents.ForRead existingPerSSTable = indexDescriptor.perSSTableComponents();
+                if (perIndexComponentsOnly && existingPerSSTable.isComplete() && existingPerSSTable.version().isApache())
+                {
+                    OnDiskFormat format = existingPerSSTable.onDiskFormat();
+                    existingRowIdsFactory = format.newPrimaryKeyMapFactory(existingPerSSTable, format.newPrimaryKeyFactory(metadata.comparator), sstable);
+                    existingRowIds = existingRowIdsFactory.newPerSSTablePrimaryKeyMap();
+                }
                 indexWriter = new StorageAttachedIndexWriter(indexDescriptor, metadata, indexes,
                                                              updateViews ? nonQueryableOnAbort : Collections.emptySet(),
-                                                             txn, keyCount, perIndexComponentsOnly, group.table().metric);
+                                                             txn, keyCount, perIndexComponentsOnly, existingRowIds,
+                                                             group.table().metric);
 
                 indexWriter.begin();
                 indexPartitions(sstable, dataFile, indexDescriptor, indexWriter, numberEmptyStaticRows);
@@ -828,6 +847,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             // they were, so that their indexes keep using them, and the next build replaces them all again.
             if (replacingApache != null && !succeeded && !registered)
                 restoreApacheComponents(sstable, indexDescriptor, indexes);
+            FileUtils.closeQuietly(existingRowIds);
+            FileUtils.closeQuietly(existingRowIdsFactory);
             ref.release();
             // release current lock in case of error
             if (perSSTableFileLock != null)
@@ -1221,9 +1242,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                                                       @Nullable CountDownLatch rewritingCorrupt)
     {
         boolean corrupt = rewritingCorrupt != null;
-        // if per-table files are incomplete or checksum failed during full rebuild, or if they were written by Apache
-        // Cassandra (we never write new components in that format, see IndexDescriptor#versionForNewComponents), or if
-        // they failed checksum validation during a partial build (see hasCorruptPerSSTableComponents).
+        // if per-table files are incomplete or checksum failed during full rebuild, or if they are Apache Cassandra's,
+        // which a build replaces outside storage_compatibility_mode CASSANDRA_5 (see hasApacheComponents), or if they
+        // failed checksum validation during a partial build (see hasCorruptPerSSTableComponents).
         if (!indexDescriptor.perSSTableComponents().isComplete() || isFullRebuild
             || hasApacheComponents(indexDescriptor.perSSTableComponents()) || corrupt)
         {
@@ -1294,13 +1315,14 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
         IndexComponents.ForRead perSSTable = indexDescriptor.perSSTableComponents();
         // The builder that gets to rewrite them says so; the others wait for it, and may look again meanwhile.
-        return perSSTable.isComplete() && !perSSTable.version().isApache() && !perSSTable.isValid(true);
+        return perSSTable.isComplete() && (!perSSTable.version().isApache() || writesApacheFormat(perSSTable)) && !perSSTable.isValid(true);
     }
 
     /**
-     * @return the components named after the index that the TOC lists, but not Apache Cassandra's: those of previous
-     * builds of the name, possibly of component types the new build doesn't write (e.g. of a dropped index of the same
-     * name on a column of another type)
+     * @return the components named after the index that the TOC lists, but not Apache Cassandra's outside
+     * storage_compatibility_mode CASSANDRA_5 (where builds write their names): those of previous builds of the name,
+     * possibly of component types the new build doesn't write (e.g. of a dropped index of the same name on a column of
+     * another type)
      */
     private static Set<Component> listedComponentsOfName(SSTableReader sstable, IndexContext context)
     {
@@ -1308,7 +1330,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         for (Component component : sstable.components())
         {
             Optional<Version.ParsedFileName> parsed = StorageAttachedIndex.tryParseFileName(component.name, context);
-            if (parsed.isPresent() && context.getIndexName().equals(parsed.get().indexName) && !parsed.get().buildId.version().isApache())
+            if (parsed.isPresent() && context.getIndexName().equals(parsed.get().indexName)
+                && (!parsed.get().buildId.version().isApache() || Version.forNewComponents(sstable.getKeyspaceName()).isApache()))
                 listed.add(component);
         }
         return listed;
@@ -1323,7 +1346,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     /**
      * The new build replaces the provided listed components of the index's name (see {@link #listedComponentsOfName})
      * all. Without immutable components, their files are deleted before the build, so they are unregistered now;
-     * otherwise, once the new build has registered its own. Apache Cassandra's are left to {@link #prepareForRebuild}.
+     * otherwise, once the new build has registered its own. Outside storage_compatibility_mode CASSANDRA_5, Apache
+     * Cassandra's are left to {@link #prepareForRebuild}.
      */
     private void replaceListedComponents(SSTableReader sstable,
                                          IndexDescriptor indexDescriptor,
@@ -1353,9 +1377,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
     private static void prepareForRebuild(IndexComponents.ForRead components, Set<Component> replacedComponents)
     {
-        // Apache Cassandra's components are never overwritten (we write other file names), and they are streamable,
-        // so they stay in the TOC and on disk until the build is complete, and StorageAttachedIndexGroup#removeApacheComponents removes them.
-        if (components.version().isApache())
+        // Apache Cassandra's components are never overwritten outside storage_compatibility_mode CASSANDRA_5 (we write
+        // other file names), and they are streamable, so they stay in the TOC and on disk until the build is complete,
+        // and StorageAttachedIndexGroup#removeApacheComponents removes them. In the mode, the build writes the same
+        // names, and deletes them first, as ours.
+        if (components.version().isApache() && !writesApacheFormat(components))
             return;
 
         // The current components are "replaced" (by "other" components) if the build create different components than
@@ -1374,13 +1400,23 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             replacedComponents.addAll(components.allAsCustomComponents());
 
         if (deletesOnRebuild(components))
+        {
+            // those the build doesn't write again are left out of the TOC (see completeSSTable)
+            replacedComponents.addAll(components.allAsCustomComponents());
             components.forWrite().forceDeleteAllComponents();
+        }
     }
 
     /** Whether {@link #prepareForRebuild} deletes the files of the provided components. */
     private static boolean deletesOnRebuild(IndexComponents.ForRead components)
     {
-        return !components.version().isApache() && !components.version().useImmutableComponentFiles();
+        return (!components.version().isApache() || writesApacheFormat(components)) && !components.version().useImmutableComponentFiles();
+    }
+
+    /** Whether builds on the SSTable of the provided components write Apache Cassandra's format (see {@link Version#forNewComponents}). */
+    private static boolean writesApacheFormat(IndexComponents.ForRead components)
+    {
+        return Version.forNewComponents(components.descriptor().ksname).isApache();
     }
 
     /**
@@ -1556,9 +1592,13 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         }
     }
 
+    /**
+     * Whether the components are Apache Cassandra's, which a build replaces with ours, unless it writes Apache
+     * Cassandra's format too (see {@link Version#forNewComponents(String)}).
+     */
     private static boolean hasApacheComponents(IndexComponents.ForRead components)
     {
-        return components.isComplete() && components.version().isApache();
+        return components.isComplete() && components.version().isApache() && !writesApacheFormat(components);
     }
 
     /**

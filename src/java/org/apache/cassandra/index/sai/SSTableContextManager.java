@@ -170,7 +170,11 @@ public class SSTableContextManager
         //    from a complete set, so if it is not complete, it means the previous components have been corrupted, and
         //    we want to use the new one (a rebuild)).
         // 3. it uses "up-to-date" per-sstable components.
-        if (previousContext != null && previousContext.usedPerSSTableComponents().isComplete() && previousContext.usedPerSSTableComponents().buildId().equals(perSSTableComponents.buildId()))
+        // 4. for Apache Cassandra's components, which have no generations, it uses the same ones: a build of new
+        //    components has the same build id.
+        IndexComponents.ForRead previous = previousContext == null ? null : previousContext.usedPerSSTableComponents();
+        if (previous != null && previous.isComplete() && previous.buildId().equals(perSSTableComponents.buildId())
+            && (!perSSTableComponents.version().isApache() || previous == perSSTableComponents))
             return previousContext;
 
         // Now, if we create a new one, we should close the previous one if it exists.

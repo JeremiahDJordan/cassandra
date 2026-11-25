@@ -28,6 +28,7 @@ import org.apache.cassandra.exceptions.ConfigurationException;
 import static org.apache.cassandra.config.CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION;
 import static org.apache.cassandra.config.CassandraRelevantProperties.IMMUTABLE_SAI_COMPONENTS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.NODES_PERSISTENCE_CLASS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_READ_APACHE_FORMAT;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VERSION_SELECTOR_CLASS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_CHECKSUM_TYPE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_COMPRESSION_SELECTOR_CLASS;
@@ -99,6 +100,7 @@ public class Cassandra5ModeChecksTest
         assertRefused("-Dcassandra.sstable.compression.selector.class=com.example.Selector", new WithProperties().set(SSTABLE_COMPRESSION_SELECTOR_CLASS, "com.example.Selector"));
         assertRefused("-Dcassandra.system_distributed_replication_dc_names", new WithProperties().set(SYSTEM_DISTRIBUTED_NTS_RF_OVERRIDE_PROPERTY, "3"));
         assertRefused("-Dcassandra.sai.immutable_components=true", new WithProperties().set(IMMUTABLE_SAI_COMPONENTS, true));
+        assertRefused("-Dcassandra.sai.read_apache_format=false", new WithProperties().set(SAI_READ_APACHE_FORMAT, false));
         assertRefused("-Dcassandra.sai.version.selector.class=com.example.Selector", new WithProperties().set(SAI_VERSION_SELECTOR_CLASS, "com.example.Selector"));
         assertRefused("-Dcassandra.nodes.persistence_class=com.example.Persistence", new WithProperties().set(NODES_PERSISTENCE_CLASS, "com.example.Persistence"));
     }

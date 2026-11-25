@@ -139,7 +139,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                             : Optional.empty();
         this.groupMetrics = new IndexGroupMetrics(baseCfs.metadata(), this);
         this.contextManager = new SSTableContextManager(baseCfs.getTracker());
-        this.version = Version.current(baseCfs.keyspace.getName());
+        this.version = Version.forNewComponents(baseCfs.keyspace.getName());
 
         Tracker tracker = baseCfs.getTracker();
         tracker.subscribe(this);
@@ -729,6 +729,9 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
      */
     void removeApacheComponents(SSTableReader sstable, boolean reserved, @Nullable Tracker tracker)
     {
+        // builds that write Apache Cassandra's format replace none of its components
+        if (Version.forNewComponents(baseCfs.keyspace.getName()).isApache())
+            return;
         Set<Component> apacheComponents = apacheComponents(sstable);
         if (apacheComponents.isEmpty())
             return;
@@ -834,7 +837,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 sstable.unregisterComponents(components, cfs.getTracker());
                 logger.debug("[{}.{}.{}] Unregistered the Apache Cassandra SAI components of the dropped index from {}",
                              cfs.getKeyspaceName(), cfs.name, indexName, sstable.descriptor);
-                deleteFilesWhenNotStreamed(sstable, components);
+                deleteFilesWhenNotStreamed(sstable, indexName, components);
             }
             catch (Throwable t)
             {
@@ -927,16 +930,22 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     }
 
     /**
-     * Deletes the files of the provided (unregistered) components of the provided SSTable under its stream/rebuild
-     * reservation, now if possible, or once no stream or rebuild holds it.
+     * Deletes the files of the provided (unregistered) components of the provided dropped index of the provided SSTable
+     * under its stream/rebuild reservation, now if possible, or once no stream or rebuild holds it. Not once an index
+     * of the same name has been created: it has discarded them (see {@link StorageAttachedIndex#onAddedToExistingTable}),
+     * and in storage_compatibility_mode CASSANDRA_5 it writes its own files under the same names.
      */
-    static void deleteFilesWhenNotStreamed(SSTableReader sstable, Set<Component> components)
+    static void deleteFilesWhenNotStreamed(SSTableReader sstable, String indexName, Set<Component> components)
     {
         if (sstable.streamRebuildState().tryBeginRebuild())
         {
             try
             {
-                deleteFiles(sstable, components);
+                synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+                {
+                    if (!StorageAttachedIndex.hasStorageAttachedIndexNamed(sstable.metadata(), indexName))
+                        deleteFiles(sstable, components);
+                }
             }
             finally
             {
@@ -946,7 +955,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         else
         {
             sstable.streamRebuildState().runWhenNormal(() -> ScheduledExecutors.optionalTasks.execute(
-                () -> deleteFilesWhenNotStreamed(sstable, components)));
+                () -> deleteFilesWhenNotStreamed(sstable, indexName, components)));
         }
     }
 
@@ -1202,8 +1211,8 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
 
     /**
      * @return the minimum version that new per-index components of this group would be written in on its sstables
-     * (that of their per-sstable components, see {@link IndexDescriptor#versionForNewComponents()}), or the current
-     * version if there are no sstable indexes.
+     * (see {@link IndexDescriptor#versionForNewComponents()}), or {@link Version#forNewComponents(String)} if there are
+     * no sstable indexes.
      */
     public Version getMinVersion()
     {
@@ -1217,12 +1226,34 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             IndexDescriptor indexDescriptor = indexGroup.descriptorFor(sstable);
             assert indexDescriptor != null;
 
-            // The version new indexes would be written in, which isn't that of the per-sstable components if those
-            // were written by Apache Cassandra (whose format we don't write).
             Version version = indexDescriptor.versionForNewComponents();
             if (minVersion == null || version.compareTo(minVersion) < 0)
                 minVersion = version;
         }
-        return minVersion == null ? Version.current(baseCfs.metadata.keyspace) : minVersion;
+        return minVersion == null ? Version.forNewComponents(baseCfs.metadata.keyspace) : minVersion;
+    }
+
+    /**
+     * @return a version that new per-index components of this group would be written in on one of its sstables (see
+     * {@link IndexDescriptor#versionForNewComponents()}) and that doesn't write vector indexes as jvector graphs, or
+     * null if there is none
+     */
+    @Nullable
+    public Version versionWithoutJVector()
+    {
+        StorageAttachedIndexGroup indexGroup = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
+        assert indexGroup != null;
+        // The canonical set: the sources of a running compaction, which have their components, rather than its
+        // results opened early, which may not have them yet.
+        for (SSTableReader sstable : baseCfs.getSSTables(SSTableSet.CANONICAL))
+        {
+            IndexDescriptor indexDescriptor = indexGroup.descriptorFor(sstable);
+            assert indexDescriptor != null;
+
+            Version version = indexDescriptor.versionForNewComponents();
+            if (!version.onDiskFormat().supportsJVector())
+                return version;
+        }
+        return null;
     }
 }

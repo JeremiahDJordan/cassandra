@@ -175,6 +175,14 @@ public class ApacheOnDiskFormat extends V9OnDiskFormat
     }
 
     /**
+     * @return whether Apache Cassandra's format has files of the provided component type.
+     */
+    public static boolean hasFileName(IndexComponentType indexComponentType)
+    {
+        return FILE_NAMES.containsKey(indexComponentType);
+    }
+
+    /**
      * @return the component type of the provided Apache component file name part ({@code PartitionKeyBlocks}, ...), or
      * {@code null} if it isn't one.
      */
