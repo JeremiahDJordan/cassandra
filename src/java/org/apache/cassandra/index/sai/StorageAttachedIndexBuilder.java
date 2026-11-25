@@ -141,8 +141,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                                                       "which rewrites those components.";
 
     /**
-     * Number the empty static row of every partition without a static row, as the builds of releases before
-     * "Skip empty static rows when building SAI indexes" did, to write per-SSTable components like theirs in tests.
+     * Number the empty static row of every partition without a static row, as the builds of earlier releases did, to
+     * write per-SSTable components like theirs in tests.
      */
     @VisibleForTesting
     public static volatile boolean NUMBER_EMPTY_STATIC_ROWS = false;
@@ -648,7 +648,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
                 // every index of the SSTable is rebuilt (Apache Cassandra's or corrupt per-SSTable components, see above)
                 boolean widened = replacingApache != null || rewritingCorrupt != null;
-                if (!widened && numberingMayChange && !perIndexComponentsOnly && !NUMBER_EMPTY_STATIC_ROWS)
+                if (!widened && isFullRebuild && numberingMayChange && !perIndexComponentsOnly && !NUMBER_EMPTY_STATIC_ROWS)
                 {
                     // We rewrite per-SSTable components (a full rebuild) whose numbering ours may not match,
                     // so the row IDs of every other index of the SSTable could point to the wrong rows: rebuild all of
@@ -672,6 +672,14 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                                     sstable.descriptor, reason, others);
                         SSTableWatcher.instance.onIndexBuild(sstable, others);
                     }
+                }
+                else if (!widened && !perIndexComponentsOnly && !isFullRebuild && !NUMBER_EMPTY_STATIC_ROWS)
+                {
+                    // A partial build that writes the per-SSTable components: they were lost, maybe after we looked at
+                    // them. We write them with the usual numbering, whatever the lost ones did, as the builds that wait
+                    // for us do, and invalidate the components of the other indexes (below).
+                    numberEmptyStaticRows = false;
+                    existingRows = -1;
                 }
                 else if (numberEmptyStaticRows && !NUMBER_EMPTY_STATIC_ROWS)
                 {
@@ -968,10 +976,10 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             }
             return lock;
         }
-        catch (InterruptedException | CompactionInterruptedException e)
+        catch (Throwable t)
         {
             releaseBuildLock(sstable);
-            throw e;
+            throw t;
         }
     }
 
@@ -1033,12 +1041,12 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
     }
 
     /**
-     * @return whether an index of the table that isn't in the given ones has components for the sstable
+     * @return whether an index of the table that isn't in the given ones has complete components for the sstable
      */
     private boolean hasComponentsOfOtherIndexes(IndexDescriptor indexDescriptor, Set<StorageAttachedIndex> indexes)
     {
         for (StorageAttachedIndex index : group.getIndexes())
-            if (!indexes.contains(index) && !indexDescriptor.perIndexComponents(index.getIndexContext()).isEmpty())
+            if (!indexes.contains(index) && indexDescriptor.perIndexComponents(index.getIndexContext()).isComplete())
                 return true;
         return false;
     }

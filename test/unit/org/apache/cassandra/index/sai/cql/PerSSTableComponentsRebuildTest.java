@@ -155,45 +155,82 @@ public class PerSSTableComponentsRebuildTest extends SAITester
     public void testIndexesLeftByTheFullRebuildSafetyNet() throws Throwable
     {
         IMMUTABLE_SAI_COMPONENTS.setBoolean(false);
-        for (Version version : new Version[]{ Version.DC, Version.LATEST })
+        try
         {
-            SAIUtil.setCurrentVersion(version);
-            createTable("CREATE TABLE %s (pk int, ck int, st int static, v int, w int, d int, PRIMARY KEY (pk, ck))");
-            disableCompaction();
-            String v = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
-            String w = createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
-            for (int pk = 0; pk < 12; pk++)
-            {
-                execute("INSERT INTO %s (pk, ck, v, w) VALUES (?, 0, ?, ?)", pk, pk * 10, pk);
-                execute("UPDATE %s SET d = 1 WHERE pk = ? AND ck = 1", pk);
-                execute("INSERT INTO %s (pk, ck, v, w) VALUES (?, 2, ?, ?)", pk, pk * 10 + 2, pk);
-            }
-            flush();
-            schemaChange(String.format("ALTER TABLE %s.%s DROP d", KEYSPACE, currentTable()));
-
-            ActionBuilder returnFalse = ActionBuilder.newActionBuilder();
-            returnFalse.actions().doReturn("false");
-            Injections.inject(Injections.newCustom("silence_dropped_column_trigger_" + UUID.randomUUID())
-                                        .add(InvokePointBuilder.newInvokePoint()
-                                                               .onClass(StorageAttachedIndexBuilder.class)
-                                                               .onMethod("mayHaveDroppedColumnCells")
-                                                               .atEntry())
-                                        .add(returnFalse)
-                                        .build());
-            assertThatThrownBy(() -> rebuildIndexes(v)).hasStackTraceContaining("but the per-SSTable index components this build replaces had");
-            waitForIndexBuilds(KEYSPACE, v);
-            assertFalse("w is on per-index components whose per-SSTable components are gone", isIndexQueryable(KEYSPACE, w));
-
-            // the obvious retry, then a restart, which builds w again
-            rebuildIndexes(v);
-            Injections.deleteAll();
-            simulateNodeRestart();
-            for (int pk = 0; pk < 12; pk++)
-            {
-                assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE w = ?", pk), row(pk, 0), row(pk, 2));
-                assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE v = ?", pk * 10 + 2), row(pk, 2));
-            }
+            for (Version version : new Version[]{ Version.DC, Version.LATEST })
+                checkIndexesLeftByTheFullRebuildSafetyNet(version);
         }
+        finally
+        {
+            SAIUtil.resetCurrentVersion();
+        }
+    }
+
+    private void checkIndexesLeftByTheFullRebuildSafetyNet(Version version) throws Throwable
+    {
+        SAIUtil.setCurrentVersion(version);
+        createTable("CREATE TABLE %s (pk int, ck int, st int static, v int, w int, d int, PRIMARY KEY (pk, ck))");
+        disableCompaction();
+        String v = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        String w = createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
+        for (int pk = 0; pk < 12; pk++)
+        {
+            execute("INSERT INTO %s (pk, ck, v, w) VALUES (?, 0, ?, ?)", pk, pk * 10, pk);
+            execute("UPDATE %s SET d = 1 WHERE pk = ? AND ck = 1", pk);
+            execute("INSERT INTO %s (pk, ck, v, w) VALUES (?, 2, ?, ?)", pk, pk * 10 + 2, pk);
+        }
+        flush();
+        schemaChange(String.format("ALTER TABLE %s.%s DROP d", KEYSPACE, currentTable()));
+
+        ActionBuilder returnFalse = ActionBuilder.newActionBuilder();
+        returnFalse.actions().doReturn("false");
+        Injections.inject(Injections.newCustom("silence_dropped_column_trigger_" + UUID.randomUUID())
+                                    .add(InvokePointBuilder.newInvokePoint()
+                                                           .onClass(StorageAttachedIndexBuilder.class)
+                                                           .onMethod("mayHaveDroppedColumnCells")
+                                                           .atEntry())
+                                    .add(returnFalse)
+                                    .build());
+        assertThatThrownBy(() -> rebuildIndexes(v)).hasStackTraceContaining("but the per-SSTable index components this build replaces had");
+        waitForIndexBuilds(KEYSPACE, v);
+        assertFalse("w is on per-index components whose per-SSTable components are gone", isIndexQueryable(KEYSPACE, w));
+
+        // the obvious retry, then a restart, which builds w again
+        rebuildIndexes(v);
+        Injections.deleteAll();
+        simulateNodeRestart();
+        for (int pk = 0; pk < 12; pk++)
+        {
+            assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE w = ?", pk), row(pk, 0), row(pk, 2));
+            assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE v = ?", pk * 10 + 2), row(pk, 2));
+        }
+    }
+
+    /**
+     * A full rebuild of v that finds the per-SSTable components missing, while no other index has complete components
+     * on the SSTable, rebuilds v alone: w, which has none there, wasn't built on the lost ones.
+     */
+    @Test
+    public void testFullRebuildOfMissingComponentsLeavesIndexesWithoutComponents() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, w int, PRIMARY KEY (pk, ck))");
+        disableCompaction();
+        String v = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        String w = createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
+        for (int pk = 0; pk < 10; pk++)
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, v, w) VALUES (?, ?, ?, ?)", pk, ck, pk * 10 + ck, pk);
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+        group.descriptorFor(sstable).perSSTableComponents().invalidate(sstable, cfs.getTracker());
+        group.descriptorFor(sstable).perIndexComponents(getIndexContext(w)).invalidate(sstable, cfs.getTracker());
+
+        rebuildIndexes(v);
+        assertFalse(group.descriptorFor(sstable).perIndexComponents(getIndexContext(w)).isComplete());
+        for (int pk = 0; pk < 10; pk++)
+            assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE v = ?", pk * 10 + 1), row(pk, 1));
     }
 
     /**
@@ -234,7 +271,6 @@ public class PerSSTableComponentsRebuildTest extends SAITester
     @Test
     public void testMissingSharedComponentsAfterReopeningSSTable() throws Throwable
     {
-        Version previous = SAIUtil.currentVersion();
         String minImmutableVersion = IMMUTABLE_SAI_COMPONENTS_MIN_VERSION.getString();
         IMMUTABLE_SAI_COMPONENTS.setBoolean(true);
         IMMUTABLE_SAI_COMPONENTS_MIN_VERSION.setString("ca");
@@ -274,7 +310,7 @@ public class PerSSTableComponentsRebuildTest extends SAITester
         }
         finally
         {
-            SAIUtil.setCurrentVersion(previous);
+            SAIUtil.resetCurrentVersion();
             IMMUTABLE_SAI_COMPONENTS_MIN_VERSION.setString(minImmutableVersion);
         }
     }
@@ -446,14 +482,29 @@ public class PerSSTableComponentsRebuildTest extends SAITester
                                                            .onMethod("numbersEmptyStaticRows")
                                                            .atEntry())
                                     .build());
+        Injections.Counter locking = Injections.newCounter("locking_" + UUID.randomUUID())
+                                               .add(InvokePointBuilder.newInvokePoint()
+                                                                      .onClass(StorageAttachedIndexBuilder.class)
+                                                                      .onMethod("lockForBuild")
+                                                                      .atEntry())
+                                               .build();
+        Injections.Counter locked = Injections.newCounter("locked_" + UUID.randomUUID())
+                                              .add(InvokePointBuilder.newInvokePoint()
+                                                                     .onClass(StorageAttachedIndexBuilder.class)
+                                                                     .onMethod("lockForBuild")
+                                                                     .atExit())
+                                              .build();
+        Injections.inject(locking, locked);
         String keyspace = KEYSPACE;
         String table = currentTable();
         CompletableFuture<Void> rebuild = CompletableFuture.runAsync(() -> ColumnFamilyStore.rebuildSecondaryIndex(keyspace, table, v));
-        Thread.sleep(2000);
+        waitForAssert(() -> assertEquals(1, locked.get()));
 
         // CREATE INDEX w waits for the lock
         String w = createIndexAsync("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
-        Thread.sleep(2000);
+        waitForAssert(() -> assertEquals(2, locking.get()));
+        Thread.sleep(1000);
+        assertEquals(1, locked.get());
 
         long stop = System.nanoTime();
         CompactionManager.instance.stopCompaction("INDEX_BUILD");
@@ -462,14 +513,8 @@ public class PerSSTableComponentsRebuildTest extends SAITester
         assertTrue("The build of w stopped after " + waitedMillis + " ms, with the lock still held", waitedMillis < pauseMillis / 2);
         assertFalse(isIndexQueryable(KEYSPACE, w));
 
-        try
-        {
-            rebuild.get(2, TimeUnit.MINUTES);
-        }
-        catch (Throwable stopped)
-        {
-            // the rebuild of v was stopped too, once its pause was over
-        }
+        // the rebuild of v is stopped too, once its pause is over
+        assertThatThrownBy(() -> rebuild.get(2, TimeUnit.MINUTES)).hasStackTraceContaining("Compaction interrupted");
         Injections.deleteAll();
 
         // both indexes can be built again

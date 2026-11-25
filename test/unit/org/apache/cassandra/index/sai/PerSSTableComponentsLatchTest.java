@@ -25,8 +25,11 @@ import org.junit.After;
 import org.junit.Test;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.index.sai.disk.PrimaryKeyMap;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.format.OnDiskFormat;
+import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injections;
@@ -36,6 +39,7 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -224,6 +228,112 @@ public class PerSSTableComponentsLatchTest extends SAITester
             CompletableFuture.runAsync(() -> cfs.indexManager.rebuildIndexesBlocking(Collections.singleton("v_idx")));
         rebuild.get(120, TimeUnit.SECONDS);
         assertQueries();
+    }
+
+    /**
+     * A partial build that finds per-SSTable components whose numbering may change (here a column was dropped since,
+     * that was the only data of some rows), and then writes them because they are gone once it takes the latch,
+     * rebuilds no other index: it doesn't exclude the other builds of the SSTable. It invalidates the components of the
+     * other indexes instead, and doesn't compare its row count with the lost components.
+     */
+    @Test
+    public void testPartialBuildOfComponentsLostAfterItLooksAtThemRebuildsNoOtherIndex() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int, d int)");
+        disableCompaction();
+        createIndex("CREATE CUSTOM INDEX v_idx ON %s(v) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX w_idx ON %s(w) USING 'StorageAttachedIndex'");
+        for (int k = 0; k < ROWS; k++)
+            execute("INSERT INTO %s (k, v, w) VALUES (?, ?, ?)", k, k % 10, k % 7);
+        for (int k = ROWS; k < ROWS + 10; k++)
+            execute("UPDATE %s SET d = 0 WHERE k = ?", k);
+        flush();
+        schemaChange(String.format("ALTER TABLE %s.%s DROP d", KEYSPACE, currentTable()));
+
+        buildLostPerSSTableComponents();
+        assertEquals(ROWS / 10, execute("SELECT k FROM %s WHERE v = 3").size());
+    }
+
+    /**
+     * The same with per-SSTable components that number the empty static rows, as the builds of earlier releases did:
+     * the partial build writes them with the usual numbering, as the builds that wait for it do.
+     */
+    @Test
+    public void testPartialBuildOfLostComponentsOfAnEarlierReleaseUsesTheUsualNumbering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, st int static, v int, w int, PRIMARY KEY (pk, ck))");
+        disableCompaction();
+        for (int pk = 0; pk < 20; pk++)
+        {
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, v, w) VALUES (?, ?, ?, ?)", pk, ck, pk * 10 + ck, pk);
+            // most partitions have no static row
+            if (pk % 4 == 0)
+                execute("INSERT INTO %s (pk, st) VALUES (?, ?)", pk, pk);
+        }
+        flush();
+        StorageAttachedIndexBuilder.NUMBER_EMPTY_STATIC_ROWS = true;
+        try
+        {
+            createIndex("CREATE CUSTOM INDEX v_idx ON %s(v) USING 'StorageAttachedIndex'");
+            createIndex("CREATE CUSTOM INDEX w_idx ON %s(w) USING 'StorageAttachedIndex'");
+        }
+        finally
+        {
+            StorageAttachedIndexBuilder.NUMBER_EMPTY_STATIC_ROWS = false;
+        }
+
+        SSTableReader sstable = buildLostPerSSTableComponents();
+        IndexComponents.ForRead perSSTable = StorageAttachedIndexGroup.getIndexGroup(getCurrentColumnFamilyStore())
+                                                                      .descriptorFor(sstable)
+                                                                      .perSSTableComponents();
+        OnDiskFormat format = perSSTable.onDiskFormat();
+        PrimaryKey.Factory keyFactory = format.newPrimaryKeyFactory(sstable.metadata().comparator);
+        try (PrimaryKeyMap.Factory factory = format.newPrimaryKeyMapFactory(perSSTable, keyFactory, sstable))
+        {
+            // 60 rows and 5 static rows, without the 15 empty static rows
+            assertEquals(65, factory.count());
+        }
+        for (int pk = 0; pk < 20; pk++)
+            assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE v = ?", pk * 10 + 1), row(pk, 1));
+    }
+
+    /**
+     * Holds a partial build of v_idx as it is about to take the per-SSTable latch, invalidates the per-SSTable
+     * components meanwhile, and checks that the build succeeds and invalidates the components of w_idx.
+     */
+    private SSTableReader buildLostPerSSTableComponents() throws Throwable
+    {
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+        SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
+        IndexContext w = ((StorageAttachedIndex) cfs.indexManager.getIndexByName("w_idx")).getIndexContext();
+
+        arrivals.set(0);
+        holding = true;
+        Injections.inject(Injections.newCustom("hold_before_latch_" + System.nanoTime())
+                                    .add(InvokePointBuilder.newInvokePoint()
+                                                           .onClass(StorageAttachedIndexBuilder.class)
+                                                           .onMethod("shouldWritePerSSTableFiles")
+                                                           .atEntry())
+                                    .add(ActionBuilder.newActionBuilder()
+                                                      .actions()
+                                                      .doAction(Expression.expr(PerSSTableComponentsLatchTest.class.getName())
+                                                                          .method("holdFirstBuilder")
+                                                                          .args()))
+                                    .build());
+
+        CompletableFuture<Throwable> buildV =
+            CompletableFuture.supplyAsync(() -> partialBuild(group, sstable, "v_idx"));
+        waitForAssert(() -> assertThat(arrivals.get()).isEqualTo(1), 120, TimeUnit.SECONDS);
+        group.descriptorFor(sstable).perSSTableComponents().invalidate(sstable, cfs.getTracker());
+        holding = false;
+        assertThat(buildV.get(120, TimeUnit.SECONDS)).isNull();
+        Injections.deleteAll();
+
+        assertFalse(group.descriptorFor(sstable).perIndexComponents(w).isComplete());
+        assertFalse(isIndexQueryable(KEYSPACE, "w_idx"));
+        return sstable;
     }
 
     private void assertQueries()
