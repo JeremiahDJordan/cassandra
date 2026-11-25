@@ -445,6 +445,12 @@ public class SSTableCursorMerger extends Reducer<SSTableCursor, SSTableCursor> i
                     return a.column().compareTo(b.column());
                 case ROW:
                 case RANGE_TOMBSTONE:
+                    // The clustering comparator puts a bound with an empty prefix, which opens a deletion at the start
+                    // of the partition, before the static row, but the static row comes first in a partition.
+                    boolean aStatic = a.clusteringKey().kind() == ClusteringPrefix.Kind.STATIC_CLUSTERING;
+                    boolean bStatic = b.clusteringKey().kind() == ClusteringPrefix.Kind.STATIC_CLUSTERING;
+                    if (aStatic || bStatic)
+                        return Boolean.compare(bStatic, aStatic);
                     return clusteringComparator.compare(a.clusteringKey(), b.clusteringKey());
                 case PARTITION:
                     return a.partitionKey().compareTo(b.partitionKey());
