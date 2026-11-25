@@ -204,7 +204,10 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
 
     private void addTerm(ByteBuffer term, PrimaryKey key, long sstableRowId) throws IOException
     {
-        if (!index.validateTermSize(key.partitionKey(), term, false, null))
+        // The terms of an analyzed value are checked once analyzed, as the memtable index does: they can be smaller
+        // or larger than the value.
+        boolean analyzed = analyzer != null && index.termType().isLiteral();
+        if (!analyzed && !index.validateTermSize(key.partitionKey(), term, false, null))
             return;
 
         if (currentBuilder == null)
@@ -220,7 +223,7 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
         // Some types support empty byte buffers:
         if (term.remaining() == 0 && index.termType().skipsEmptyValue()) return;
 
-        if (analyzer == null || !index.termType().isLiteral())
+        if (!analyzed)
         {
             limiter.increment(currentBuilder.add(term, key, sstableRowId));
         }
@@ -232,7 +235,8 @@ public class SSTableIndexWriter implements PerColumnIndexWriter
                 while (analyzer.hasNext())
                 {
                     ByteBuffer tokenTerm = analyzer.next();
-                    limiter.increment(currentBuilder.add(tokenTerm, key, sstableRowId));
+                    if (index.validateTermSize(key.partitionKey(), tokenTerm, false, null))
+                        limiter.increment(currentBuilder.add(tokenTerm, key, sstableRowId));
                 }
             }
             finally
