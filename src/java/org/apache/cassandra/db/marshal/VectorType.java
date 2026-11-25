@@ -207,15 +207,16 @@ public final class VectorType<T> extends MultiElementType<List<T>>
         if (buffers == null)
             return null;
 
-        for (V buffer : buffers)
+        for (int i = 0; i < buffers.size(); i++)
         {
+            V buffer = buffers.get(i);
             if (buffer == null || elementType.isNull(buffer, valueAccessor))
                 throw new MarshalException("null is not supported inside vectors");
 
             if (buffer == unsetValue)
                 throw new InvalidRequestException("unset is not supported inside vectors");
 
-            elementType.validate(buffer, valueAccessor);
+            buffers.set(i, validateElement(elementType, buffer, valueAccessor));
         }
         return buffers;
     }

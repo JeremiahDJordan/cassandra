@@ -421,10 +421,8 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             if (keyBytes == null || valueBytes == null)
                 throw new MarshalException("null is not supported inside collections");
 
-            getKeysType().validate(keyBytes, valueAccessor);
-            getValuesType().validate(valueBytes, valueAccessor);
-
-            map.put(keyBytes, valueBytes);
+            map.put(validateElement(getKeysType(), keyBytes, valueAccessor),
+                    validateElement(getValuesType(), valueBytes, valueAccessor));
         }
 
         List<T> sortedBuffers = new ArrayList<>(map.size() << 1);

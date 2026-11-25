@@ -281,8 +281,7 @@ public class SetType<T> extends CollectionType<Set<T>>
         {
             if (buffer == null)
                 throw new MarshalException("null is not supported inside collections");
-            elements.validate(buffer, valueAccessor);
-            sorted.add(buffer);
+            sorted.add(validateElement(elements, buffer, valueAccessor));
         }
         return new ArrayList<>(sorted);
     }

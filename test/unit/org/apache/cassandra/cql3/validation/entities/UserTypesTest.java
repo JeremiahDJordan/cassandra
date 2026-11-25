@@ -17,15 +17,21 @@
  */
 package org.apache.cassandra.cql3.validation.entities;
 
+import java.nio.ByteBuffer;
+import java.util.Arrays;
 import java.util.UUID;
 
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.service.StorageService;
+
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 public class UserTypesTest extends CQLTester
 {
@@ -117,6 +123,19 @@ public class UserTypesTest extends CQLTester
                        row(-104.99251)
             )
         );
+    }
+
+    @Test
+    public void testBoundUDTWithUnsortedSetField() throws Throwable
+    {
+        String myType = createType("CREATE TYPE %s (a int, b frozen<set<int>>)");
+        createTable("CREATE TABLE %s (k int, t frozen<" + myType + ">, PRIMARY KEY (k, t))");
+
+        // {2, 1, 2}, not sorted and with a duplicate
+        ByteBuffer set = ListType.getInstance(Int32Type.instance, false).pack(Arrays.asList(bytes(2), bytes(1), bytes(2)));
+        execute("INSERT INTO %s (k, t) VALUES (0, ?)", userType("a", 0, "b", set));
+        execute("INSERT INTO %s (k, t) VALUES (0, {a: 0, b: {1, 2}})");
+        assertRowCount(execute("SELECT * FROM %s"), 1);
     }
 
     @Test

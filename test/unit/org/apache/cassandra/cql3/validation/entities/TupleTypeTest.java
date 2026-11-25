@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Comparator;
 import java.util.HashSet;
 import java.util.List;
@@ -38,6 +39,9 @@ import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.DurationType;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.ListType;
+import org.apache.cassandra.db.marshal.SetType;
 import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.utils.AbstractTypeGenerators;
 import org.apache.cassandra.utils.AbstractTypeGenerators.TypeSupport;
@@ -45,6 +49,7 @@ import org.apache.cassandra.utils.AbstractTypeGenerators.TypeSupport;
 import static org.apache.cassandra.db.SchemaCQLHelper.toCqlType;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.getTypeSupport;
 import static org.apache.cassandra.utils.AbstractTypeGenerators.tupleTypeGen;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 import static org.apache.cassandra.utils.FailingConsumer.orFail;
 import static org.apache.cassandra.utils.Generators.filter;
 import static org.quicktheories.QuickTheory.qt;
@@ -99,6 +104,23 @@ public class TupleTypeTest extends CQLTester
 
         execute("INSERT INTO %s (t) VALUES (?)", tuple(3, "foo"));
         assertAllRows(row(tuple(3, "foo")));
+    }
+
+    @Test
+    public void testBoundTupleWithUnsortedSetField() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, t frozen<tuple<int, frozen<set<int>>>>, v frozen<tuple<int, frozen<set<int>>>>, PRIMARY KEY (k, t)) WITH CLUSTERING ORDER BY (t DESC)");
+
+        // {2, 1, 2}, not sorted and with a duplicate
+        ByteBuffer set = ListType.getInstance(Int32Type.instance, false).pack(Arrays.asList(bytes(2), bytes(1), bytes(2)));
+        ByteBuffer tuple = new TupleType(Arrays.asList(Int32Type.instance, SetType.getInstance(Int32Type.instance, false))).pack(bytes(0), set);
+        execute("INSERT INTO %s (k, t) VALUES (0, ?)", tuple);
+        execute("INSERT INTO %s (k, t) VALUES (0, (0, {1, 2}))");
+        assertRowCount(execute("SELECT * FROM %s"), 1);
+        assertRowCount(execute("SELECT * FROM %s WHERE k = 0 AND t IN ?", list(tuple)), 1);
+
+        executeNet("UPDATE %s SET v = ? WHERE k = 0 AND t = (0, {1, 2})", tuple);
+        assertRows(execute("SELECT k FROM %s WHERE v = (0, {1, 2}) ALLOW FILTERING"), row(0));
     }
 
     @Test
