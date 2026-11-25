@@ -18,6 +18,7 @@ package org.apache.cassandra.distributed.test.sai;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
@@ -120,6 +121,48 @@ public class StaticFilterReplicaDivergenceCasesTest extends TestBaseImpl
         { "K", "st = 5 AND (sx = 5 OR ck = 1)", "",
           "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 1, {1}) USING TIMESTAMP 3",
           "3: UPDATE %s USING TIMESTAMP 2 SET st = 5 WHERE pk = 1", "3: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck >= 0" },
+        // three replica states: node 3 returns the partition for row 2 without the deletion of row 1, which v = 1
+        // doesn't match; node 2 has the newer static row that matches; node 1 is silent and its whole partition read
+        { "A", "st = 5 OR v = 1", "2",
+          "1: " + ST0, "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 2, {1}) USING TIMESTAMP 1",
+          "2: UPDATE %s USING TIMESTAMP 3 SET st = 5 WHERE pk = 1",
+          "3: " + ST0, "3: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck = 1", "3: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 1, {1}) USING TIMESTAMP 1" },
+        // the same with a range tombstone
+        { "A2", "st = 5 OR v = 1", "2",
+          "1: " + ST0, "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 2, {1}) USING TIMESTAMP 1",
+          "2: UPDATE %s USING TIMESTAMP 3 SET st = 5 WHERE pk = 1",
+          "3: " + ST0, "3: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck <= 1", "3: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 1, {1}) USING TIMESTAMP 1" },
+        // two replica states, an AND of static and regular under the OR
+        { "B", "(st = 5 AND v = 3) OR v = 1", "2",
+          "1: " + ST0, "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 3, {1}) USING TIMESTAMP 1",
+          "23: UPDATE %s USING TIMESTAMP 2 SET st = 5 WHERE pk = 1", "23: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck = 1",
+          "23: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 1, {1}) USING TIMESTAMP 1" },
+        // as B, with a clustering restriction on the other side of the OR, which the deleted row doesn't satisfy
+        { "E3", "(st = 5 AND v = 3) OR ck >= 2", "2",
+          "1: " + ST0, "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 3, {3}) USING TIMESTAMP 1",
+          "23: UPDATE %s USING TIMESTAMP 2 SET st = 5 WHERE pk = 1", "23: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck = 1",
+          "23: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 0, {1}) USING TIMESTAMP 1" },
+        // without a disjunction: node 3 returns the partition for row 2 without the
+        // deletion of row 1, node 2 has nothing that matches but the static row, node 1 the stale static row and row 1
+        { "I", "st = 5 AND v = 1", "2",
+          "1: " + ST0, "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 1, {1}) USING TIMESTAMP 1",
+          "23: UPDATE %s USING TIMESTAMP 3 SET st = 5 WHERE pk = 1",
+          "3: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck = 1", "3: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 1, {1}) USING TIMESTAMP 1" },
+        // a live row missing: nodes 1 and 3 return the partition for row 1 with their older static row, without row 2
+        // of node 1, which the newer static row of node 2 selects; node 2 returns its static row; nobody is silent
+        // about the static row or any of its columns, so only comparing what the static rows select finds that they
+        // diverge
+        { "J", "v = 1 OR sx = 5", "1,2",
+          "123: " + ST0, "13: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 1, {1}) USING TIMESTAMP 1",
+          "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 2, {1}) USING TIMESTAMP 1",
+          "2: UPDATE %s USING TIMESTAMP 3 SET sx = 5 WHERE pk = 1" },
+        // static rows that diverge without changing what the filter selects (st = 7 doesn't match either): the whole
+        // partitions aren't read, and the deletion of row 1 on node 3, which returns the partition for row 2, is still
+        // found, as nodes 1 and 2 return row 1 and node 3 is silent about it
+        { "L", "st = 5 OR v = 1", "2",
+          "123: " + ST0, "123: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 1, {1}) USING TIMESTAMP 1",
+          "2: UPDATE %s USING TIMESTAMP 3 SET st = 7 WHERE pk = 1",
+          "3: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck = 1", "3: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 1, {1}) USING TIMESTAMP 1" },
     };
 
     /**
@@ -202,10 +245,17 @@ public class StaticFilterReplicaDivergenceCasesTest extends TestBaseImpl
                 for (String prefix : new String[]{ "", "pk = 1 AND " })
                 {
                     String restriction = prefix.isEmpty() ? c[1] : prefix + '(' + c[1] + ')';
-                    for (String limits : new String[]{ "", " LIMIT 1", " PER PARTITION LIMIT 1", " LIMIT 2" })
+                    List<String> variants = new ArrayList<>(Arrays.asList("", " LIMIT 1", " PER PARTITION LIMIT 1", " LIMIT 2"));
+                    // reversed reads, which ORDER BY allows without indexes and with a partition restriction only
+                    if (kind.equals("plain") && !prefix.isEmpty())
+                        variants.addAll(Arrays.asList(" ORDER BY ck DESC", " ORDER BY ck DESC LIMIT 1"));
+                    for (String limits : variants)
                     {
                         int limit = limits.endsWith("1") ? 1 : limits.endsWith("2") ? 2 : Integer.MAX_VALUE;
-                        List<String> expected = all.subList(0, Math.min(limit, all.size()));
+                        List<String> ordered = new ArrayList<>(all);
+                        if (limits.contains(" DESC"))
+                            Collections.reverse(ordered);
+                        List<String> expected = ordered.subList(0, Math.min(limit, ordered.size()));
                         for (int pageSize : new int[]{ 0, 1, 2, 100 })
                         {
                             String query = "SELECT pk, ck FROM " + table(kind, c) + " WHERE " + restriction + limits + " ALLOW FILTERING";
