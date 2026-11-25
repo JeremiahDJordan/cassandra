@@ -1,4 +1,6 @@
 5.0.10
+ * Keep unrepaired tombstones written during a read of a table with only_purge_repaired_tombstones (CASSANDRA-XXXXX)
+ * Keep unrepaired tombstones in row cache hits and index searches of tables with only_purge_repaired_tombstones (CASSANDRA-XXXXX)
  * Fix reads of tables with only_purge_repaired_tombstones purging no tombstone after a write without deletion or TTL (CASSANDRA-XXXXX)
  * CONTAINS KEY restriction on a frozen map clustering column with descending order is rejected: "Cannot use CONTAINS KEY on non-map column" (CASSANDRA-21742)
  * Prevent tiny SSTables from accumulating under UCS (CASSANDRA-21615)

@@ -309,6 +309,12 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
         metric.rangeLatency.addNano(latencyNanos);
     }
 
+    @Override
+    protected void updateMinOldestUnrepairedTombstone(ColumnFamilyStore cfs, ReadExecutionController controller)
+    {
+        controller.updateMinOldestUnrepairedTombstone(cfs.select(View.selectLive(dataRange().keyRange())));
+    }
+
     @VisibleForTesting
     public UnfilteredPartitionIterator queryStorage(final ColumnFamilyStore cfs, ReadExecutionController controller)
     {
@@ -320,10 +326,11 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
         try
         {
             SSTableReadsListener readCountUpdater = newReadCountUpdater();
+            boolean onlyPurgeRepairedTombstones = cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones();
             for (Memtable memtable : view.memtables)
             {
                 UnfilteredPartitionIterator iter = memtable.partitionIterator(columnFilter(), dataRange(), readCountUpdater);
-                controller.updateMinOldestUnrepairedTombstone(memtable.getMinLocalDeletionTime());
+                controller.updateMinOldestUnrepairedTombstone(memtable, onlyPurgeRepairedTombstones);
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
             }
 
@@ -402,6 +409,10 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
 
     private UnfilteredPartitionIterator checkCacheFilter(UnfilteredPartitionIterator iter, final ColumnFamilyStore cfs)
     {
+        // The purge takes its bound from the scanned sources, which a partition cached later may not match
+        if (cfs.getCompactionStrategyManager().onlyPurgeRepairedTombstones())
+            return iter;
+
         class CacheFilter extends Transformation<BaseRowIterator<?>>
         {
             @Override

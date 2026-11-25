@@ -479,6 +479,10 @@ public class TrieMemtable extends AbstractShardedMemtable
             }
             try
             {
+                // EncodingStats uses a synthetic epoch for no local deletion time. The minimum goes down before the
+                // update is visible, for the reads that purge the tombstones older than it
+                if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
+                    minLocalDeletionTime = Math.min(minLocalDeletionTime, update.stats().minLocalDeletionTime);
                 try
                 {
                     long onHeap = data.sizeOnHeap();
@@ -494,9 +498,6 @@ public class TrieMemtable extends AbstractShardedMemtable
                 finally
                 {
                     minTimestamp = Math.min(minTimestamp, update.stats().minTimestamp);
-                    // EncodingStats uses a synthetic epoch for no local deletion time
-                    if (update.stats().minLocalDeletionTime != EncodingStats.NO_STATS.minLocalDeletionTime)
-                        minLocalDeletionTime = Math.min(minLocalDeletionTime, update.stats().minLocalDeletionTime);
                     liveDataSize += updater.dataSize;
                     currentOperations += update.operationCount();
 

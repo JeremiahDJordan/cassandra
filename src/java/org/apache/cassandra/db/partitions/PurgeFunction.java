@@ -32,16 +32,29 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
     private boolean isReverseOrder;
 
     private boolean ignoreGcGraceSeconds;
+    private final long oldestUnrepairedTombstone;
+    // Whether a range tombstone is open in the current partition, and whether it is purged. Its close bound is purged
+    // with it, as the oldest unrepaired tombstone of a read can go down between the two
+    private boolean rangeTombstoneOpen;
+    private boolean openRangeTombstonePurged;
 
     public PurgeFunction(long nowInSec, long gcBefore, long oldestUnrepairedTombstone, boolean onlyPurgeRepairedTombstones,
                          boolean enforceStrictLiveness)
     {
         this.nowInSec = nowInSec;
+        this.oldestUnrepairedTombstone = oldestUnrepairedTombstone;
         this.purger = (timestamp, localDeletionTime) ->
-                      !(onlyPurgeRepairedTombstones && localDeletionTime >= oldestUnrepairedTombstone)
-                      && (localDeletionTime < gcBefore || ignoreGcGraceSeconds)
+                      (localDeletionTime < gcBefore || ignoreGcGraceSeconds)
+                      && !(onlyPurgeRepairedTombstones && localDeletionTime >= oldestUnrepairedTombstone())
                       && getPurgeEvaluator().test(timestamp);
         this.enforceStrictLiveness = enforceStrictLiveness;
+    }
+
+    // Called for each gc-able tombstone of a table that only purges repaired tombstones
+    // Return the oldest unrepaired tombstone of the data read, no higher than the value given to the constructor
+    protected long oldestUnrepairedTombstone()
+    {
+        return oldestUnrepairedTombstone;
     }
 
     protected abstract LongPredicate getPurgeEvaluator();
@@ -79,6 +92,7 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
         onNewPartition(partition.partitionKey());
 
         ignoreGcGraceSeconds = shouldIgnoreGcGrace();
+        rangeTombstoneOpen = false;
 
         setReverseOrder(partition.isReverseOrder());
         UnfilteredRowIterator purged = Transformation.apply(partition, this);
@@ -122,8 +136,10 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
             // We can only skip the whole marker if both deletion time are purgeable.
             // If only one of them is, filterTombstoneMarker will deal with it.
             RangeTombstoneBoundaryMarker boundary = (RangeTombstoneBoundaryMarker)marker;
-            boolean shouldPurgeClose = purger.shouldPurge(boundary.closeDeletionTime(reversed));
+            boolean shouldPurgeClose = rangeTombstoneOpen ? openRangeTombstonePurged : purger.shouldPurge(boundary.closeDeletionTime(reversed));
             boolean shouldPurgeOpen = purger.shouldPurge(boundary.openDeletionTime(reversed));
+            rangeTombstoneOpen = true;
+            openRangeTombstonePurged = shouldPurgeOpen;
 
             if (shouldPurgeClose)
             {
@@ -139,7 +155,12 @@ public abstract class PurgeFunction extends Transformation<UnfilteredRowIterator
         }
         else
         {
-            return purger.shouldPurge(((RangeTombstoneBoundMarker)marker).deletionTime()) ? null : marker;
+            boolean shouldPurge = rangeTombstoneOpen && marker.isClose(reversed)
+                                  ? openRangeTombstonePurged
+                                  : purger.shouldPurge(((RangeTombstoneBoundMarker)marker).deletionTime());
+            rangeTombstoneOpen = marker.isOpen(reversed);
+            openRangeTombstonePurged = shouldPurge;
+            return shouldPurge ? null : marker;
         }
     }
 }
