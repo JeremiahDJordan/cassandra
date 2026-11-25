@@ -240,6 +240,8 @@ public class SSTableIndex implements Comparable<SSTableIndex>
     // 2. or includes everything minus the keys matching the expression
     // if the column type values cannot be truncated, i.e., matching the keys is always precise.
     // (not matching precisely will lead to false negatives)
+    // 3. or includes everything if the expression is of a value without terms, which matches no indexed value
+    // (see Expression#isWithoutTerms).
     //
     // keys k such that row(k) not contains v = (all keys) \ (keys k such that row(k) contains v)
     //
@@ -254,7 +256,8 @@ public class SSTableIndex implements Comparable<SSTableIndex>
     {
         KeyRangeIterator allKeys = allSSTableKeys(keyRange);
         if (TypeUtil.supportsRounding(expression.validator)
-            || !this.getVersion().onDiskFormat().indexFeatureSet().isRowAware())
+            || !this.getVersion().onDiskFormat().indexFeatureSet().isRowAware()
+            || expression.isWithoutTerms())
         {
             return allKeys;
         }

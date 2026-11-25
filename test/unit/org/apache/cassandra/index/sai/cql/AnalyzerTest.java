@@ -158,4 +158,50 @@ public class AnalyzerTest extends SAITester
                   .isInstanceOf(InvalidRequestException.class)
                   .hasMessageContaining("Cannot use an analyzer on " + column + " because it's a frozen collection.");
     }
+
+    /**
+     * A match of a value that the query analyzer makes no terms of matches no row, and its negation every row, also
+     * with an index analyzer that makes the empty term of an empty value.
+     */
+    @Test
+    public void testMatchOfValueWithoutTerms() throws Throwable
+    {
+        for (String analyzer : new String[]{ "'case_sensitive': 'false'", "'index_analyzer': 'keyword'" })
+        {
+            String options = "{" + analyzer + ", 'query_analyzer': 'standard'}";
+            createTable("CREATE TABLE %s (k int PRIMARY KEY, v text, w text, i int, u int, l list<text>, m map<text, int>)");
+            createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = " + options);
+            createIndex("CREATE CUSTOM INDEX ON %s(l) USING 'StorageAttachedIndex' WITH OPTIONS = " + options);
+            createIndex("CREATE CUSTOM INDEX ON %s(KEYS(m)) USING 'StorageAttachedIndex' WITH OPTIONS = " + options);
+            createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex' WITH OPTIONS = {" + analyzer + '}');
+            createIndex("CREATE CUSTOM INDEX ON %s(i) USING 'StorageAttachedIndex'");
+            execute("INSERT INTO %s (k, v, w, i, u, l, m) VALUES (1, '', '', 1, 1, [''], {'': 1})");
+            execute("INSERT INTO %s (k, v, i, u, l, m) VALUES (2, 'x', 2, 2, ['x'], {'x': 2})");
+            execute("INSERT INTO %s (k, i, m) VALUES (3, 1, {'y': 3})");
+
+            beforeAndAfterFlush(() -> {
+                assertMatches("v = '!!!'");
+                assertMatches("v : '!!!'");
+                assertMatches("v = ''");
+                assertMatches("v = '!!!' AND i = 1");
+                assertMatches("v = '!!!' OR i = 2", row(2));
+                assertMatches("v : '!!!' OR v = 'x'", row(2));
+                assertMatches("l CONTAINS '!!!'");
+                assertMatches("l CONTAINS '!!!' OR i = 2", row(2));
+                assertMatches("i = 1 AND (v = '!!!' OR v : '!!!' OR l CONTAINS '!!!' OR m CONTAINS KEY '!!!' OR u = 2) ALLOW FILTERING");
+                assertMatches("m CONTAINS KEY '!!!'");
+                assertMatches("l NOT CONTAINS '!!!'", row(1), row(2), row(3));
+                assertMatches("l NOT CONTAINS '!!!' AND i = 1", row(1), row(3));
+                assertMatches("m NOT CONTAINS KEY '!!!'", row(1), row(2), row(3));
+                assertMatches("w = ''", row(1));
+            });
+        }
+    }
+
+    private void assertMatches(String where, Object[]... rows)
+    {
+        String query = "SELECT k FROM %s WHERE " + where;
+        assertRowsIgnoringOrder(executeInternal(query), rows);
+        assertRowsIgnoringOrder(execute(query), rows);
+    }
 }

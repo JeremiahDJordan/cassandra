@@ -157,11 +157,34 @@ public class Expression
 
     final List<ByteBuffer> exclusions = new ArrayList<>();
 
+    // Whether the query analyzer makes no terms of the value of this expression (see #withoutTerms)
+    private boolean withoutTerms;
+
     public Expression(IndexContext indexContext)
     {
         this.context = indexContext;
         this.analyzerFactory = indexContext.getAnalyzerFactory();
         this.validator = indexContext.getValidator();
+    }
+
+    /**
+     * @return an expression of the given operator on a value that the query analyzer makes no terms of: like
+     * {@code Operator.ANALYZER_MATCHES#isSatisfiedByAnalyzed}, it matches no value, and its negation matches every value
+     */
+    static Expression withoutTerms(IndexContext indexContext, Operator operator)
+    {
+        Expression expression = new Expression(indexContext).add(operator, ByteBuffer.allocate(0));
+        expression.withoutTerms = true;
+        return expression;
+    }
+
+    /**
+     * @return whether this expression is of a value without terms (see {@link #withoutTerms}), which the index
+     * must not search as the empty term: it matches no indexed value, and its negation all the keys
+     */
+    public boolean isWithoutTerms()
+    {
+        return withoutTerms;
     }
 
     public boolean isLiteral()
@@ -273,6 +296,9 @@ public class Expression
     {
         if (columnValue == null)
             return false;
+
+        if (withoutTerms)
+            return operation.isNonEquality();
 
         // ORDER_BY is not indepently verifiable, so we always return true
         if (operation == Op.ORDER_BY)
@@ -561,7 +587,8 @@ public class Expression
                                     .append(operation)
                                     .append(validator)
                                     .append(lower).append(upper)
-                                    .append(exclusions).build();
+                                    .append(exclusions)
+                                    .append(withoutTerms).build();
     }
 
     public boolean equals(Object other)
@@ -579,7 +606,8 @@ public class Expression
                 && operation == o.operation
                 && Objects.equals(lower, o.lower)
                 && Objects.equals(upper, o.upper)
-                && exclusions.equals(o.exclusions);
+                && exclusions.equals(o.exclusions)
+                && withoutTerms == o.withoutTerms;
     }
 
     /**
