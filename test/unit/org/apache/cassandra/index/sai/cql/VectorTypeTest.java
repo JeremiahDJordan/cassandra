@@ -660,6 +660,30 @@ public class VectorTypeTest extends VectorTester
     }
 
     @Test
+    public void testSomeStaticColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, x int, s int static, s2 int static, v vector<float, 2>, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        for (int pk = 0; pk < 3; pk++)
+        {
+            execute("INSERT INTO %s (pk, s, s2) VALUES (?, ?, ?)", pk, pk, pk);
+            for (int ck = 0; ck < 2; ck++)
+                execute("INSERT INTO %s (pk, ck, x, v) VALUES (?, ?, ?, ?)", pk, ck, ck, vector((float) (pk * 2 + ck), (float) (pk * 2 + ck)));
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRowsNet(executeNet("SELECT pk, ck, s2 FROM %s ORDER BY v ANN OF [0, 0] LIMIT 3"),
+                          row(0, 0, 0), row(0, 1, 0), row(1, 0, 1));
+            assertRowsNet(executeNet("SELECT pk, ck, s2 FROM %s WHERE x = 1 ORDER BY v ANN OF [0, 0] LIMIT 3"),
+                          row(0, 1, 0), row(1, 1, 1), row(2, 1, 2));
+            assertRowsNet(executeNet("SELECT pk, ck, s2 FROM %s WHERE pk = 1 AND x = 1 ORDER BY v ANN OF [0, 0] LIMIT 3"),
+                          row(1, 1, 1));
+        });
+    }
+
+    @Test
     public void multiPartitionUpdateMultiIndexTest()
     {
         createTable("CREATE TABLE %s (pk int, row_v vector<float, 2>, metadata map<text, text>, PRIMARY KEY(pk))");
@@ -678,6 +702,42 @@ public class VectorTypeTest extends VectorTester
     }
 
     @Test
+    public void testStaticVectorColumnPartitionWithoutRows() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, x int, s int static, sv vector<float, 2> static, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(sv) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        execute("INSERT INTO %s (pk, s, sv) VALUES (0, 1, [0, 0])");
+        execute("INSERT INTO %s (pk, ck, x, s, sv) VALUES (1, 1, 1, 1, [1, 1])");
+        execute("INSERT INTO %s (pk, s, sv) VALUES (2, 2, [2, 2])");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 1"), row(0, null));
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null), row(1, 1), row(2, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY sv ANN OF [0, 0] LIMIT 1"), row(0, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null), row(1, 1));
+            assertRowsNet(executeNet("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null), row(1, 1), row(2, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"), row(0, null));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 0 AND ck > 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE token(pk) >= -9223372036854775807 AND ck > 0 ORDER BY sv ANN OF [0, 0] LIMIT 1"), row(1, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x IN (1, 2) ORDER BY sv ANN OF [0, 0] LIMIT 1 ALLOW FILTERING"), row(1, 1));
+        });
+
+        // partition 0 then has only deleted rows
+        execute("INSERT INTO %s (pk, ck, x) VALUES (0, 1, 1)");
+        execute("INSERT INTO %s (pk, ck, x) VALUES (0, 2, 1)");
+        flush();
+        execute("DELETE FROM %s WHERE pk = 0 AND ck = 1");
+        execute("DELETE FROM %s WHERE pk = 0 AND ck = 2");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 2"), row(0, null), row(1, 1));
+            assertRowsNet(executeNet("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 2"), row(0, null), row(1, 1));
+        });
+    }
+
+    @Test
     public void testStaticVectorColumnIndex() throws Throwable
     {
         createTable("CREATE TABLE %s (pk int, ck int, val vector<float, 2> static, PRIMARY KEY(pk, ck))");
@@ -691,6 +751,99 @@ public class VectorTypeTest extends VectorTester
         beforeAndAfterFlush(() -> {
             assertRows(execute("SELECT ck FROM %s ORDER BY val ANN OF [0,1] LIMIT 3"), row(4), row(1), row(2));
             assertRows(execute("SELECT ck FROM %s ORDER BY val ANN OF [0,1] LIMIT 2"), row(4), row(1));
+        });
+    }
+
+    @Test
+    public void testStaticColumnPredicate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, s int static, sval vector<float, 2> static, val vector<float, 2>, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(sval) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        // the rows are ordered by their distance to [0, 0] as by (pk, ck)
+        for (int pk = 0; pk < 4; pk++)
+        {
+            execute("INSERT INTO %s (pk, s, sval) VALUES (?, ?, ?)", pk, pk % 2, vector((float) -pk, (float) -pk));
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, val) VALUES (?, ?, ?)", pk, ck, vector((float) (pk * 3 + ck), (float) (pk * 3 + ck)));
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY val ANN OF [0, 0] LIMIT 3"),
+                       row(1, 0), row(1, 1), row(1, 2));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY val ANN OF [0, 0] LIMIT 10"),
+                       row(1, 0), row(1, 1), row(1, 2), row(3, 0), row(3, 1), row(3, 2));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 3 AND ck > 0 AND s = 1 ORDER BY val ANN OF [0, 0] LIMIT 1"),
+                       row(3, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY sval ANN OF [-9, -9] LIMIT 3"),
+                       row(3, 0), row(3, 1), row(3, 2));
+        });
+
+        // the static rows are then in a different memtable or sstable than the rows
+        execute("UPDATE %s SET s = 1 WHERE pk = 0");
+        execute("UPDATE %s SET s = 0 WHERE pk = 1");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY val ANN OF [0, 0] LIMIT 4"),
+                       row(0, 0), row(0, 1), row(0, 2), row(3, 0));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE s = 0 ORDER BY val ANN OF [0, 0] LIMIT 2"),
+                       row(1, 0), row(1, 1));
+        });
+    }
+
+    @Test
+    public void testStaticColumnPredicateWithVectorClusteringColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck vector<float, 2>, s int static, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(ck) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        execute("INSERT INTO %s (pk, ck, s) VALUES (0, [1, 1], 0)");
+        execute("INSERT INTO %s (pk, ck) VALUES (0, [2, 2])");
+        execute("INSERT INTO %s (pk, ck, s) VALUES (1, [3, 3], 1)");
+        execute("INSERT INTO %s (pk, ck) VALUES (1, [4, 4])");
+
+        beforeAndAfterFlush(() -> assertRows(execute("SELECT pk, ck FROM %s WHERE s = 1 ORDER BY ck ANN OF [0, 0] LIMIT 2"),
+                                             row(1, vector(3f, 3f)), row(1, vector(4f, 4f))));
+    }
+
+    @Test
+    public void testStaticVectorColumnWithPredicate() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, x int, sv vector<float, 2> static, PRIMARY KEY(pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(x) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(sv) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function' : 'euclidean'}");
+
+        for (int pk = 0; pk < 5; pk++)
+        {
+            // partition 4 has no vector
+            if (pk < 4)
+                execute("INSERT INTO %s (pk, sv) VALUES (?, ?)", pk, vector((float) pk, (float) pk));
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, x) VALUES (?, ?, ?)", pk, ck, ck % 2);
+        }
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 1 ORDER BY sv ANN OF [0, 0] LIMIT 2"),
+                       row(0, 1), row(1, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"),
+                       row(0, 0), row(0, 2), row(1, 0));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 1 ORDER BY sv ANN OF [0, 0] LIMIT 10"),
+                       row(0, 1), row(1, 1), row(2, 1), row(3, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE pk = 2 AND ck > 0 AND x = 0 ORDER BY sv ANN OF [0, 0] LIMIT 3"),
+                       row(2, 2));
+        });
+
+        // the vectors and the restricted values are then in different memtables or sstables
+        execute("UPDATE %s SET sv = [9, 9] WHERE pk = 0");
+        flush();
+        execute("UPDATE %s SET x = 2 WHERE pk = 3 AND ck = 0");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 1 ORDER BY sv ANN OF [0, 0] LIMIT 10"),
+                       row(1, 1), row(2, 1), row(3, 1), row(0, 1));
+            assertRows(execute("SELECT pk, ck FROM %s WHERE x = 2 ORDER BY sv ANN OF [0, 0] LIMIT 10"),
+                       row(3, 0));
         });
     }
 

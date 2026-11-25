@@ -23,11 +23,13 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.NavigableSet;
+import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import javax.annotation.Nullable;
 
+import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
@@ -41,15 +43,21 @@ import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.ReadExecutionController;
+import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
+import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.rows.BaseRowIterator;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredSource;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.QueryContext;
@@ -64,8 +72,10 @@ import org.apache.cassandra.index.sai.memory.MemtableIndex;
 import org.apache.cassandra.index.sai.utils.MergePrimaryKeyWithScoreIterator;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.RowWithSource;
+import org.apache.cassandra.io.sstable.SSTableReadsListener;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.net.ParamType;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.CloseableIterator;
@@ -390,11 +400,114 @@ public class QueryController
     public CloseableIterator<PrimaryKeyWithScore> getTopKRows(KeyRangeIterator source, QueryViewBuilder.QueryExpressionView queryExpressionView)
     {
         List<PrimaryKey> primaryKeys = materializeKeysAndCloseSource(source);
+        if (primaryKeys != null)
+            primaryKeys = queryExpressionView.expression.getIndexTermType().columnMetadata().isStatic()
+                          ? replaceRowKeysByStaticKeys(primaryKeys)
+                          : replaceStaticKeysByRowKeys(primaryKeys, queryExpressionView);
         if (primaryKeys == null)
             return getTopKRows(queryExpressionView);
         if (primaryKeys.isEmpty())
             return CloseableIterator.empty();
         return getTopKRows(primaryKeys, queryExpressionView);
+    }
+
+    /**
+     * An index on a static vector column only orders the keys of static rows, and the key of a static row stands for
+     * every row of its partition.
+     */
+    private static List<PrimaryKey> replaceRowKeysByStaticKeys(List<PrimaryKey> keys)
+    {
+        List<PrimaryKey> staticKeys = new ArrayList<>(keys.size());
+        for (PrimaryKey key : keys)
+        {
+            PrimaryKey staticKey = key.toStatic();
+            if (staticKeys.isEmpty() || !staticKeys.get(staticKeys.size() - 1).equals(staticKey))
+                staticKeys.add(staticKey);
+        }
+        return staticKeys;
+    }
+
+    /**
+     * The key of a static row, from an index on a static column, stands for every row of its partition, but an index on
+     * a non-static vector column only orders the keys of rows. This replaces the keys of each partition that has a
+     * static key by the keys of its rows selected by the query that have a live value for the vector column in the
+     * memtables and sstables of the vector index.
+     *
+     * @return the keys, or null if there are more than {@link #MAX_MATERIALIZED_KEYS} of them
+     */
+    private List<PrimaryKey> replaceStaticKeysByRowKeys(List<PrimaryKey> keys, QueryViewBuilder.QueryExpressionView queryExpressionView)
+    {
+        ColumnMetadata column = queryExpressionView.expression.getIndexTermType().columnMetadata();
+        if (keys.stream().noneMatch(key -> key.kind() == PrimaryKey.Kind.STATIC))
+            return keys;
+
+        ColumnFamilyStore.ViewFragment view = queryExpressionView.computeViewFragment();
+        // a primary key column has no cell, and every row has a value for it
+        ColumnFilter columnFilter = column.isPrimaryKeyColumn() ? ColumnFilter.all(cfs.metadata())
+                                                                : ColumnFilter.selection(RegularAndStaticColumns.of(column));
+        List<PrimaryKey> replaced = new ArrayList<>(keys.size());
+        int start = 0;
+        while (start < keys.size())
+        {
+            DecoratedKey partitionKey = keys.get(start).partitionKey();
+            boolean hasStaticKey = false;
+            int end = start;
+            while (end < keys.size() && keys.get(end).partitionKey().equals(partitionKey))
+                hasStaticKey |= keys.get(end++).kind() == PrimaryKey.Kind.STATIC;
+
+            if (hasStaticKey)
+                addRowKeys(partitionKey, column, columnFilter, view, MAX_MATERIALIZED_KEYS - replaced.size(), replaced);
+            else
+                replaced.addAll(keys.subList(start, end));
+
+            if (replaced.size() > MAX_MATERIALIZED_KEYS)
+            {
+                Tracing.trace("WHERE clause generated more than {} rows. Switching to ORDER BY then post filter.", MAX_MATERIALIZED_KEYS);
+                return null;
+            }
+            start = end;
+        }
+        return replaced;
+    }
+
+    /**
+     * Adds the keys of the rows of the partition, stopping after more than {@code maxKeys} of them.
+     */
+    private void addRowKeys(DecoratedKey partitionKey,
+                            ColumnMetadata column,
+                            ColumnFilter columnFilter,
+                            ColumnFamilyStore.ViewFragment view,
+                            int maxKeys,
+                            List<PrimaryKey> keys)
+    {
+        Slices slices = command.clusteringIndexFilter(partitionKey).getSlices(cfs.metadata());
+        NavigableSet<Clustering<?>> clusterings = new TreeSet<>(cfs.metadata().comparator);
+        long nowInSec = command.nowInSec();
+        for (UnfilteredSource source : Iterables.<UnfilteredSource>concat(view.memtables, view.sstables))
+        {
+            if (clusterings.size() > maxKeys)
+                break;
+            queryContext.checkpoint();
+            try (UnfilteredRowIterator partition = source.rowIterator(partitionKey, slices, columnFilter, false, SSTableReadsListener.NOOP_LISTENER))
+            {
+                // a memtable returns null for a partition it doesn't have
+                while (partition != null && clusterings.size() <= maxKeys && partition.hasNext())
+                {
+                    queryContext.checkpoint();
+                    Unfiltered unfiltered = partition.next();
+                    if (!unfiltered.isRow())
+                        continue;
+                    Row row = (Row) unfiltered;
+                    Cell<?> cell = column.isPrimaryKeyColumn() ? null : row.getCell(column);
+                    if (column.isPrimaryKeyColumn() ? row.hasLiveData(nowInSec, cfs.metadata().enforceStrictLiveness())
+                                                    : cell != null && cell.isLive(nowInSec))
+                        clusterings.add(row.clustering());
+                }
+            }
+        }
+
+        for (Clustering<?> clustering : clusterings)
+            keys.add(keyFactory.create(partitionKey, clustering));
     }
 
     private CloseableIterator<PrimaryKeyWithScore> getTopKRows(List<PrimaryKey> sourceKeys, QueryViewBuilder.QueryExpressionView queryExpressionView)

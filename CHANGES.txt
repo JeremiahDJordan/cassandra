@@ -1,4 +1,8 @@
 5.0.10
+ * Fix SAI ANN queries ordered by a static vector column leaving out the partitions that only have static data (CASSANDRA-XXXXX)
+ * Fix ANN query responses failing to serialize when the table has static columns outside the selection (CASSANDRA-21719)
+ * SAI ANN queries on a static vector column with a restriction on another indexed column return no rows (CASSANDRA-XXXXX)
+ * SAI ANN queries on a non-static vector column with a restriction on an indexed static column return no rows (CASSANDRA-XXXXX)
  * Assorted fixes for SAI replica reconciliation with multi-cell collections and range tombstones (CASSANDRA-21897)
  * Harden client STARTUP options (CASSANDRA-21755)
  * Assorted fixes for post-filtering on collection elements and inet columns (CASSANDRA-21863)
