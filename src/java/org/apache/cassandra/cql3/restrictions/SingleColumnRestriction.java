@@ -46,7 +46,6 @@ import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
 
-import static com.google.common.base.Preconditions.checkNotNull;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkBindValueSet;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkTrue;
@@ -269,12 +268,17 @@ public abstract class SingleColumnRestriction implements SingleRestriction
                                    IndexHints indexHints)
         {
             List<ByteBuffer> values = this.terms.bindAndGet(options, columnDef.name);
+            // A null element of a filtered IN matches no value, so it is left out, and an IN with only null elements
+            // matches nothing. This includes a primary key column that is filtered rather than used to select the
+            // partitions or the clustering, which rejects a null element (see appendTo).
+            List<ByteBuffer> nonNullValues = new ArrayList<>(values.size());
             for (ByteBuffer v : values)
             {
-                checkNotNull(v, "Invalid null value for column %s", columnDef.name);
                 checkBindValueSet(v, "Invalid unset value for column %s", columnDef.name);
+                if (v != null)
+                    nonNullValues.add(v);
             }
-            ByteBuffer buffer = ListSerializer.pack(values, values.size(), ProtocolVersion.V3);
+            ByteBuffer buffer = ListSerializer.pack(nonNullValues, nonNullValues.size(), ProtocolVersion.V3);
             filter.add(columnDef, Operator.IN, buffer);
         }
 
