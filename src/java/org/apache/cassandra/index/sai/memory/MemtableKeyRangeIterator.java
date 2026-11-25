@@ -42,7 +42,8 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.schema.TableMetadata;
 
 /**
- * Iterates over primary keys in a memtable
+ * Iterates over the primary keys of the rows of a memtable or, for an index on a static column, over the keys of the
+ * static rows of its partitions.
  */
 public class MemtableKeyRangeIterator extends KeyRangeIterator
 {
@@ -50,13 +51,27 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
     private final PrimaryKey.Factory pkFactory;
     private final AbstractBounds<PartitionPosition> keyRange;
     private final ColumnFilter columns;
+    private final boolean staticKeys;
     private UnfilteredPartitionIterator partitionIterator;
+    // the partition we are positioned on; with staticKeys, one whose key we haven't returned yet
     private UnfilteredRowIterator rowIterator;
     private PrimaryKey lastKey;
 
     public MemtableKeyRangeIterator(Memtable memtable,
                                     PrimaryKey.Factory pkFactory,
                                     AbstractBounds<PartitionPosition> keyRange)
+    {
+        this(memtable, pkFactory, keyRange, false);
+    }
+
+    /**
+     * @param staticKeys whether to return the static row key of each partition instead of the keys of its rows, for an
+     *                   index on a static column (a partition with only a static row has no row key)
+     */
+    public MemtableKeyRangeIterator(Memtable memtable,
+                                    PrimaryKey.Factory pkFactory,
+                                    AbstractBounds<PartitionPosition> keyRange,
+                                    boolean staticKeys)
     {
         super(minKey(memtable, pkFactory),
               maxKey(memtable, pkFactory),
@@ -66,6 +81,7 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
         this.memtable = memtable;
         this.pkFactory = pkFactory;
         this.keyRange = keyRange;
+        this.staticKeys = staticKeys;
         this.columns = ColumnFilter.selectionBuilder()
                                            .addAll(metadata.partitionKeyColumns())
                                            .addAll(metadata.clusteringColumns())
@@ -118,7 +134,7 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
         if (partitionIterator.hasNext())
         {
             this.rowIterator = partitionIterator.next();
-            if (nextKey.hasClustering() && rowIterator.partitionKey().equals(nextKey.partitionKey()))
+            if (!staticKeys && nextKey.hasClustering() && rowIterator.partitionKey().equals(nextKey.partitionKey()))
             {
                 Slice slice = Slice.make(nextKey.clustering(), Clustering.EMPTY);
                 Slices slices = Slices.with(memtable.metadata().comparator, slice);
@@ -137,6 +153,9 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
     @Override
     protected PrimaryKey computeNext()
     {
+        if (staticKeys)
+            return computeNextStaticKey();
+
         while (hasNextRow(rowIterator) || partitionIterator.hasNext())
         {
             if (!hasNextRow(rowIterator))
@@ -155,6 +174,21 @@ public class MemtableKeyRangeIterator extends KeyRangeIterator
             }
         }
         return endOfData();
+    }
+
+    private PrimaryKey computeNextStaticKey()
+    {
+        // the partition a skip positioned us on, or the next one
+        if (rowIterator == null)
+        {
+            if (!partitionIterator.hasNext())
+                return endOfData();
+            rowIterator = partitionIterator.next();
+        }
+        lastKey = pkFactory.create(rowIterator.partitionKey(), Clustering.STATIC_CLUSTERING);
+        FileUtils.closeQuietly(rowIterator);
+        rowIterator = null;
+        return lastKey;
     }
 
     private static boolean hasNextRow(UnfilteredRowIterator rowIterator)

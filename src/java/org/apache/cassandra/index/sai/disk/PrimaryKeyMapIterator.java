@@ -49,7 +49,8 @@ public final class PrimaryKeyMapIterator extends KeyRangeIterator
     private enum KeyFilter
     {
         ALL,   // return all keys, fast, but safe only if we know there are no mixed keys with and without clustering
-        KEYS_WITH_CLUSTERING     // return keys with clustering
+        KEYS_WITH_CLUSTERING,     // return keys with clustering
+        STATIC_KEYS               // the static row key of each partition (index on a static column)
     }
 
     private final PrimaryKeyMap keys;
@@ -68,12 +69,21 @@ public final class PrimaryKeyMapIterator extends KeyRangeIterator
 
     public static KeyRangeIterator create(SSTableContext ctx, AbstractBounds<PartitionPosition> keyRange) throws IOException
     {
+        return create(ctx, keyRange, false);
+    }
+
+    /**
+     * @param staticKeys whether to return the key of the static row of each partition instead of the keys of its rows,
+     *                   for an index on a static column (see {@link KeyFilter#STATIC_KEYS})
+     */
+    public static KeyRangeIterator create(SSTableContext ctx, AbstractBounds<PartitionPosition> keyRange, boolean staticKeys) throws IOException
+    {
         KeyFilter filter;
         TableMetadata metadata = ctx.sstable().metadata();
         // if not row-aware, we don't have clustering
         var perSSTableComponents = ctx.usedPerSSTableComponents();
         if (perSSTableComponents.onDiskFormat().indexFeatureSet().isRowAware() && metadata.hasStaticColumns())
-            filter = KeyFilter.KEYS_WITH_CLUSTERING;
+            filter = staticKeys ? KeyFilter.STATIC_KEYS : KeyFilter.KEYS_WITH_CLUSTERING;
         else // the table doesn't consist anything we want to filter out, so let's use the cheap option
             filter = KeyFilter.ALL;
 
@@ -118,6 +128,13 @@ public final class PrimaryKeyMapIterator extends KeyRangeIterator
             PrimaryKey key = keys.primaryKeyFromRowId(currentRowId++, getMinimum(), getMaximum());
             if (filter == KeyFilter.KEYS_WITH_CLUSTERING && !key.hasClustering())
                 continue;
+            if (filter == KeyFilter.STATIC_KEYS)
+            {
+                // the static key we returned compares equal to every key of its partition
+                if (lastKey != null && lastKey.compareTo(key) == 0)
+                    continue;
+                key = key.forStaticRow();
+            }
             lastKey = key;
             return key;
         }

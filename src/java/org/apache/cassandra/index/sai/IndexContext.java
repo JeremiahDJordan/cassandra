@@ -480,8 +480,13 @@ public class IndexContext
     // 2. or includes everything minus the keys matching the expression
     // if the column type values cannot be truncated, i.e., matching the keys is always precise.
     // (not matching precisely will lead to false negatives)
+    // The negations on a collection index (NOT CONTAINS, NOT CONTAINS KEY and m[k] != v) include everything, because
+    // the index can match keys whose collection no longer holds the value (see IndexContext#canSubtractMatches).
     //
     // keys k such that row(k) not contains v = (all keys) \ (keys k such that row(k) contains v)
+    //
+    // For an index on a static column, all keys are the keys of the static rows of all partitions, which match the
+    // whole partitions, including those with only a static row and those without one.
     //
     // Note that rows in other indexes are not matched, so this can return false positives,
     // but they are not a problem as post-filtering would get rid of them.
@@ -490,7 +495,9 @@ public class IndexContext
     private KeyRangeIterator getNonEqIterator(QueryContext context, Collection<MemtableIndex> memtables, Expression expression, AbstractBounds<PartitionPosition> keyRange)
     {
         KeyRangeIterator allKeys = scanMemtable(keyRange, memtables);
-        if (TypeUtil.supportsRounding(expression.validator) || !version.onDiskFormat().indexFeatureSet().isRowAware())
+        if (TypeUtil.supportsRounding(expression.validator)
+            || !version.onDiskFormat().indexFeatureSet().isRowAware()
+            || !canSubtractMatches(expression))
         {
             return allKeys;
         }
@@ -500,6 +507,16 @@ public class IndexContext
             KeyRangeIterator matchedKeys = searchMemtable(context, memtables, negExpression, keyRange);
             return KeyRangeAntiJoinIterator.create(allKeys, matchedKeys);
         }
+    }
+
+    /**
+     * Whether the rows an index matches with the negation of a non-equality expression can be subtracted from all its
+     * rows. Not for collection element, key and entry indexes: their entries can be stale (expired by a TTL, shadowed
+     * by a deletion in another SSTable, or overwritten elements the memtable index wasn't given) until compaction.
+     */
+    public static boolean canSubtractMatches(Expression expression)
+    {
+        return !expression.context.isNonFrozenCollection();
     }
 
     public KeyRangeIterator searchMemtable(QueryContext context, Collection<MemtableIndex> memtables, Expression expression, AbstractBounds<PartitionPosition> keyRange)
@@ -544,7 +561,7 @@ public class IndexContext
             for (MemtableIndex memtableIndex : memtables)
             {
                 Memtable memtable = memtableIndex.getMemtable();
-                KeyRangeIterator memtableIterator = new MemtableKeyRangeIterator(memtable, primaryKeyFactory, keyRange);
+                KeyRangeIterator memtableIterator = new MemtableKeyRangeIterator(memtable, primaryKeyFactory, keyRange, getDefinition().isStatic());
                 builder.add(memtableIterator);
             }
 
