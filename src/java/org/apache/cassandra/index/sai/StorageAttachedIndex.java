@@ -520,6 +520,9 @@ public class StorageAttachedIndex implements Index
     @Override
     public void validate(PartitionUpdate update, ClientState state) throws InvalidRequestException
     {
+        if (!maxTermSizeGuardrail.enabled(state))
+            return;
+
         DecoratedKey key = update.partitionKey();
 
         if (indexTermType.columnMetadata().isStatic())
@@ -791,8 +794,8 @@ public class StorageAttachedIndex implements Index
         if (cellBuffer == null || cellBuffer.remaining() == 0)
             return;
 
-        // analyzer should not return terms that are larger than the origin value.
-        if (!maxTermSizeGuardrail.warnsOn(cellBuffer.remaining(), null))
+        // The term is the value unless the analyzer transforms it, which can make it larger.
+        if ((analyzer == null || !analyzer.transformValue()) && !maxTermSizeGuardrail.triggersOn(cellBuffer.remaining(), state))
             return;
 
         if (analyzer != null)
