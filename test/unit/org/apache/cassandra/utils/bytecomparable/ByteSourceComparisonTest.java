@@ -1135,6 +1135,18 @@ public class ByteSourceComparisonTest extends ByteSourceTestBase
                      -1,
                      actual);
         maybeAssertNotPrefix(after, before, version);
+
+        ByteComparable tokenBound = k.getToken().minKeyBound();
+        actual = Integer.signum(ByteComparable.compare(k, tokenBound, version));
+        assertEquals(String.format("Failed comparing token bound (%s) for %s[%s](%s)\npartitioner %s version %s",
+                                   tokenBound.byteComparableAsString(version),
+                                   ByteBufferUtil.bytesToHex(b),
+                                   k,
+                                   k.byteComparableAsString(version),
+                                   type,
+                                   version),
+                     1,
+                     actual);
     }
 
     static Object safeStr(Object i)

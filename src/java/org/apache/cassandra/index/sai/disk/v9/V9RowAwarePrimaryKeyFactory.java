@@ -62,7 +62,7 @@ public class V9RowAwarePrimaryKeyFactory extends V2RowAwarePrimaryKeyFactory
         @Override
         protected ByteSource asComparableBytes(int terminator, ByteComparable.Version version, boolean isPrefix)
         {
-            return ByteSource.withTerminator(terminator, buildComparableSources(version, isPrefix, false));
+            return ByteSource.withTerminator(version, terminator, buildComparableSources(version, isPrefix, false));
         }
     }
 }

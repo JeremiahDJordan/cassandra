@@ -476,7 +476,7 @@ public final class ByteSourceInverse
 
     public static boolean nextComponentNull(int separator)
     {
-        return separator == ByteSource.NEXT_COMPONENT_NULL
+        return separator == ByteSource.NEXT_COMPONENT_NULL || separator == ByteSource.NEXT_CLUSTERING_NULL
                || separator == ByteSource.NEXT_COMPONENT_NULL_REVERSED;
     }
 }

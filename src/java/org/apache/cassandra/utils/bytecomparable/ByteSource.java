@@ -82,7 +82,7 @@ public interface ByteSource
     // Next component marker.
     int NEXT_COMPONENT = 0x40;
     // Marker used to present null values represented by empty buffers (e.g. by Int32Type), as well as nulls in
-    // collections.
+    // collections. OSS50 sequences mark null components with NEXT_CLUSTERING_NULL, as Apache Cassandra 5.0 does.
     int NEXT_COMPONENT_NULL = 0x3F;
     int NEXT_COMPONENT_NULL_REVERSED = 0x41;
     // Marker for null components in clustering keys. Null clusterings are normally encoded by empty buffers (which end
@@ -161,7 +161,17 @@ public interface ByteSource
     {
         assert terminator >= MIN_SEPARATOR && terminator <= MAX_SEPARATOR;
         assert terminator < MIN_NEXT_COMPONENT || terminator > MAX_NEXT_COMPONENT;
-        return new Multi(srcs, terminator);
+        return new Multi(srcs, terminator, NEXT_COMPONENT_NULL);
+    }
+
+    /**
+     * As above, marking null components as the given version does.
+     */
+    static ByteSource withTerminator(Version version, int terminator, ByteSource... srcs)
+    {
+        assert terminator >= MIN_SEPARATOR && terminator <= MAX_SEPARATOR;
+        assert terminator < MIN_NEXT_COMPONENT || terminator > MAX_NEXT_COMPONENT;
+        return new Multi(srcs, terminator, version == Version.OSS50 ? NEXT_CLUSTERING_NULL : NEXT_COMPONENT_NULL);
     }
 
     /**
@@ -170,13 +180,13 @@ public interface ByteSource
      */
     static ByteSource withTerminatorLegacy(int terminator, ByteSource... srcs)
     {
-        return new Multi(srcs, terminator);
+        return new Multi(srcs, terminator, NEXT_COMPONENT_NULL);
     }
 
     static ByteSource withTerminatorMaybeLegacy(Version version, int legacyTerminator, ByteSource... srcs)
     {
         return version == Version.LEGACY ? withTerminatorLegacy(legacyTerminator, srcs)
-                                         : withTerminator(TERMINATOR, srcs);
+                                         : withTerminator(version, TERMINATOR, srcs);
     }
 
     static ByteSource of(String s, Version version)
@@ -701,7 +711,7 @@ public interface ByteSource
     }
 
     /**
-     * Combination of multiple byte sources. Adds {@link #NEXT_COMPONENT} before sources, or {@link #NEXT_COMPONENT_NULL}
+     * Combination of multiple byte sources. Adds {@link #NEXT_COMPONENT} before sources, or the given null marker
      * if next is null.
      */
     static class Multi implements ByteSource
@@ -709,11 +719,13 @@ public interface ByteSource
         private final ByteSource[] srcs;
         private int srcnum = -1;
         private final int sequenceTerminator;
+        private final int nullMarker;
 
-        Multi(ByteSource[] srcs, int sequenceTerminator)
+        Multi(ByteSource[] srcs, int sequenceTerminator, int nullMarker)
         {
             this.srcs = srcs;
             this.sequenceTerminator = sequenceTerminator;
+            this.nullMarker = nullMarker;
         }
 
         @Override
@@ -732,7 +744,7 @@ public interface ByteSource
             if (srcnum == srcs.length)
                 return sequenceTerminator;
             if (srcs[srcnum] == null)
-                return NEXT_COMPONENT_NULL;
+                return nullMarker;
             return NEXT_COMPONENT;
         }
     }

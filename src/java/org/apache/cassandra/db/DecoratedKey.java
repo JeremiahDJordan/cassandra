@@ -123,6 +123,7 @@ public abstract class DecoratedKey implements PartitionPosition, FilterKey
             assert (version != Version.LEGACY) : "Decorated key bounds are not supported by the legacy encoding.";
 
             return ByteSource.withTerminator(
+                    version,
                     before ? ByteSource.LT_NEXT_COMPONENT : ByteSource.GT_NEXT_COMPONENT,
                     token.asComparableBytes(version),
                     keyComparableBytes(version));

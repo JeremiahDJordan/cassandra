@@ -150,7 +150,7 @@ public class V2RowAwarePrimaryKeyFactory implements PrimaryKey.Factory
 
         protected ByteSource asComparableBytes(int terminator, ByteComparable.Version version, boolean isPrefix)
         {
-            return ByteSource.withTerminator(terminator, buildComparableSources(version, isPrefix, true));
+            return ByteSource.withTerminator(version, terminator, buildComparableSources(version, isPrefix, true));
         }
 
         protected ByteSource[] buildComparableSources(ByteComparable.Version version, boolean isPrefix, boolean includeToken)
