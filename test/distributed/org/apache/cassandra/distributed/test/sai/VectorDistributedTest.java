@@ -51,6 +51,8 @@ import org.apache.cassandra.index.sai.utils.Glove;
 
 import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
+import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
+import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -305,6 +307,27 @@ public class VectorDistributedTest extends TestBaseImpl
                 assertThat(recall).isGreaterThanOrEqualTo(0.8);
             }
         }
+    }
+
+    @Test
+    public void testStaticVectorColumnPartitionWithoutRows()
+    {
+        cluster.schemaChange(formatQuery("CREATE TABLE %s (pk int, ck int, sv vector<float, 2> static, PRIMARY KEY(pk, ck))"));
+        cluster.schemaChange(formatQuery("CREATE INDEX ON %s(sv) USING 'sai' WITH OPTIONS = {'similarity_function' : 'euclidean'}"));
+        SAIUtil.waitForIndexQueryable(cluster, KEYSPACE);
+
+        // the nearest partitions have no rows, and each replica has only some of them
+        for (int pk = 0; pk < 15; pk++)
+        {
+            String insert = pk < 5 ? "INSERT INTO %s (pk, sv) VALUES (" + pk + ", [" + pk + ", " + pk + "])"
+                                   : "INSERT INTO %s (pk, ck, sv) VALUES (" + pk + ", 1, [" + pk + ", " + pk + "])";
+            cluster.coordinator(1).execute(formatQuery(insert), ConsistencyLevel.ALL);
+        }
+
+        Object[][] expected = { row(0, null), row(1, null), row(2, null), row(3, null), row(4, null), row(5, 1) };
+        assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 6"), expected);
+        cluster.forEach(n -> n.flush(KEYSPACE));
+        assertRows(execute("SELECT pk, ck FROM %s ORDER BY sv ANN OF [0, 0] LIMIT 6"), expected);
     }
 
     private List<float[]> searchWithRange(float[] queryVector, long minToken, long maxToken, int expectedSize)
