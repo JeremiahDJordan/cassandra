@@ -453,7 +453,10 @@ public abstract class Constants
             {
                 ByteBuffer value = options.getValues().get(bindIndex);
                 if (value != null && value != ByteBufferUtil.UNSET_BYTE_BUFFER)
+                {
                     receiver.type.validate(value);
+                    value = Terms.sortSetsAndMaps(receiver.type, value);
+                }
                 return value;
             }
             catch (MarshalException e)

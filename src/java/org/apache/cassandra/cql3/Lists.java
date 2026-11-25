@@ -232,7 +232,7 @@ public abstract class Lists
                 List<ByteBuffer> elements = new ArrayList<>(l.size());
                 for (T element : l)
                     // elements can be null in lists that represent a set of IN values
-                    elements.add(element == null ? null : type.getElementsType().decompose(element));
+                    elements.add(element == null ? null : Terms.sortSetsAndMaps(type.getElementsType(), type.getElementsType().decompose(element)));
                 return new Value(elements);
             }
             catch (MarshalException e)
