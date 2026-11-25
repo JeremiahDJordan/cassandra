@@ -58,6 +58,7 @@ import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
+import org.apache.cassandra.distributed.api.IUpgradeableInstance;
 import org.apache.cassandra.distributed.shared.Versions;
 import org.apache.cassandra.distributed.shared.WithProperties;
 import org.apache.cassandra.utils.Hex;
@@ -193,6 +194,108 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
             assertThat(pks(node.executeInternal(withKeyspace("SELECT pk FROM %s.tuples WHERE m[1] = (null, 2)")))).hasSize(2);
             assertRebuildWritesSameBytes(node, "tuples", files.resolve("tuples"), tableDirs.get("tuples"), SEGMENT_ROWS, List.of("tuples_a", "tuples_b", "tuples_m"));
         }, "tuples");
+    }
+
+    @Test
+    public void testIndexOnApacheFilesAfterRowsExpired() throws Throwable
+    {
+        Consumer<Consumer<String>> schema = schemaChange -> {
+            schemaChange.accept(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"));
+            schemaChange.accept(withKeyspace("CREATE TABLE %s.expiring (pk int, ck int, a int, b int, PRIMARY KEY (pk, ck))"));
+            schemaChange.accept(withKeyspace("CREATE INDEX expiring_a ON %s.expiring (a) USING 'sai'"));
+            schemaChange.accept(withKeyspace("CREATE TABLE %s.built (pk int, ck int, st text static, b int, PRIMARY KEY (pk, ck))"));
+        };
+        String builtIndex = withKeyspace("CREATE INDEX built_b ON %s.built (b) USING 'sai'");
+        Path files = temporaryFolder.newFolder().toPath();
+        try (UpgradeableCluster cluster = startCluster(1, ApacheIndexFormatTest::oneDataDirectory, apacheVersion()))
+        {
+            schema.accept(cluster::schemaChange);
+            IUpgradeableInstance node = cluster.get(1);
+            // Apache's flush numbers the rows that expire before the index on b is built
+            for (int ck = 0; ck < 30; ck++)
+                node.executeInternal(withKeyspace("INSERT INTO %s.expiring (pk, ck, a, b) VALUES (0, ?, ?, ?) USING TTL " + (ck % 3 == 0 ? 5 : 0)), ck, ck, ck);
+            node.nodetoolResult("flush", KEYSPACE, "expiring").asserts().success();
+            // Apache's build of an index on the flushed sstable numbers the static rows live then: not that of
+            // partition 1, which has expired, nor that of partition 2, which has none
+            for (int pk = 0; pk < 3; pk++)
+            {
+                if (pk < 2)
+                    node.executeInternal(withKeyspace("INSERT INTO %s.built (pk, st) VALUES (?, ?) USING TTL " + (pk == 1 ? 2 : 0)), pk, pk == 1 ? "gone" : "live");
+                for (int ck = 0; ck < 5; ck++)
+                    node.executeInternal(withKeyspace("INSERT INTO %s.built (pk, ck, b) VALUES (?, ?, ?)"), pk, ck, 10 * pk + ck);
+            }
+            node.nodetoolResult("flush", KEYSPACE, "built").asserts().success();
+            Thread.sleep(3000);
+            cluster.schemaChange(builtIndex);
+            await().atMost(1, TimeUnit.MINUTES).until(() -> Boolean.TRUE.equals(node.executeInternal("SELECT is_queryable FROM system_views.sai_column_indexes WHERE keyspace_name = ? AND index_name = 'built_b'", KEYSPACE)[0][0]));
+            assertRows(node.executeInternal(withKeyspace("SELECT pk, ck FROM %s.built WHERE b = 10")), row(1, 0));
+            for (String table : new String[]{ "expiring", "built" })
+            {
+                Path tableFiles = Files.createDirectory(files.resolve(table));
+                try (Stream<Path> paths = Files.list(tableDir(node.config(), table)))
+                {
+                    for (Path path : paths.filter(Files::isRegularFile).collect(Collectors.toList()))
+                        Files.copy(path, tableFiles.resolve(path.getFileName()));
+                }
+            }
+        }
+
+        try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
+             Cluster cluster = Cluster.build(1)
+                                      .withConfig(config -> {
+                                          config.set("storage_compatibility_mode", "CASSANDRA_5");
+                                          oneDataDirectory(config);
+                                      })
+                                      .start())
+        {
+            schema.accept(cluster::schemaChange);
+            cluster.schemaChange(builtIndex);
+            IInvokableInstance node = cluster.get(1);
+            Map<String, Path> tableDirs = new HashMap<>();
+            for (String table : new String[]{ "expiring", "built" })
+                tableDirs.put(table, tableDir(node.config(), table));
+            node.shutdown().get();
+            for (String table : tableDirs.keySet())
+            {
+                try (Stream<Path> paths = Files.list(files.resolve(table)))
+                {
+                    for (Path path : paths.collect(Collectors.toList()))
+                        Files.copy(path, tableDirs.get(table).resolve(path.getFileName()));
+                }
+            }
+            node.startup();
+            await().atMost(1, TimeUnit.MINUTES).until(() -> node.executeInternal(withKeyspace("SELECT ck FROM %s.expiring WHERE a = 0")).length == 0);
+
+            cluster.schemaChange(withKeyspace("CREATE INDEX expiring_b ON %s.expiring (b) USING 'sai'"));
+            cluster.schemaChange(withKeyspace("CREATE INDEX built_st ON %s.built (st) USING 'sai'"));
+            for (String[] index : new String[][]{ { "expiring", "expiring_b" }, { "built", "built_st" } })
+            {
+                await().atMost(1, TimeUnit.MINUTES).until(() -> node.callOnInstance(() -> {
+                    ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(index[0]);
+                    return cfs.indexManager.isIndexQueryable(cfs.indexManager.getIndexByName(index[1]));
+                }));
+            }
+            for (int ck = 1; ck < 30; ck++)
+            {
+                if (ck % 3 != 0)
+                    assertRows(node.executeInternal(withKeyspace("SELECT ck FROM %s.expiring WHERE b = ?"), ck), row(ck));
+            }
+            assertThat(pks(node.executeInternal(withKeyspace("SELECT pk, ck FROM %s.built WHERE st = 'live'")))).hasSize(5);
+            assertThat(pks(node.executeInternal(withKeyspace("SELECT pk, ck FROM %s.built WHERE st = 'gone'")))).isEmpty();
+            for (int pk = 0; pk < 3; pk++)
+            {
+                for (int ck = 0; ck < 5; ck++)
+                    assertRows(node.executeInternal(withKeyspace("SELECT pk, ck FROM %s.built WHERE b = ?"), 10 * pk + ck), row(pk, ck));
+            }
+        }
+    }
+
+    private static Path tableDir(IInstanceConfig config, String table) throws IOException
+    {
+        try (Stream<Path> dirs = Files.list(Paths.get(((String[]) config.get("data_file_directories"))[0], KEYSPACE)))
+        {
+            return dirs.filter(dir -> dir.getFileName().toString().startsWith(table + '-')).findFirst().orElseThrow();
+        }
     }
 
     @Test

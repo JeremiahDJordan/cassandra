@@ -35,6 +35,7 @@ import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SSTableContext;
 import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
+import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.Pair;
@@ -154,7 +155,11 @@ public class IndexViewManager
         {
             // If the new index use the same files that the exiting one (and the previous one is still complete, meaning
             // that the files weren't corrupted), then keep the old one (no point in changing for the same thing).
-            if (previous.usedPerIndexComponents().isComplete() && ssTableIndex.usedPerIndexComponents().buildId().equals(previous.usedPerIndexComponents().buildId()))
+            // Apache Cassandra's components have no generations: a new build has the same build id, so only the same
+            // components are the same files.
+            IndexComponents.ForRead used = previous.usedPerIndexComponents();
+            IndexComponents.ForRead next = ssTableIndex.usedPerIndexComponents();
+            if (used.isComplete() && next.buildId().equals(used.buildId()) && (!next.version().isApache() || next == used))
                 return;
         }
         addTo.put(descriptor, ssTableIndex);

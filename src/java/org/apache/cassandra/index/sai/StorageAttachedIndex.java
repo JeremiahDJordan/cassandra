@@ -89,6 +89,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.dht.OrderPreservingPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.gms.DataStaxFeatureSupport;
 import org.apache.cassandra.index.Index;
@@ -673,6 +674,31 @@ public class StorageAttachedIndex implements Index
         // SAI performs partial initialization so it must always execute it; the actual index build is then still skipped
         // if IndexBuildDecider.instance.onInitialBuild().skipped() is true.
         return false;
+    }
+
+    private static boolean isStorageAttachedIndexClass(String className)
+    {
+        // Subclasses run StorageAttachedIndex#onAddedToExistingTable too. Not finding the class only means deleting
+        // the files of the dropped index.
+        try
+        {
+            FBUtilities.classForNameWithoutInitialization(className, "Index", StorageAttachedIndex.class);
+            return true;
+        }
+        catch (ConfigurationException | LinkageError e)
+        {
+            return false;
+        }
+    }
+
+    /**
+     * Whether the table has a storage-attached index of the provided name.
+     */
+    static boolean hasStorageAttachedIndexNamed(TableMetadata metadata, String name)
+    {
+        return metadata.indexes.get(name)
+                               .map(index -> isStorageAttachedIndexClass(index.getIndexClassName()))
+                               .orElse(false);
     }
 
     /**

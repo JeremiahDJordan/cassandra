@@ -837,7 +837,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 sstable.unregisterComponents(components, cfs.getTracker());
                 logger.debug("[{}.{}.{}] Unregistered the Apache Cassandra SAI components of the dropped index from {}",
                              cfs.getKeyspaceName(), cfs.name, indexName, sstable.descriptor);
-                deleteFilesWhenNotStreamed(sstable, components);
+                deleteFilesWhenNotStreamed(sstable, indexName, components);
             }
             catch (Throwable t)
             {
@@ -930,16 +930,22 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     }
 
     /**
-     * Deletes the files of the provided (unregistered) components of the provided SSTable under its stream/rebuild
-     * reservation, now if possible, or once no stream or rebuild holds it.
+     * Deletes the files of the provided (unregistered) components of the provided dropped index of the provided SSTable
+     * under its stream/rebuild reservation, now if possible, or once no stream or rebuild holds it. Not once an index
+     * of the same name has been created: it has discarded them (see {@link StorageAttachedIndex#onAddedToExistingTable}),
+     * and in storage_compatibility_mode CASSANDRA_5 it writes its own files under the same names.
      */
-    static void deleteFilesWhenNotStreamed(SSTableReader sstable, Set<Component> components)
+    static void deleteFilesWhenNotStreamed(SSTableReader sstable, String indexName, Set<Component> components)
     {
         if (sstable.streamRebuildState().tryBeginRebuild())
         {
             try
             {
-                deleteFiles(sstable, components);
+                synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+                {
+                    if (!StorageAttachedIndex.hasStorageAttachedIndexNamed(sstable.metadata(), indexName))
+                        deleteFiles(sstable, components);
+                }
             }
             finally
             {
@@ -949,7 +955,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         else
         {
             sstable.streamRebuildState().runWhenNormal(() -> ScheduledExecutors.optionalTasks.execute(
-                () -> deleteFilesWhenNotStreamed(sstable, components)));
+                () -> deleteFilesWhenNotStreamed(sstable, indexName, components)));
         }
     }
 

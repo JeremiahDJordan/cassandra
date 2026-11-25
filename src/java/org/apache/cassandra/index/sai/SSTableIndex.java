@@ -36,7 +36,6 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.virtual.SimpleDataSet;
 import org.apache.cassandra.dht.AbstractBounds;
-import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.index.sai.disk.EmptyIndex;
 import org.apache.cassandra.index.sai.disk.PrimaryKeyMapIterator;
 import org.apache.cassandra.index.sai.disk.SearchableIndex;
@@ -57,9 +56,7 @@ import org.apache.cassandra.io.sstable.SSTableIdFactory;
 import org.apache.cassandra.io.sstable.SSTableWatcher;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
-import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.CloseableIterator;
-import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
 
 /**
@@ -385,10 +382,10 @@ public class SSTableIndex implements Comparable<SSTableIndex>
             if (indexWasDropped.get())
             {
                 // Apache Cassandra's components are streamable: delete their files under the stream/rebuild
-                // reservation of the SSTable. We never write files of those names, so a late deletion is safe.
+                // reservation of the SSTable, unless an index of the same name has been created since
                 if (perIndexComponents.version().isApache())
                 {
-                    StorageAttachedIndexGroup.deleteFilesWhenNotStreamed(sstable, perIndexComponents.allAsCustomComponents());
+                    StorageAttachedIndexGroup.deleteFilesWhenNotStreamed(sstable, indexContext.getIndexName(), perIndexComponents.allAsCustomComponents());
                 }
                 else
                 {
@@ -396,34 +393,12 @@ public class SSTableIndex implements Comparable<SSTableIndex>
                     // StorageAttachedIndex#onAddedToExistingTable), and its own have the same names.
                     synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
                     {
-                        if (!hasStorageAttachedIndexNamed(sstable.metadata(), indexContext.getIndexName()))
+                        if (!StorageAttachedIndex.hasStorageAttachedIndexNamed(sstable.metadata(), indexContext.getIndexName()))
                             SSTableWatcher.instance.onIndexDropped(sstable.metadata(), perIndexComponents.forWrite());
                     }
                 }
             }
         }
-    }
-
-    private static boolean isStorageAttachedIndexClass(String className)
-    {
-        // Subclasses run StorageAttachedIndex#onAddedToExistingTable too. Not finding the class only means deleting
-        // the files of the dropped index.
-        try
-        {
-            FBUtilities.classForNameWithoutInitialization(className, "Index", StorageAttachedIndex.class);
-            return true;
-        }
-        catch (ConfigurationException | LinkageError e)
-        {
-            return false;
-        }
-    }
-
-    private static boolean hasStorageAttachedIndexNamed(TableMetadata metadata, String name)
-    {
-        return metadata.indexes.get(name)
-                               .map(index -> isStorageAttachedIndexClass(index.getIndexClassName()))
-                               .orElse(false);
     }
 
     /**

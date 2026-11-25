@@ -739,6 +739,10 @@ public class IndexDescriptor
         @Override
         public void forceDeleteAllComponents()
         {
+            // the completion marker first: the group is incomplete as soon as any of its files is gone
+            IndexComponentImpl marker = components.remove(completionMarkerComponent());
+            if (marker != null)
+                marker.delete();
             components.values().forEach(IndexComponentImpl::delete);
             components.clear();
         }
