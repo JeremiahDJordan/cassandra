@@ -19,10 +19,10 @@ package org.apache.cassandra.distributed.upgrade;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.regex.Pattern;
 
 import org.junit.Assume;
 
@@ -50,6 +50,8 @@ import static org.awaitility.Awaitility.await;
 public abstract class ApacheMixedClusterTestBase extends UpgradeTestBase
 {
     protected static final Version CURRENT = AbstractCluster.CURRENT_VERSION;
+
+    private static final Pattern TABLE_OPTIONS = Pattern.compile("\\) WITH (CLUSTERING ORDER BY \\([^)]*\\))?.*", Pattern.DOTALL);
 
     /**
      * The Apache Cassandra version of the dtest jar in the configured directory.
@@ -108,7 +110,8 @@ public abstract class ApacheMixedClusterTestBase extends UpgradeTestBase
     }
 
     /**
-     * Runs a schema statement on node 1 and waits until every node has the same definition of {@code keyspace}. Unlike
+     * Runs a schema statement on node 1 and waits until every node has the same definition of {@code keyspace} in its
+     * schema, apart from table options and {@code frozen<>}, which the two kinds of node don't all print alike. Unlike
      * {@link UpgradeableCluster#schemaChange(String)} it doesn't wait for equal schema versions, which nodes of this
      * build and Apache nodes don't compute alike.
      */
@@ -119,17 +122,38 @@ public abstract class ApacheMixedClusterTestBase extends UpgradeTestBase
                .until(() -> cluster.stream().allMatch(instance -> describe(instance, keyspace).equals(describe(cluster.get(1), keyspace))));
     }
 
-    private static List<List<Object>> describe(IUpgradeableInstance instance, String keyspace)
+    private static List<String> describe(IUpgradeableInstance instance, String keyspace)
     {
-        List<List<Object>> rows = new ArrayList<>();
-        for (String query : new String[]{ "SELECT replication FROM system_schema.keyspaces WHERE keyspace_name = ?",
-                                          "SELECT table_name, column_name, type FROM system_schema.columns WHERE keyspace_name = ?",
-                                          "SELECT table_name, index_name, options FROM system_schema.indexes WHERE keyspace_name = ?" })
+        // DESCRIBE reads the schema a node has loaded, not the schema tables, which it writes first
+        List<String> statements = new ArrayList<>();
+        for (Object[] row : instance.executeInternal("DESCRIBE SCHEMA"))
         {
-            for (Object[] row : instance.executeInternal(query, keyspace))
-                rows.add(Arrays.asList(row));
+            if (row[0].equals(keyspace))
+                statements.add(withoutFrozen(TABLE_OPTIONS.matcher((String) row[3]).replaceFirst(")$1")));
         }
-        return rows;
+        return statements;
+    }
+
+    /**
+     * Removes the {@code frozen<>} around types, which this build leaves out in some places where Apache prints it, such as
+     * around tuples.
+     */
+    private static String withoutFrozen(String statement)
+    {
+        StringBuilder builder = new StringBuilder(statement);
+        for (int start = builder.indexOf("frozen<"); start >= 0; start = builder.indexOf("frozen<", start))
+        {
+            int end = start + "frozen<".length();
+            for (int depth = 0; depth > 0 || builder.charAt(end) != '>'; end++)
+            {
+                if (builder.charAt(end) == '<')
+                    depth++;
+                else if (builder.charAt(end) == '>')
+                    depth--;
+            }
+            builder.deleteCharAt(end).delete(start, start + "frozen<".length());
+        }
+        return builder.toString();
     }
 
     /**
