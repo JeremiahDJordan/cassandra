@@ -1221,9 +1221,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                                                       @Nullable CountDownLatch rewritingCorrupt)
     {
         boolean corrupt = rewritingCorrupt != null;
-        // if per-table files are incomplete or checksum failed during full rebuild, or if they were written by Apache
-        // Cassandra (we never write new components in that format, see IndexDescriptor#versionForNewComponents), or if
-        // they failed checksum validation during a partial build (see hasCorruptPerSSTableComponents).
+        // if per-table files are incomplete or checksum failed during full rebuild, or if they are Apache Cassandra's,
+        // which a build replaces outside storage_compatibility_mode CASSANDRA_5 (see hasApacheComponents), or if they
+        // failed checksum validation during a partial build (see hasCorruptPerSSTableComponents).
         if (!indexDescriptor.perSSTableComponents().isComplete() || isFullRebuild
             || hasApacheComponents(indexDescriptor.perSSTableComponents()) || corrupt)
         {
@@ -1556,9 +1556,14 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         }
     }
 
+    /**
+     * Whether the components are Apache Cassandra's, which a build replaces with ours, unless it writes Apache
+     * Cassandra's format too (see {@link Version#forNewComponents(String)}).
+     */
     private static boolean hasApacheComponents(IndexComponents.ForRead components)
     {
-        return components.isComplete() && components.version().isApache();
+        return components.isComplete() && components.version().isApache()
+               && !Version.forNewComponents(components.descriptor().ksname).isApache();
     }
 
     /**

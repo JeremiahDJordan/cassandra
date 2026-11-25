@@ -32,6 +32,7 @@ import org.apache.cassandra.utils.StorageCompatibilityMode;
 import static org.apache.cassandra.config.CassandraRelevantProperties.DS_CURRENT_MESSAGING_VERSION;
 import static org.apache.cassandra.config.CassandraRelevantProperties.IMMUTABLE_SAI_COMPONENTS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.NODES_PERSISTENCE_CLASS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_READ_APACHE_FORMAT;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VERSION_SELECTOR_CLASS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_CHECKSUM_TYPE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SSTABLE_COMPRESSION_SELECTOR_CLASS;
@@ -100,6 +101,9 @@ public final class Cassandra5ModeChecks
             refused.add(String.format("-D%s and -D%s", SYSTEM_DISTRIBUTED_NTS_DC_OVERRIDE_PROPERTY.getKey(), SYSTEM_DISTRIBUTED_NTS_RF_OVERRIDE_PROPERTY.getKey()));
         if (IMMUTABLE_SAI_COMPONENTS.getBoolean())
             refused.add(String.format("-D%s=true", IMMUTABLE_SAI_COMPONENTS.getKey()));
+        // the SAI indexes the node writes are in Apache Cassandra's format
+        if (!SAI_READ_APACHE_FORMAT.getBoolean())
+            refused.add(String.format("-D%s=false", SAI_READ_APACHE_FORMAT.getKey()));
         if (!SAI_VERSION_SELECTOR_CLASS.getString().isEmpty())
             refused.add(String.format("-D%s=%s", SAI_VERSION_SELECTOR_CLASS.getKey(), SAI_VERSION_SELECTOR_CLASS.getString()));
         for (SSTableFormat<?, ?> format : DatabaseDescriptor.getSSTableFormats().values())

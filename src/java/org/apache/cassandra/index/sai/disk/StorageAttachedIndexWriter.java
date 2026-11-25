@@ -137,8 +137,8 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
                                        TableMetrics tableMetrics) throws IOException
     {
         this.nonQueryableOnAbort = nonQueryableOnAbort;
-        // We always use the version of the existing per-sstable components, if any, or the configured current version
-        // if there are no previously existing per-sstable components.
+        // The version of the existing per-sstable components, if any, or that of new components (see
+        // IndexDescriptor#versionForNewComponents).
         Version version = indexDescriptor.versionForNewComponents();
         OnDiskFormat onDiskFormat = version.onDiskFormat();
         this.skipRowsWithoutLiveData = version.isApache();

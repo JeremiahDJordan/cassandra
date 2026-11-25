@@ -16,15 +16,24 @@
 
 package org.apache.cassandra.index.sai.disk.apache;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.attribute.BasicFileAttributes;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Random;
 
+import com.google.common.collect.Iterables;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.SAIUtil;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
@@ -34,38 +43,34 @@ import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
 import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
-import org.apache.cassandra.inject.ActionBuilder;
-import org.apache.cassandra.inject.Injection;
-import org.apache.cassandra.inject.Injections;
-import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileInputStreamPlus;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
-import static org.apache.cassandra.inject.Expression.expr;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Vector indexes written in Apache Cassandra 5.0's format, read back.
+ * Vector indexes written in storage_compatibility_mode CASSANDRA_5, in Apache Cassandra 5.0's format, read back.
  */
 public class ApacheVectorIndexWriterTest extends SAITester
 {
-    private Injection writeApacheFormat;
+    private StorageCompatibilityMode mode;
 
     @Before
-    public void writeApacheFormat() throws Throwable
+    public void enterCassandra5Mode()
     {
-        writeApacheFormat = Injections.newCustom("write_apache_format")
-                                      .add(InvokePointBuilder.newInvokePoint().onClass(IndexDescriptor.class).onMethod("versionForNewComponents").atEntry())
-                                      .add(ActionBuilder.newActionBuilder().actions().doReturn(expr(Version.class.getName() + ".APACHE_AA")))
-                                      .build();
-        Injections.inject(writeApacheFormat);
+        mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
     }
 
     @After
-    public void stopApacheFormat()
+    public void leaveCassandra5Mode()
     {
-        writeApacheFormat.disable();
+        DatabaseDescriptor.setStorageCompatibilityMode(mode);
     }
 
     @Test
@@ -117,6 +122,60 @@ public class ApacheVectorIndexWriterTest extends SAITester
             UntypedResultSet rows = execute("SELECT pk FROM %s ORDER BY v ANN OF ? LIMIT 1", vector(vectors[pk]));
             assertRows(rows, row(pk));
         }
+    }
+
+    @Test
+    public void testIndexOnSSTablesWithOtherIndexes() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, v vector<float, 2>)");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (pk, s, v) VALUES (0, 'a', [1.0, 0.0])");
+        execute("INSERT INTO %s (pk, s, v) VALUES (1, 'b', [0.0, 1.0])");
+        flush();
+        Map<String, List<Object>> files = fileKeys();
+
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        assertWrittenInApacheFormat(index);
+        // the other files of the sstable, its per-sstable components and the other index's included, are kept
+        assertThat(fileKeys()).containsAllEntriesOf(files);
+        assertRows(execute("SELECT pk FROM %s ORDER BY v ANN OF [1.0, 0.1] LIMIT 1"), row(0));
+    }
+
+    @Test
+    public void testIndexRefusedOnSSTablesWithoutJVector() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text, v vector<float, 2>)");
+        disableCompaction();
+        // an sstable whose indexes are in a version without jvector, written outside the mode, then one in Apache's
+        // format, which sorts before it
+        Version current = Version.current(KEYSPACE);
+        DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        SAIUtil.setCurrentVersion(Version.BA);
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (pk, s, v) VALUES (0, 'a', [1.0, 0.0])");
+        flush();
+        SAIUtil.setCurrentVersion(current);
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
+        execute("INSERT INTO %s (pk, s, v) VALUES (1, 'b', [0.0, 1.0])");
+        flush();
+
+        assertThatThrownBy(() -> createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'"))
+        .hasMessageContaining(StorageAttachedIndex.vectorUnsupportedByExistingVersionError(Version.BA));
+    }
+
+    private Map<String, List<Object>> fileKeys() throws IOException
+    {
+        Map<String, List<Object>> keys = new HashMap<>();
+        SSTableReader sstable = Iterables.getOnlyElement(getCurrentColumnFamilyStore().getLiveSSTables());
+        for (Component component : sstable.components())
+        {
+            // the TOC lists the new index's components
+            if (component.equals(SSTableFormat.Components.TOC))
+                continue;
+            BasicFileAttributes attributes = Files.readAttributes(sstable.descriptor.fileFor(component).toPath(), BasicFileAttributes.class);
+            keys.put(component.name, List.of(attributes.fileKey(), attributes.lastModifiedTime()));
+        }
+        return keys;
     }
 
     private void assertWrittenInApacheFormat(String index)

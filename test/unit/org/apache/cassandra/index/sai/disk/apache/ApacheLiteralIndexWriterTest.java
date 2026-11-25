@@ -20,16 +20,19 @@ import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import com.google.common.collect.Iterables;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.SSTableContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.PrimaryKeyMap;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
@@ -37,36 +40,31 @@ import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
-import org.apache.cassandra.inject.ActionBuilder;
-import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
-import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
-import static org.apache.cassandra.inject.Expression.expr;
+import static org.apache.cassandra.inject.InvokePointBuilder.newInvokePoint;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Literal indexes and per-sstable components written in Apache Cassandra 5.0's format, read back.
+ * Literal indexes and per-sstable components written in storage_compatibility_mode CASSANDRA_5, in Apache Cassandra 5.0's format, read back.
  */
 public class ApacheLiteralIndexWriterTest extends SAITester
 {
-    private Injection writeApacheFormat;
+    private StorageCompatibilityMode mode;
 
     @Before
-    public void writeApacheFormat() throws Throwable
+    public void enterCassandra5Mode()
     {
-        writeApacheFormat = Injections.newCustom("write_apache_format")
-                                      .add(InvokePointBuilder.newInvokePoint().onClass(IndexDescriptor.class).onMethod("versionForNewComponents").atEntry())
-                                      .add(ActionBuilder.newActionBuilder().actions().doReturn(expr(Version.class.getName() + ".APACHE_AA")))
-                                      .build();
-        Injections.inject(writeApacheFormat);
+        mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
     }
 
     @After
-    public void stopApacheFormat()
+    public void leaveCassandra5Mode()
     {
-        writeApacheFormat.disable();
+        DatabaseDescriptor.setStorageCompatibilityMode(mode);
     }
 
     @Test
@@ -114,6 +112,25 @@ public class ApacheLiteralIndexWriterTest extends SAITester
         assertWrittenInApacheFormat(index);
         assertRowCount(execute("SELECT pk, ck FROM %s WHERE s = 's3'"), 20);
         assertRows(execute("SELECT pk, ck FROM %s WHERE s = 's3' AND pk = 7"), row(7, 3L));
+    }
+
+    @Test
+    public void testIndexOnUnflushedRows() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, s text)");
+        for (int pk = 0; pk < 100; pk++)
+            execute("INSERT INTO %s (pk, s) VALUES (?, ?)", pk, "s" + (pk % 2));
+        Injections.Counter builds = Injections.newCounter("builds_" + UUID.randomUUID())
+                                              .add(newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("indexSSTable"))
+                                              .build();
+        Injections.inject(builds);
+
+        // the initial build flushes the rows, and the flush writes the index
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        builds.disable();
+        assertWrittenInApacheFormat(index);
+        assertThat(builds.get()).isZero();
+        assertRowCount(execute("SELECT pk FROM %s WHERE s = 's1'"), 50);
     }
 
     @Test

@@ -35,7 +35,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
-import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
@@ -52,10 +51,6 @@ import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
 
-import net.bytebuddy.ByteBuddy;
-import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
-import net.bytebuddy.implementation.MethodDelegation;
-import net.bytebuddy.implementation.bind.annotation.FieldValue;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
@@ -65,14 +60,8 @@ import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.shared.Versions;
 import org.apache.cassandra.distributed.shared.WithProperties;
-import org.apache.cassandra.index.sai.StorageAttachedIndex;
-import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
-import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
-import org.apache.cassandra.index.sai.disk.format.Version;
-import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.utils.Hex;
 
-import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MINIMUM_POSTINGS_LEAVES;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_TEST_LAST_VALID_SEGMENTS;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VECTOR_ENABLE_NVQ;
@@ -430,7 +419,6 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
         Path files = temporaryFolder.newFolder().toPath();
         try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
              Cluster cluster = Cluster.build(1)
-                                      .withInstanceInitializer(WriteApacheFormat::install)
                                       .withConfig(config -> {
                                           config.set("storage_compatibility_mode", "CASSANDRA_5");
                                           oneDataDirectory(config);
@@ -639,41 +627,5 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
     private static List<Object> pks(int rows, IntPredicate filter)
     {
         return IntStream.range(0, rows).filter(filter).boxed().collect(Collectors.toList());
-    }
-
-    /**
-     * Writes and lists the SAI components of new sstables in Apache's format.
-     */
-    public static class WriteApacheFormat
-    {
-        static void install(ClassLoader classLoader, Integer node)
-        {
-            new ByteBuddy().rebase(IndexDescriptor.class)
-                           .method(named("versionForNewComponents"))
-                           .intercept(MethodDelegation.to(WriteApacheFormat.class))
-                           .make()
-                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
-            new ByteBuddy().rebase(StorageAttachedIndexGroup.class)
-                           .method(named("componentsForNewSSTable"))
-                           .intercept(MethodDelegation.to(ListApacheFormat.class))
-                           .make()
-                           .load(classLoader, ClassLoadingStrategy.Default.INJECTION);
-        }
-
-        @SuppressWarnings("unused")
-        public static Version versionForNewComponents()
-        {
-            return Version.APACHE_AA;
-        }
-    }
-
-    public static class ListApacheFormat
-    {
-        @SuppressWarnings("unused")
-        public static Set<Component> componentsForNewSSTable(@FieldValue("indices") Set<StorageAttachedIndex> indices,
-                                                             @FieldValue("baseCfs") ColumnFamilyStore baseCfs)
-        {
-            return IndexDescriptor.componentsForNewlyFlushedSSTable(indices, Version.APACHE_AA, baseCfs.metadata().hasClustering());
-        }
     }
 }

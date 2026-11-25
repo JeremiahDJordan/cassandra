@@ -21,6 +21,7 @@ import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.distributed.shared.WithProperties;
@@ -34,37 +35,30 @@ import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.Segment;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
-import org.apache.cassandra.inject.ActionBuilder;
-import org.apache.cassandra.inject.Injection;
-import org.apache.cassandra.inject.Injections;
-import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MINIMUM_POSTINGS_LEAVES;
-import static org.apache.cassandra.inject.Expression.expr;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Numeric indexes written in Apache Cassandra 5.0's format, read back.
+ * Numeric indexes written in storage_compatibility_mode CASSANDRA_5, in Apache Cassandra 5.0's format, read back.
  */
 public class ApacheNumericIndexWriterTest extends SAITester
 {
-    private Injection writeApacheFormat;
+    private StorageCompatibilityMode mode;
 
     @Before
-    public void writeApacheFormat() throws Throwable
+    public void enterCassandra5Mode()
     {
-        writeApacheFormat = Injections.newCustom("write_apache_format")
-                                      .add(InvokePointBuilder.newInvokePoint().onClass(IndexDescriptor.class).onMethod("versionForNewComponents").atEntry())
-                                      .add(ActionBuilder.newActionBuilder().actions().doReturn(expr(Version.class.getName() + ".APACHE_AA")))
-                                      .build();
-        Injections.inject(writeApacheFormat);
+        mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.CASSANDRA_5);
     }
 
     @After
-    public void stopApacheFormat()
+    public void leaveCassandra5Mode()
     {
-        writeApacheFormat.disable();
+        DatabaseDescriptor.setStorageCompatibilityMode(mode);
     }
 
     @Test
