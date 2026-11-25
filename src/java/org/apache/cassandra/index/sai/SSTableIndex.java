@@ -240,8 +240,13 @@ public class SSTableIndex implements Comparable<SSTableIndex>
     // 2. or includes everything minus the keys matching the expression
     // if the column type values cannot be truncated, i.e., matching the keys is always precise.
     // (not matching precisely will lead to false negatives)
+    // The negations on a collection index (NOT CONTAINS, NOT CONTAINS KEY and m[k] != v) include everything, because
+    // the index can match keys whose collection no longer holds the value (see IndexContext#canSubtractMatches).
     //
     // keys k such that row(k) not contains v = (all keys) \ (keys k such that row(k) contains v)
+    //
+    // For an index on a static column, all keys are the keys of the static rows of all partitions, which match the
+    // whole partitions, including those with only a static row and those without one.
     //
     // Note that rows in other indexes are not matched, so this can return false positives,
     // but they are not a problem as post-filtering would get rid of them.
@@ -254,7 +259,8 @@ public class SSTableIndex implements Comparable<SSTableIndex>
     {
         KeyRangeIterator allKeys = allSSTableKeys(keyRange);
         if (TypeUtil.supportsRounding(expression.validator)
-            || !this.getVersion().onDiskFormat().indexFeatureSet().isRowAware())
+            || !this.getVersion().onDiskFormat().indexFeatureSet().isRowAware()
+            || !IndexContext.canSubtractMatches(expression))
         {
             return allKeys;
         }
@@ -398,7 +404,7 @@ public class SSTableIndex implements Comparable<SSTableIndex>
 
     protected final KeyRangeIterator allSSTableKeys(AbstractBounds<PartitionPosition> keyRange) throws IOException
     {
-        return PrimaryKeyMapIterator.create(sstableContext, keyRange);
+        return PrimaryKeyMapIterator.create(sstableContext, keyRange, indexContext.getDefinition().isStatic());
     }
 
     @Override

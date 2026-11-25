@@ -70,6 +70,7 @@ import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.read.ListAppender;
 import org.apache.cassandra.schema.CompressionParams;
 import org.apache.cassandra.service.ClientWarn;
+import org.apache.commons.lang3.ArrayUtils;
 import org.junit.After;
 import org.junit.AfterClass;
 import org.junit.Assert;
@@ -668,6 +669,21 @@ public abstract class CQLTester
             store.forceBlockingFlush(UNIT_TESTS);
     }
 
+    public void flush(String keyspace, String table1, String... tables)
+    {
+        tables = ArrayUtils.add(tables, table1);
+        for (ColumnFamilyStore store : getTables(keyspace, tables))
+            store.forceBlockingFlush(UNIT_TESTS);
+    }
+
+    private List<ColumnFamilyStore> getTables(String keyspace, String[] tables)
+    {
+        List<ColumnFamilyStore> stores = new ArrayList<>(tables.length);
+        for (String name : tables)
+            stores.add(getColumnFamilyStore(keyspace, name));
+        return stores;
+    }
+
     public void disableCompaction(String keyspace)
     {
         disableCompaction(keyspace, currentTable());
@@ -689,6 +705,13 @@ public abstract class CQLTester
     {
         ColumnFamilyStore store = getColumnFamilyStore(keyspace, table);
         if (store != null)
+            store.forceMajorCompaction();
+    }
+
+    public void compact(String keyspace, String table1, String... tables)
+    {
+        tables = ArrayUtils.add(tables, table1);
+        for (ColumnFamilyStore store : getTables(keyspace, tables))
             store.forceMajorCompaction();
     }
 
