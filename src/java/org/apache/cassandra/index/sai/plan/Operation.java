@@ -141,7 +141,7 @@ public class Operation
                 {
                     if (!analyzer.hasNext())
                     {
-                        perColumn.add(new Expression(indexContext).add(e.operator(), ByteBuffer.allocate(0)));
+                        perColumn.add(Expression.withoutTerms(indexContext, e.operator()));
                     }
                     else
                     {
