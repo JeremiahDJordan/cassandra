@@ -339,6 +339,79 @@ public class UFTypesTest extends CQLTester
     }
 
     @Test
+    public void testFunctionReturningUnsortedSet() throws Throwable
+    {
+        String functionName = createFunction(KEYSPACE,
+                                             "",
+                                             "CREATE FUNCTION %s () " +
+                                             "CALLED ON NULL INPUT " +
+                                             "RETURNS set<int> " +
+                                             "LANGUAGE java\n" +
+                                             "AS 'java.util.Set<Integer> values = new java.util.LinkedHashSet<>(); values.add(2); values.add(1); return values;';");
+
+        createTable("CREATE TABLE %s (k frozen<set<int>>, c frozen<set<int>>, v frozen<set<int>>, i int, PRIMARY KEY (k, c))");
+        execute("INSERT INTO %s (k, c, v, i) VALUES (" + functionName + "(), " + functionName + "(), {1, 2}, 1)");
+        execute("INSERT INTO %s (k, c, v) VALUES ({1, 2}, {1, 2}, " + functionName + "())");
+
+        assertRows(execute("SELECT k, c, v FROM %s"), row(set(1, 2), set(1, 2), set(1, 2)));
+        assertRows(execute("SELECT k FROM %s WHERE k = {1, 2} AND c IN (" + functionName + "())"), row(set(1, 2)));
+        assertRows(execute("SELECT " + functionName + "()[1], " + functionName + "()[1..2] FROM %s"), row(1, set(1, 2)));
+        assertRows(execute("UPDATE %s SET v = {3} WHERE k = {1, 2} AND c = {1, 2} IF v = " + functionName + "()"), row(true));
+
+        String stateFunctionName = createFunction(KEYSPACE,
+                                                  "set<int>, int",
+                                                  "CREATE FUNCTION %s (state set<int>, value int) " +
+                                                  "CALLED ON NULL INPUT " +
+                                                  "RETURNS set<int> " +
+                                                  "LANGUAGE java\n" +
+                                                  "AS 'java.util.Set<Integer> values = new java.util.LinkedHashSet<>(); values.add(value); values.addAll(state); return values;';");
+        String aggregateName = createAggregate(KEYSPACE,
+                                               "int",
+                                               "CREATE AGGREGATE %s (int) " +
+                                               "SFUNC " + shortFunctionName(stateFunctionName) + " " +
+                                               "STYPE set<int> " +
+                                               "INITCOND {}");
+        execute("INSERT INTO %s (k, c, i) VALUES ({1, 2}, {3}, 2)");
+        assertRows(execute("SELECT " + aggregateName + "(i)[1] FROM %s WHERE k = {1, 2}"), row(1));
+
+        String finalFunctionName = createFunction(KEYSPACE,
+                                                  "set<int>",
+                                                  "CREATE FUNCTION %s (state set<int>) " +
+                                                  "CALLED ON NULL INPUT " +
+                                                  "RETURNS set<int> " +
+                                                  "LANGUAGE java\n" +
+                                                  "AS 'return state;';");
+        aggregateName = createAggregate(KEYSPACE,
+                                        "int",
+                                        "CREATE AGGREGATE %s (int) " +
+                                        "SFUNC " + shortFunctionName(stateFunctionName) + " " +
+                                        "STYPE set<int> " +
+                                        "FINALFUNC " + shortFunctionName(finalFunctionName) + " " +
+                                        "INITCOND {}");
+        assertRows(execute("SELECT " + aggregateName + "(i)[1] FROM %s WHERE k = {1, 2}"), row(1));
+
+        functionName = createFunction(KEYSPACE,
+                                      "list<frozen<set<int>>>",
+                                      "CREATE FUNCTION %s (sets list<frozen<set<int>>>) " +
+                                      "CALLED ON NULL INPUT " +
+                                      "RETURNS list<frozen<set<int>>> " +
+                                      "LANGUAGE java\n" +
+                                      "AS 'java.util.Set<Integer> values = new java.util.LinkedHashSet<>(); values.add(2); values.add(1); sets.add(values); return sets;';");
+        createTable("CREATE TABLE %s (k frozen<list<frozen<set<int>>>> PRIMARY KEY)");
+        execute("INSERT INTO %s (k) VALUES (" + functionName + "([{3}]))");
+        assertRows(execute("SELECT k FROM %s WHERE k = [{3}, {1, 2}]"), row(list(set(3), set(1, 2))));
+
+        functionName = createFunction(KEYSPACE,
+                                      "map<int, int>",
+                                      "CREATE FUNCTION %s (values map<int, int>) " +
+                                      "CALLED ON NULL INPUT " +
+                                      "RETURNS map<int, int> " +
+                                      "LANGUAGE java\n" +
+                                      "AS 'values.put(1, 10); return values;';");
+        assertRows(execute("SELECT " + functionName + "({2: 20})[1] FROM %s"), row(10));
+    }
+
+    @Test
     public void testFunctionWithFrozenListType() throws Throwable
     {
         createTable("CREATE TABLE %s (a int PRIMARY KEY, b frozen<list<int>>)");
