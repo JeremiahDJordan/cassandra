@@ -794,9 +794,8 @@ public class RowFilter
      * <p>
      * The range tombstone markers of an unfiltered partition aren't rows, so the partition doesn't have rows just
      * because it has more contents: the markers before its first row are read ahead, and returned before that row, or
-     * dropped with the partition if it has no rows, as SAI's {@code FilteringPartitionIterator} does on the replicas.
-     * Otherwise a partition whose rows all fail the filter, but which has a range deletion, would be returned with its
-     * static row, although that row doesn't satisfy the filter either.
+     * dropped with the partition if it has no rows. Otherwise a partition whose rows all fail the filter, but which has
+     * a range deletion, would be returned with its static row, although that row doesn't satisfy the filter either.
      *
      * @param partition a partition filtered by this filter
      * @return the partition, or {@code null} if it has no rows

@@ -30,6 +30,7 @@ import org.junit.Test;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringBound;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
@@ -43,6 +44,7 @@ import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.RangeTombstoneBoundMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -57,6 +59,7 @@ import org.apache.cassandra.utils.btree.BTree;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 public class RowFilterTest
@@ -213,6 +216,77 @@ public class RowFilterTest
         assertFalse(returnsStaticOnlyPartition(filter(and(eq(s, 1), or(eq(t, 0), eq(a, 1)))), metadata, s, t));
         // ...unless the static row alone satisfies a disjunction mixing static and regular columns
         assertTrue(returnsStaticOnlyPartition(filter(and(eq(s, 1), or(eq(t, 2), eq(a, 1)))), metadata, s, t));
+    }
+
+    /**
+     * A partition is returned with the rows that pass a filter on a regular column, and with the range tombstone
+     * markers around them, whether its first content is a row or a marker. A partition without such rows is dropped.
+     */
+    @Test
+    public void testPartitionsStartingWithRowOrMarker()
+    {
+        TableMetadata metadata = TableMetadata.builder("testks", "testcf")
+                                              .addPartitionKeyColumn("pk", Int32Type.instance)
+                                              .addClusteringColumn("ck", Int32Type.instance)
+                                              .addRegularColumn("a", Int32Type.instance)
+                                              .build();
+        ColumnMetadata a = metadata.getColumn(new ColumnIdentifier("a", true));
+        RowFilter filter = filter(and(eq(a, 1)));
+        Unfiltered open = new RangeTombstoneBoundMarker(ClusteringBound.inclusiveStartOf(clustering(0)), DeletionTime.build(1, 1));
+        Unfiltered close = new RangeTombstoneBoundMarker(ClusteringBound.inclusiveEndOf(clustering(9)), DeletionTime.build(1, 1));
+        Unfiltered match1 = row(a, 1, 1);
+        Unfiltered match2 = row(a, 4, 1);
+
+        assertEquals(List.of(match1, match2), filtered(filter, metadata, row(a, 0, 0), match1, row(a, 3, 0), match2));
+        assertEquals(List.of(match1), filtered(filter, metadata, match1));
+        assertEquals(List.of(open, match1, close), filtered(filter, metadata, open, row(a, 0, 0), match1, close));
+        assertNull(filtered(filter, metadata, open, row(a, 0, 0), close));
+        assertNull(filtered(filter, metadata, row(a, 0, 0)));
+    }
+
+    private static Clustering<?> clustering(int ck)
+    {
+        return Clustering.make(Int32Type.instance.decompose(ck));
+    }
+
+    private static Row row(ColumnMetadata column, int ck, int value)
+    {
+        Row.Builder builder = BTreeRow.unsortedBuilder();
+        builder.newRow(clustering(ck));
+        builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(2, 1));
+        builder.addCell(BufferCell.live(column, 2, Int32Type.instance.decompose(value)));
+        return builder.build();
+    }
+
+    /** The contents of the given partition that the filter returns, or null if it drops the partition. */
+    private static List<Unfiltered> filtered(RowFilter filter, TableMetadata metadata, Unfiltered... contents)
+    {
+        DecoratedKey key = Murmur3Partitioner.instance.decorateKey(Int32Type.instance.decompose(0));
+        UnfilteredRowIterator partition = new AbstractUnfilteredRowIterator(metadata, key, DeletionTime.LIVE,
+                                                                            metadata.regularAndStaticColumns(),
+                                                                            Rows.EMPTY_STATIC_ROW, false, EncodingStats.NO_STATS)
+        {
+            private int next = 0;
+
+            @Override
+            protected Unfiltered computeNext()
+            {
+                return next < contents.length ? contents[next++] : endOfData();
+            }
+        };
+
+        try (UnfilteredPartitionIterator partitions = filter.filter(new SingletonUnfilteredPartitionIterator(partition), 1))
+        {
+            if (!partitions.hasNext())
+                return null;
+            List<Unfiltered> returned = new ArrayList<>();
+            try (UnfilteredRowIterator rows = partitions.next())
+            {
+                rows.forEachRemaining(returned::add);
+            }
+            assertFalse(partitions.hasNext());
+            return returned;
+        }
     }
 
     /** Whether the filter returns a partition with only a static row, with s = 1 and t = 2. */

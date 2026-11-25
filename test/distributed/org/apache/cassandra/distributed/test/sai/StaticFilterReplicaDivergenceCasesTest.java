@@ -142,7 +142,7 @@ public class StaticFilterReplicaDivergenceCasesTest extends TestBaseImpl
           "1: " + ST0, "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 3, {1}) USING TIMESTAMP 1",
           "23: UPDATE %s USING TIMESTAMP 2 SET st = 5 WHERE pk = 1", "23: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck = 1",
           "23: INSERT INTO %s (pk, ck, v, r) VALUES (1, 2, 1, {1}) USING TIMESTAMP 1" },
-        // as B, with a clustering restriction that the deleted row satisfies
+        // as B, with a clustering restriction on the other side of the OR, which the deleted row doesn't satisfy
         { "E3", "(st = 5 AND v = 3) OR ck >= 2", "2",
           "1: " + ST0, "1: INSERT INTO %s (pk, ck, v, r) VALUES (1, 1, 3, {3}) USING TIMESTAMP 1",
           "23: UPDATE %s USING TIMESTAMP 2 SET st = 5 WHERE pk = 1", "23: DELETE FROM %s USING TIMESTAMP 2 WHERE pk = 1 AND ck = 1",

@@ -108,11 +108,19 @@ public class StaticDisjunctionHeldDeletionsTest extends SAITester
 
     /**
      * With and without reconciliation, a read fails once SAI holds or drops more deletions than the tombstone failure
-     * threshold, with and without indexes, and counts one failure and no warning.
+     * threshold, with and without indexes, and counts one failure and no warning. A read that holds deletions stops
+     * reading the partition once it holds as many as the failure threshold: it doesn't hold all of them first.
      */
     @Test
     public void testHeldDeletionsAreBoundedByTheTombstoneFailureThreshold() throws Throwable
     {
+        Injections.Counter held = Injections.newCounter("held_bounded")
+                                            .add(newInvokePoint().onClass("org.apache.cassandra.db.rows.UnfilteredRowIterators")
+                                                                 .onMethod("withLiveRowsOrNullUnsafe")
+                                                                 .at("INVOKE List.add"))
+                                            .build();
+        Injections.inject(held);
+
         withTombstoneThresholds(() -> {
             for (boolean indexed : new boolean[]{ false, true })
             {
@@ -137,7 +145,14 @@ public class StaticDisjunctionHeldDeletionsTest extends SAITester
                 {
                     String label = (indexed ? "indexed: " : "plain: ") + query;
                     for (ConsistencyLevel consistency : new ConsistencyLevel[]{ ConsistencyLevel.ALL, ConsistencyLevel.ONE })
+                    {
+                        held.reset();
                         assertFailsOnTombstones(label + " at " + consistency, query, consistency);
+                        // the failure threshold is 1000, and the 1001st held deletion fails the read
+                        assertTrue(label + " at " + consistency + ", held " + held.get(), held.get() <= 1001);
+                        if (consistency == ConsistencyLevel.ALL)
+                            assertTrue(label + " at ALL, held nothing", held.get() > 0);
+                    }
                 }
             }
         });

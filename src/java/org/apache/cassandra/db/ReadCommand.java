@@ -891,8 +891,8 @@ public abstract class ReadCommand extends AbstractReadQuery
             private DecoratedKey currentKey;
             private boolean inPartition;
 
-                // tombstones dropped by the searcher for a partition the read hasn't seen yet: reported with that
-                // partition if the searcher returns it, otherwise on their own
+            // tombstones dropped by the searcher for a partition the read hasn't seen yet: reported with that
+            // partition if the searcher returns it, otherwise on their own
             private DecoratedKey droppedKey;
             private long droppedTombstones;
 
