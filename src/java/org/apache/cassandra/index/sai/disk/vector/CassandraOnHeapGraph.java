@@ -21,6 +21,8 @@ package org.apache.cassandra.index.sai.disk.vector;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -87,6 +89,7 @@ import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.Version;
+import org.apache.cassandra.index.sai.disk.io.IndexFileUtils;
 import org.apache.cassandra.index.sai.disk.v1.Segment;
 import org.apache.cassandra.index.sai.disk.v1.SegmentMetadata;
 import org.apache.cassandra.index.sai.disk.v2.V2VectorIndexSearcher;
@@ -106,6 +109,7 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.NoSpamLogger;
+import org.apache.cassandra.utils.SyncUtil;
 import org.apache.lucene.util.StringHelper;
 
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
@@ -149,11 +153,20 @@ public class CassandraOnHeapGraph<T> implements Accountable
     private final ExplicitThreadLocal<GraphSearcherAccessManager> searchers;
 
     private final boolean writeNvq;
+    private final Version version;
 
     /**
      * @param forSearching if true, vectorsByKey will be initialized and populated with vectors as they are added
      */
     public CassandraOnHeapGraph(IndexContext context, boolean forSearching, Memtable memtable)
+    {
+        this(context, forSearching, memtable, context.version());
+    }
+
+    /**
+     * @param version the version whose graph options and jvector file format the graph is built and written with
+     */
+    public CassandraOnHeapGraph(IndexContext context, boolean forSearching, Memtable memtable, Version version)
     {
         this.indexName = context.getIndexName();
         this.indexMetrics = context.getIndexMetrics();
@@ -180,12 +193,13 @@ public class CassandraOnHeapGraph<T> implements Accountable
         vectorsByKey = forSearching ? new NonBlockingHashMap<>() : null;
         invalidVectorBehavior = forSearching ? InvalidVectorBehavior.FAIL : InvalidVectorBehavior.IGNORE;
 
-        int jvectorVersion = context.version().onDiskFormat().jvectorFileFormatVersion();
+        this.version = version;
+        int jvectorVersion = version.onDiskFormat().jvectorFileFormatVersion();
         // Assume true until we observe otherwise.
         allVectorsAreUnitLength = true;
 
         // NVQ is only written during compaction to save on compute costs
-        writeNvq = JVectorVersionUtil.shouldWriteNVQ(dimension, context.version()) && !forSearching;
+        writeNvq = JVectorVersionUtil.shouldWriteNVQ(dimension, version) && !forSearching;
 
         // This is only a warning since it's not a fatal error to write without hierarchy
         if (indexConfig.isHierarchyEnabled() && jvectorVersion < 4)
@@ -568,11 +582,11 @@ public class CassandraOnHeapGraph<T> implements Accountable
             SAICodecUtils.writeHeader(postingsOutput);
 
             // Write fused unless we don't meet some criteria (will be determined in the writePQ method)
-            boolean writeFusedPQ = JVectorVersionUtil.shouldWriteFused(perIndexComponents.version());
+            boolean writeFusedPQ = JVectorVersionUtil.shouldWriteFused(version);
 
             // compute and write PQ
             long pqOffset = pqOutput.getFilePointer();
-            var compressor = writePQ(pqOutput.asSequentialWriter(), remappedPostings, perIndexComponents.context(), writeFusedPQ);
+            var compressor = writePQ(pqOutput.asSequentialWriter(), remappedPostings, perIndexComponents.context(), version, writeFusedPQ);
             long pqLength = pqOutput.getFilePointer() - pqOffset;
 
             // write postings
@@ -587,7 +601,9 @@ public class CassandraOnHeapGraph<T> implements Accountable
             else
             {
                 IntUnaryOperator newToOldMapper = remappedPostings.ordinalMapper::newToOld;
-                postingsPosition = new V2VectorPostingsWriter<T>(remappedPostings.structure == Structure.ONE_TO_ONE, builder.getGraph().size(), newToOldMapper)
+                // Apache Cassandra reads only the general layout, with the count of deleted ordinals
+                boolean oneToOne = remappedPostings.structure == Structure.ONE_TO_ONE && !perIndexComponents.version().isApache();
+                postingsPosition = new V2VectorPostingsWriter<T>(oneToOne, builder.getGraph().size(), newToOldMapper)
                                    .writePostings(postingsOutput.asSequentialWriter(), vectorValues, postingsMap, deletedOrdinals);
             }
             long postingsLength = postingsPosition - postingsOffset;
@@ -598,7 +614,8 @@ public class CassandraOnHeapGraph<T> implements Accountable
             // ProductQuantization.
             NVQuantization nvq = writeNvq ? NVQuantization.compute(vectorValues, NUM_SUB_VECTORS) : null;
 
-            try (var indexWriter = createIndexWriter(indexFile, termsOffset, perIndexComponents.context(), ordinalMapper, compressor, nvq);
+            SegmentMetadata.ComponentMetadataMap metadataMap;
+            try (var indexWriter = createIndexWriter(indexFile, termsOffset, perIndexComponents.context(), version, ordinalMapper, compressor, nvq);
                  var view = builder.getGraph().getView())
             {
                 indexWriter.getOutput().seek(indexFile.length()); // position at the end of the previous segment before writing our own header
@@ -608,29 +625,46 @@ public class CassandraOnHeapGraph<T> implements Accountable
                 // write the graph
                 var start = nanoTime();
                 indexWriter.write(suppliers(view, compressor, nvq, writeFusedPQ));
-                SAICodecUtils.writeFooter(indexWriter.getOutput(), indexWriter.checksum());
+                long termsLength;
+                if (perIndexComponents.version().isApache())
+                {
+                    // Apache Cassandra records the graph without the footer, whose checksum covers the segment's frame
+                    termsLength = indexWriter.getOutput().position() - termsOffset;
+                    SAICodecUtils.writeFrameFooter(indexWriter.getOutput(), indexFile, termsOffset - SAICodecUtils.headerSize(),
+                                                   IndexFileUtils.getChecksumFactory(perIndexComponents.version()).get());
+                }
+                else
+                {
+                    SAICodecUtils.writeFooter(indexWriter.getOutput(), indexWriter.checksum());
+                    termsLength = indexWriter.getOutput().position() - termsOffset;
+                }
                 logger.info("Writing graph took {}ms", (nanoTime() - start) / 1_000_000);
-                long termsLength = indexWriter.getOutput().position() - termsOffset;
 
                 // write remaining footers/checksums
                 SAICodecUtils.writeFooter(pqOutput);
                 SAICodecUtils.writeFooter(postingsOutput);
 
                 // add components to the metadata map
-                return createMetadataMap(termsOffset, termsLength, postingsOffset, postingsLength, pqOffset, pqLength);
+                metadataMap = createMetadataMap(termsOffset, termsLength, postingsOffset, postingsLength, pqOffset, pqLength);
             }
+            // jvector's writer doesn't sync the graph when it closes, unlike the writers of the other components
+            try (FileChannel channel = FileChannel.open(indexFile.toPath(), StandardOpenOption.WRITE))
+            {
+                SyncUtil.force(channel, true);
+            }
+            return metadataMap;
         }
     }
 
-    private OnDiskGraphIndexWriter createIndexWriter(File indexFile, long termsOffset, IndexContext context, OrdinalMapper ordinalMapper, VectorCompressor<?> compressor, NVQuantization nvq) throws IOException
+    private OnDiskGraphIndexWriter createIndexWriter(File indexFile, long termsOffset, IndexContext context, Version version, OrdinalMapper ordinalMapper, VectorCompressor<?> compressor, NVQuantization nvq) throws IOException
     {
         var indexWriterBuilder = new OnDiskGraphIndexWriter.Builder(builder.getGraph(), indexFile.toPath())
             .withStartOffset(termsOffset)
-            .withVersion(context.version().onDiskFormat().jvectorFileFormatVersion())
+            .withVersion(version.onDiskFormat().jvectorFileFormatVersion())
             .withMapper(ordinalMapper)
             .with(nvq != null ? new NVQ(nvq) : new InlineVectors(vectorValues.dimension()));
 
-        if (compressor instanceof ProductQuantization && JVectorVersionUtil.shouldWriteFused(context.version()))
+        if (compressor instanceof ProductQuantization && JVectorVersionUtil.shouldWriteFused(version))
             indexWriterBuilder.with(new FusedPQ(context.getIndexWriterConfig().getAnnMaxDegree(), (ProductQuantization) compressor));
 
         return indexWriterBuilder.build();
@@ -727,9 +761,14 @@ public class CassandraOnHeapGraph<T> implements Accountable
         }
     }
 
-    private VectorCompressor<?> writePQ(SequentialWriter writer, V5VectorPostingsWriter.RemappedPostings remapped, IndexContext indexContext, boolean writeFusedPQ) throws IOException
+    private VectorCompressor<?> writePQ(SequentialWriter writer, V5VectorPostingsWriter.RemappedPostings remapped, IndexContext indexContext, Version version, boolean writeFusedPQ) throws IOException
     {
-        var preferredCompression = sourceModel.compressionProvider.apply(vectorValues.dimension());
+        // Apache Cassandra compresses a segment of enough vectors into half as many subspaces as dimensions, with a
+        // new codebook (it can't compress vectors of one dimension, which it reads uncompressed)
+        int dimension = vectorValues.dimension();
+        var preferredCompression = !version.isApache() ? sourceModel.compressionProvider.apply(dimension)
+                                   : dimension < 2 ? VectorCompression.NO_COMPRESSION
+                                   : new VectorCompression(CompressionType.PRODUCT_QUANTIZATION, dimension * Float.BYTES, dimension / 2);
 
         // Build encoder and compress vectors
         VectorCompressor<?> compressor = null; // will be null if we can't compress
@@ -741,7 +780,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
             // build encoder (expensive for PQ)
             if (preferredCompression.type == CompressionType.PRODUCT_QUANTIZATION)
             {
-                var pqi = getPqIfPresent(indexContext, preferredCompression::equals);
+                var pqi = version.isApache() ? null : getPqIfPresent(indexContext, preferredCompression::equals);
                 compressor = computeOrRefineFrom(pqi, preferredCompression);
             }
             assert !vectorValues.isValueShared();
@@ -751,18 +790,18 @@ public class CassandraOnHeapGraph<T> implements Accountable
         }
 
         var actualType = compressor == null ? CompressionType.NONE : preferredCompression.type;
-        writePqHeader(writer, allVectorsAreUnitLength, actualType, indexContext.version());
+        writePqHeader(writer, allVectorsAreUnitLength, actualType, version);
         if (actualType == CompressionType.NONE)
             return null;
 
         if (writeFusedPQ)
         {
-            compressor.write(writer, indexContext.version().onDiskFormat().jvectorFileFormatVersion());
+            compressor.write(writer, version.onDiskFormat().jvectorFileFormatVersion());
             return compressor;
         }
 
         // save (outside the synchronized block, this is io-bound not CPU)
-        cv.write(writer, indexContext.version().onDiskFormat().jvectorFileFormatVersion());
+        cv.write(writer, version.onDiskFormat().jvectorFileFormatVersion());
         return null; // Don't need compressor in this case
     }
 

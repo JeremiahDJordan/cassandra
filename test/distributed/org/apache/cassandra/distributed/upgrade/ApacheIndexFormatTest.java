@@ -34,6 +34,7 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Random;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
@@ -57,8 +58,10 @@ import net.bytebuddy.implementation.MethodDelegation;
 import net.bytebuddy.implementation.bind.annotation.FieldValue;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.UpgradeableCluster;
+import org.apache.cassandra.distributed.api.IInstanceConfig;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.shared.Versions;
 import org.apache.cassandra.distributed.shared.WithProperties;
@@ -72,6 +75,7 @@ import org.apache.cassandra.utils.Hex;
 import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_MINIMUM_POSTINGS_LEAVES;
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_TEST_LAST_VALID_SEGMENTS;
+import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_VECTOR_ENABLE_NVQ;
 import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_CASSANDRA_5_MODE_ENABLED;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
 import static org.apache.cassandra.distributed.shared.AssertUtils.row;
@@ -105,6 +109,10 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
     private static final int NUMERIC_SEGMENT_ROWS = 10000;
     private static final int MIDDLE = NUMERIC_ROWS / 2;
     private static final int VARINT_AS_WRITTEN = 7;
+    private static final String VECTORS = "vectors";
+    private static final int VECTOR_ROWS = 6000;
+    private static final int VECTOR_DIMENSION = 16;
+    private static final int VECTOR_SEGMENT_ROWS = 1500;
 
     @Rule
     public TemporaryFolder temporaryFolder = new TemporaryFolder();
@@ -299,6 +307,86 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
         return files;
     }
 
+    @Test
+    public void testVectorIndexes() throws Throwable
+    {
+        Random random = new Random(42);
+        float[][] vectors = new float[VECTOR_ROWS][VECTOR_DIMENSION];
+        // vectors of other lengths than 1, for the dot product
+        float[][] products = new float[VECTOR_ROWS][VECTOR_DIMENSION];
+        for (int pk = 0; pk < VECTOR_ROWS; pk++)
+        {
+            for (int d = 0; d < VECTOR_DIMENSION; d++)
+            {
+                vectors[pk][d] = random.nextFloat();
+                products[pk][d] = 1 + 4 * random.nextFloat();
+            }
+            // rows sharing a vector
+            if (pk % 10 == 5)
+                vectors[pk] = vectors[pk - 1];
+        }
+
+        // segments of more and fewer vectors than Apache compresses (1024), and NVQ enabled for our formats
+        try (WithProperties properties = new WithProperties().set(SAI_TEST_LAST_VALID_SEGMENTS, VECTOR_SEGMENT_ROWS)
+                                                             .set(SAI_VECTOR_ENABLE_NVQ, true))
+        {
+            Path files = writeInApacheFormat(ApacheIndexFormatTest::createVectorSchema, node -> {
+                for (int pk = 0; pk < VECTOR_ROWS; pk++)
+                {
+                    String s = pk % 2 == 0 ? "'a'" : "'b'";
+                    // a live row without vectors
+                    if (pk % 10 == 7)
+                        node.executeInternal(withKeyspace("INSERT INTO %s.vectors (pk, s) VALUES (" + pk + ", " + s + ')'));
+                    else
+                        node.executeInternal(withKeyspace("INSERT INTO %s.vectors (pk, s, v, p) VALUES (" + pk + ", " + s + ", " +
+                                                          vectorLiteral(vectors[pk]) + ", " + vectorLiteral(products[pk]) + ')'));
+                    // a row without live data, which Apache's row ids leave out
+                    if (pk % 10 == 3)
+                        node.executeInternal(withKeyspace("DELETE FROM %s.vectors WHERE pk = " + pk));
+                    // the files Apache loads are those of a compaction of two sstables
+                    if (pk == VECTOR_ROWS / 2)
+                        node.flush(KEYSPACE);
+                }
+                node.flush(KEYSPACE);
+                node.forceCompact(KEYSPACE, VECTORS);
+                // the files of the compacted sstables are gone before the table's files are copied
+                node.runOnInstance(() -> LifecycleTransaction.waitForDeletions());
+            }, VECTORS);
+
+            loadOnApache(files, ApacheIndexFormatTest::createVectorSchema, (cluster, node, tableDirs) -> {
+                for (int pk = 0; pk < VECTOR_ROWS; pk += 97)
+                {
+                    String query = vectorLiteral(vectors[pk]);
+                    // each live row with a vector is its own nearest neighbour, or that of the row sharing its vector
+                    Object[][] rows = node.executeInternal(withKeyspace("SELECT pk FROM %s.vectors ORDER BY v ANN OF " + query + " LIMIT 10"));
+                    assertThat(pks(rows)).hasSize(10).doesNotHaveDuplicates().noneMatch(key -> (int) key % 10 == 3 || (int) key % 10 == 7);
+                    if (pk % 10 != 3 && pk % 10 != 7)
+                        assertThat(rows[0][0]).as("nearest to the vector of %d", pk).isIn(pk, pk % 10 == 4 ? pk + 1 : pk % 10 == 5 ? pk - 1 : pk);
+                    // both rows sharing a vector
+                    if (pk % 10 == 4 || pk % 10 == 5)
+                        assertThat(pks(rows)).contains(pk, pk % 10 == 4 ? pk + 1 : pk - 1);
+
+                    rows = node.executeInternal(withKeyspace("SELECT pk FROM %s.vectors WHERE s = 'a' ORDER BY v ANN OF " + query + " LIMIT 10"));
+                    assertThat(pks(rows)).hasSize(10).doesNotHaveDuplicates().allMatch(key -> (int) key % 2 == 0);
+                    if (pk % 2 == 0)
+                        assertThat(rows[0][0]).as("nearest even row to the vector of %d", pk).isEqualTo(pk);
+
+                    // the first row by dot product is among the ten that are
+                    float[] product = products[pk];
+                    rows = node.executeInternal(withKeyspace("SELECT pk FROM %s.vectors ORDER BY p ANN OF " + vectorLiteral(product) + " LIMIT 10"));
+                    List<Object> best = IntStream.range(0, VECTOR_ROWS)
+                                                 .filter(key -> key % 10 != 3 && key % 10 != 7)
+                                                 .boxed()
+                                                 .sorted((x, y) -> Float.compare(dot(products[y], product), dot(products[x], product)))
+                                                 .limit(10)
+                                                 .collect(Collectors.toList());
+                    assertThat(pks(rows)).hasSize(10).doesNotHaveDuplicates().noneMatch(key -> (int) key % 10 == 3 || (int) key % 10 == 7);
+                    assertThat(rows[0][0]).as("first by dot product with the vector of %d", pk).isIn(best);
+                }
+            }, VECTORS);
+        }
+    }
+
     private static void assertNumericRows(IInvokableInstance node, String table, String restriction, IntPredicate expected)
     {
         Object[][] rows = node.executeInternal(withKeyspace("SELECT pk FROM %s." + table + " WHERE " + restriction));
@@ -343,7 +431,10 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
         try (WithProperties properties = new WithProperties().set(TEST_CASSANDRA_5_MODE_ENABLED, true);
              Cluster cluster = Cluster.build(1)
                                       .withInstanceInitializer(WriteApacheFormat::install)
-                                      .withConfig(config -> config.set("storage_compatibility_mode", "CASSANDRA_5"))
+                                      .withConfig(config -> {
+                                          config.set("storage_compatibility_mode", "CASSANDRA_5");
+                                          oneDataDirectory(config);
+                                      })
                                       .start())
         {
             schema.accept(cluster::schemaChange);
@@ -382,7 +473,7 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
         Versions.Version apache = apacheVersion();
         URL testClasses = ApacheIndexFormatTest.class.getProtectionDomain().getCodeSource().getLocation();
         Versions.Version apacheWithTests = new Versions.Version(apache.version, ArrayUtils.add(apache.classpath, testClasses));
-        try (UpgradeableCluster cluster = startCluster(1, config -> config.set("uuid_sstable_identifiers_enabled", true), apacheWithTests))
+        try (UpgradeableCluster cluster = startCluster(1, config -> oneDataDirectory(config.set("uuid_sstable_identifiers_enabled", true)), apacheWithTests))
         {
             schema.accept(cluster::schemaChange);
             IInvokableInstance node = (IInvokableInstance) cluster.get(1);
@@ -424,6 +515,12 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
         }
     }
 
+    // which vector indexes require, on Apache and in the mode
+    private static void oneDataDirectory(IInstanceConfig config)
+    {
+        config.set("data_file_directories", new String[]{ ((String[]) config.get("data_file_directories"))[0] });
+    }
+
     private interface ApacheChecks
     {
         void check(UpgradeableCluster cluster, IInvokableInstance node, Map<String, Path> tableDirs) throws Throwable;
@@ -443,6 +540,32 @@ public class ApacheIndexFormatTest extends ApacheMixedClusterTestBase
         schemaChange.accept(withKeyspace("CREATE INDEX skinny_m ON %s.skinny (ENTRIES(m)) USING 'sai'"));
         schemaChange.accept(withKeyspace("CREATE INDEX skinny_a ON %s.skinny (a) USING 'sai' WITH OPTIONS = {'case_sensitive': 'false'}"));
         schemaChange.accept(withKeyspace("CREATE INDEX skinny_se ON %s.skinny (se) USING 'sai'"));
+    }
+
+    private static void createVectorSchema(Consumer<String> schemaChange)
+    {
+        schemaChange.accept(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"));
+        schemaChange.accept(withKeyspace("CREATE TABLE %s.vectors (pk int PRIMARY KEY, s text, v vector<float, " + VECTOR_DIMENSION + ">, " +
+                                         "p vector<float, " + VECTOR_DIMENSION + ">)"));
+        schemaChange.accept(withKeyspace("CREATE INDEX vectors_s ON %s.vectors (s) USING 'sai'"));
+        schemaChange.accept(withKeyspace("CREATE INDEX vectors_v ON %s.vectors (v) USING 'sai'"));
+        schemaChange.accept(withKeyspace("CREATE INDEX vectors_p ON %s.vectors (p) USING 'sai' WITH OPTIONS = {'similarity_function': 'dot_product'}"));
+    }
+
+    private static float dot(float[] x, float[] y)
+    {
+        float product = 0;
+        for (int d = 0; d < x.length; d++)
+            product += x[d] * y[d];
+        return product;
+    }
+
+    private static String vectorLiteral(float[] vector)
+    {
+        StringBuilder literal = new StringBuilder("[");
+        for (int d = 0; d < vector.length; d++)
+            literal.append(d == 0 ? "" : ", ").append(vector[d]);
+        return literal.append(']').toString();
     }
 
     private static void createNumericSchema(Consumer<String> schemaChange)

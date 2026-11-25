@@ -75,4 +75,21 @@ public class VectorIndexMixedVersionTest extends VectorTester
         compact();
         assertEquals(2, execute("SELECT pk FROM %s ORDER BY vec ANN OF [2.0, 2.0, 3.0, 4.0] LIMIT 2").size());
     }
+
+    @Test
+    public void testIndexOnSSTableOfEarlierVersion()
+    {
+        // FA components, which always have FusedPQ, built while the current version is another
+        createTable("CREATE TABLE %s (pk int, s text, vec vector<float, 4>, PRIMARY KEY(pk))");
+        createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex'");
+        disableCompaction();
+        SAIUtil.setCurrentVersion(Version.FA);
+        for (int i = 0; i < CassandraOnHeapGraph.MIN_PQ_ROWS * 2; i++)
+            execute("INSERT INTO %s (pk, s, vec) VALUES (?, 'x', ?)", i, randomVectorBoxed(4));
+        flush();
+        SAIUtil.setCurrentVersion(Version.LATEST);
+
+        createIndex("CREATE CUSTOM INDEX ON %s(vec) USING 'StorageAttachedIndex'");
+        assertEquals(2, execute("SELECT pk FROM %s ORDER BY vec ANN OF [2.0, 2.0, 3.0, 4.0] LIMIT 2").size());
+    }
 }

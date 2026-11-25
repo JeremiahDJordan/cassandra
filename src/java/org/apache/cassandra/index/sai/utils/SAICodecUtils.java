@@ -19,11 +19,16 @@ package org.apache.cassandra.index.sai.utils;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.nio.channels.FileChannel;
+import java.util.zip.Checksum;
 
 import io.github.jbellis.jvector.disk.RandomAccessWriter;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.io.IndexFileUtils;
 import org.apache.cassandra.io.compress.CorruptBlockException;
+import org.apache.cassandra.io.storage.StorageProvider;
+import org.apache.cassandra.io.util.File;
 import org.apache.lucene.index.CorruptIndexException;
 import org.apache.lucene.store.ChecksumIndexInput;
 import org.apache.lucene.store.DataInput;
@@ -110,6 +115,35 @@ public class SAICodecUtils
         writeBEInt(out, FOOTER_MAGIC);
         writeBEInt(out, 0);
         writeBELong(out, checksum);
+    }
+
+    /**
+     * Writes the footer of the frame that starts at {@code frameStart} of {@code file}, which {@code braw} writes,
+     * with the checksum of the frame up to its checksum, footer magic included, as Apache Cassandra writes and
+     * validates each segment of a component.
+     */
+    public static void writeFrameFooter(RandomAccessWriter braw, File file, long frameStart, Checksum checksum) throws IOException
+    {
+        braw.flush();
+        try (FileChannel channel = StorageProvider.instance.writeTimeReadFileChannelFor(file))
+        {
+            ByteBuffer buffer = ByteBuffer.allocate(65536);
+            long position = frameStart;
+            long end = braw.position();
+            while (position < end)
+            {
+                buffer.clear().limit((int) Math.min(buffer.capacity(), end - position));
+                int read = channel.read(buffer, position);
+                if (read < 0)
+                    throw new IOException("Unexpected end of " + file + " at " + position + ", expected " + end);
+                buffer.flip();
+                checksum.update(buffer);
+                position += read;
+            }
+        }
+        ByteBuffer magic = ByteBuffer.allocate(2 * Integer.BYTES).putInt(FOOTER_MAGIC).putInt(0);
+        checksum.update(magic.array(), 0, magic.capacity());
+        writeFooter(braw, checksum.getValue());
     }
 
     public static Version checkHeader(DataInput in) throws IOException

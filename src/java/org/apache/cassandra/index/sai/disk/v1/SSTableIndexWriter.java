@@ -459,7 +459,12 @@ public class SSTableIndexWriter implements PerIndexWriter
     {
         SegmentBuilder builder;
 
-        if (indexContext.isVector())
+        if (indexContext.isVector() && apacheTermType != null)
+        {
+            // Apache Cassandra's graphs are built on heap
+            builder = new SegmentBuilder.VectorOnHeapSegmentBuilder(perIndexComponents, rowIdOffset, keyCount, limiter);
+        }
+        else if (indexContext.isVector())
         {
             // if we have a PQ instance available, we can use it to build a CompactionGraph;
             // otherwise, build on heap (which will create PQ for next time, if we have enough vectors)

@@ -238,10 +238,9 @@ public class ApacheOnDiskFormat extends V9OnDiskFormat
     @Override
     public PerIndexWriter newPerIndexWriter(StorageAttachedIndex index, IndexDescriptor indexDescriptor, LifecycleNewTracker tracker, RowMapping rowMapping, long keyCount)
     {
-        IndexContext context = index.getIndexContext();
-        if (context.isVector())
-            throw new UnsupportedOperationException("Vector indexes aren't written in the Apache Cassandra SAI format: " + context.getIndexName());
-        return new SSTableIndexWriter(indexDescriptor.newPerIndexComponentsForWrite(context),
+        // Every index, vector indexes too, is built from the sstable's rows: the graph of a memtable index has the
+        // options of the index's version, and its flush writes our segment metadata
+        return new SSTableIndexWriter(indexDescriptor.newPerIndexComponentsForWrite(index.getIndexContext()),
                                       SEGMENT_BUILD_MEMORY_LIMITER,
                                       index.isDropped(),
                                       index.isUnloaded(),
