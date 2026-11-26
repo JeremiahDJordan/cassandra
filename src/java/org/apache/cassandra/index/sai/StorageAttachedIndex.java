@@ -42,6 +42,7 @@ import java.util.stream.Collectors;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicates;
 import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import org.slf4j.Logger;
@@ -66,6 +67,7 @@ import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
+import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
@@ -141,12 +143,16 @@ public class StorageAttachedIndex implements Index
 
                                 // If this is not a full manual index rebuild we can skip SSTables that already have an
                                 // attached index. Otherwise, we override any pre-existent index.
-                                Collection<SSTableReader> ss = sstablesToRebuild;
+                                // A compaction result opened early is still being written, with its index
+                                // components, by the compaction, which adds it when it completes: never build it.
+                                Collection<SSTableReader> ss = sstablesToRebuild.stream()
+                                                                                .filter(s -> s.openReason != SSTableReader.OpenReason.EARLY)
+                                                                                .collect(Collectors.toList());
                                 if (!isFullRebuild)
                                 {
-                                    ss = sstablesToRebuild.stream()
-                                                          .filter(s -> !IndexDescriptor.isIndexBuildCompleteOnDisk(s, indexContext))
-                                                          .collect(Collectors.toList());
+                                    ss = ss.stream()
+                                           .filter(s -> !IndexDescriptor.isIndexBuildCompleteOnDisk(s, indexContext))
+                                           .collect(Collectors.toList());
                                 }
 
                                 group.prepareIndexSSTablesForRebuild(ss, sai);
@@ -861,7 +867,9 @@ public class StorageAttachedIndex implements Index
      */
     private synchronized List<SSTableReader> findNonIndexedSSTables(ColumnFamilyStore baseCfs, StorageAttachedIndexGroup group, boolean validate)
     {
-        Set<SSTableReader> sstables = baseCfs.getLiveSSTables();
+        // The canonical set: the sources of a running compaction as they were, rather than the readers whose starts it
+        // has moved (which can't be built, as their first keys aren't readable) or its results opened early.
+        Set<SSTableReader> sstables = Sets.newHashSet(baseCfs.getSSTables(SSTableSet.CANONICAL));
 
         // Initialize the SSTable indexes w/ valid existing components (some of them may already be in the view)...
         assert group != null : "Missing index group on " + baseCfs.name;
