@@ -21,10 +21,15 @@ import org.junit.Before;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.exceptions.QueryReferencesTooManyIndexesAbortException;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Tests the SSTable indexes the {@code sai_sstable_indexes_per_query} guardrail counts: the highest number of SSTable
@@ -156,6 +161,37 @@ public class SSTableIndexesPerQueryGuardrailTest extends SAITester
         setFailThreshold(1);
         assertRowCount(execute("SELECT * FROM %s WHERE k = 0 AND a = 0"), 1);
         assertFails("SELECT * FROM %s WHERE a = 0", SSTABLES);
+    }
+
+    /**
+     * A single partition query doesn't search the SSTable indexes whose SSTable bloom filter doesn't have the key, even
+     * if the key is in the key range of the SSTable, so they aren't counted, also with several expressions.
+     */
+    @Test
+    public void testIgnoresIndexesWithoutPartition() throws Throwable
+    {
+        for (int i = 0; i < SSTABLES; i++)
+        {
+            for (int k = 1; k <= 20; k++)
+                execute("INSERT INTO %s (k, c, a, b) VALUES (?, 0, 0, 0)", k);
+            if (i > 0)
+                execute("INSERT INTO %s (k, c, a, b) VALUES (0, 0, 0, 0)");
+            flush();
+        }
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        DecoratedKey key = cfs.decorateKey(Int32Type.instance.decompose(0));
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+            assertTrue(sstable.first.compareTo(key) < 0 && sstable.last.compareTo(key) > 0);
+
+        setFailThreshold(SSTABLES - 1);
+        assertRows(execute("SELECT k, c FROM %s WHERE k = 0 AND a = 0"), row(0, 0));
+        assertRows(execute("SELECT k, c FROM %s WHERE k = 0 AND a = 0 AND b = 0"), row(0, 0));
+        assertRows(execute("SELECT k, c FROM %s WHERE k = 0 AND (a = 0 OR b = 0)"), row(0, 0));
+        assertFails("SELECT * FROM %s WHERE a = 0", SSTABLES);
+
+        setFailThreshold(SSTABLES - 2);
+        assertFails("SELECT * FROM %s WHERE k = 0 AND a = 0", SSTABLES - 1);
+        assertFails("SELECT * FROM %s WHERE k = 0 AND a = 0 AND b = 0", SSTABLES - 1);
     }
 
     private static void setFailThreshold(int fail)

@@ -145,6 +145,8 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     private final IndexFeatureSet indexFeatureSet;
     private final List<DataRange> ranges;
     private final AbstractBounds<PartitionPosition> mergeRange;
+    @Nullable
+    private final QueryView.KeyInFilters keyInFilters;
 
     private final PrimaryKey.Factory keyFactory;
     private final PrimaryKey firstPrimaryKey;
@@ -224,6 +226,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
         this.indexFeatureSet = indexFeatureSet;
         this.ranges = dataRanges(command);
         this.mergeRange = merge(ranges);
+        this.keyInFilters = QueryView.Builder.isSingleKey(mergeRange) ? new QueryView.KeyInFilters((DecoratedKey) mergeRange.left) : null;
 
         this.keyFactory = PrimaryKey.factory(cfs.metadata().comparator, indexFeatureSet);
         this.firstPrimaryKey = keyFactory.createTokenOnly(mergeRange.left.getToken());
@@ -292,14 +295,12 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     }
 
     /**
-     * Note: merged range may contain subrange that no longer belongs to the local node after range movement.
-     * It should only be used as an optimization to reduce search space. Use {@link #dataRanges()} instead to filter data.
-     *
-     * @return merged token range
+     * @return whether the given SSTable index holds data in the merged key range of the query, as the query view of its
+     * column would include it
      */
-    AbstractBounds<PartitionPosition> mergeRange()
+    boolean indexInRange(SSTableIndex index)
     {
-        return mergeRange;
+        return QueryView.Builder.indexInRange(index, mergeRange, keyInFilters);
     }
 
     /**
@@ -721,7 +722,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
     QueryView getQueryView(IndexContext context) throws QueryView.Builder.MissingIndexException
     {
         return queryViews.computeIfAbsent(context,
-                                          c -> new QueryView.Builder(c, mergeRange).build());
+                                          c -> new QueryView.Builder(c, mergeRange, keyInFilters).build());
     }
 
     private float avgCellsPerRow()

@@ -21,9 +21,11 @@ package org.apache.cassandra.index.sai.plan;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,6 +43,7 @@ import org.apache.cassandra.index.sai.view.View;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableReaderWithFilter;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.IFilter;
 
 
 public class QueryView implements AutoCloseable
@@ -137,11 +140,19 @@ public class QueryView implements AutoCloseable
 
         private final IndexContext indexContext;
         private final AbstractBounds<PartitionPosition> range;
+        @Nullable
+        private final KeyInFilters keyInFilters;
 
         Builder(IndexContext indexContext, AbstractBounds<PartitionPosition> range)
         {
+            this(indexContext, range, null);
+        }
+
+        Builder(IndexContext indexContext, AbstractBounds<PartitionPosition> range, @Nullable KeyInFilters keyInFilters)
+        {
             this.indexContext = indexContext;
             this.range = range;
+            this.keyInFilters = keyInFilters;
         }
 
         /**
@@ -196,7 +207,7 @@ public class QueryView implements AutoCloseable
                 // These are already referenced because they are referenced by the same view we just referenced.
                 for (var index : saiView.getIndexes())
                 {
-                    if (!indexInRange(index, range))
+                    if (!indexInRange(index, range, keyInFilters))
                         continue;
                     sstableIndexes.add(index);
                     sstableReaders.add(index.getSSTable());
@@ -236,15 +247,54 @@ public class QueryView implements AutoCloseable
         // statistics on that; it looks like it was only used to check bounds overlap, so computing
         // an actual global bounds should be an improvement.  But computing global bounds as an intersection
         // of individual bounds is messy because you can end up with more than one range.
-        static boolean indexInRange(SSTableIndex index, AbstractBounds<PartitionPosition> range)
+        //
+        // keyInFilters, if not null, keeps the bloom filter results for the key of a single partition range.
+        static boolean indexInRange(SSTableIndex index, AbstractBounds<PartitionPosition> range, @Nullable KeyInFilters keyInFilters)
         {
             SSTableReader sstable = index.getSSTable();
-            if (range instanceof Bounds && range.left.equals(range.right) && (!range.left.isMinimum()) && range.left instanceof DecoratedKey)
+            if (isSingleKey(range))
             {
-                if (!((SSTableReaderWithFilter) sstable).getFilter().isPresent((DecoratedKey)range.left))
+                IFilter filter = ((SSTableReaderWithFilter) sstable).getFilter();
+                DecoratedKey key = (DecoratedKey) range.left;
+                if (!(keyInFilters == null ? filter.isPresent(key) : keyInFilters.isPresent(filter, key)))
                     return false;
             }
             return range.left.compareTo(sstable.last) <= 0 && (range.right.isMinimum() || sstable.first.compareTo(range.right) <= 0);
+        }
+
+        static boolean isSingleKey(AbstractBounds<PartitionPosition> range)
+        {
+            return range instanceof Bounds && range.left.equals(range.right) && (!range.left.isMinimum()) && range.left instanceof DecoratedKey;
+        }
+    }
+
+    /**
+     * Whether the SSTable bloom filters contain the key of a single partition query, kept by filter instance so that
+     * the guardrail and the query views of the query probe each filter once. A filter doesn't change, but an SSTable
+     * can replace its filter with a loaded one, which is then probed as a new filter.
+     */
+    static class KeyInFilters
+    {
+        private final DecoratedKey key;
+        private IdentityHashMap<IFilter, Boolean> results;
+
+        KeyInFilters(DecoratedKey key)
+        {
+            this.key = key;
+        }
+
+        boolean isPresent(IFilter filter, DecoratedKey key)
+        {
+            assert this.key.equals(key) : "Bloom filter results for " + this.key + " asked for " + key;
+            if (results == null)
+                results = new IdentityHashMap<>();
+            Boolean present = results.get(filter);
+            if (present == null)
+            {
+                present = filter.isPresent(key);
+                results.put(filter, present);
+            }
+            return present;
         }
     }
 }

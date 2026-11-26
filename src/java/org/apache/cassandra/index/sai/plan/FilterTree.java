@@ -27,10 +27,8 @@ import java.util.Set;
 import com.google.common.collect.ListMultimap;
 
 import org.apache.cassandra.db.DecoratedKey;
-import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
-import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
@@ -308,17 +306,17 @@ public class FilterTree
 
     /**
      * Returns the highest number of SSTable indexes that a single indexed expression of this filter tree searches: those
-     * whose key range overlaps the given key range, which {@link QueryView.Builder} puts in the query view of the column
-     * and {@link org.apache.cassandra.index.sai.iterators.KeyRangeTermIterator} searches. This includes the expressions
-     * that order the results (ANN, BM25, ORDER BY), which search every index in the key range.
+     * whose key range overlaps the key range of the query, which {@link QueryView.Builder} puts in the query view of
+     * the column and {@link org.apache.cassandra.index.sai.iterators.KeyRangeTermIterator} searches. This includes the
+     * expressions that order the results (ANN, BM25, ORDER BY), which search every index in the key range.
      * <p>
      * This is what the {@code sai_sstable_indexes_per_query} guardrail limits: how many SSTable indexes a single
      * column search touches, not how many indexed columns the query has.
      *
-     * @param keyRange the key range of the query
+     * @param controller the controller of the query, which tells whether an index is in the key range of the query
      * @return the highest number of SSTable indexes searched for an expression of this tree, or 0 if there are none
      */
-    public int maxSSTableIndexesPerExpression(AbstractBounds<PartitionPosition> keyRange)
+    public int maxSSTableIndexesPerExpression(QueryController controller)
     {
         int max = 0;
         for (Expression expression : expressions.values())
@@ -329,13 +327,13 @@ public class FilterTree
             int count = 0;
             for (SSTableIndex index : expression.context.getView().getIndexes())
             {
-                if (QueryView.Builder.indexInRange(index, keyRange))
+                if (controller.indexInRange(index))
                     count++;
             }
             max = Math.max(max, count);
         }
         for (FilterTree child : children)
-            max = Math.max(max, child.maxSSTableIndexesPerExpression(keyRange));
+            max = Math.max(max, child.maxSSTableIndexesPerExpression(controller));
         return max;
     }
 }
