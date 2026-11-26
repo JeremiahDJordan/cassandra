@@ -35,6 +35,7 @@ import com.datastax.driver.core.policies.WhiteListPolicy;
 import com.vdurmont.semver4j.Semver;
 import org.junit.Assume;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.IInstanceConfig;
@@ -65,8 +66,16 @@ public abstract class ApacheMixedClusterTestBase extends UpgradeTestBase
      */
     protected static Version apacheVersion()
     {
-        String dir = TEST_APACHE_DTEST_JAR_DIR.getString();
-        Assume.assumeTrue("No Apache dtest jar directory set with -D" + TEST_APACHE_DTEST_JAR_DIR.getKey(), dir != null && !dir.isEmpty());
+        return dtestJarVersion(TEST_APACHE_DTEST_JAR_DIR);
+    }
+
+    /**
+     * The version of the single dtest jar in the directory named by {@code property}. Skips the test without it.
+     */
+    static Version dtestJarVersion(CassandraRelevantProperties property)
+    {
+        String dir = property.getString();
+        Assume.assumeTrue("No dtest jar directory set with -D" + property.getKey(), dir != null && !dir.isEmpty());
 
         File[] jars = new File(dir).listFiles((d, name) -> name.startsWith("dtest-") && name.endsWith(".jar"));
         if (jars == null || jars.length != 1)
