@@ -217,6 +217,20 @@ public abstract class DataLimits
         return counter.counted() < count() && counter.bytesCounted() < bytes();
     }
 
+    /**
+     * Returns whether the replica response counted by the given counter, which is still open, stopped before reaching
+     * these limits, which means that the replica has no more data to return.
+     * <p>
+     * This is {@link #isCounterBelowLimits(Counter)} for everything but GROUP BY limits. A GROUP BY counter only counts
+     * a group once the next one starts, or when it is closed, while a replica stops as soon as it has returned as many
+     * groups as the limit. So a counter over the response of a replica that returned exactly that many groups has
+     * counted one group less, unless the group that is still open is taken into account.
+     */
+    public boolean isReplicaExhausted(Counter counter)
+    {
+        return isCounterBelowLimits(counter);
+    }
+
     public abstract DataLimits forPaging(PageSize pageSize);
     public abstract DataLimits forPaging(PageSize pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining);
 
@@ -1030,6 +1044,14 @@ public abstract class DataLimits
         public boolean isCounterBelowLimits(Counter counter)
         {
             return counter.rowsCounted() < rowLimit && counter.bytesCounted() < bytesLimit && counter.counted() < groupLimit;
+        }
+
+        @Override
+        public boolean isReplicaExhausted(Counter counter)
+        {
+            GroupByAwareCounter groupByCounter = (GroupByAwareCounter) counter;
+            int groups = groupByCounter.groupCounted + (groupByCounter.hasUnfinishedGroup ? 1 : 0);
+            return groupByCounter.rowsCounted < rowLimit && groupByCounter.bytesCounted < bytesLimit && groups < groupLimit;
         }
 
         protected class GroupByAwareCounter extends Counter

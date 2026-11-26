@@ -409,6 +409,7 @@ public class EndpointGroupingCoordinator
                                                   command,
                                                   new EndpointShortReadResponseProtection(command,
                                                                                           context.replicas.get(i),
+                                                                                          originalResponse,
                                                                                           () -> responses.clearUnsafe(i),
                                                                                           singleResultCounter,
                                                                                           context.mergedResultCounter(),
@@ -428,19 +429,21 @@ public class EndpointGroupingCoordinator
         {
             public EndpointShortReadResponseProtection(ReadCommand command,
                                                        Replica source,
+                                                       UnfilteredPartitionIterator firstResponse,
                                                        Runnable preFetchCallback,
                                                        DataLimits.Counter singleResultCounter,
                                                        DataLimits.Counter mergedResultCounter,
                                                        long queryStartNanoTime)
             {
-                super(command, source, preFetchCallback, singleResultCounter, mergedResultCounter, queryStartNanoTime);
+                super(command, source, firstResponse, preFetchCallback, singleResultCounter, mergedResultCounter, queryStartNanoTime);
             }
 
             @Override
             public boolean rangeExhausted()
             {
-                // if the range is not fetched by original request or SRP, SRP is needed.
-                return super.rangeExhausted() && (rangeFetched || !singleResultCounter.isDone());
+                // if the range is not fetched by original request or SRP, SRP is needed if the replica stopped at the
+                // limits before getting to it
+                return super.rangeExhausted() && (rangeFetched || !replicaReachedLimits());
             }
         }
     }

@@ -220,6 +220,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                               command,
                                               new ShortReadPartitionsProtection(command,
                                                                                 context.replicas.get(i),
+                                                                                originalResponse,
                                                                                 () -> responses.clearUnsafe(i),
                                                                                 singleResultCounter,
                                                                                 context.mergedResultCounter(),
