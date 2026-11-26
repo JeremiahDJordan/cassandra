@@ -801,7 +801,7 @@ memtable:
     trie:
       class_name: TrieMemtable
     default:
-      inherits: skiplist
+      inherits: trie
 
 # Total permitted memory to use for memtables. Cassandra will stop
 # accepting writes when the limit is exceeded until a flush completes,

@@ -263,6 +263,11 @@ New features
 
 Upgrading
 ---------
+    - The shipped cassandra.yaml selects the trie memtable (TrieMemtable) as the default memtable configuration, which
+      the tables without a memtable property use, as the server does when cassandra.yaml has no memtable section. It
+      selected the skip-list memtable (SkipListMemtable) before. A node that keeps its earlier cassandra.yaml keeps
+      the memtable that file selects. To keep the skip-list memtable with the new file, change the `default`
+      configuration to `inherits: skiplist`.
     - This release speaks messaging version DS 21 (111), which tells the other nodes that it supports LIKE and blob
       indexes, and serializes everything as DS 20 (110), the version of the earlier 5.0 releases: reads, writes,
       repair, hints, batches, streaming, commit logs and Paxos state work across an upgrade and a downgrade. Upgrade
@@ -557,15 +562,15 @@ Upgrading
       read data from all the replicas they contact, so that the coordinator filters the reconciled rows. Other
       partition-restricted queries are single-partition reads, with digest reads and speculative retry, which run
       Paxos at SERIAL and LOCAL_SERIAL. Queries of full primary keys of that kind use the index instead of skipping it.
-    - On the skip-list memtables (SkipListMemtable, the default in the shipped cassandra.yaml, and
-      ShardedSkipListMemtable), the writes to one partition of a table with a storage-attached index (SAI) are now
-      applied one at a time, under a lock of the partition, as the trie memtables apply the writes of a shard: writes
-      racing on a partition could make SAI's in-memory index lose rows that hold a value, also after flush. Writes to
-      different partitions, and tables without SAI, are unaffected. Concurrent inserts into a single partition can be
-      slower: about half the throughput with many writers, and several times slower with a vector index (one partition
-      per tenant or per document ingests on one thread per partition). A legacy or custom index on such a table also
-      runs under the lock. An SAI index that fails on a write now leaves the write applied and fails it, as on the
-      trie memtables; the failing index misses the row until it is rebuilt with nodetool rebuild_index.
+    - On the skip-list memtables (SkipListMemtable and ShardedSkipListMemtable), the writes to one partition of a
+      table with a storage-attached index (SAI) are now applied one at a time, under a lock of the partition, as the
+      trie memtables apply the writes of a shard: writes racing on a partition could make SAI's in-memory index lose
+      rows that hold a value, also after flush. Writes to different partitions, and tables without SAI, are
+      unaffected. Concurrent inserts into a single partition can be slower: about half the throughput with many
+      writers, and several times slower with a vector index (one partition per tenant or per document ingests on one
+      thread per partition). A legacy or custom index on such a table also runs under the lock. An SAI index that
+      fails on a write now leaves the write applied and fails it, as on the trie memtables; the failing index misses
+      the row until it is rebuilt with nodetool rebuild_index.
     - nodetool rebuild_index flushes the table before it rebuilds the indexes, also when they were already writable,
       so that the rebuild repairs an index that missed a write still in the memtable: an SAI index that failed on a
       write, on any memtable, or another index that failed on a write after it was applied (on the trie memtables, or
