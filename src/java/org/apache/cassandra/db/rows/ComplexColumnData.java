@@ -149,7 +149,16 @@ public class ComplexColumnData extends ColumnData implements Iterable<Cell<?>>
     @Override
     public int liveDataSize(int nowInSec)
     {
-        return complexDeletion.isLive() ? dataSize() : 0;
+        // A column with a complex deletion counts nothing, as in earlier releases: their coordinators count the
+        // responses of replicas this way, and a replica must not count more bytes than they do.
+        if (!complexDeletion.isLive())
+            return 0;
+
+        int size = 0;
+        for (Cell<?> cell : this)
+            size += cell.liveDataSize(nowInSec);
+        // Exclude complex deletion metadata when no live cells contribute bytes.
+        return size == 0 ? 0 : complexDeletion.dataSize() + size;
     }
 
     public long unsharedHeapSizeExcludingData()

@@ -215,7 +215,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
 
         if (context.needShortReadProtection())
         {
-            DataLimits.Counter singleResultCounter = command.createLimitedCounter(false);
+            DataLimits.Counter singleResultCounter = command.createLimitedCounter(false).countingFullRowSize();
             return ShortReadProtection.extend(originalResponse,
                                               command,
                                               new ShortReadPartitionsProtection(command,
