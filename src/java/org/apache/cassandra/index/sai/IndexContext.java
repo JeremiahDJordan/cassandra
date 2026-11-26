@@ -1479,18 +1479,30 @@ public class IndexContext
     }
 
     /**
+     * The legacy {@code cassandra.sai.validate_max_term_size_at_coordinator} property, or null if it isn't set, for
+     * {@link #validate(DecoratedKey, Row, ClientState, Boolean)}.
+     */
+    @Nullable
+    public static Boolean validateMaxTermSizeAtCoordinator()
+    {
+        return SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.isPresent() ? SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.getBoolean() : null;
+    }
+
+    /**
      * Validates the given row of a mutation at the coordinator: its terms are checked with the term size guardrail,
      * unless the legacy {@code cassandra.sai.validate_max_term_size_at_coordinator} property is set: {@code true}
      * rejects any term over {@link #maxTermSize()} whoever writes it, {@code false} checks nothing.
+     *
+     * @param validateMaxTermSize the value of the legacy property, see {@link #validateMaxTermSizeAtCoordinator()}
      */
-    public void validate(DecoratedKey key, Row row, @Nullable ClientState state)
+    public void validate(DecoratedKey key, Row row, @Nullable ClientState state, @Nullable Boolean validateMaxTermSize)
     {
         validateIndexableMapEntries(row);
 
         // Validate the size of the inserted term.
-        if (!SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.isPresent())
+        if (validateMaxTermSize == null)
             guardTermSizeForRow(key, row, state);
-        else if (SAI_VALIDATE_MAX_TERM_SIZE_AT_COORDINATOR.getBoolean())
+        else if (validateMaxTermSize)
             validateMaxTermSizeForRow(key, row);
 
         // Verify vector is valid.

@@ -1799,26 +1799,32 @@ public class StorageAttachedIndex implements Index
         if (!VALIDATE_TERMS_AT_COORDINATOR)
             return;
 
+        ColumnMetadata column = indexContext.getDefinition();
+        // the rows of the update have no cells of the regular and static columns it doesn't have
+        if (!column.isPrimaryKeyColumn() && !update.columns().contains(column))
+            return;
+
         DecoratedKey key = update.partitionKey();
-        if (indexContext.getDefinition().isPartitionKey())
+        Boolean validateMaxTermSize = IndexContext.validateMaxTermSizeAtCoordinator();
+        if (column.isPartitionKey())
         {
             // the same term for every row, and indexed with the static row too, if it has live data
             Row row = Iterables.getFirst(update.rows(), null);
             if (row == null && update.staticRow().hasLiveData(FBUtilities.nowInSeconds(), false))
                 row = update.staticRow();
             if (row != null)
-                indexContext.validate(key, row, state);
+                indexContext.validate(key, row, state, validateMaxTermSize);
         }
-        else if (indexContext.getDefinition().isStatic())
+        else if (column.isStatic())
         {
             Row staticRow = update.staticRow();
             if (!staticRow.isEmpty())
-                indexContext.validate(key, staticRow, state);
+                indexContext.validate(key, staticRow, state, validateMaxTermSize);
         }
         else
         {
             for (Row row : update.rows())
-                indexContext.validate(key, row, state);
+                indexContext.validate(key, row, state, validateMaxTermSize);
         }
     }
 
