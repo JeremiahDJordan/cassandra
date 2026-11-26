@@ -39,8 +39,8 @@ import org.apache.cassandra.cql3.selection.SimpleSelector;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.MultiCellCapableType;
+import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.marshal.UTF8Type;
-import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.db.rows.ColumnData;
@@ -545,11 +545,13 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
             if (cell.path() != null)
                 validateCellPath(cell.path());
         }
-        else if(type.isUDT())
+        else if (type instanceof TupleType)
         {
             // To validate a non-frozen UDT field, both the path and the value
             // are needed, the path being an index into an array of value types.
-            ((UserType)type).validateCell(cell);
+            // A dropped non-frozen UDT column has a multi-cell tuple type, which
+            // needs the same.
+            ((TupleType)type).validateCell(cell);
         }
         else
         {
@@ -565,10 +567,7 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
             throw new MarshalException("Only complex cells should have a cell path");
 
         assert type.isMultiCell();
-        if (type.isCollection())
-            ((CollectionType)type).nameComparator().validate(path.get(0));
-        else
-            ((UserType)type).nameComparator().validate(path.get(0));
+        ((MultiCellCapableType<?>)type).nameComparator().validate(path.get(0));
     }
 
     public void appendCqlTo(CqlBuilder builder)
@@ -612,11 +611,11 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
      * This is the same than the column type, except for non-frozen collections where it's the 'valueComparator'
      * of the collection.
      *
-     * This method should not be used to get value type of non-frozon UDT.
+     * This method should not be used to get value type of non-frozon UDT, nor of the multi-cell tuple of a dropped one.
      */
     public AbstractType<?> cellValueType()
     {
-        assert !(type instanceof UserType && type.isMultiCell());
+        assert !(type instanceof TupleType && type.isMultiCell());
         return type instanceof CollectionType && type.isMultiCell()
                 ? ((CollectionType)type).valueComparator()
                 : type;
