@@ -908,12 +908,12 @@ public class MessagingService extends MessagingServiceMBeanImpl implements Messa
         if (connections == null)
             return false;
 
+        Integer announced = versions.getRawIfKnown(node);
         for (ConnectionType type : ConnectionType.MESSAGING_TYPES)
         {
             OutboundConnection connection = connections.connectionFor(type);
             if (connection != null)
             {
-                Integer announced = versions.getRawIfKnown(node);
                 int version = connection.isConnected() || announced == null
                               ? connection.messagingVersion()
                               : Math.min(announced, current_version);

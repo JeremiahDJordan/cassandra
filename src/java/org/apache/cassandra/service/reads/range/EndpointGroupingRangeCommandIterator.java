@@ -19,7 +19,9 @@
 package org.apache.cassandra.service.reads.range;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -71,17 +73,17 @@ public class EndpointGroupingRangeCommandIterator extends NonGroupingRangeComman
     {
         // the plans of one batch, as both EndpointGroupingCoordinator and sendNextRangeRequests take them
         List<ReplicaPlan.ForRangeRead> plans = new ArrayList<>();
-        boolean grouping = true;
+        Set<InetAddressAndPort> endpoints = new HashSet<>();
         for (int vnodeRanges = 0; vnodeRanges < concurrencyFactor() && replicaPlans.hasNext(); )
         {
             ReplicaPlan.ForRangeRead plan = replicaPlans.next();
             plans.add(plan);
             vnodeRanges += plan.vnodeCount();
             for (Replica replica : plan.contacts())
-                grouping = grouping && canSendMultiRangeRead(replica.endpoint());
+                endpoints.add(replica.endpoint());
         }
 
-        if (!grouping)
+        if (!endpoints.stream().allMatch(EndpointGroupingRangeCommandIterator::canSendMultiRangeRead))
         {
             Tracing.trace("Not grouping range requests by endpoint, as a replica may be on a messaging version without multi-range reads");
             return sendNextRangeRequests(plans.iterator());
