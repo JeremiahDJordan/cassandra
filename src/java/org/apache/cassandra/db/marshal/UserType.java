@@ -29,7 +29,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.*;
-import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.schema.Difference;
 import org.apache.cassandra.serializers.MarshalException;
@@ -180,21 +179,6 @@ public class UserType extends TupleType implements SchemaElement
     {
         // we use the field position instead of the field name to allow for field renaming in ALTER TYPE statements
         return CellPath.create(ByteBufferUtil.bytes((short)fieldPosition(fieldName)));
-    }
-
-    public <V> void validateCell(Cell<V> cell) throws MarshalException
-    {
-        if (isMultiCell())
-        {
-            ByteBuffer path = cell.path().get(0);
-            nameComparator().validate(path);
-            Short fieldPosition = nameComparator().getSerializer().deserialize(path);
-            fieldType(fieldPosition).validate(cell.value(), cell.accessor());
-        }
-        else
-        {
-            validate(cell.value(), cell.accessor());
-        }
     }
 
     @Override
