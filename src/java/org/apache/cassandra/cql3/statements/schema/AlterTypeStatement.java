@@ -30,6 +30,7 @@ import org.apache.cassandra.audit.AuditLogContext;
 import org.apache.cassandra.audit.AuditLogEntryType;
 import org.apache.cassandra.auth.Permission;
 import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.Constants;
 import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.cql3.UTName;
@@ -37,6 +38,9 @@ import org.apache.cassandra.cql3.statements.RawKeyspaceAwareStatement;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.UserType;
+import org.apache.cassandra.index.internal.CassandraIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.Keyspaces;
 import org.apache.cassandra.schema.TableMetadata;
@@ -173,6 +177,14 @@ public abstract class AlterTypeStatement extends AlterSchemaStatement
                           String.join(", ", transform(tablesWithTypeInPartitionKey, TableMetadata::toString)));
             }
 
+            Collection<String> indexesWithTypeInKey = findIndexesReferencingTypeInKey(keyspace, userType);
+            if (!indexesWithTypeInKey.isEmpty())
+            {
+                throw ire("Cannot add new field %s of type %s to user type %s as the type is being used in the keys of the following indexes: %s. " +
+                          "Drop the indexes, alter the type and create the indexes again",
+                          fieldName, type, userType.getCqlTypeName(), String.join(", ", indexesWithTypeInKey));
+            }
+
             Guardrails.fieldsPerUDT.guard(userType.size() + 1, userType.getNameAsString(), false, state);
             type.validate(state, "Field " + fieldName);
 
@@ -194,6 +206,29 @@ public abstract class AlterTypeStatement extends AlterSchemaStatement
                    table -> any(table.partitionKeyColumns(), column -> column.type.referencesUserType(userType.name)))
                   .forEach(tables::add);
             return tables;
+        }
+
+        /**
+         * The indexes whose keys have values of the type, which they encode with the type they were created with:
+         * storage-attached indexes on a table with the type in its clustering, and legacy indexes keyed by values of
+         * the type.
+         */
+        private static Collection<String> findIndexesReferencingTypeInKey(KeyspaceMetadata keyspace, UserType userType)
+        {
+            Collection<String> indexes = new ArrayList<>();
+            for (TableMetadata table : keyspace.tables)
+            {
+                boolean typeInClustering = any(table.clusteringColumns(), column -> column.type.referencesUserType(userType.name));
+                for (IndexMetadata index : table.indexes)
+                {
+                    boolean inKey = index.isCustom()
+                                    ? typeInClustering && StorageAttachedIndex.isStorageAttachedIndexClass(index.getIndexClassName())
+                                    : CassandraIndex.indexCfsMetadata(table, index).partitionKeyType.referencesUserType(userType.name);
+                    if (inKey)
+                        indexes.add(ColumnIdentifier.maybeQuote(index.name) + " on " + table);
+                }
+            }
+            return indexes;
         }
     }
 

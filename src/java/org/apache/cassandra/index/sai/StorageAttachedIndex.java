@@ -676,10 +676,10 @@ public class StorageAttachedIndex implements Index
         return false;
     }
 
-    private static boolean isStorageAttachedIndexClass(String className)
+    public static boolean isStorageAttachedIndexClass(String className)
     {
-        // Subclasses run StorageAttachedIndex#onAddedToExistingTable too. Not finding the class only means deleting
-        // the files of the dropped index.
+        // Subclasses are storage-attached indexes too, e.g. they run StorageAttachedIndex#onAddedToExistingTable. A
+        // class that can't be found isn't taken for one.
         try
         {
             FBUtilities.classForNameWithoutInitialization(className, "Index", StorageAttachedIndex.class);
