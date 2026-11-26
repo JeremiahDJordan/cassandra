@@ -19,6 +19,7 @@
 package org.apache.cassandra.distributed.test;
 
 import java.util.Iterator;
+import java.util.concurrent.Callable;
 
 import com.google.common.collect.Iterators;
 import org.junit.Assert;
@@ -27,11 +28,23 @@ import org.junit.Test;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.Session;
 import com.datastax.driver.core.SimpleStatement;
+import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
+import net.bytebuddy.implementation.MethodDelegation;
+import net.bytebuddy.implementation.bind.annotation.SuperCall;
+import org.apache.cassandra.db.ClusteringPrefix;
+import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
+import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.Feature;
 import org.apache.cassandra.distributed.api.ICoordinator;
+import org.apache.cassandra.service.reads.ShortReadProtection;
 
+import static net.bytebuddy.matcher.ElementMatchers.named;
 import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
 import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.shared.AssertUtils.assertRows;
@@ -90,6 +103,230 @@ public class GroupByTest extends TestBaseImpl
                     assertRows(Iterators.toArray(rows, Object[].class));
                 }
             }
+        }
+    }
+
+    @Test
+    public void groupByWithLimitAfterRangeTombstone() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(2).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck0 int, ck1 int, PRIMARY KEY (pk, ck0, ck1))"));
+            ICoordinator coordinator = cluster.coordinator(1);
+
+            // a range tombstone on both nodes
+            coordinator.execute(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 2 WHERE pk = 1 AND ck0 > 2"), ConsistencyLevel.ALL);
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (1, 1, 1) USING TIMESTAMP 3"), ConsistencyLevel.ALL);
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (1, 3, 1) USING TIMESTAMP 3"), ConsistencyLevel.ALL);
+
+            // a range tombstone on one node only
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (2, 1, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+            cluster.get(1).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 2 WHERE pk = 2 AND ck0 = 2"));
+            coordinator.execute(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1) VALUES (2, 2, 1) USING TIMESTAMP 3"), ConsistencyLevel.ALL);
+
+            for (int pk = 1; pk <= 2; pk++)
+            {
+                int ck0 = pk == 1 ? 3 : 2;
+                for (int pageSize = 1; pageSize <= 4; pageSize++)
+                {
+                    assertRows(coordinator.executeWithPaging(withKeyspace("SELECT pk, ck0, ck1 FROM %s.tbl WHERE pk = ? GROUP BY pk, ck0"),
+                                                             ConsistencyLevel.ALL, pageSize, pk),
+                               row(pk, 1, 1), row(pk, ck0, 1));
+                    assertRows(coordinator.executeWithPaging(withKeyspace("SELECT pk, ck0, ck1 FROM %s.tbl WHERE pk = ? GROUP BY pk, ck0 LIMIT 1"),
+                                                             ConsistencyLevel.ALL, pageSize, pk),
+                               row(pk, 1, 1));
+                }
+                assertRows(coordinator.execute(withKeyspace("SELECT pk, ck0, ck1 FROM %s.tbl WHERE pk = ? GROUP BY pk, ck0 LIMIT 1"),
+                                               ConsistencyLevel.ALL, pk),
+                           row(pk, 1, 1));
+            }
+        }
+    }
+
+    @Test
+    public void groupByWithSrpAfterRangeTombstone() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(3).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck0 int, ck1 int, v int, PRIMARY KEY (pk, ck0, ck1)) " +
+                                              "WITH read_repair = 'NONE' AND speculative_retry = 'NONE'"));
+
+            // on node 2, the row that ends group (1, 2) follows the opening bound of a range tombstone, and node 3 has
+            // a newer deletion of group (1, 2)
+            cluster.get(2).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 1 WHERE pk = 1 AND ck0 = 3"));
+            for (int i = 2; i <= 3; i++)
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 3, 0, 0) USING TIMESTAMP 2"));
+            cluster.get(2).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 2, 2, 0) USING TIMESTAMP 3"));
+            cluster.get(3).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 4 WHERE pk = 1 AND ck0 = 2 AND ck1 = 2"));
+
+            for (String limit : new String[]{ "", "PER PARTITION LIMIT 1", "LIMIT 1" })
+            {
+                String query = withKeyspace("SELECT pk, ck0, count(*) FROM %s.tbl GROUP BY pk, ck0 " + limit);
+                assertRows(cluster.coordinator(1).execute(query, ConsistencyLevel.ALL), row(1, 3, 1L));
+                for (int pageSize = 1; pageSize <= 4; pageSize++)
+                    assertRows(cluster.coordinator(1).executeWithPaging(query, ConsistencyLevel.ALL, pageSize), row(1, 3, 1L));
+            }
+        }
+    }
+
+    @Test
+    public void groupByWithLimitAfterRangeTombstoneOnSomeReplicas() throws Throwable
+    {
+        // the range tombstone opens after row (1, 3, 0)
+        testGroupByWithLimitAndRangeTombstoneOnSomeReplicas("(ck0, ck1) > (3, 0)");
+    }
+
+    @Test
+    public void groupByWithLimitInRangeTombstoneOnSomeReplicas() throws Throwable
+    {
+        // the range tombstone opens before row (1, 3, 0)
+        testGroupByWithLimitAndRangeTombstoneOnSomeReplicas("ck0 > 2");
+    }
+
+    private void testGroupByWithLimitAndRangeTombstoneOnSomeReplicas(String deletion) throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(3).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck0 int, ck1 int, v int, PRIMARY KEY (pk, ck0, ck1)) " +
+                                              "WITH read_repair = 'NONE' AND speculative_retry = 'NONE'"));
+
+            // nodes 1 and 3 delete row (1, 3, 1) of node 2 with a range tombstone that covers rows (1, 3, 1) and
+            // (1, 4, 0), and row (1, 4, 0) is newer
+            for (int i : new int[]{ 1, 3 })
+                cluster.get(i).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 2 WHERE pk = 1 AND " + deletion));
+            for (int i = 1; i <= 3; i++)
+            {
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 3, 0, 0) USING TIMESTAMP 3"));
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 4, 0, 0) USING TIMESTAMP 3"));
+            }
+            cluster.get(2).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 3, 1, 0) USING TIMESTAMP 1"));
+
+            String query = withKeyspace("SELECT pk, ck0, count(*) FROM %s.tbl WHERE pk = 1 GROUP BY pk, ck0");
+            assertRows(cluster.coordinator(1).execute(query + " LIMIT 1", ConsistencyLevel.ALL), row(1, 3, 1L));
+            for (int pageSize = 1; pageSize <= 3; pageSize++)
+                assertRows(cluster.coordinator(1).executeWithPaging(query, ConsistencyLevel.ALL, pageSize), row(1, 3, 1L), row(1, 4, 1L));
+        }
+    }
+
+    @Test
+    public void groupByWithPagingInReverseOrderAfterRangeTombstoneOnSomeReplicas() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(3).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck0 int, ck1 int, v int, PRIMARY KEY (pk, ck0, ck1)) " +
+                                              "WITH read_repair = 'NONE' AND speculative_retry = 'NONE'"));
+
+            // nodes 1 and 3 delete row (1, 4, 0) of node 2 with a range tombstone, so the second page of group (1, 4)
+            // has no row of theirs before row (1, 3, 0)
+            for (int i = 1; i <= 3; i++)
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 4, 0, 0) USING TIMESTAMP 1"));
+            for (int i : new int[]{ 1, 3 })
+                cluster.get(i).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 2 WHERE pk = 1 AND ck0 > 2"));
+            for (int i : new int[]{ 1, 2 })
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 4, 1, 0) USING TIMESTAMP 3"));
+            for (int i = 1; i <= 3; i++)
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck0, ck1, v) VALUES (1, 3, 0, 0) USING TIMESTAMP 4"));
+
+            String query = withKeyspace("SELECT pk, ck0, count(*) FROM %s.tbl WHERE pk = 1 GROUP BY pk, ck0 ORDER BY ck0 DESC");
+            for (int pageSize = 1; pageSize <= 3; pageSize++)
+                assertRows(cluster.coordinator(1).executeWithPaging(query, ConsistencyLevel.ALL, pageSize), row(1, 4, 1L), row(1, 3, 1L));
+        }
+    }
+
+    @Test
+    public void groupByWithSrpAfterRangeTombstoneKeepsClusteringOrder() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(3).withInstanceInitializer(ClusteringOrderChecker::install).start()))
+        {
+            String[] deletions = { "ck0 > 1", "ck0 < 4", "ck0 > 1 AND ck0 < 4" };
+            for (int t = 0; t < deletions.length * 2; t++)
+            {
+                String table = "tbl" + t;
+                boolean reversed = t % 2 == 1;
+                cluster.schemaChange(withKeyspace("CREATE TABLE %s." + table + " (pk int, ck0 int, ck1 int, v int, PRIMARY KEY (pk, ck0, ck1)) " +
+                                                  "WITH read_repair = 'NONE' AND speculative_retry = 'NONE'"));
+
+                // a range tombstone on every node, with newer rows of two groups in it: node 2 has the row of the first
+                // group, which nodes 1 and 3 have a newer deletion of, and every node has the row of the second group
+                int first = reversed ? 3 : 2;
+                int second = reversed ? 2 : 3;
+                String insert = withKeyspace("INSERT INTO %s." + table + " (pk, ck0, ck1, v) VALUES (1, ?, 0, 0) USING TIMESTAMP ?");
+                cluster.coordinator(1).execute(withKeyspace("DELETE FROM %s." + table + " USING TIMESTAMP 2 WHERE pk = 1 AND " + deletions[t / 2]), ConsistencyLevel.ALL);
+                cluster.coordinator(1).execute(insert, ConsistencyLevel.ALL, second, 5L);
+                cluster.get(2).executeInternal(insert, first, 3L);
+                for (int i : new int[]{ 1, 3 })
+                    cluster.get(i).executeInternal(withKeyspace("DELETE FROM %s." + table + " USING TIMESTAMP 4 WHERE pk = 1 AND ck0 = ? AND ck1 = 0"), first);
+
+                for (String limit : new String[]{ "", "PER PARTITION LIMIT 1", "LIMIT 1" })
+                {
+                    String query = withKeyspace("SELECT pk, ck0, count(*) FROM %s." + table + " WHERE pk = 1 GROUP BY pk, ck0 " +
+                                                (reversed ? "ORDER BY ck0 DESC " : "") + limit);
+                    assertRows(cluster.coordinator(1).execute(query, ConsistencyLevel.ALL), row(1, second, 1L));
+                    for (int pageSize = 1; pageSize <= 3; pageSize++)
+                        assertRows(cluster.coordinator(1).executeWithPaging(query, ConsistencyLevel.ALL, pageSize), row(1, second, 1L));
+                }
+                long requests = cluster.get(1).callOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore(table).metric.shortReadProtectionRequests.getCount());
+                Assert.assertTrue(requests > 0);
+            }
+        }
+    }
+
+    /**
+     * Fails a read on node 1 if the response of a replica, with its short read protection responses, has an item that
+     * sorts before the previous item.
+     */
+    public static class ClusteringOrderChecker extends Transformation<UnfilteredRowIterator>
+    {
+        static void install(ClassLoader cl, int node)
+        {
+            if (node == 1)
+            {
+                new ByteBuddy().rebase(ShortReadProtection.class)
+                               .method(named("extend"))
+                               .intercept(MethodDelegation.to(ClusteringOrderChecker.class))
+                               .make()
+                               .load(cl, ClassLoadingStrategy.Default.INJECTION);
+            }
+        }
+
+        @SuppressWarnings("unused")
+        public static UnfilteredPartitionIterator extend(@SuperCall Callable<UnfilteredPartitionIterator> zuper) throws Exception
+        {
+            return Transformation.apply(zuper.call(), new ClusteringOrderChecker());
+        }
+
+        @Override
+        protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+        {
+            return Transformation.apply(partition, new Transformation<UnfilteredRowIterator>()
+            {
+                private ClusteringPrefix<?> last;
+
+                @Override
+                protected org.apache.cassandra.db.rows.Row applyToRow(org.apache.cassandra.db.rows.Row row)
+                {
+                    check(row.clustering());
+                    return row;
+                }
+
+                @Override
+                protected RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+                {
+                    check(marker.clustering());
+                    return marker;
+                }
+
+                private void check(ClusteringPrefix<?> clustering)
+                {
+                    if (null != last)
+                    {
+                        int cmp = partition.metadata().comparator.compare(clustering, last);
+                        if (partition.isReverseOrder() ? cmp > 0 : cmp < 0)
+                            throw new AssertionError(clustering.toString(partition.metadata()) + " after " + last.toString(partition.metadata()));
+                    }
+                    last = clustering;
+                }
+            });
         }
     }
 
