@@ -334,6 +334,23 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
         }
     }
 
+    /// An indexer that fails in finish() after the memtable has applied the update, with no other failure. The update
+    /// stays applied, the other indexer still gets every event and finish(), and the write fails.
+    @Test
+    public void testIndexerFailureAtFinish()
+    {
+        for (String memtable : ATOMIC_MEMTABLES)
+        {
+            RuntimeException finishFailure = new RuntimeException("Injected finish failure");
+            Throwable failure = writeWithScriptedIndexes(memtable, (index, event) -> index.equals("pa") && event.equals("finish#1")
+                                                                                     ? finishFailure : null);
+            assertTrue(memtable + ": " + failure, isOrIsCausedBy(failure, finishFailure));
+            assertRows(execute("SELECT ck, v FROM %s WHERE pk = 1"), row(1, 1), row(2, 1), row(3, 1), row(4, 1), row(5, 1));
+            assertEquals(memtable, 5, scriptedIndex("pb").rowsUpdated.size());
+            assertEquals(memtable, 1, scriptedIndex("pb").finishCalls);
+        }
+    }
+
     /// An OutOfMemoryError from an indexer is rethrown at once, for the JVM to handle; it ends the delivery.
     @Test
     public void testIndexerOutOfMemoryErrorIsRethrown()

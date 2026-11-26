@@ -2287,6 +2287,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                     count++;
             if (count == indexers.length)
                 return indexers;
+            if (count == 0)
+                return NO_INDEXERS;
             Index.Indexer[] selected = new Index.Indexer[count];
             int i = 0;
             for (Index.Indexer indexer : indexers)
@@ -2330,17 +2332,16 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 return;
             // The memtable has applied the update, so an indexer that fails on one event must not cost the other
             // events, or the other indexers: deliver everything, and report the failures in commit().
-            IndexerFailures failures = new IndexerFailures(table);
+            IndexerFailures failures = null;
             try
             {
                 maybeCompleteRow();
             }
             catch (Throwable t)
             {
-                failures.add(t);
+                failures = addFailure(failures, t);
             }
-            deliverPendingEvents(failures);
-            appliedFailures = failures;
+            appliedFailures = deliverPendingEvents(failures);
         }
 
         public void onPartitionDeletion(DeletionTime deletionTime)
@@ -2404,7 +2405,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         }
 
         /// Delivers the held events to every held indexer, even if some fail, and records the failures.
-        private void deliverPendingEvents(IndexerFailures failures)
+        @Nullable
+        private IndexerFailures deliverPendingEvents(@Nullable IndexerFailures failures)
         {
             for (Consumer<Index.Indexer> event : pendingEvents)
             {
@@ -2416,11 +2418,21 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                     }
                     catch (Throwable t)
                     {
-                        failures.add(t);
+                        failures = addFailure(failures, t);
                     }
                 }
             }
             pendingEvents.clear();
+            return failures;
+        }
+
+        /// Records a failure in the given failures, created on the first one.
+        private IndexerFailures addFailure(@Nullable IndexerFailures failures, Throwable t)
+        {
+            if (failures == null)
+                failures = new IndexerFailures(table);
+            failures.add(t);
+            return failures;
         }
 
         private void maybeCompleteRow()
@@ -2489,14 +2501,14 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
         public void commit()
         {
-            IndexerFailures failures = appliedFailures != null ? appliedFailures : new IndexerFailures(table);
+            IndexerFailures failures = appliedFailures;
             try
             {
                 maybeCompleteRow();
             }
             catch (Throwable t)
             {
-                failures.add(t);
+                failures = addFailure(failures, t);
             }
 
             if (pendingEvents != null)
@@ -2505,7 +2517,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 {
                     // The memtable has already applied the update, so an indexer that fails on one event must not cost
                     // the other events, or the other indexers: deliver everything, then report the first failure.
-                    deliverPendingEvents(failures);
+                    failures = deliverPendingEvents(failures);
                 }
                 else
                 {
@@ -2515,8 +2527,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 }
             }
 
-            finish(failures);
-            failures.maybeFail();
+            failures = finish(failures);
+            if (failures != null)
+                failures.maybeFail();
         }
 
         @Override
@@ -2534,13 +2547,14 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             // update with no events.
             rowUpdated = false;
             pendingEvents.clear();
-            IndexerFailures failures = new IndexerFailures(table);
-            finish(failures);
-            failures.maybeFail();
+            IndexerFailures failures = finish(null);
+            if (failures != null)
+                failures.maybeFail();
         }
 
         /// Calls finish() on every indexer, even if some fail, and records their failures.
-        private void finish(IndexerFailures failures)
+        @Nullable
+        private IndexerFailures finish(@Nullable IndexerFailures failures)
         {
             for (Index.Indexer indexer : indexers)
             {
@@ -2550,9 +2564,10 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 }
                 catch (Throwable t)
                 {
-                    failures.add(t);
+                    failures = addFailure(failures, t);
                 }
             }
+            return failures;
         }
 
         private <V1, V2> boolean shouldCleanupOldValue(Cell<V1> oldCell, Cell<V2> newCell)
