@@ -965,6 +965,25 @@ public class JsonTest extends CQLTester
     }
 
     @Test
+    public void testToJsonWithNullCollectionElements() throws Throwable
+    {
+        String typeName = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, i2 int, l frozen<list<int>>, l2 frozen<list<int>>, " +
+                    "u frozen<" + typeName + ">, u2 frozen<" + typeName + ">)");
+        execute("INSERT INTO %s (k, i, l, u) VALUES (0, 1, [1], {a: 1, b: 2})");
+
+        assertRows(execute("SELECT toJson([i, i2]) FROM %s"), row("[1, null]"));
+        assertRows(execute("SELECT toJson([i2, i]) FROM %s"), row("[null, 1]"));
+        assertRows(execute("SELECT toJson([i, null]) FROM %s"), row("[1, null]"));
+        assertRows(execute("SELECT toJson([l, l2]) FROM %s"), row("[[1], null]"));
+        assertRows(execute("SELECT toJson([u, u2]) FROM %s"), row("[{\"a\": 1, \"b\": 2}, null]"));
+        assertRows(execute("SELECT toJson([u, null]) FROM %s"), row("[{\"a\": 1, \"b\": 2}, null]"));
+        assertRows(execute("SELECT toJson([[i, i2]]) FROM %s"), row("[[1, null]]"));
+        assertRows(execute("SELECT toJson((map<int, int>){1: i, 2: i2}) FROM %s"), row("{\"1\": 1, \"2\": null}"));
+        assertRows(execute("SELECT JSON [i, i2] FROM %s"), row("{\"[i, i2]\": [1, null]}"));
+    }
+
+    @Test
     public void testJsonWithGroupBy() throws Throwable
     {
         // tests SELECT JSON statements
