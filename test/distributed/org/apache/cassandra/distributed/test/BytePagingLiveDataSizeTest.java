@@ -1,0 +1,177 @@
+/*
+ * Copyright IBM Corp.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package org.apache.cassandra.distributed.test;
+
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+import org.junit.AfterClass;
+import org.junit.BeforeClass;
+import org.junit.Test;
+
+import org.apache.cassandra.cql3.PageSize;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.distributed.Cluster;
+import org.apache.cassandra.distributed.impl.RowUtil;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.FBUtilities;
+
+import static java.lang.String.format;
+import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
+import static org.junit.Assert.assertEquals;
+
+/**
+ * Reads paged by bytes, and aggregations, return every row when the rows have expired or deleted data that replicas
+ * count before purging it and the coordinator counts after. Rows are read once their TTLs have expired, well within
+ * gc_grace_seconds.
+ */
+public class BytePagingLiveDataSizeTest extends TestBaseImpl
+{
+    private static final int PARTITIONS = 2;
+    private static final int ROWS = 50;
+    private static final int PAGE_SIZE_IN_BYTES = 256;
+    private static final int READ_DELAY_IN_SEC = 3600;
+
+    private static Cluster cluster;
+    private static int tables;
+
+    @BeforeClass
+    public static void setupCluster() throws IOException
+    {
+        cluster = init(Cluster.build(3)
+                              .withConfig(config -> config.set("aggregation_subpage_size", "1KiB"))
+                              .start());
+    }
+
+    @AfterClass
+    public static void teardownCluster()
+    {
+        if (cluster != null)
+            cluster.close();
+    }
+
+    @Test
+    public void testExpiredRowLiveness()
+    {
+        testPaging("a int, b int",
+                   "INSERT INTO %s (pk, ck, a) VALUES (?, ?, 0) USING TTL 60",
+                   "UPDATE %s SET b = 1 WHERE pk = ? AND ck = ?");
+    }
+
+    @Test
+    public void testExpiredCollectionCells()
+    {
+        testPaging("m map<int, int>",
+                   "UPDATE %s USING TTL 60 SET m = m + {1: 1, 2: 2} WHERE pk = ? AND ck = ?",
+                   "UPDATE %s SET m = m + {3: 3} WHERE pk = ? AND ck = ?");
+    }
+
+    @Test
+    public void testDeletedCollectionElements()
+    {
+        testPaging("m map<int, int>",
+                   "UPDATE %s SET m = m + {1: 1, 2: 2, 3: 3} WHERE pk = ? AND ck = ?",
+                   "DELETE m[1], m[2] FROM %s WHERE pk = ? AND ck = ?");
+    }
+
+    /**
+     * Writes every row with the first statement and then with the second, with the data in memtables, split between
+     * a memtable and an sstable, or in two sstables.
+     */
+    private static void testPaging(String columns, String first, String second)
+    {
+        for (int flushes = 0; flushes <= 2; flushes++)
+        {
+            String table = createTable(columns);
+            write(first, table);
+            if (flushes >= 1)
+                cluster.forEach(node -> node.flush(KEYSPACE));
+            write(second, table);
+            if (flushes == 2)
+                cluster.forEach(node -> node.flush(KEYSPACE));
+
+            for (String cl : new String[]{ "ONE", "ALL" })
+            {
+                for (String query : new String[]{ "SELECT * FROM %s WHERE pk = 0", "SELECT * FROM %s" })
+                {
+                    String select = format(query, table);
+                    String context = select + " at " + cl + " after " + flushes + " flushes";
+                    List<String> expected = execute(select, cl, Integer.MAX_VALUE, false);
+                    assertEquals(context, query.contains("WHERE") ? ROWS : ROWS * PARTITIONS, expected.size());
+                    assertEquals(context, expected, execute(select, cl, PAGE_SIZE_IN_BYTES, true));
+                }
+
+                List<String> count = execute(format("SELECT COUNT(*) FROM %s", table), cl, 1000, false);
+                assertEquals("COUNT(*) at " + cl + " after " + flushes + " flushes",
+                             Collections.singletonList(Arrays.toString(new Object[]{ (long) ROWS * PARTITIONS })), count);
+            }
+        }
+    }
+
+    private static String createTable(String columns)
+    {
+        String table = KEYSPACE + ".t" + tables++;
+        cluster.schemaChange(format("CREATE TABLE %s (pk int, ck int, %s, PRIMARY KEY (pk, ck))", table, columns));
+        return table;
+    }
+
+    private static void write(String statement, String table)
+    {
+        for (int pk = 0; pk < PARTITIONS; pk++)
+            for (int ck = 0; ck < ROWS; ck++)
+                cluster.coordinator(1).execute(format(statement, table), ALL, pk, ck);
+    }
+
+    /**
+     * Executes the query on node 1 with the given page size, in rows or bytes, as if READ_DELAY_IN_SEC later.
+     */
+    private static List<String> execute(String query, String consistency, int pageSize, boolean inBytes)
+    {
+        return cluster.get(1).callOnInstance(() -> {
+            long nowInSec = FBUtilities.nowInSeconds() + READ_DELAY_IN_SEC;
+            ClientState clientState = ClientState.forInternalCalls();
+            SelectStatement statement = (SelectStatement) QueryProcessor.getStatement(query, clientState);
+            QueryState queryState = new QueryState(clientState);
+            PageSize size = inBytes ? PageSize.inBytes(pageSize) : PageSize.inRows(pageSize);
+
+            List<String> rows = new ArrayList<>();
+            PagingState pagingState = null;
+            do
+            {
+                QueryOptions options = QueryOptions.create(ConsistencyLevel.valueOf(consistency), Collections.emptyList(), false,
+                                                           size, pagingState, null, ProtocolVersion.CURRENT, null,
+                                                           Long.MIN_VALUE, nowInSec);
+                ResultMessage.Rows page = statement.execute(queryState, options, Dispatcher.RequestTime.forImmediateExecution());
+                RowUtil.toIter(page).forEachRemaining(row -> rows.add(Arrays.toString(row)));
+                pagingState = page.result.metadata.getPagingState();
+            }
+            while (pagingState != null);
+            return rows;
+        });
+    }
+}
