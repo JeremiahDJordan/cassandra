@@ -588,9 +588,12 @@ public class IndexHints
                 throw new IOException("Found unsupported index hints, likely due to the index hints containing " +
                                       "new types of hint that are not supported by this node.");
 
+            if (flags == 0)
+                return IndexHints.NONE;
+
             // read included and excluded indexes
-            Set<IndexMetadata> included = new HashSet<>();
-            Set<IndexMetadata> excluded = new HashSet<>();
+            Set<IndexMetadata> included = hasIncluded(flags) ? new HashSet<>() : Collections.emptySet();
+            Set<IndexMetadata> excluded = hasExcluded(flags) ? new HashSet<>() : Collections.emptySet();
             boolean knowsIncluded = !hasIncluded(flags) || indexSetSerializer.deserialize(in, version, table, included);
             if (!included.isEmpty())
             {

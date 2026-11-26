@@ -1839,14 +1839,15 @@ public abstract class ReadCommand extends AbstractReadQuery
                 Index.Group indexGroup = index == null ? null : indexManager.getIndexGroup(index);
                 // a plan without the index of an expression that only an index can evaluate would drop the expression,
                 // or fail to order by it
-                if (indexGroup == null || !hasIndexesForIndexOnlyExpressions(rowFilter, indexManager, indexGroup))
+                boolean hasIndexOnlyOperator = rowFilter.hasIndexOnlyOperator();
+                if (indexGroup == null || (hasIndexOnlyOperator && !hasIndexesForIndexOnlyExpressions(rowFilter, indexManager, indexGroup)))
                 {
                     missingIndex = true;
                 }
                 else
                 {
                     indexQueryPlan = indexGroup.queryPlanFor(rowFilter);
-                    if (indexQueryPlan != null && !evaluatesIndexOnlyExpressions(indexQueryPlan, rowFilter, indexGroup))
+                    if (indexQueryPlan != null && hasIndexOnlyOperator && !evaluatesIndexOnlyExpressions(indexQueryPlan, rowFilter, indexGroup))
                     {
                         indexQueryPlan = null;
                         missingIndex = true;
