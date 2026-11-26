@@ -519,16 +519,15 @@ public class TupleType extends MultiCellCapableType<ByteBuffer>
     @Override
     public String toJSONString(ByteBuffer buffer, ProtocolVersion protocolVersion)
     {
-        ByteBuffer duplicated = buffer.duplicate();
-        int offset = 0;
+        ByteBuffer[] buffers = split(ByteBufferAccessor.instance, buffer);
         StringBuilder sb = new StringBuilder("[");
         for (int i = 0; i < size(); i++)
         {
             if (i > 0)
                 sb.append(", ");
 
-            ByteBuffer value = CollectionSerializer.readValue(duplicated, ByteBufferAccessor.instance, offset, protocolVersion);
-            offset += CollectionSerializer.sizeOfValue(value, ByteBufferAccessor.instance, protocolVersion);
+            // the value can have fewer components than the type, the missing ones are null
+            ByteBuffer value = (i >= buffers.length) ? null : buffers[i];
             if (value == null)
                 sb.append("null");
             else
