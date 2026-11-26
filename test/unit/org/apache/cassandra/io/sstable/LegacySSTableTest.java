@@ -31,6 +31,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -80,6 +81,8 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.gms.ApplicationState;
+import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.StatsComponent;
@@ -98,6 +101,7 @@ import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.RangesAtEndpoint;
 import org.apache.cassandra.net.EndpointMessagingVersions;
 import org.apache.cassandra.net.MessagingService;
+import org.apache.cassandra.nodes.Nodes;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.CacheService;
 import org.apache.cassandra.service.StorageService;
@@ -974,11 +978,14 @@ public class LegacySSTableTest
         try
         {
             assertOutgoingStream(cfs, FBUtilities.getBroadcastAddressAndPort(), entire, null);
-            for (int version : new int[]{ MessagingService.VERSION_50, MessagingService.VERSION_DS_21 })
-            {
-                versions.set(peer, version);
-                assertOutgoingStream(cfs, peer, entire, null);
-            }
+            // a peer at messaging version 13 takes it entire only with this node's schema version
+            versions.set(peer, MessagingService.VERSION_50);
+            assertOutgoingStream(cfs, peer, false, null);
+            Gossiper.instance.initializeNodeUnsafe(peer, UUID.randomUUID(), MessagingService.VERSION_50, 1);
+            Gossiper.instance.injectApplicationState(peer, ApplicationState.SCHEMA, StorageService.instance.valueFactory.schema(Schema.instance.getVersion()));
+            assertOutgoingStream(cfs, peer, entire, null);
+            versions.set(peer, MessagingService.VERSION_DS_21);
+            assertOutgoingStream(cfs, peer, entire, null);
             versions.set(peer, MessagingService.VERSION_DS_20);
             assertOutgoingStream(cfs, peer, false, null);
             for (int version : new int[]{ MessagingService.VERSION_DS_12, MessagingService.VERSION_DSE_68 })
@@ -994,6 +1001,8 @@ public class LegacySSTableTest
         finally
         {
             versions.reset(peer);
+            Gossiper.runInGossipStageBlocking(() -> Gossiper.instance.unsafeAnnulEndpoint(peer));
+            Nodes.peers().remove(peer, true, true);
         }
     }
 
