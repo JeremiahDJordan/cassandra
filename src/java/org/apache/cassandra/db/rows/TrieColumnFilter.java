@@ -106,7 +106,7 @@ public class TrieColumnFilter
 
         for (ColumnMetadata column : queriedColumns)
         {
-            int id = columnIds.get(column.name);
+            int id = TrieBackedRow.columnId(columnIds, column);
             if (id == TrieBackedRow.COLUMN_NOT_PRESENT)
                 continue;
             ByteComparable columnKey = TrieBackedRow.encodeUnsignedInt(id);
