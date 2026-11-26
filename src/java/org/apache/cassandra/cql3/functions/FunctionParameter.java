@@ -70,6 +70,15 @@ public interface FunctionParameter
     }
 
     /**
+     * @return whether the type of this parameter is the type of another argument of the function call when that type
+     * is known, rather than the type inferred from the argument of this parameter (see {@link #sameAs})
+     */
+    default boolean prefersTypeOfOtherArgument()
+    {
+        return false;
+    }
+
+    /**
      * @return a function parameter definition that accepts values that can be interpreted as floats
      */
     static FunctionParameter float32()
@@ -184,6 +193,12 @@ public interface FunctionParameter
             public void validateType(FunctionFactory factory, AssignmentTestable arg, AbstractType<?> argType)
             {
                 parameter.validateType(factory, arg, argType);
+            }
+
+            @Override
+            public boolean prefersTypeOfOtherArgument()
+            {
+                return preferOther;
             }
 
             @Override

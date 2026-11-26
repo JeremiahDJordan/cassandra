@@ -19,8 +19,9 @@ package org.apache.cassandra.cql3.functions;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.IdentityHashMap;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Map;
 
 import javax.annotation.Nullable;
 
@@ -67,7 +68,8 @@ public final class FunctionResolver
                                AbstractType<?> receiverType)
     throws InvalidRequestException
     {
-        Collection<Function> candidates = collectCandidates(keyspace, name, receiverKs, receiverCf, providedArgs, receiverType);
+        Map<Function, FunctionFactory> factories = new IdentityHashMap<>();
+        Collection<Function> candidates = collectCandidates(keyspace, name, receiverKs, receiverCf, providedArgs, receiverType, factories);
 
         if (candidates.isEmpty())
             return null;
@@ -76,11 +78,11 @@ public final class FunctionResolver
         if (candidates.size() == 1)
         {
             Function fun = candidates.iterator().next();
-            validateTypes(keyspace, fun, providedArgs, receiverKs, receiverCf);
+            validateTypes(keyspace, fun, factories.get(fun), providedArgs, receiverKs, receiverCf);
             return fun;
         }
 
-        return pickBestMatch(keyspace, name, providedArgs, receiverKs, receiverCf, receiverType, candidates);
+        return pickBestMatch(keyspace, name, providedArgs, receiverKs, receiverCf, receiverType, candidates, factories);
     }
 
     private static Collection<Function> collectCandidates(String keyspace,
@@ -88,7 +90,8 @@ public final class FunctionResolver
                                                           String receiverKs,
                                                           String receiverCf,
                                                           List<? extends AssignmentTestable> providedArgs,
-                                                          AbstractType<?> receiverType)
+                                                          AbstractType<?> receiverType,
+                                                          Map<Function, FunctionFactory> factories)
     {
         Collection<Function> candidates = new ArrayList<>();
 
@@ -97,9 +100,7 @@ public final class FunctionResolver
             // function name is fully qualified (keyspace + name)
             candidates.addAll(Schema.instance.getUserFunctions(name));
             candidates.addAll(NativeFunctions.instance.getFunctions(name));
-            candidates.addAll(NativeFunctions.instance.getFactories(name).stream()
-                                            .map(f -> f.getOrCreateFunction(providedArgs, receiverType, receiverKs, receiverCf))
-                                            .collect(Collectors.toList()));
+            addBuiltFunctions(name, providedArgs, receiverType, receiverKs, receiverCf, candidates, factories);
         }
         else
         {
@@ -109,12 +110,29 @@ public final class FunctionResolver
             // add 'SYSTEM' (native) candidates
             FunctionName nativeName = name.asNativeFunction();
             candidates.addAll(NativeFunctions.instance.getFunctions(nativeName));
-            candidates.addAll(NativeFunctions.instance.getFactories(nativeName).stream()
-                                            .map(f -> f.getOrCreateFunction(providedArgs, receiverType, receiverKs, receiverCf))
-                                            .collect(Collectors.toList()));
+            addBuiltFunctions(nativeName, providedArgs, receiverType, receiverKs, receiverCf, candidates, factories);
         }
 
         return candidates;
+    }
+
+    private static void addBuiltFunctions(FunctionName name,
+                                          List<? extends AssignmentTestable> providedArgs,
+                                          AbstractType<?> receiverType,
+                                          String receiverKs,
+                                          String receiverCf,
+                                          Collection<Function> candidates,
+                                          Map<Function, FunctionFactory> factories)
+    {
+        for (FunctionFactory factory : NativeFunctions.instance.getFactories(name))
+        {
+            NativeFunction function = factory.getOrCreateFunction(providedArgs, receiverType, receiverKs, receiverCf);
+            if (function != null)
+            {
+                candidates.add(function);
+                factories.put(function, factory);
+            }
+        }
     }
 
     private static Function pickBestMatch(String keyspace,
@@ -122,14 +140,15 @@ public final class FunctionResolver
                                           List<? extends AssignmentTestable> providedArgs,
                                           String receiverKs,
                                           String receiverCf, AbstractType<?> receiverType,
-                                          Collection<Function> candidates)
+                                          Collection<Function> candidates,
+                                          Map<Function, FunctionFactory> factories)
     {
         List<Function> compatibles = null;
         for (Function toTest : candidates)
         {
             if (matchReturnType(toTest, receiverType))
             {
-                AssignmentTestable.TestResult r = matchAguments(keyspace, toTest, providedArgs, receiverKs, receiverCf);
+                AssignmentTestable.TestResult r = matchAguments(keyspace, toTest, factories.get(toTest), providedArgs, receiverKs, receiverCf);
                 switch (r)
                 {
                     case EXACT_MATCH:
@@ -209,6 +228,7 @@ public final class FunctionResolver
     // case where there is no override for a given function. This is thus probably worth the minor code duplication.
     private static void validateTypes(String keyspace,
                                       Function fun,
+                                      @Nullable FunctionFactory factory,
                                       List<? extends AssignmentTestable> providedArgs,
                                       String receiverKs,
                                       String receiverCf)
@@ -227,7 +247,7 @@ public final class FunctionResolver
                 continue;
 
             ColumnSpecification expected = makeArgSpec(receiverKs, receiverCf, fun, i);
-            if (!provided.testAssignment(keyspace, expected).isAssignable())
+            if (!testArgument(keyspace, factory, providedArgs, i, expected).isAssignable())
                 throw invalidRequest("Type error: %s cannot be passed as argument %d of function %s of type %s",
                                      provided, i, fun.name(), expected.type.asCQL3Type());
         }
@@ -235,6 +255,7 @@ public final class FunctionResolver
 
     private static AssignmentTestable.TestResult matchAguments(String keyspace,
                                                                Function fun,
+                                                               @Nullable FunctionFactory factory,
                                                                List<? extends AssignmentTestable> providedArgs,
                                                                String receiverKs,
                                                                String receiverCf)
@@ -254,13 +275,27 @@ public final class FunctionResolver
             }
 
             ColumnSpecification expected = makeArgSpec(receiverKs, receiverCf, fun, i);
-            AssignmentTestable.TestResult argRes = provided.testAssignment(keyspace, expected);
+            AssignmentTestable.TestResult argRes = testArgument(keyspace, factory, providedArgs, i, expected);
             if (argRes == AssignmentTestable.TestResult.NOT_ASSIGNABLE)
                 return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
             if (argRes == AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE)
                 res = AssignmentTestable.TestResult.WEAKLY_ASSIGNABLE;
         }
         return res;
+    }
+
+    /** @param factory the factory that built the candidate, or {@code null} for a function with declared argument types */
+    private static AssignmentTestable.TestResult testArgument(String keyspace,
+                                                              @Nullable FunctionFactory factory,
+                                                              List<? extends AssignmentTestable> providedArgs,
+                                                              int i,
+                                                              ColumnSpecification expected)
+    {
+        AssignmentTestable.TestResult result = providedArgs.get(i).testAssignment(keyspace, expected);
+        if (result == AssignmentTestable.TestResult.NOT_ASSIGNABLE && factory != null)
+            return factory.testArgumentAgainstInferredType(keyspace, providedArgs, i, expected);
+
+        return result;
     }
 
     private static String format(Collection<Function> funs)
