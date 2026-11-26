@@ -488,6 +488,14 @@ public abstract class ReadCommand extends AbstractReadQuery
              */
             iterator = filter.filter(iterator, nowInSec());
 
+            // GROUP BY limits can read a row that they don't return, RTBoundCloser needs to know about it
+            RTBoundCloser.LastReadRow lastReadRow = null;
+            if (limits().isGroupByLimit())
+            {
+                lastReadRow = new RTBoundCloser.LastReadRow();
+                iterator = Transformation.apply(iterator, lastReadRow);
+            }
+
             // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
             // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
             // If tracking repaired data, the counter is needed for overreading repaired data, otherwise we can
@@ -508,7 +516,7 @@ public abstract class ReadCommand extends AbstractReadQuery
             }
 
             // because of the above, we need to append an artifical end bound if the source iterator was stopped short by a counter.
-            iterator = RTBoundCloser.close(iterator);
+            iterator = RTBoundCloser.close(iterator, lastReadRow);
 
             if (executionInfo != null)
                 iterator = executionInfo.countReturned(iterator, nowInSec());

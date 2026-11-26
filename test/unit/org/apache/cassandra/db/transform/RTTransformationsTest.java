@@ -186,6 +186,126 @@ public final class RTTransformationsTest
     }
 
     @Test
+    public void testRemovesUnclosedBoundAfterLastRow()
+    {
+        UnfilteredPartitionIterator original = iter(false
+        , row(1, "a", "0", "")
+        , bound(Kind.INCL_START_BOUND, 0, "a", "1")
+        );
+        UnfilteredPartitionIterator extended = closeWithoutReturning(original);
+
+        UnfilteredPartitionIterator expected = iter(false
+        , row(1, "a", "0", "")
+        );
+        assertIteratorsEqual(expected, extended);
+    }
+
+    @Test
+    public void testRemovesUnclosedBoundAfterLastRowInReverseOrder()
+    {
+        UnfilteredPartitionIterator original = iter(true
+        , row(1, "a", "1", "")
+        , bound(Kind.INCL_END_BOUND, 0, "a", "0")
+        );
+        UnfilteredPartitionIterator extended = closeWithoutReturning(original);
+
+        UnfilteredPartitionIterator expected = iter(true
+        , row(1, "a", "1", "")
+        );
+        assertIteratorsEqual(expected, extended);
+    }
+
+    @Test
+    public void testClosesUnclosedBoundaryAfterLastRow()
+    {
+        UnfilteredPartitionIterator original = iter(false
+        , bound(Kind.INCL_START_BOUND, 0, "a")
+        , row(2, "a", "0", "")
+        , boundary(Kind.EXCL_END_INCL_START_BOUNDARY, 0, 1, "a", "1")
+        );
+        UnfilteredPartitionIterator extended = closeWithoutReturning(original);
+
+        UnfilteredPartitionIterator expected = iter(false
+        , bound(Kind.INCL_START_BOUND, 0, "a")
+        , row(2, "a", "0", "")
+        , bound(Kind.EXCL_END_BOUND, 0, "a", "1")
+        );
+        assertIteratorsEqual(expected, extended);
+    }
+
+    @Test
+    public void testClosesUnclosedBoundBeforeUnreturnedRow()
+    {
+        UnfilteredPartitionIterator original = iter(false
+        , bound(Kind.INCL_START_BOUND, 0, "a")
+        , row(1, "a", "0", "")
+        , row(1, "a", "1", "")
+        );
+        UnfilteredPartitionIterator extended = closeWithoutReturning(original, "a", "1", "");
+
+        UnfilteredPartitionIterator expected = iter(false
+        , bound(Kind.INCL_START_BOUND, 0, "a")
+        , row(1, "a", "0", "")
+        , bound(Kind.EXCL_END_BOUND, 0, "a", "1", "")
+        );
+        assertIteratorsEqual(expected, extended);
+    }
+
+    @Test
+    public void testClosesUnclosedBoundBeforeUnreturnedRowInReverseOrder()
+    {
+        UnfilteredPartitionIterator original = iter(true
+        , bound(Kind.INCL_END_BOUND, 0, "a")
+        , row(1, "a", "1", "")
+        , row(1, "a", "0", "")
+        );
+        UnfilteredPartitionIterator extended = closeWithoutReturning(original, "a", "0", "");
+
+        UnfilteredPartitionIterator expected = iter(true
+        , bound(Kind.INCL_END_BOUND, 0, "a")
+        , row(1, "a", "1", "")
+        , bound(Kind.EXCL_START_BOUND, 0, "a", "0", "")
+        );
+        assertIteratorsEqual(expected, extended);
+    }
+
+    @Test
+    public void testKeepsUnclosedBoundBeforeUnreturnedRow()
+    {
+        UnfilteredPartitionIterator original = iter(false
+        , row(1, "a", "0", "")
+        , bound(Kind.INCL_START_BOUND, 0, "a", "1")
+        , row(1, "a", "1", "")
+        );
+        UnfilteredPartitionIterator extended = closeWithoutReturning(original, "a", "1", "");
+
+        UnfilteredPartitionIterator expected = iter(false
+        , row(1, "a", "0", "")
+        , bound(Kind.INCL_START_BOUND, 0, "a", "1")
+        , bound(Kind.EXCL_END_BOUND, 0, "a", "1", "")
+        );
+        assertIteratorsEqual(expected, extended);
+    }
+
+    @Test
+    public void testKeepsUnclosedBoundBeforeUnreturnedRowInReverseOrder()
+    {
+        UnfilteredPartitionIterator original = iter(true
+        , row(1, "a", "1", "")
+        , bound(Kind.INCL_END_BOUND, 0, "a", "0")
+        , row(1, "a", "0", "")
+        );
+        UnfilteredPartitionIterator extended = closeWithoutReturning(original, "a", "0", "");
+
+        UnfilteredPartitionIterator expected = iter(true
+        , row(1, "a", "1", "")
+        , bound(Kind.INCL_END_BOUND, 0, "a", "0")
+        , bound(Kind.EXCL_START_BOUND, 0, "a", "0", "")
+        );
+        assertIteratorsEqual(expected, extended);
+    }
+
+    @Test
     public void testValidatesLegalBounds()
     {
         UnfilteredPartitionIterator iterator = iter(false
@@ -396,6 +516,35 @@ public final class RTTransformationsTest
             clusteringByteBuffers[i] = decompose(metadata.clusteringColumns().get(i).type, clusteringValues[i]);
 
         return BTreeRow.noCellLiveRow(Clustering.make(clusteringByteBuffers), LivenessInfo.create(timestamp, nowInSec));
+    }
+
+    /**
+     * Closes the iterator after limits that stop at the row with the given clustering, if any, without returning it.
+     */
+    private UnfilteredPartitionIterator closeWithoutReturning(UnfilteredPartitionIterator iterator, Object... clusteringValues)
+    {
+        Clustering<?> unreturned = clusteringValues.length == 0 ? null : row(0, clusteringValues).clustering();
+        RTBoundCloser.LastReadRow lastReadRow = new RTBoundCloser.LastReadRow();
+        iterator = Transformation.apply(iterator, lastReadRow);
+        iterator = Transformation.apply(iterator, new StoppingTransformation<UnfilteredRowIterator>()
+        {
+            @Override
+            protected UnfilteredRowIterator applyToPartition(UnfilteredRowIterator partition)
+            {
+                return Transformation.apply(partition, this);
+            }
+
+            @Override
+            protected Row applyToRow(Row row)
+            {
+                if (!row.clustering().equals(unreturned))
+                    return row;
+
+                stopInPartition();
+                return null;
+            }
+        });
+        return close(iterator, lastReadRow);
     }
 
     @SuppressWarnings("unchecked")
