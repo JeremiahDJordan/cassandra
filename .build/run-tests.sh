@@ -1,0 +1,399 @@
+#!/bin/bash
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+#
+# Wrapper script for running a split or regexp of tests (excluding python dtests)
+#
+
+[ $DEBUG ] && set -x
+
+set -o errexit
+set -o pipefail
+
+# variables, with defaults
+[ "x${CASSANDRA_DIR}" != "x" ] || CASSANDRA_DIR="$(readlink -f $(dirname -- "$0")/..)"
+[ "x${DIST_DIR}" != "x" ] || DIST_DIR="${CASSANDRA_DIR}/build"
+
+# target types
+TARGET_TYPES="stress-test fqltool-test test-burn long-test cqlsh-test test test-cdc test-compression test-bigtable test-system-keyspace-directory jvm-dtest"
+
+error() {
+  echo >&2 $2;
+  set -x
+  exit $1
+}
+
+# pre-conditions (error() must be defined above)
+command -v ant >/dev/null 2>&1 || { error 1 "ant needs to be installed"; }
+command -v git >/dev/null 2>&1 || { error 1 "git needs to be installed"; }
+command -v uuidgen >/dev/null 2>&1 || test -f /proc/sys/kernel/random/uuid || { error 1 "uuidgen needs to be installed"; }
+[ -d "${CASSANDRA_DIR}" ] || { error 1 "Directory ${CASSANDRA_DIR} must exist"; }
+[ -f "${CASSANDRA_DIR}/build.xml" ] || { error 1 "${CASSANDRA_DIR}/build.xml must exist"; }
+[ -d "${DIST_DIR}" ] || { mkdir -p "${DIST_DIR}" ; }
+
+print_help() {
+  echo "Usage: $0 [-a|-t|-c|-e|-i|-b|-s|-h]"
+  echo "   -a, --target <type>  Test target type: ${TARGET_TYPES}"
+  echo "   -t, --test <regexp>  Test name regexp to run."
+  echo "   -c, --chunk <X/Y>    Chunk to run in the form X/Y: Run chunk X from a total of Y chunks."
+  echo "   -b, --base <branch>  Specify the base git branch for comparison when determining changed tests to"
+  echo "                        repeat. Defaults to ${BASE_BRANCH}. Note that this option is not used when"
+  echo "                        the '-a' option is specified."
+  echo "   -e, --env <key=value> Environment variables to be used in the repeated runs:"
+  echo "                   -e REPEATED_TESTS_STOP_ON_FAILURE=false"
+  echo "                   -e REPEATED_TESTS_COUNT=500"
+  echo "                  If you want to specify multiple environment variables simply add multiple -e options."
+  echo "   -i, --ignore-unknown-env  Ignore unknown environment variables"
+  echo "   -s, --summary        Print a summary of failed tests instead of the full ant output."
+  echo "                        The full output is kept in \${DIST_DIR}/run-tests.log"
+  echo "   -h, --help           Print help"
+}
+
+
+# legacy argument handling, for the form <target> [<test regexp|chunk>]
+if [[ " ${TARGET_TYPES} " =~ " ${1} " ]]; then
+  test_type="-a ${1}"
+  _java_supported=`grep 'property\s*name="java.supported"' ${CASSANDRA_DIR}/build.xml |sed -ne 's/.*value="\([^"]*\)".*/\1/p'`
+  if [[ -z ${2} ]]; then
+    test_list=""
+  elif [[ -n ${2} && "${2}" =~ ^[0-9]+/[0-9]+$ ]]; then
+    test_list="-c ${2}";
+  elif [[ "${2}" =~ ^(${_java_supported//,/|})$ ]]; then
+    # this script runs on the java already on the path, so it has no version to switch to
+    error 1 "This script cannot set the java version, it uses the java on the path. Use '.build/docker/run-tests.sh -a ${1} -j ${2}' instead"
+  else
+    test_list="-t ${2}";
+  fi
+  echo "Using deprecated legacy arguments.  Please update to new parameter format: ${test_type} ${test_list}"
+  $0 ${test_type} ${test_list}
+  exit $?
+fi
+
+
+env_vars=""
+has_env_vars=false
+check_env_vars=true
+summary=false
+
+# getopts accepts single characters only, so parse by hand to offer long flags too
+_require_arg() {
+  [ -n "${2}" ] || error 1 "Option ${1} requires an argument"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -a|--target)
+        _require_arg "$1" "${2:-}"
+        test_target="$2"
+        [[ " ${TARGET_TYPES} " =~ " ${test_target/-repeat/} " ]] || error 1 "Invalid test target type '${test_target}'. Valid types: ${TARGET_TYPES}"
+        shift 2
+        ;;
+    -t|--test)
+        _require_arg "$1" "${2:-}"
+        test_name_regexp="$2"; shift 2
+        ;;
+    -c|--chunk)
+        _require_arg "$1" "${2:-}"
+        chunk="$2"; shift 2
+        ;;
+    -e|--env)
+        _require_arg "$1" "${2:-}"
+        if (! ($has_env_vars)); then
+          env_vars="$2"
+        else
+          env_vars="$env_vars|$2"
+        fi
+        has_env_vars=true
+        shift 2
+        ;;
+    -b|--base)
+        _require_arg "$1" "${2:-}"
+        BASE_BRANCH="$2"; shift 2
+        ;;
+    -i|--ignore-unknown-env)
+        check_env_vars=false; shift
+        ;;
+    -s|--summary)
+        summary=true; shift
+        ;;
+    -h|--help)
+        print_help
+        exit 0
+        ;;
+    -j|--java)
+        # accepted and ignored, to avoid failing on the java_version param from docker/run-tests.sh
+        _require_arg "$1" "${2:-}"
+        shift 2
+        ;;
+    *)  error 1 "Invalid option: $1"
+        ;;
+  esac
+done
+
+# validate environment variables
+if $has_env_vars && $check_env_vars; then
+  for entry in $(echo $env_vars | tr "|" "\n"); do
+    key=$(echo $entry | tr "=" "\n" | sed -n 1p)
+    case $key in
+      "REPEATED_TESTS_STOP_ON_FAILURE" | "REPEATED_TESTS_COUNT" )
+        [[ ${test_target} == *"-repeat" ]] || { error 1 "'-e REPEATED_*' variables only valid against *-repeat target types"; }
+        ;;
+      *)
+        error 1 "unrecognized environment variable name: $key"
+        ;;
+    esac
+  done
+fi
+
+# print debug information on versions
+ant -version
+git --version
+java -version  2>&1
+javac -version  2>&1
+
+# lists all tests for the specific test type
+_list_tests() {
+  local -r classlistprefix="$1"
+  find "test/${classlistprefix}" -name '*Test.java' | sed "s;^test/${classlistprefix}/;;g" | sort
+}
+
+_split_tests() {
+  local -r _split_chunk="$1"
+  split_cmd=split
+  if [[ "${_split_chunk}" =~ ^[0-9]+/[0-9]+$ ]]; then
+    ( split --help 2>&1 ) | grep -q "r/K/N" || split_cmd=gsplit
+    command -v ${split_cmd} >/dev/null 2>&1 || { error 1 "${split_cmd} needs to be installed"; }
+    ${split_cmd} -n r/${_split_chunk}
+  elif [[ "x" != "x${_split_chunk}" ]] ; then
+    grep -e "${_split_chunk}"
+  else
+    echo
+  fi
+}
+
+_timeout_for() {
+  grep "name=\"${1}\"" build.xml | awk -F'"' '{print $4}'
+}
+
+_get_env_var() {
+  [[ ${env_vars} =~ ${1}=([^|]+) ]]
+  echo "${BASH_REMATCH[1]}"
+}
+
+_run_testlist() {
+    local _target_prefix=$1
+    local _testlist_target=$2
+    local _test_name_regexp=$3
+    local _split_chunk=$4
+    local _test_timeout=$5
+    local _test_iterations=${6:-1}
+
+    # are we running ${_test_name_regexp} or ${_split_chunk}
+    if [ -n "${_test_name_regexp}" ]; then
+      echo "Running tests: ${_test_name_regexp} (${_test_iterations} times)"
+      # test regexp can come in csv
+      for i in ${_test_name_regexp//,/ }; do
+        [ -n "${testlist}" ] && testlist="${testlist}"$'\n'
+        testlist="${testlist}$( _list_tests "${_target_prefix}" | _split_tests "${i}")"
+      done
+      [[ -z "${testlist}" ]] && error 1 "No tests found in test name regexp: ${_test_name_regexp}"
+    else
+      [ -n "${_split_chunk}" ] || { error 1 "Neither name regexp or split chunk defined"; }
+      echo "Running split: ${_split_chunk}"
+      testlist="$( _list_tests "${_target_prefix}" | _split_tests "${_split_chunk}")"
+      if [[ -z "${testlist}" ]]; then
+        # something has to run in the split to generate a junit xml result
+        echo "Hacking ${_target_prefix} ${_testlist_target} to run only first test found as no tests in split ${_split_chunk} were found"
+        testlist="$( _list_tests "${_target_prefix}" | sed -n 1p)"
+      fi
+    fi
+
+    local -r _results_uuid="$(command -v uuidgen >/dev/null 2>&1 && uuidgen || cat /proc/sys/kernel/random/uuid)"
+    local failures=0
+    for ((i=0; i < _test_iterations; i++)); do
+      [ "${_test_iterations}" -eq 1 ] || printf "–––– run ${i}\n"
+      set +o errexit
+      ant "$_testlist_target" -Dtest.classlistprefix="${_target_prefix}" -Dtest.classlistfile=<(echo "${testlist}") -Dtest.timeout="${_test_timeout}" ${ANT_TEST_OPTS}
+      ant_status=$?
+      set -o errexit
+      if [[ $ant_status -ne 0 ]]; then
+        echo "failed ${_target_prefix} ${_testlist_target} ${split_chunk} ${_test_name_regexp}"
+
+        # Only store logs for failed tests on repeats to save up space
+        if [ "${_test_iterations}" -gt 1 ]; then
+          # Get this test results and rename file with iteration and 'fail'
+          find "${DIST_DIR}"/test/output/ -type f -name "*.xml" -not -name "*fail.xml" -print0 | while read -r -d $'\0' file; do
+            mv "${file}" "${file%.xml}-${_results_uuid}-${i}-fail.xml"
+          done
+          find "${DIST_DIR}"/test/logs/ -type f -name "*.log" -not -name "*fail.log" -print0 | while read -r -d $'\0' file; do
+            mv "${file}" "${file%.log}-${_results_uuid}-${i}-fail.log"
+          done
+
+          if [ "$(_get_env_var 'REPEATED_TESTS_STOP_ON_FAILURE')" == true ]; then
+            error 0 "fail fast, after ${i} successful runs"
+          fi
+          let failures+=1
+        fi
+      fi
+    done
+    [ "${_test_iterations}" -eq 1 ] || printf "––––\nfailure rate: ${failures}/${_test_iterations}\n"
+}
+
+_main() {
+  # parameters
+  local -r target="${test_target/-repeat/}"
+  local -r split_chunk="${chunk:-1/1}" # Chunks formatted as "K/N" for the Kth chunk of N chunks
+
+  # check split_chunk is compatible with target (if not a regexp)
+  if [[ "${split_chunk}" =~ ^[0-9]+/[0-9]+$ ]] && [[ "1/1" != "${split_chunk}" ]] ; then
+    case ${target} in
+      "stress-test" | "fqltool-test" | "cqlsh-test")
+          error 1 "Target ${target} does not support splits."
+          ;;
+        *)
+          ;;
+    esac
+  fi
+
+  # "-repeat" is a reserved suffix on target types
+  if [[ ${test_target} == *"-repeat" ]] ; then
+    [[ "${split_chunk}" =~ ^[0-9]+/[0-9]+$ ]] && { error 1 "Repeated tests not valid with splits"; }
+    if [[ -z "${test_name_regexp}" ]] ; then
+      error 1 "Repeated tests requires use of -t option"
+    fi
+    local -r repeat_count="$(_get_env_var 'REPEATED_TESTS_COUNT')"
+  else
+    test_name_regexp="${test_name_regexp:-}"
+  fi
+
+  pushd ${CASSANDRA_DIR}/ >/dev/null
+
+  # jdk check
+  local -r java_version=$(java -version 2>&1 | awk -F '"' '/version/ {print $2}' | awk -F. '{print $1}')
+  local -r project_name=$(grep '<project\s*basedir=' build.xml |sed -ne 's/.*name=\"\([^"]*\)\".*/\1/p')
+  local -r version=$(grep 'property\s*name=\"base.version\"' build.xml |sed -ne 's/.*value=\"\([^"]*\)\".*/\1/p')
+  local -r java_version_default=`grep 'property\s*name="java.default"' build.xml |sed -ne 's/.*value="\([^"]*\)".*/\1/p'`
+
+  # check project is already built. no cleaning is done, so jenkins unstash works, beware.
+  [[ -f "${DIST_DIR}/${project_name}-${version}.jar" ]] || [[ -f "${DIST_DIR}/${project_name}-${version}-SNAPSHOT.jar" ]] || { error 1 "Project must be built first. Use \`ant jar\`. Build directory is ${DIST_DIR} with: $(ls ${DIST_DIR} | xargs)"; }
+
+  # check if dist artifacts exist, this breaks the dtests
+  [[ -d "${DIST_DIR}/dist" ]] && { error 1 "tests don't work when build/dist ("${DIST_DIR}/dist") exists (from \`ant artifacts\`)"; }
+
+  # ant test setup
+  export TMP_DIR="${DIST_DIR}/tmp"
+  [ -d ${TMP_DIR} ] || mkdir -p "${TMP_DIR}"
+  export ANT_TEST_OPTS="-Dno-build-test=true -Dtmp.dir=${TMP_DIR} -Dbuild.test.output.dir=${DIST_DIR}/test/output/${target}"
+
+  # fresh virtualenv and test logs results everytime.
+  # loop instead of a brace expansion, which needs ${DIST_DIR} unquoted and so word split
+  if [[ "/" != "${DIST_DIR}" ]] ; then
+    for d in html output logs reports ; do rm -rf "${DIST_DIR}/test/${d}" ; done
+  fi
+
+  # cheap trick to ensure dependency libraries are in place. allows us to stash only project specific build artifacts.
+  #  also recreate some of the non-build files we need
+  ant -quiet -silent resolver-dist-lib createVersionPropFile
+
+  case ${target} in
+    "stress-test")
+      # hard fail on test compilation, but dont fail the test run as unstable test reports are processed
+      ant stress-build-test ${ANT_TEST_OPTS}
+      ant $target ${ANT_TEST_OPTS} || echo "failed ${target} ${split_chunk}"
+      ;;
+    "fqltool-test")
+      # hard fail on test compilation, but dont fail the test run so unstable test reports are processed
+      ant fqltool-build-test ${ANT_TEST_OPTS}
+      ant $target ${ANT_TEST_OPTS} || echo "failed ${target} ${split_chunk}"
+      ;;
+    "test")
+      _run_testlist "unit" "testclasslist" "${test_name_regexp}" "${split_chunk}" "$(_timeout_for 'test.timeout')" "${repeat_count}"
+      ;;
+    "test-cdc")
+      _run_testlist "unit" "testclasslist-cdc" "${test_name_regexp}" "${split_chunk}" "$(_timeout_for 'test.timeout')" "${repeat_count}"
+      ;;
+    "test-compression")
+      _run_testlist "unit" "testclasslist-compression" "${test_name_regexp}" "${split_chunk}" "$(_timeout_for 'test.timeout')" "${repeat_count}"
+      ;;
+    "test-bigtable")
+      _run_testlist "unit" "testclasslist-bigtable" "${test_name_regexp}" "${split_chunk}" "$(_timeout_for 'test.timeout')" "${repeat_count}"
+      ;;
+    "test-system-keyspace-directory")
+      _run_testlist "unit" "testclasslist-system-keyspace-directory" "${test_name_regexp}" "${split_chunk}" "$(_timeout_for 'test.timeout')" "${repeat_count}"
+      ;;
+    "test-burn")
+      _run_testlist "burn" "testclasslist" "${test_name_regexp}" "${split_chunk}" "$(_timeout_for 'test.burn.timeout')" "${repeat_count}"
+      ;;
+    "long-test")
+      _run_testlist "long" "testclasslist" "${test_name_regexp}" "${split_chunk}" "$(_timeout_for 'test.long.timeout')" "${repeat_count}"
+      ;;
+    "jvm-dtest")
+      if [[ -z "${test_name_regexp}" ]] ; then
+        test_name_regexp=$( _list_tests "distributed" | grep -v "upgrade" | _split_tests "${split_chunk}")
+        if [[ -z "${test_name_regexp}" ]]; then
+          [[ "${split_chunk}" =~ ^[0-9]+/[0-9]+$ ]] || { error 1 "No tests match ${test_name_regexp}"; }
+          # something has to run in the split to generate a junit xml result
+          echo "Hacking jvm-dtest to run only first test found as no tests in split ${split_chunk} were found"
+          test_name_regexp="$( _list_tests "distributed"  | grep -v "upgrade" | sed -n 1p)"
+        fi
+      fi
+      _run_testlist "distributed" "testclasslist" "${test_name_regexp}" "" "$(_timeout_for 'test.distributed.timeout')" "${repeat_count}"
+      ;;
+    "cqlsh-test")
+      ./pylib/cassandra-cqlsh-tests.sh $(pwd)
+      ;;
+    *)
+      error 1 "unconfigured build command for test type \"${target}\""
+      ;;
+  esac
+
+  # merge all unit xml files into one, and print summary test numbers
+  ant -quiet -silent generate-test-report \
+    -Dbuild.test.output.dir="${DIST_DIR}/test/output" \
+    -Dbuild.test.report.dir="${DIST_DIR}/test/reports"
+
+  popd  >/dev/null
+}
+
+if ${summary}; then
+  # Summarize the run: run-tests.sh keeps going past failing tests.
+  # Keep the full output, as the summary prints matched lines only.
+  # ${DIST_DIR}/test/ is not used, as _main removes it while the log is open.
+  log="${DIST_DIR}/run-tests.log"
+  echo "full output: ${log}"
+  # errexit is dynamically scoped, so the subshell is what keeps it inside _main
+  set +o errexit
+  ( set -o errexit -o pipefail ; _main "$@" ) > "${log}" 2>&1
+  main_status=$?
+  "${CASSANDRA_DIR}/.build/sh/test-log-summary.py" "${log}"
+  summary_status=$?
+  # jenkins archives test/logs/**, see .jenkins/Jenkinsfile
+  [[ -d "${DIST_DIR}/test/logs" ]] && cp "${log}" "${DIST_DIR}/test/logs/run-tests.log"
+  # a setup failure inside _main (error() exits non-zero) takes precedence
+  if [[ ${main_status} -ne 0 ]]; then
+    # the summary matches test results only, so a setup failure leaves it silent.
+    # print the tail of the log, or the cause stays hidden in a file
+    if [[ ${summary_status} -eq 0 ]]; then
+      echo "run-tests.sh exited ${main_status}. The last 25 lines of ${log}:"
+      tail -n 25 "${log}"
+    fi
+    exit ${main_status}
+  fi
+  exit ${summary_status}
+else
+  _main "$@"
+fi
