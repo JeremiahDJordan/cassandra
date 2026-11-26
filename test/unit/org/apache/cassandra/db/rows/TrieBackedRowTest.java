@@ -32,6 +32,7 @@ import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.context.CounterContext;
+import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.CounterColumnType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.MapType;
@@ -120,6 +121,21 @@ public class TrieBackedRowTest
         builder.addRowDeletion(new Row.Deletion(DeletionTime.build(deletionTimestamp, FBUtilities.nowInSeconds()), false));
         Row row = builder.build();
         assertEquals(deletionTimestamp, row.minTimestamp());
+    }
+
+    /// The filter queries a column added to the table after the row was built.
+    @Test
+    public void testWithOnlyQueriedDataOfAColumnTheRowHasNoIdFor()
+    {
+        TableMetadata altered = metadata.unbuild().addRegularColumn("v3", Int32Type.instance).build();
+        ColumnMetadata v3Metadata = altered.getColumn(ByteBufferUtil.bytes("v3"));
+        Row row = row(1, cell(v1Metadata, 1, 1000), cell(v2Metadata, 2, 1000)).build();
+        ColumnFilter filter = ColumnFilter.allRegularColumnsBuilder(altered, false).add(v1Metadata).add(v3Metadata).build();
+
+        Row queried = row.withOnlyQueriedData(filter);
+
+        assertEquals(1, queried.columnCount());
+        assertEquals(ByteBufferUtil.bytes(1), queried.getCell(v1Metadata).buffer());
     }
 
     @Test
