@@ -200,7 +200,8 @@ public class TrieBackedPartition implements Partition
     }
 
     /// Create a row with the given properties and content, making sure to copy all off-heap data to keep it alive when
-    /// the given access mode requires it.
+    /// the given access mode requires it. The cells are keyed with the column ids of `metadata`. Partitions copied to
+    /// the heap, which reads get, report `droppedColumnsSource`, the table's current metadata.
     public static TrieBackedPartition create(DecoratedKey partitionKey,
                                              RegularAndStaticColumns columnMetadata,
                                              EncodingStats encodingStats,
@@ -605,7 +606,7 @@ public class TrieBackedPartition implements Partition
         @Override
         public TableMetadata metadata()
         {
-            return metadata;
+            return TrieBackedPartition.this.metadata();
         }
 
         @Override
@@ -676,7 +677,7 @@ public class TrieBackedPartition implements Partition
         // AbstractBTreePartition does): a response's serialization header only has the fetched static columns, so a
         // static row with any other column fails to serialize ("... is not a subset of ...").
         if (bounds.length == 0)
-            return UnfilteredRowIterators.noRowsIterator(metadata,
+            return UnfilteredRowIterators.noRowsIterator(metadata(),
                                                          partitionKey,
                                                          filteredStaticRow(selection, mayFilterColumns(selection)),
                                                          partitionLevelDeletion(),
@@ -754,6 +755,12 @@ public class TrieBackedPartition implements Partition
                                  TableMetadata droppedColumnsSource)
         {
             super(partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, originalClusterings, metadata, droppedColumnsSource);
+        }
+
+        @Override
+        public TableMetadata metadata()
+        {
+            return droppedColumnsSource;
         }
 
         /// Copies the row to the heap as a `BTreeRow`, built directly from the trie cells. Readers of memtable data

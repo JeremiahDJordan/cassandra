@@ -1150,7 +1150,7 @@ public class TrieMemtable extends AbstractShardedMemtable
                                                    long minLocalDeletionTime)
         {
             this.iter = new PartitionIterator(source, originalClusterings, metadata, droppedColumnsSource, copyToHeap);
-            this.metadata = metadata;
+            this.metadata = droppedColumnsSource;
             this.columnFilter = columnFilter;
             this.dataRange = dataRange;
             this.minLocalDeletionTime = minLocalDeletionTime;
