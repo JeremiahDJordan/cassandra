@@ -324,10 +324,13 @@ public class Operation
      * Returns the mutable (non-primary key) columns of the given expressions with expressions that aren't served by
      * index scans, either because their column isn't indexed, or because the user-provided hints exclude its index.
      * Those columns might have been updated on different replicas, whether their indexed counterparts are repaired or
-     * not (CASSANDRA-20189).
+     * not (CASSANDRA-20189). Only non-strict filtering uses them, so a strict tree gets none.
      */
-    private static Set<ColumnMetadata> unindexedColumns(QueryController controller, ListMultimap<ColumnMetadata, Expression> expressions)
+    private static Set<ColumnMetadata> unindexedColumns(QueryController controller, ListMultimap<ColumnMetadata, Expression> expressions, boolean isStrict)
     {
+        if (isStrict)
+            return Collections.emptySet();
+
         Set<ColumnMetadata> unindexed = null;
         for (Map.Entry<ColumnMetadata, Expression> entry : expressions.entries())
         {
@@ -545,7 +548,7 @@ public class Operation
         FilterTree filterTree(QueryController controller, boolean isStrict)
         {
             assert expressionMap != null;
-            var tree = new FilterTree(operationType(), expressionMap, isStrict, controller.queryContext(), unindexedColumns(controller, expressionMap));
+            var tree = new FilterTree(operationType(), expressionMap, isStrict, controller.queryContext(), unindexedColumns(controller, expressionMap, isStrict));
             for (Node child : children())
                 if (child.canFilter())
                     tree.addChild(child.filterTree(controller, isStrict));
@@ -662,7 +665,7 @@ public class Operation
         FilterTree filterTree(QueryController controller, boolean isStrict)
         {
             assert expressionMap != null;
-            return new FilterTree(OperationType.AND, expressionMap, isStrict, controller.queryContext(), unindexedColumns(controller, expressionMap));
+            return new FilterTree(OperationType.AND, expressionMap, isStrict, controller.queryContext(), unindexedColumns(controller, expressionMap, isStrict));
         }
 
         public ExpressionNode(RowFilter.Expression expression)

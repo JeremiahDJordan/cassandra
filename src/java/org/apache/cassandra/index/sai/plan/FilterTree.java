@@ -74,7 +74,7 @@ public class FilterTree
      * @param context the context of the query, which tells whether there are index matches on unrepaired data;
      *                it can only be {@code null} if {@code isStrict} is {@code true}
      * @param unindexedColumns the mutable (non-primary key) columns in {@code expressions} with expressions that
-     *                         aren't served by index scans
+     *                         aren't served by index scans; only used if {@code isStrict} is {@code false}
      */
     FilterTree(OperationType operation,
                ListMultimap<ColumnMetadata, Expression> expressions,
