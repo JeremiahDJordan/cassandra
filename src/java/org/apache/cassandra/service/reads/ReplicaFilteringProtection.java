@@ -21,12 +21,15 @@ package org.apache.cassandra.service.reads;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
 import java.util.concurrent.TimeUnit;
 import java.util.Queue;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
 import org.slf4j.Logger;
@@ -37,6 +40,7 @@ import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.ReadCommand;
@@ -48,6 +52,7 @@ import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.marshal.Redaction;
 import org.apache.cassandra.db.partitions.PartitionIterator;
+import org.apache.cassandra.db.partitions.PartitionIterators;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
 import org.apache.cassandra.db.rows.EncodingStats;
@@ -139,23 +144,29 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /** Tracks the current partitions when not consuming entire partitions in {@link #queryProtectedPartitions}. */
     private RowIterator currentRowIterator = null;
 
+    /** Counts the first-phase rows that the second phase returns, if they can be counted for the query's limits. */
+    @Nullable
+    private final CompleteRows completeRows;
+
     ReplicaFilteringProtection(Keyspace keyspace,
                                ReadCommand command,
                                ConsistencyLevel consistency,
                                Dispatcher.RequestTime requestTime,
                                E sources,
                                int cachedRowsWarnThreshold,
-                               int cachedRowsFailThreshold)
+                               int cachedRowsFailThreshold,
+                               DataLimits.Counter firstPhaseCounter,
+                               UnaryOperator<PartitionIterator> rowFilter)
     {
         this.keyspace = keyspace;
         this.command = command;
-        // When it doesn't consume entire partitions, it hands the partition over to the second phase in several pages,
-        // each of which restarts the per-partition count of the second phase, so it can't do that if there is a
-        // per-partition limit.
+        // Per-partition and GROUP BY limits need entire partitions: a partition handed over in several pages restarts
+        // the second phase's per-partition count, and GroupMaker expects each partition key once.
         this.consumeEntirePartitions = command.limits().isUnlimited()
                                        || !command.isLimitedToOnePartition()
                                        || command.rowFilter().hasStaticExpression()
-                                       || command.limits().perPartitionCount() != DataLimits.NO_LIMIT;
+                                       || command.limits().perPartitionCount() != DataLimits.NO_LIMIT
+                                       || command.limits().isGroupByLimit();
         this.consistency = consistency;
         this.requestTime = requestTime;
         this.sources = sources;
@@ -172,6 +183,16 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         this.cachedRowsFailThreshold = cachedRowsFailThreshold;
 
         mergeListener = new QueryMergeListener();
+
+        // Per-partition limits would need the rows counted by partition. Without a row or group limit (no limit, or
+        // only a limit in bytes), the rows would be held and never counted. A filter on a static column can stop
+        // matching the rows of a partition when its static row is completed.
+        DataLimits limits = command.limits();
+        completeRows = limits.count() == DataLimits.NO_LIMIT
+                       || limits.perPartitionCount() != DataLimits.NO_LIMIT
+                       || command.rowFilter().hasStaticExpression()
+                       ? null
+                       : new CompleteRows(firstPhaseCounter, rowFilter);
     }
 
     private UnfilteredPartitionIterator executeReadCommand(ReadCommand cmd, Replica source, ReplicaPlan.Shared<EndpointsForToken, ReplicaPlan.ForTokenRead> replicaPlan)
@@ -274,9 +295,18 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                     silentRowAt[i] |= silentColumnAt[i] && !allSilent;
             }
 
+            boolean complete = true;
             for (int i = 0; i < silentRowAt.length; i++)
+            {
                 if (silentRowAt[i])
+                {
                     builders.get(i).addToFetch(merged);
+                    complete = false;
+                }
+            }
+
+            if (complete && completeRows != null && !merged.isStatic())
+                completeRows.add(key, merged);
         }
 
         @Override
@@ -332,7 +362,11 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         public UnfilteredRowIterators.MergeListener getRowMergeListener(DecoratedKey partitionKey, List<UnfilteredRowIterator> versions)
         {
             if (currentListener == null || !currentListener.key.equals(partitionKey))
+            {
                 currentListener = new PartitionMergeListerner(partitionKey, versions);
+                if (completeRows != null)
+                    completeRows.startPartition(partitionKey);
+            }
 
             return currentListener;
         }
@@ -481,6 +515,162 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 return builder.protectedPartition();
             }
         };
+    }
+
+    /**
+     * Counts, in the first phase's merged result counter, the rows that no replica is silent about and that match the
+     * row filter: the second phase returns them as they are, so short read protection stops asking for more rows once
+     * they fill the limit. The rows are filtered and counted in batches big enough to fill the rest of the limit, or
+     * one at a time for GROUP BY.
+     * <p>
+     * A GROUP BY counter closes a group when the next one starts and expects each partition once, so it is given the
+     * start of each merged partition and each row as they come. A group whose last row is the last row of a replica's
+     * response tells short read protection that the replica isn't needed (see DataLimits#isCompleteWithLastRowOf). The
+     * rows it doesn't count can only make more groups.
+     */
+    private class CompleteRows
+    {
+        private final DataLimits.Counter counter;
+        private final UnaryOperator<PartitionIterator> rowFilter;
+        private final boolean groupBy;
+        // whether the coordinator filter filters rows (see DataResolver#preCountFilterForReplicaFilteringProtection)
+        private final boolean filtersRows;
+        private final List<DecoratedKey> keys = new ArrayList<>();
+        private final List<List<Row>> rows = new ArrayList<>();
+        private int pending = 0;
+
+        private CompleteRows(DataLimits.Counter counter, UnaryOperator<PartitionIterator> rowFilter)
+        {
+            this.counter = counter;
+            this.rowFilter = rowFilter;
+            this.groupBy = command.limits().isGroupByLimit();
+            this.filtersRows = command.rowFilter().hasNonKeyExpression();
+        }
+
+        private void startPartition(DecoratedKey key)
+        {
+            if (groupBy && !counter.isDone())
+                counter.countPartitionStart(key);
+        }
+
+        private void add(DecoratedKey key, Row merged)
+        {
+            if (counter.isDone())
+                return;
+
+            // The second phase purges the merged rows before filtering them
+            Row row = merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
+            if (row == null)
+                return;
+
+            if (groupBy)
+            {
+                // The filter has no static expression, so this is what the coordinator filter does with the row
+                if (!filtersRows || command.rowFilter().root().isSatisfiedBy(command.metadata(), key, row, command.nowInSec()))
+                    counter.countRow(row);
+                return;
+            }
+
+            if (keys.isEmpty() || !keys.get(keys.size() - 1).equals(key))
+            {
+                keys.add(key);
+                rows.add(new ArrayList<>());
+            }
+            rows.get(rows.size() - 1).add(row);
+
+            if (++pending >= command.limits().count() - counter.rowsCounted())
+                count();
+        }
+
+        private void count()
+        {
+            try (PartitionIterator partitions = counter.applyTo(rowFilter.apply(pendingPartitions())))
+            {
+                PartitionIterators.consume(partitions);
+            }
+
+            keys.clear();
+            rows.clear();
+            pending = 0;
+        }
+
+        private PartitionIterator pendingPartitions()
+        {
+            Iterator<DecoratedKey> keyIterator = keys.iterator();
+            Iterator<List<Row>> rowsIterator = rows.iterator();
+            return new PartitionIterator()
+            {
+                @Override
+                public boolean hasNext()
+                {
+                    return keyIterator.hasNext();
+                }
+
+                @Override
+                public RowIterator next()
+                {
+                    return partition(keyIterator.next(), rowsIterator.next().iterator());
+                }
+
+                @Override
+                public void close()
+                {
+                }
+            };
+        }
+
+        private RowIterator partition(DecoratedKey key, Iterator<Row> partitionRows)
+        {
+            return new RowIterator()
+            {
+                @Override
+                public TableMetadata metadata()
+                {
+                    return command.metadata();
+                }
+
+                @Override
+                public boolean isReverseOrder()
+                {
+                    return command.isReversed();
+                }
+
+                @Override
+                public RegularAndStaticColumns columns()
+                {
+                    return command.metadata().regularAndStaticColumns();
+                }
+
+                @Override
+                public DecoratedKey partitionKey()
+                {
+                    return key;
+                }
+
+                @Override
+                public Row staticRow()
+                {
+                    return Rows.EMPTY_STATIC_ROW;
+                }
+
+                @Override
+                public boolean hasNext()
+                {
+                    return partitionRows.hasNext();
+                }
+
+                @Override
+                public Row next()
+                {
+                    return partitionRows.next();
+                }
+
+                @Override
+                public void close()
+                {
+                }
+            };
+        }
     }
 
     private class PartitionBuilder
