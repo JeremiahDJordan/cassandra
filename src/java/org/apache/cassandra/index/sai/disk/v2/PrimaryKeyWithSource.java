@@ -24,13 +24,11 @@ import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.sai.disk.PrimaryKeyMap;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
-import org.apache.cassandra.io.sstable.SSTableId;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.bytecomparable.ByteSource;
 
 public class PrimaryKeyWithSource implements PrimaryKey
 {
-    private final SSTableId<?> sourceSstableId;
     // see PrimaryKeyMap#rowIdSpace: the row id is only meaningful in maps of the same row id space
     private final Object sourceRowIdSpace;
     private final long sourceRowId;
@@ -42,7 +40,6 @@ public class PrimaryKeyWithSource implements PrimaryKey
     public PrimaryKeyWithSource(PrimaryKeyMap primaryKeyMap, long sstableRowId, PrimaryKey sourceSstableMinKey, PrimaryKey sourceSstableMaxKey)
     {
         this.primaryKeyMap = primaryKeyMap;
-        this.sourceSstableId = primaryKeyMap.getSSTableId();
         this.sourceRowIdSpace = primaryKeyMap.rowIdSpace();
         this.sourceRowId = sstableRowId;
         this.sourceSstableMinKey = sourceSstableMinKey;
@@ -63,11 +60,6 @@ public class PrimaryKeyWithSource implements PrimaryKey
     public long getSourceRowId()
     {
         return sourceRowId;
-    }
-
-    public SSTableId<?> getSourceSstableId()
-    {
-        return sourceSstableId;
     }
 
     /**
@@ -185,13 +177,13 @@ public class PrimaryKeyWithSource implements PrimaryKey
     @Override
     public String toString()
     {
-        return String.format("%s (source sstable: %s, %s)", delegatePrimaryKey, sourceSstableId, sourceRowId);
+        return String.format("%s (source sstable: %s, %s)", delegatePrimaryKey, sourceRowIdSpace, sourceRowId);
     }
 
     @Override
     public long ramBytesUsed()
     {
-        // Object header + 3 references (primaryKey, sourceSstableId) + long value
+        // Object header + 2 references (primaryKey, sourceRowIdSpace) + long value
         return RamUsageEstimator.NUM_BYTES_OBJECT_HEADER +
                2L * RamUsageEstimator.NUM_BYTES_OBJECT_REF +
                Long.BYTES +
