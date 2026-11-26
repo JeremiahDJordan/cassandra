@@ -260,7 +260,9 @@ public class SSTableIndexWriter implements PerIndexWriter
 
     private boolean addTerm(ByteBuffer term, PrimaryKey key, long sstableRowId, AbstractType<?> type) throws IOException
     {
-        if (!indexContext.validateMaxTermSize(key.partitionKey(), term))
+        // The size of literal values is checked term by term once they're analyzed (see SegmentBuilder#analyzeAndAdd),
+        // as the memtable index does: a value may be larger than the max term size, but not its terms.
+        if (!TypeUtil.isLiteral(type) && !indexContext.validateMaxTermSize(key.partitionKey(), term))
             return false;
 
         if (currentBuilder == null)

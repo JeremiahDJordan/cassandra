@@ -21,10 +21,10 @@ package org.apache.cassandra.db.guardrails;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 
-import org.junit.Ignore;
 import org.junit.Test;
 
 import org.apache.cassandra.config.DataStorageSpec;
+import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
 import static java.nio.ByteBuffer.allocate;
@@ -66,7 +66,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testCompositePartitionKey() throws Throwable
     {
         createTable("CREATE TABLE %s (k1 int, k2 text, v int, PRIMARY KEY((k1, k2)))");
@@ -77,7 +76,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testSimpleClustering() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, c text, v int, PRIMARY KEY(k, c))");
@@ -88,7 +86,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testRegularColumn() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
@@ -99,7 +96,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testStaticColumn() throws Throwable
     {
         createTable("CREATE TABLE %s (k int, c int, s text STATIC, r int, PRIMARY KEY(k, c))");
@@ -112,7 +108,20 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
+    public void testAnalyzedTermLargerThanValue() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': '{" +
+                    "\"tokenizer\": {\"name\": \"keyword\"}, \"filters\": [{\"name\": \"patternReplace\", " +
+                    "\"args\": {\"pattern\": \"a\", \"replacement\": \"aaaaaaaaaaaa\", \"replace\": \"all\"}}]}'}");
+
+        // each 'a' becomes 12 bytes, so the terms are over the thresholds while the values are under the warning one
+        String query = "INSERT INTO %s (k, v) VALUES (0, ?)";
+        assertWarns("v", query, UTF8Type.instance.decompose("a".repeat(WARN_THRESHOLD / 12) + "bbbbb"));
+        assertFails("v", query, UTF8Type.instance.decompose("a".repeat(FAIL_THRESHOLD / 12) + "bbbbb"));
+    }
+
+    @Test
     public void testList() throws Throwable
     {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, l list<text>)");
@@ -134,7 +143,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testBatch() throws Throwable
     {
         createTable("CREATE TABLE %s (k text, c text, r text, s text STATIC, PRIMARY KEY(k, c))");
@@ -153,7 +161,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testCASWithIfNotExistsCondition() throws Throwable
     {
         createTable("CREATE TABLE %s (k text, c text, v text, s text STATIC, PRIMARY KEY(k, c))");
@@ -206,7 +213,6 @@ public class GuardrailSaiStringTermSizeTest extends ValueThresholdTester
     }
 
     @Test
-    @Ignore("CNDB-12704")
     public void testFailingTermOnBuild()
     {
         ByteBuffer oversizedTerm = allocate(failThreshold() + 1);
