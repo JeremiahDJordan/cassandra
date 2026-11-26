@@ -148,6 +148,18 @@ public class ColumnMetadataVersionComparatorTest
     }
 
     @Test
+    public void testWithUDTsAndExpandedTuples()
+    {
+        UserType multiCellUdt = new UserType("ks", bytes("myType"), udtWith2Fields.fieldNames(), udtWith2Fields.fieldTypes(), true);
+        checkComparisonResults(udtWith2Fields, udtWith2Fields.expandUserTypes());
+        checkComparisonResults(multiCellUdt, multiCellUdt.expandUserTypes());
+        checkComparisonResults(udtWith2Fields, udtWith3Fields.expandUserTypes());
+        checkComparisonResults(udtWith2Fields.expandUserTypes(), udtWith3Fields);
+        checkComparisonResults(MapType.getInstance(Int32Type.instance, udtWith2Fields, true),
+                               MapType.getInstance(Int32Type.instance, udtWith2Fields.expandUserTypes(), true));
+    }
+
+    @Test
     public void testInvalidComparison()
     {
         assertInvalidComparison("Found 2 incompatible versions of column c in ks.t: one of type org.apache.cassandra.db.marshal.Int32Type and one of type org.apache.cassandra.db.marshal.UTF8Type (but both types are incompatible)",

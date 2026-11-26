@@ -58,6 +58,22 @@ public final class ColumnMetadataVersionComparator implements Comparator<ColumnM
         if (v1Type.equals(v2Type))
             return 0;
 
+        // The drop record of a column describes its user types as the tuples they expand to, while an sstable opened
+        // before the drop still has the user types: compare them as tuples, the drop record's version winning a tie.
+        if (v1Type.referencesUserTypes() != v2Type.referencesUserTypes())
+        {
+            AbstractType<?> v1Expanded = v1Type.expandUserTypes();
+            AbstractType<?> v2Expanded = v2Type.expandUserTypes();
+            if (v1Expanded.equals(v2Expanded))
+                return v1Type.referencesUserTypes() ? -1 : 1;
+            return compareDifferentTypes(v1, v2, v1Expanded, v2Expanded);
+        }
+
+        return compareDifferentTypes(v1, v2, v1Type, v2Type);
+    }
+
+    private static int compareDifferentTypes(ColumnMetadata v1, ColumnMetadata v2, AbstractType<?> v1Type, AbstractType<?> v2Type)
+    {
         // If those aren't the same type, one must be "more general" than the other, that is accept strictly more values.
         if (v1Type.isValueCompatibleWith(v2Type))
         {
@@ -79,7 +95,7 @@ public final class ColumnMetadataVersionComparator implements Comparator<ColumnM
             // Neither is a super type of the other: something is pretty wrong and we probably shouldn't ignore it.
             throw new IllegalArgumentException(String.format("Found 2 incompatible versions of column %s in %s.%s: one " +
                                                              "of type %s and one of type %s (but both types are incompatible)",
-                                                             v1.name, v1.ksName, v1.cfName, v1Type, v2Type));
+                                                             v1.name, v1.ksName, v1.cfName, v1.type, v2.type));
         }
     }
 }
