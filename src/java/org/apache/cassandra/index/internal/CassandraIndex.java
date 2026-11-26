@@ -59,6 +59,7 @@ import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.IndexMetadata;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.sensors.Context;
 import org.apache.cassandra.sensors.RequestSensors;
@@ -243,7 +244,11 @@ public abstract class CassandraIndex implements Index
         metadata = indexDef;
         Pair<ColumnMetadata, IndexTarget.Type> target = TargetParser.parse(baseCfs.metadata(), indexDef);
         functions = getFunctions(indexDef, target);
-        TableMetadataRef tableRef = TableMetadataRef.forOfflineTools(indexCfsMetadata(baseCfs.metadata(), indexDef));
+        // The schema's ref is updated with the base table, whose clustering types the index table has, before the
+        // index table is reloaded. There is none for a table that isn't in the schema yet (CQLSSTableWriter).
+        TableMetadataRef tableRef = Schema.instance.getIndexTableMetadataRef(baseCfs.getKeyspaceName(), indexDef.name);
+        if (tableRef == null)
+            tableRef = TableMetadataRef.forOfflineTools(indexCfsMetadata(baseCfs.metadata(), indexDef));
         indexCfs = ColumnFamilyStore.createColumnFamilyStore(baseCfs.keyspace,
                                                              tableRef.name,
                                                              tableRef,

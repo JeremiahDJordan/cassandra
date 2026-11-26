@@ -36,6 +36,7 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
+import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ClusteringIndexSliceFilter;
@@ -45,7 +46,9 @@ import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -109,6 +112,46 @@ public class CassandraIndexTest extends CQLTester
                                 row(1, 1, 2, 9, 2),
                                 row(3, 1, null, 9, null),
                                 row(4, 1, 1, 9, 1));
+    }
+
+    @Test
+    public void testWriteOfAFieldAddedToTheTypeOfAClusteringColumn() throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (k int, c frozen<" + udt + ">, v int, PRIMARY KEY (k, c)) WITH memtable = 'trie'");
+        createIndex("CREATE INDEX ON %s (v) USING 'legacy_local_table'");
+        execute("INSERT INTO %s (k, c, v) VALUES (0, {a: 1, b: 2}, 0)");
+        // the index's keys from before the change are then in an sstable, and not in the memtables the reads look in
+        flush();
+        execute("ALTER TYPE " + KEYSPACE + '.' + udt + " ADD d int");
+
+        execute("INSERT INTO %s (k, c, v) VALUES (0, {a: 1, b: 2, d: 3}, 1)");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT c FROM %s WHERE v = 1"), row(userType("a", 1, "b", 2, "d", 3)));
+            assertRows(execute("SELECT c FROM %s WHERE v = 0"), row(userType("a", 1, "b", 2)));
+        });
+    }
+
+    /** As a node that is behind on the schema can get the DROP INDEX and the CREATE INDEX. */
+    @Test
+    public void testIndexCreatedAgainOnTheKeysOfAMapInOneSchemaChange() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, m map<int, int>, PRIMARY KEY (k, c))");
+        String index = createIndex("CREATE INDEX ON %s (values(m)) USING 'legacy_local_table'");
+        execute("INSERT INTO %s (k, c, m) VALUES (0, 0, {1: 2})");
+
+        TableMetadata table = currentTableMetadata();
+        IndexMetadata old = table.indexes.get(index).get();
+        IndexMetadata recreated = IndexMetadata.fromSchemaMetadata(index, old.kind, ImmutableMap.of(IndexTarget.TARGET_OPTION_NAME, "keys(m)"));
+        SchemaTestUtil.announceTableUpdate(table.unbuild().indexes(table.indexes.replace(recreated)).build());
+        waitForIndexQueryable(index);
+
+        execute("INSERT INTO %s (k, c, m) VALUES (0, 1, {3: 4})");
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT c FROM %s WHERE m CONTAINS KEY 1"), row(0));
+            assertRows(execute("SELECT c FROM %s WHERE m CONTAINS KEY 3"), row(1));
+        });
     }
 
     @Test
