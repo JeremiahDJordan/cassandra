@@ -45,7 +45,6 @@ import org.apache.cassandra.db.IDataSize;
 import org.apache.cassandra.db.LivenessInfo;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.marshal.AbstractType;
-import org.apache.cassandra.db.marshal.ByteBufferAccessor;
 import org.apache.cassandra.db.marshal.MultiCellCapableType;
 import org.apache.cassandra.db.partitions.TrieBackedPartition;
 import org.apache.cassandra.db.tries.BaseTrie;
@@ -577,28 +576,6 @@ public class TrieBackedRow extends AbstractRow
         return encodeUnsignedInt(id);
     }
 
-    /// The cell path of cell data found by looking up the given path: the path stored with it, or for a path that has
-    /// other forms with the same byte-comparable representation, the form the trie path decodes to.
-    public static CellPath foundCellPath(ColumnMetadata column, CellData<?, ?> value, CellPath lookedUp)
-    {
-        ByteBuffer storedPath = value.storedPath();
-        if (storedPath != null)
-            return CellPath.create(storedPath);
-        AbstractType<?> pathType = getCellPathType(column);
-        ByteBuffer path = lookedUp.get(0);
-        if (pathType.decodesComparableBytesExactly(path, ByteBufferAccessor.instance))
-            return lookedUp;
-        ByteSource.Peekable comparable = ByteSource.peekable(pathType.asComparableBytes(path, BYTE_COMPARABLE_VERSION));
-        return CellPath.create(pathType.fromComparableBytes(comparable, BYTE_COMPARABLE_VERSION));
-    }
-
-    /// The cell path of the given cell data, stored with it or converted from the cell-path part of the trie path.
-    static CellPath cellPath(ColumnMetadata column, CellData<?, ?> value, ByteSource.Peekable src)
-    {
-        ByteBuffer storedPath = value.storedPath();
-        return storedPath != null ? CellPath.create(storedPath) : cellPath(column, src);
-    }
-
     /// Convert the cell-path part of the trie path into a cell path to use in a [Cell].
     static CellPath cellPath(ColumnMetadata column, ByteSource.Peekable src)
     {
@@ -635,7 +612,7 @@ public class TrieBackedRow extends AbstractRow
         if (o == null || o instanceof Cell)
             return (Cell<?>) o;
         CellData<?, ?> cellData = (CellData<?, ?>) o;
-        return cellData.toCell(c, path != null ? foundCellPath(c, cellData, path) : null);
+        return cellData.toCell(c, path);
     }
 
     @Override
@@ -752,7 +729,7 @@ public class TrieBackedRow extends AbstractRow
         ByteSource.Peekable pathBytes = ByteSource.preencoded(bytes, 0, byteLength);
         long columnIdx = ByteSourceInverse.getVariableLengthUnsignedInteger(pathBytes);
         ColumnMetadata column = columns.getSimple((int) columnIdx);
-        return value.toCell(column, column.isComplex() ? cellPath(column, value, pathBytes) : null);
+        return value.toCell(column, column.isComplex() ? cellPath(column, pathBytes) : null);
     }
 
     /// Count the columns in the provided data trie (a row or a partition trie). This includes simple and complex

@@ -31,7 +31,6 @@ import com.google.common.primitives.Ints;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionInfo;
@@ -288,9 +287,9 @@ public class TriePartitionUpdateStage2 extends TrieBackedPartitionStage2 impleme
                                                ? DeletionTime.LIVE
                                                : DeletionTime.build(newTimestamp - 1, update.deletion.localDeletionTime());
 
-                    return update.withContent(BTree.transformAndFilter(update.columnsBTree,
-                                                                       (ColumnData cd) -> cd.updateAllTimestamp(newTimestamp)),
-                                              newInfo, newDeletion);
+                    return new RowData(BTree.transformAndFilter(update.columnsBTree,
+                                                                (ColumnData cd) -> cd.updateAllTimestamp(newTimestamp)),
+                                       newInfo, newDeletion);
                 }
 
                 public DeletionInfo applyDeletion(DeletionInfo update)
@@ -580,8 +579,7 @@ public class TriePartitionUpdateStage2 extends TrieBackedPartitionStage2 impleme
             {
                 // this is not expected to happen much, so going through toRow and the existing size is okay
                 RowData rowData = (RowData) existing;
-                Clustering<?> clustering = rowData.clustering();
-                update = Rows.merge(rowData.toRow(clustering != null ? clustering : update.clustering()), update);
+                update = Rows.merge(rowData.toRow(update.clustering()), update);
                 dataSize += update.dataSize() - rowData.dataSize();
             }
             else
@@ -590,7 +588,7 @@ public class TriePartitionUpdateStage2 extends TrieBackedPartitionStage2 impleme
                 dataSize += update.dataSize();
             }
 
-            return rowToData(metadata.comparator, update);
+            return rowToData(update);
         }
 
         public RegularAndStaticColumns columns()

@@ -81,8 +81,7 @@ public class TrieBackedComplexColumn extends ComplexColumnData
         Object cell = data.get(TrieBackedRow.cellKey(-1, column, path));
         if (cell == null || cell instanceof Cell)
             return (Cell<?>) cell;
-        CellData<?, ?> cellData = (CellData<?, ?>) cell;
-        return cellData.toCell(column, TrieBackedRow.foundCellPath(column, cellData, path));
+        return ((CellData<?, ?>) cell).toCell(column, path);
     }
 
     /// @inheritDoc The implementation is O(idx) as it has to walk the trie to find the value. Use sparingly.
@@ -99,14 +98,14 @@ public class TrieBackedComplexColumn extends ComplexColumnData
     {
         if (value instanceof Cell || value == null)
             return (Cell<?>) value;
-        return value.toCell(column, TrieBackedRow.cellPath(column, value, ByteSource.preencoded(keyBytes, 0, keyLength)));
+        return value.toCell(column, TrieBackedRow.cellPath(column, ByteSource.preencoded(keyBytes, 0, keyLength)));
     }
 
     private Cell<?> cellDataToCell(CellData<?, ?> value, ByteComparable.Preencoded key)
     {
         if (value instanceof Cell || value == null)
             return (Cell<?>) value;
-        return value.toCell(column, TrieBackedRow.cellPath(column, value, key.getPreencodedBytes()));
+        return value.toCell(column, TrieBackedRow.cellPath(column, key.getPreencodedBytes()));
     }
 
     @VisibleForTesting

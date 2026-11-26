@@ -1121,27 +1121,6 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
     }
 
     /**
-     * Whether {@link #fromComparableBytes} gives back every value of this type byte for byte. It does not for types
-     * whose values have several equal forms with a single byte-comparable representation (e.g. decimals that differ
-     * only in scale), as it can only return one of them.
-     */
-    public boolean decodesComparableBytesExactly()
-    {
-        for (AbstractType<?> subType : subTypes)
-            if (!subType.decodesComparableBytesExactly())
-                return false;
-        return true;
-    }
-
-    /**
-     * Whether {@link #fromComparableBytes} gives back the given value of this type byte for byte.
-     */
-    public <V> boolean decodesComparableBytesExactly(V value, ValueAccessor<V> accessor)
-    {
-        return decodesComparableBytesExactly();
-    }
-
-    /**
      * This must be overriden by subclasses if necessary so that for any
      * AbstractType, this == TypeParser.parse(toString()).
      *

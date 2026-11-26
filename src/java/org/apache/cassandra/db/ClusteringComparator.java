@@ -51,7 +51,6 @@ import static org.apache.cassandra.utils.bytecomparable.ByteSource.TERMINATOR;
 public class ClusteringComparator implements Comparator<Clusterable>
 {
     private final List<AbstractType<?>> clusteringTypes;
-    private final boolean decodesComparableBytesExactly;
 
     private final Comparator<IndexInfo> indexComparator;
     private final Comparator<IndexInfo> indexReverseComparator;
@@ -105,38 +104,8 @@ public class ClusteringComparator implements Comparator<Clusterable>
                 return ClusteringComparator.this.compare(o2, o1);
             }
         };
-        boolean decodesExactly = true;
         for (AbstractType<?> type : clusteringTypes)
-        {
             type.checkComparable(); // this should already be enforced by TableMetadata.Builder.addColumn, but we check again for other constructors
-            decodesExactly &= type.decodesComparableBytesExactly();
-        }
-        this.decodesComparableBytesExactly = decodesExactly;
-    }
-
-    /**
-     * Whether {@link #clusteringFromByteComparable} and the bound and boundary variants give back the values of every
-     * prefix byte for byte. See {@link AbstractType#decodesComparableBytesExactly()}.
-     */
-    public boolean decodesComparableBytesExactly()
-    {
-        return decodesComparableBytesExactly;
-    }
-
-    /**
-     * Whether the values of the given prefix are given back byte for byte by decoding its byte-comparable form.
-     */
-    public <V> boolean decodesComparableBytesExactly(ClusteringPrefix<V> prefix)
-    {
-        if (decodesComparableBytesExactly)
-            return true;
-        for (int i = 0; i < prefix.size(); i++)
-        {
-            V value = prefix.get(i);
-            if (value != null && !subtype(i).decodesComparableBytesExactly(value, prefix.accessor()))
-                return false;
-        }
-        return true;
     }
 
     /**

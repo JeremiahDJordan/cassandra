@@ -16,7 +16,6 @@
 
 package org.apache.cassandra.db.partitions;
 
-import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -35,11 +34,8 @@ import org.apache.cassandra.db.marshal.LongType;
 import org.apache.cassandra.db.memtable.SkipListMemtable;
 import org.apache.cassandra.db.memtable.TrieMemtable;
 import org.apache.cassandra.index.StubIndex;
-import org.apache.cassandra.utils.ByteBufferUtil;
-import org.apache.cassandra.utils.ReflectionUtils;
 
 import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /// Tests the index notifications issued by [TriePartitionUpdaterLegacyIndex] for deletions that overlap existing
@@ -337,42 +333,6 @@ public class TriePartitionUpdaterLegacyIndexTest extends CQLTester
         assertIndexedReadsMatch(scenarios, reference, indexed, indexedPredicate);
         flush(KEYSPACE, indexed);
         assertIndexedReadsMatch(scenarios, reference, indexed, indexedPredicate);
-    }
-
-    /// A range deletion of a range deleted before with other forms of its bounds (varints with a redundant sign byte)
-    /// is reported with its own bounds and deletion time, and the memtable keeps no reference to the update.
-    @Test
-    public void testReportedRangeTombstoneKeepsItsBounds() throws Exception
-    {
-        createTable("CREATE TABLE %s (pk int, ck varint, v int, PRIMARY KEY (pk, ck)) WITH memtable = 'trie'");
-        String index = createIndex("CREATE CUSTOM INDEX ON %s(v) USING '" + StubIndex.class.getName() + "'");
-        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
-        assertTrieMemtable(cfs);
-        StubIndex stub = (StubIndex) cfs.indexManager.getIndexByName(index);
-        execute("DELETE FROM %s USING TIMESTAMP 10 WHERE pk = 0 AND ck >= blobAsVarint(0x01) AND ck <= blobAsVarint(0x02)");
-        stub.reset();
-        execute("DELETE FROM %s USING TIMESTAMP 20 WHERE pk = 0 AND ck >= blobAsVarint(0x0001) AND ck <= blobAsVarint(0x0002)");
-
-        assertEquals(1, stub.rangeTombstones.size());
-        RangeTombstone range = stub.rangeTombstones.get(0);
-        assertEquals(20, range.deletionTime().markedForDeleteAt());
-        assertEquals("0001", ByteBufferUtil.bytesToHex(range.deletedSlice().start().bufferAt(0)));
-        assertEquals("0002", ByteBufferUtil.bytesToHex(range.deletedSlice().end().bufferAt(0)));
-
-        for (Object shard : (Object[]) field(cfs.getCurrentMemtable(), "shards"))
-        {
-            Object updater = field(shard, "legacyIndexUpdater");
-            if (updater != null)
-                for (String name : ImmutableList.of("originalClusterings", "updateOriginalClusterings", "rangeTombstoneOpenPosition"))
-                    assertNull(name, field(updater, name));
-        }
-    }
-
-    private static Object field(Object object, String name) throws ReflectiveOperationException
-    {
-        Field field = ReflectionUtils.getField(object.getClass(), name);
-        field.setAccessible(true);
-        return field.get(object);
     }
 
     /// The trie memtable must report the range tombstones of the incoming update, like the legacy memtables do,

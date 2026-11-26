@@ -121,32 +121,12 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
             updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
         DecoratedKey key = update.partitionKey();
         AbstractMemtableShard<?, ?> shard = getShards()[boundaries.getShardForKey(key)];
-        Throwable failure = null;
-        try
-        {
-            return shard.put(update, indexer, opGroup);
-        }
-        catch (Throwable t)
-        {
-            failure = t;
-            throw t;
-        }
-        finally
-        {
-            try
-            {
-                // A failed write can leave space in use in the tries.
-                if (shard.reachedAllocatedSizeThreshold())
-                    signalFlushRequired(ColumnFamilyStore.FlushReason.TRIE_LIMIT, true);
-            }
-            catch (Throwable t)
-            {
-                if (failure == null)
-                    throw t;
-                if (t != failure)
-                    failure.addSuppressed(t);
-            }
-        }
+        long colUpdateTimeDelta = shard.put(update, indexer, opGroup);
+
+        if (shard.data.reachedAllocatedSizeThreshold())
+            signalFlushRequired(ColumnFamilyStore.FlushReason.TRIE_LIMIT, true);
+
+        return colUpdateTimeDelta;
     }
 
     @Override
@@ -501,23 +481,6 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
         }
 
         /**
-         * The on-heap space that structures other than the data trie took in the last update, whether it succeeded or
-         * not. Called once per update.
-         */
-        protected long takeAuxiliaryOnHeapSize()
-        {
-            return 0;
-        }
-
-        /**
-         * Check if the shard's tries are close to their size limit.
-         */
-        protected boolean reachedAllocatedSizeThreshold()
-        {
-            return data.reachedAllocatedSizeThreshold();
-        }
-
-        /**
          * Check if the data trie is empty.
          */
         protected boolean isDataEmpty()
@@ -573,7 +536,7 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
                     finally
                     {
                         allocator.offHeap().adjust(data.usedSizeOffHeap() - offHeap, opGroup);
-                        allocator.onHeap().adjust(data.usedSizeOnHeap() - onHeap + takeAuxiliaryOnHeapSize(), opGroup);
+                        allocator.onHeap().adjust(data.usedSizeOnHeap() - onHeap, opGroup);
                     }
                     // A failed update leaves the trie unchanged, so the update's effects must not be applied.
                     allocator.onHeap().adjust(updater.heapSize, opGroup);

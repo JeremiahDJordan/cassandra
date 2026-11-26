@@ -135,13 +135,6 @@ public class UserType extends TupleType implements SchemaElement
     }
 
     @Override
-    public <V> boolean decodesComparableBytesExactly(V value, ValueAccessor<V> accessor)
-    {
-        // Fields can be added to the type, and a value then decodes with nulls for them.
-        return false;
-    }
-
-    @Override
     public boolean isUDT()
     {
         return true;

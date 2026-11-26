@@ -572,6 +572,11 @@ Upgrading
       when the index finishes the update, on any memtable). A write that fails this way while the rebuild runs is
       missed again, and needs another rebuild. On a memtable that doesn't flush for index builds, a rebuild can't
       repair such a row.
+    - Trie memtables read an empty value of a fixed-size type inside a tuple or user type clustering key, such as the
+      second component of (1, blobAsInt(0x), 1), back as null. The two compare as different keys, so a DELETE or
+      UPDATE of such a row on a trie memtable doesn't match the copies of the row in SSTables written with the empty
+      value (by a skip-list memtable, an earlier release, Apache Cassandra or streaming): the deleted row stays
+      visible, and an update leaves two rows, also once the memtable is flushed and the SSTables are compacted.
     - Storage-attached indexes (SAI) on the entries of a map with decimal keys or values now find the entries whose
       decimal equals the queried one whatever its scale (2.5 and 2.50), for indexes written at the on-disk versions
       before "db" (e.g. "aa"). Before, they only found the entries written with the queried bytes, and after a

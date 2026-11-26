@@ -361,23 +361,6 @@ public final class IntegerType extends NumberType<BigInteger>
     }
 
     @Override
-    public boolean decodesComparableBytesExactly()
-    {
-        // Values with redundant leading sign bytes (e.g. 0x0001) decode to their shortest form.
-        return false;
-    }
-
-    @Override
-    public <V> boolean decodesComparableBytesExactly(V value, ValueAccessor<V> accessor)
-    {
-        if (accessor.size(value) < 2)
-            return true;
-        byte first = accessor.getByte(value, 0);
-        byte second = accessor.getByte(value, 1);
-        return !(first == 0 && second >= 0 || first == -1 && second < 0);
-    }
-
-    @Override
     public <V> V fromComparableBytes(ValueAccessor<V> accessor, ByteSource.Peekable comparableBytes, ByteComparable.Version version)
     {
         assert version != ByteComparable.Version.LEGACY;

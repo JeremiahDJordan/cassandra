@@ -16,11 +16,9 @@
 
 package org.apache.cassandra.db.memtable;
 
-import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -32,19 +30,15 @@ import org.junit.After;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
-import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.db.ClusteringPrefix;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.WriteContext;
-import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.rows.Row;
-import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.StubIndex;
 import org.apache.cassandra.index.transactions.IndexTransaction;
@@ -102,24 +96,6 @@ import static org.junit.Assert.fail;
             targetLocation = "AT ENTRY",
             condition = "org.apache.cassandra.db.memtable.TrieMemtableFailedWriteIndexTest.shouldFail(\"saiUpdateRow\")",
             action = "throw new java.lang.RuntimeException(\"Injected indexer failure\")"),
-    @BMRule(name = "Fail when the memtable adds an original clustering of the update",
-            targetClass = "org.apache.cassandra.db.partitions.OriginalClusterings$Staging",
-            targetMethod = "add",
-            targetLocation = "AT ENTRY",
-            condition = "org.apache.cassandra.db.memtable.TrieMemtableFailedWriteIndexTest.shouldFail(\"originalClustering\")",
-            action = "throw new java.lang.RuntimeException(\"Injected memtable failure\")"),
-    @BMRule(name = "Report the trie size limit as reached",
-            targetClass = "org.apache.cassandra.db.tries.InMemoryBaseTrie",
-            targetMethod = "reachedAllocatedSizeThreshold",
-            targetLocation = "AT ENTRY",
-            condition = "org.apache.cassandra.db.memtable.TrieMemtableFailedWriteIndexTest.reportTrieLimit",
-            action = "return true"),
-    @BMRule(name = "Count the flushes requested at the trie size limit",
-            targetClass = "org.apache.cassandra.db.ColumnFamilyStore",
-            targetMethod = "signalFlushRequired",
-            targetLocation = "AT ENTRY",
-            condition = "$2 == org.apache.cassandra.db.ColumnFamilyStore$FlushReason.TRIE_LIMIT",
-            action = "org.apache.cassandra.db.memtable.TrieMemtableFailedWriteIndexTest.trieLimitFlushes.add($1.metadata().name)"),
     @BMRule(name = "Pause the first writer when it commits its index transaction",
             targetClass = "org.apache.cassandra.index.SecondaryIndexManager$WriteTimeTransaction",
             targetMethod = "commit",
@@ -146,11 +122,6 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
     private static volatile String failAtKind;
     /// The number of events of that kind to let through before the failure.
     private static final AtomicInteger eventsBeforeFailure = new AtomicInteger(-1);
-
-    /// Whether every trie reports its size limit as reached.
-    public static volatile boolean reportTrieLimit;
-    /// The tables whose memtable requested a flush at the trie size limit.
-    public static final Set<String> trieLimitFlushes = ConcurrentHashMap.newKeySet();
 
     private static volatile boolean pauseArmed;
     private static volatile CountDownLatch paused = new CountDownLatch(1);
@@ -191,8 +162,6 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
         failAtKind = null;
         eventsBeforeFailure.set(-1);
         script = NO_FAILURES;
-        reportTrieLimit = false;
-        trieLimitFlushes.clear();
         pauseArmed = false;
         resume.countDown();
     }
@@ -232,120 +201,6 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
                             "DELETE FROM %1$s USING TIMESTAMP 1 WHERE pk = 1; " +
                             "INSERT INTO %1$s (pk, ck, v, w) VALUES (1, 1, 1, 1); " +
                             "INSERT INTO %1$s (pk, ck, v, w) VALUES (1, 5, 1, 1); ");
-    }
-
-    /// A failed write of a clustering that decoding its path would change, a decimal with another scale, leaves no
-    /// trace of the form it wrote: a later write of the same row keeps its own form. trie_stage3 keeps the clusterings
-    /// of rows with data in the rows, and those of deleted rows apart.
-    @Test
-    public void testFailedWriteOfKeyWithOtherForms()
-    {
-        for (String memtable : ImmutableList.of("trie", "trie_stage3"))
-        {
-            createTable("CREATE TABLE %s (pk int, ck decimal, v int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
-            createIndex("CREATE INDEX ON %s(v) USING 'sai'");
-            String write = "trie".equals(memtable) ? "INSERT INTO %s (pk, ck, v) VALUES (1, ?, 1)" : "DELETE FROM %s WHERE pk = 1 AND ck = ?";
-
-            failWrite(memtable, "row", 0, write, new BigDecimal("1.1"));
-
-            execute(write, new BigDecimal("1.10"));
-            assertEquals(memtable, "1.10", onlyClustering());
-            flush();
-            assertEquals(memtable + ", flushed", "1.10", onlyClustering());
-        }
-    }
-
-    /// A write that fails while the memtable adds the original clusterings of its range tombstone bounds, after it
-    /// added some (one bound already in the memtable, one new), leaves none of them, and the memory they took is
-    /// charged to the memtable.
-    @Test
-    public void testFailedWriteWhileAddingOriginalClusterings()
-    {
-        for (String memtable : ImmutableList.of("trie", "trie_stage3"))
-        {
-            createTable("CREATE TABLE %s (pk int, ck decimal, v int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
-            execute("DELETE FROM %s WHERE pk = 1 AND ck >= 1.1 AND ck < 2.5");
-            long ownedBefore = Memtable.getMemoryUsage(getCurrentColumnFamilyStore().getCurrentMemtable()).ownsOnHeap;
-
-            String batch = "BEGIN UNLOGGED BATCH " +
-                           "DELETE FROM %1$s WHERE pk = 1 AND ck >= 1.10 AND ck < 2.50; " +
-                           "DELETE FROM %1$s WHERE pk = 1 AND ck >= ? AND ck < ?; " +
-                           "APPLY BATCH";
-            // the bounds are added in order: 1.10 and 2.50 are in the memtable as 1.1 and 2.5, 3.5 is new, 4.5 fails
-            failWrite(memtable, "originalClustering", 3, batch, new BigDecimal("3.5"), new BigDecimal("4.5"));
-            assertTrue(memtable, Memtable.getMemoryUsage(getCurrentColumnFamilyStore().getCurrentMemtable()).ownsOnHeap > ownedBefore);
-
-            execute(batch, new BigDecimal("3.50"), new BigDecimal("4.50"));
-            List<String> expected = ImmutableList.of("INCL_START_BOUND 1.1", "EXCL_END_BOUND 2.5", "INCL_START_BOUND 3.50", "EXCL_END_BOUND 4.50");
-            assertEquals(memtable, expected, unfilteredClusterings());
-            flush();
-            assertEquals(memtable + ", flushed", expected, unfilteredClusterings());
-        }
-    }
-
-    /// A write that fails still requests a flush when a trie of the memtable has reached its size limit.
-    @Test
-    public void testFailedWriteRequestsFlushAtTrieLimit()
-    {
-        for (String memtable : ImmutableList.of("trie", "trie_stage3"))
-        {
-            String table = createTable("CREATE TABLE %s (pk int, ck decimal, v int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
-            createIndex("CREATE INDEX ON %s(v) USING 'sai'");
-            reportTrieLimit = true;
-            try
-            {
-                failWrite(memtable, "row", 0, "DELETE FROM %s WHERE pk = 1 AND ck = ?", new BigDecimal("1.1"));
-            }
-            finally
-            {
-                reportTrieLimit = false;
-            }
-            assertTrue(memtable, trieLimitFlushes.contains(table));
-        }
-    }
-
-    private void failWrite(String memtable, String failAt, int eventsBefore, String query, Object... values)
-    {
-        eventsBeforeFailure.set(eventsBefore);
-        failAtKind = failAt;
-        try
-        {
-            execute(query, values);
-            fail(memtable + ": expected the injected failure");
-        }
-        catch (RuntimeException e)
-        {
-            assertTrue(memtable + ": " + e, String.valueOf(e).contains(FAILURE_MESSAGE) ||
-                                            String.valueOf(e.getCause()).contains(FAILURE_MESSAGE));
-        }
-        finally
-        {
-            failAtKind = null;
-        }
-    }
-
-    private List<String> unfilteredClusterings()
-    {
-        List<String> found = new ArrayList<>();
-        try (UnfilteredRowIterator partition = Util.getOnlyPartitionUnfiltered(Util.cmd(getCurrentColumnFamilyStore(), 1).build()).unfilteredIterator())
-        {
-            while (partition.hasNext())
-            {
-                ClusteringPrefix<?> clustering = partition.next().clustering();
-                found.add(clustering.kind() + " " + DecimalType.instance.compose(clustering.bufferAt(0)));
-            }
-        }
-        return found;
-    }
-
-    private String onlyClustering()
-    {
-        try (UnfilteredRowIterator partition = Util.getOnlyPartitionUnfiltered(Util.cmd(getCurrentColumnFamilyStore(), 1).build()).unfilteredIterator())
-        {
-            String clustering = DecimalType.instance.compose(partition.next().clustering().bufferAt(0)).toString();
-            assertFalse(partition.hasNext());
-            return clustering;
-        }
     }
 
     private void testFailedWrite(String memtable, String failAt, int eventsBefore, String batchStatements)

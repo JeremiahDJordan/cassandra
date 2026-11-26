@@ -244,31 +244,6 @@ public abstract class CollectionType<T> extends MultiCellCapableType<T>
         return comparator.compare(left, accessorL, right, accessorR);
     }
 
-    @Override
-    public boolean decodesComparableBytesExactly()
-    {
-        // A frozen collection can hold empty values, which some types encode as nulls.
-        return isMultiCell() && super.decodesComparableBytesExactly();
-    }
-
-    @Override
-    public <V> boolean decodesComparableBytesExactly(V value, ValueAccessor<V> accessor)
-    {
-        if (isMultiCell() || accessor.isEmpty(value))
-            return decodesComparableBytesExactly();
-
-        int size = CollectionSerializer.readCollectionSize(value, accessor);
-        int offset = CollectionSerializer.sizeOfCollectionSize();
-        for (int i = 0; i < size * subTypes.size(); i++)
-        {
-            V element = CollectionSerializer.readValue(value, accessor, offset);
-            if (element == null || accessor.isEmpty(element) || !subTypes.get(i % subTypes.size()).decodesComparableBytesExactly(element, accessor))
-                return false;
-            offset += CollectionSerializer.sizeOfValue(element, accessor);
-        }
-        return true;
-    }
-
     static <V> ByteSource asComparableBytesListOrSet(AbstractType<?> elementsComparator,
                                                      ValueAccessor<V> accessor,
                                                      V data,

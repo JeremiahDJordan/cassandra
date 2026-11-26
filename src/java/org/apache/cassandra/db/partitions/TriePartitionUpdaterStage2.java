@@ -93,7 +93,7 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
             RowData data = insert.clone(cloner);
 
             if (indexer != UpdateTransaction.NO_OP)
-                indexer.onInserted(data.toRow(clusteringForCurrentKey(data)));
+                indexer.onInserted(data.toRow(clusteringForCurrentKey()));
 
             this.dataSize += data.dataSize();
             this.heapSize += data.unsharedHeapSizeExcludingData();
@@ -107,7 +107,7 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
 
             if (indexer != UpdateTransaction.NO_OP)
             {
-                Clustering<?> clustering = clusteringForCurrentKey(existing);
+                Clustering<?> clustering = clusteringForCurrentKey();
                 indexer.onUpdated(existing.toRow(clustering), reconciled.toRow(clustering));
             }
 
@@ -130,13 +130,11 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
         Object[] tree = BTreeRow.mergeRowBTrees(this,
                                                 existing.columnsBTree, update.columnsBTree,
                                                 deletion, existing.deletion);
-        return existing.withContent(tree, livenessInfo, deletion);
+        return new RowData(tree, livenessInfo, deletion);
     }
 
-    private Clustering<?> clusteringForCurrentKey(RowData data)
+    private Clustering<?> clusteringForCurrentKey()
     {
-        if (data.clustering() != null)
-            return data.clustering();
         return metadata.comparator.clusteringFromByteComparable(
             ByteArrayAccessor.instance,
             ByteComparable.preencoded(mutator.byteComparableVersion(),

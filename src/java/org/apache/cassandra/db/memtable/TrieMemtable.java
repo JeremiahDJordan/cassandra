@@ -51,11 +51,8 @@ import org.apache.cassandra.db.Slices;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
-import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.ByteBufferAccessor;
-import org.apache.cassandra.db.marshal.MultiCellCapableType;
 import org.apache.cassandra.db.partitions.AbstractUnfilteredPartitionIterator;
-import org.apache.cassandra.db.partitions.OriginalClusterings;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.TrieBackedPartition;
@@ -78,8 +75,6 @@ import org.apache.cassandra.db.tries.DeletionAwareTrie;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryBaseTrie;
 import org.apache.cassandra.db.tries.InMemoryDeletionAwareTrie;
-import org.apache.cassandra.db.tries.InMemoryTrie;
-import org.apache.cassandra.db.tries.Trie;
 import org.apache.cassandra.db.tries.TrieDumperWithPath;
 import org.apache.cassandra.db.tries.TrieEntriesWalker;
 import org.apache.cassandra.db.tries.TrieSpaceExhaustedException;
@@ -152,9 +147,6 @@ public class TrieMemtable extends AbstractShardedMemtable
     @VisibleForTesting
     final DeletionAwareTrie<Object, TrieTombstoneMarker> mergedTrie;
 
-    /// A merged view of the shards' [MemtableShard#originalClusterings], null if the table has none.
-    private final Trie<byte[][]> mergedOriginalClusterings;
-
     @Unmetered
     private final TrieMemtableMetricsView metrics;
 
@@ -174,7 +166,6 @@ public class TrieMemtable extends AbstractShardedMemtable
         this.actualMetadata = withDroppedColumns(tableMetadataAtCreation);
         this.shards = generatePartitionShards(boundaries.shardCount(), actualMetadata, metrics, owner.readOrdering());
         this.mergedTrie = makeMergedTrie(shards);
-        this.mergedOriginalClusterings = makeMergedOriginalClusterings(shards);
         logger.trace("Created memtable with {} shards", this.shards.length);
     }
 
@@ -199,16 +190,6 @@ public class TrieMemtable extends AbstractShardedMemtable
         for (MemtableShard shard : shards)
             tries.add(shard.data);
         return DeletionAwareTrie.mergeDistinct(tries);
-    }
-
-    private static Trie<byte[][]> makeMergedOriginalClusterings(MemtableShard[] shards)
-    {
-        if (shards[0].originalClusterings == null)
-            return null;
-        List<Trie<byte[][]>> tries = new ArrayList<>(shards.length);
-        for (MemtableShard shard : shards)
-            tries.add(shard.originalClusterings);
-        return Trie.mergeDistinct(tries);
     }
 
     /// The given metadata with the dropped columns that are not columns of the table any more put back as columns, so
@@ -382,32 +363,12 @@ public class TrieMemtable extends AbstractShardedMemtable
             updateMin(minLocalDeletionTime, update.stats().minLocalDeletionTime);
         DecoratedKey key = update.partitionKey();
         MemtableShard shard = shards[boundaries.getShardForKey(key)];
-        Throwable failure = null;
-        try
-        {
-            return shard.put(update, indexer, opGroup);
-        }
-        catch (Throwable t)
-        {
-            failure = t;
-            throw t;
-        }
-        finally
-        {
-            try
-            {
-                // A failed write can leave space in use in the tries.
-                if (shard.data.reachedAllocatedSizeThreshold() || shard.originalClusterings != null && shard.originalClusterings.reachedAllocatedSizeThreshold())
-                    signalFlushRequired(ColumnFamilyStore.FlushReason.TRIE_LIMIT, true);
-            }
-            catch (Throwable t)
-            {
-                if (failure == null)
-                    throw t;
-                if (t != failure)
-                    failure.addSuppressed(t);
-            }
-        }
+        long colUpdateTimeDelta = shard.put(update, indexer, opGroup);
+
+        if (shard.data.reachedAllocatedSizeThreshold())
+            signalFlushRequired(ColumnFamilyStore.FlushReason.TRIE_LIMIT, true);
+
+        return colUpdateTimeDelta;
     }
 
     @Override
@@ -566,7 +527,6 @@ public class TrieMemtable extends AbstractShardedMemtable
                                                        true, // even if our data is on-heap, we can recycle
                                                              // cells as soon as the opOrder is closed
                                                        subMap,
-                                                       mergedOriginalClusterings,
                                                        columnFilter,
                                                        dataRange,
                                                        getMinLocalDeletionTime());
@@ -582,13 +542,13 @@ public class TrieMemtable extends AbstractShardedMemtable
 
     public Partition getPartition(DecoratedKey key)
     {
-        MemtableShard shard = shards[boundaries.getShardForKey(key)];
-        DeletionAwareTrie<Object, TrieTombstoneMarker> trie = shard.data.tailTrie(key);
+        int shardIndex = boundaries.getShardForKey(key);
+        DeletionAwareTrie<Object, TrieTombstoneMarker> trie = shards[shardIndex].data.tailTrie(key);
         // Always copy to heap. Even if our data is on-heap, we can recycle cells as soon as the opOrder is closed.
-        return createPartition(metadata(), metadata.get(), true, key, trie, shard.originalClusterings);
+        return createPartition(metadata(), metadata.get(), true, key, trie);
     }
 
-    private static TrieBackedPartition createPartition(TableMetadata metadata, TableMetadata droppedColumnsSource, boolean copyToHeap, DecoratedKey key, DeletionAwareTrie<Object, TrieTombstoneMarker> trie, Trie<byte[][]> originalClusterings)
+    private static TrieBackedPartition createPartition(TableMetadata metadata, TableMetadata droppedColumnsSource, boolean copyToHeap, DecoratedKey key, DeletionAwareTrie<Object, TrieTombstoneMarker> trie)
     {
         if (trie == null)
             return null;
@@ -604,7 +564,6 @@ public class TrieMemtable extends AbstractShardedMemtable
                                           holder.rowCountIncludingStatic(),
                                           holder.tombstoneCount(),
                                           trie,
-                                          originalClusterings != null ? originalClusterings.tailTrie(key) : null,
                                           metadata,
                                           droppedColumnsSource,
                                           copyToHeap);
@@ -660,7 +619,7 @@ public class TrieMemtable extends AbstractShardedMemtable
     /// [TrieMemtable.md](TrieMemtable.md) for an example of the output.
     public String dump()
     {
-        return mergedTrie.process(Direction.FORWARD, new Dumper(metadata(), mergedOriginalClusterings));
+        return mergedTrie.process(Direction.FORWARD, new Dumper(metadata()));
     }
 
     static final int PARTITIONDATA_OFFSET_ROW_COUNT = 0;
@@ -790,7 +749,7 @@ public class TrieMemtable extends AbstractShardedMemtable
 
             public Iterator<TrieBackedPartition> iterator()
             {
-                return new PartitionIterator(toFlush, mergedOriginalClusterings, actualMetadata, metadata.get(), false);
+                return new PartitionIterator(toFlush, actualMetadata, metadata.get(), false);
             }
 
             public long partitionKeysSize()
@@ -834,14 +793,6 @@ public class TrieMemtable extends AbstractShardedMemtable
         @VisibleForTesting
         final InMemoryDeletionAwareTrie<Object, TrieTombstoneMarker> data;
 
-        /// The [OriginalClusterings] values of the clusterings and range tombstone bounds in [#data], by the same
-        /// paths. Null if the table's clustering comparator decodes them exactly.
-        final InMemoryTrie<byte[][]> originalClusterings;
-
-        /// Whether cells store the cell paths that decoding their trie path would change, see
-        /// [TrieCellData.ExternalWithPath].
-        final boolean storesCellPaths;
-
         volatile RegularAndStaticColumns columns;
 
         volatile EncodingStats stats;
@@ -876,23 +827,11 @@ public class TrieMemtable extends AbstractShardedMemtable
                                                                    opOrder,
                                                                    BUFFER_TYPE.onHeapSizeWithoutData());
 
-            this.storesCellPaths = hasCellPathsNotDecodedExactly(metadata);
             this.data = InMemoryDeletionAwareTrie.longLived(TrieBackedPartition.BYTE_COMPARABLE_VERSION, BUFFER_TYPE, opOrder,
                                                             new TrieSerializer(cellDataBufferManager, this));
-            this.originalClusterings = metadata.comparator.decodesComparableBytesExactly()
-                                       ? null
-                                       : InMemoryTrie.shortLived(TrieBackedPartition.BYTE_COMPARABLE_VERSION);
             this.columns = RegularAndStaticColumns.NONE;
             this.stats = EncodingStats.NO_STATS;
             this.metrics = metrics;
-        }
-
-        private static boolean hasCellPathsNotDecodedExactly(TableMetadata metadata)
-        {
-            for (ColumnMetadata column : metadata.regularAndStaticColumns())
-                if (column.isComplex() && !((MultiCellCapableType<?>) column.type).nameComparator().decodesComparableBytesExactly())
-                    return true;
-            return false;
         }
 
         private TriePartitionUpdater getAndConfigureUpdater(UpdateTransaction indexer)
@@ -916,18 +855,7 @@ public class TrieMemtable extends AbstractShardedMemtable
         {
             // If the update is not TriePartitionUpdate, convert it to one before taking the lock. The cells are keyed
             // with the column ids of this memtable's metadata, which the update may not have been built with.
-            DeletionAwareTrie<Object, TrieTombstoneMarker> mergableTrie;
-            Trie<byte[][]> updateOriginalClusterings = null;
-            if (originalClusterings == null)
-            {
-                mergableTrie = TriePartitionUpdate.asMergableTrie(update, metadata);
-            }
-            else
-            {
-                TrieBackedPartition trieUpdate = TriePartitionUpdate.asTrieUpdate(update, metadata);
-                mergableTrie = trieUpdate.trie().prefixedBy(update.partitionKey());
-                updateOriginalClusterings = trieUpdate.originalClusterings();
-            }
+            DeletionAwareTrie<Object, TrieTombstoneMarker> mergableTrie = TriePartitionUpdate.asMergableTrie(update, metadata);
 
             boolean locked = writeLock.tryLock();
             if (locked)
@@ -949,18 +877,9 @@ public class TrieMemtable extends AbstractShardedMemtable
                 columns = columns.mergeTo(update.columns());
 
                 Throwable mergeFailure = null;
-                OriginalClusterings.Staging staging = null;
                 try
                 {
                     this.cellDataBufferManager.opOrderGroup = opGroup;
-                    if (originalClusterings != null)
-                    {
-                        staging = new OriginalClusterings.Staging(originalClusterings);
-                        if (updateOriginalClusterings != null)
-                            staging.addAll(update.partitionKey(), updateOriginalClusterings);
-                        if (updater == legacyIndexUpdater)
-                            legacyIndexUpdater.setOriginalClusterings(originalClusterings.tailTrie(update.partitionKey()), updateOriginalClusterings);
-                    }
                     int partitionsAdded = mergeUpdate(data,
                                                       allocator,
                                                       mergableTrie,
@@ -977,29 +896,16 @@ public class TrieMemtable extends AbstractShardedMemtable
                 catch (Throwable t)
                 {
                     mergeFailure = t;
-                    if (staging != null)
-                        staging.rollback(t);
                     throw t;
                 }
                 finally
                 {
-                    try
-                    {
-                        // The trie keeps the space of the entries a failed write removes.
-                        if (staging != null)
-                            allocator.onHeap().adjust(staging.size(), opGroup);
-                    }
-                    finally
-                    {
-                        if (updater == legacyIndexUpdater)
-                            legacyIndexUpdater.clearOriginalClusterings();
-                        // A failed merge leaves the trie without any of the update's rows and deletions, so the
-                        // indexes must not see it either.
-                        if (mergeFailure == null)
-                            indexer.commit();
-                        else
-                            abortIndexTransaction(indexer, mergeFailure);
-                    }
+                    // A failed merge leaves the trie without any of the update's rows and deletions, so the indexes
+                    // must not see it either.
+                    if (mergeFailure == null)
+                        indexer.commit();
+                    else
+                        abortIndexTransaction(indexer, mergeFailure);
                 }
                 this.cellDataBufferManager.opOrderGroup = null;
             }
@@ -1103,15 +1009,13 @@ public class TrieMemtable extends AbstractShardedMemtable
     /// partition marker as a [TrieBackedPartition].
     static class PartitionIterator extends TrieTailsIterator.DeletionAwareWithoutCoveringDeletions<Object, TrieTombstoneMarker, TrieBackedPartition>
     {
-        final Trie<byte[][]> originalClusterings;
         final TableMetadata metadata;
         final TableMetadata droppedColumnsSource;
         final boolean copyToHeap;
 
-        PartitionIterator(DeletionAwareTrie<Object, TrieTombstoneMarker> source, Trie<byte[][]> originalClusterings, TableMetadata metadata, TableMetadata droppedColumnsSource, boolean copyToHeap)
+        PartitionIterator(DeletionAwareTrie<Object, TrieTombstoneMarker> source, TableMetadata metadata, TableMetadata droppedColumnsSource, boolean copyToHeap)
         {
             super(source, Direction.FORWARD, TrieBackedPartition.IS_PARTITION_BOUNDARY);
-            this.originalClusterings = originalClusterings;
             this.metadata = metadata;
             this.droppedColumnsSource = droppedColumnsSource;
             this.copyToHeap = copyToHeap;
@@ -1130,7 +1034,6 @@ public class TrieMemtable extends AbstractShardedMemtable
                                               pd.rowCountIncludingStatic(),
                                               pd.tombstoneCount(),
                                               tailTrie,
-                                              originalClusterings != null ? originalClusterings.tailTrie(key) : null,
                                               metadata,
                                               droppedColumnsSource,
                                               copyToHeap);
@@ -1152,12 +1055,11 @@ public class TrieMemtable extends AbstractShardedMemtable
                                                    TableMetadata droppedColumnsSource,
                                                    boolean copyToHeap,
                                                    DeletionAwareTrie<Object, TrieTombstoneMarker> source,
-                                                   Trie<byte[][]> originalClusterings,
                                                    ColumnFilter columnFilter,
                                                    DataRange dataRange,
                                                    long minLocalDeletionTime)
         {
-            this.iter = new PartitionIterator(source, originalClusterings, metadata, droppedColumnsSource, copyToHeap);
+            this.iter = new PartitionIterator(source, metadata, droppedColumnsSource, copyToHeap);
             this.metadata = droppedColumnsSource;
             this.columnFilter = columnFilter;
             this.dataRange = dataRange;
@@ -1403,7 +1305,7 @@ public class TrieMemtable extends AbstractShardedMemtable
             assert !shouldPresentAfterBranch || content instanceof TrieTombstoneMarker;
             // most common first
             if (content instanceof CellData)
-                return serializeCell((CellData<?, ?>) content, buffer, inBufferPos);
+                return TrieCellData.serialize((CellData<?, ?>) content, buffer, inBufferPos, manager);
             else if (content instanceof LivenessInfo)
                 return serializeLivenessInfo((LivenessInfo) content, buffer, inBufferPos);
             else if (content instanceof TrieTombstoneMarker)
@@ -1412,32 +1314,6 @@ public class TrieMemtable extends AbstractShardedMemtable
                 return serializePartitionData((PartitionData) content, buffer, inBufferPos);
             else
                 throw new AssertionError("Unknown trie content type: " + content);
-        }
-
-        private int serializeCell(CellData<?, ?> cell, UnsafeBuffer buffer, int inBufferPos) throws TrieSpaceExhaustedException
-        {
-            if (owner != null && owner.storesCellPaths)
-            {
-                ByteBuffer path = pathToStore(cell);
-                if (path != null)
-                    return TrieCellData.serializeWithPath(cell, path, buffer, inBufferPos, manager);
-            }
-            return TrieCellData.serialize(cell, buffer, inBufferPos, manager);
-        }
-
-        /// The cell path to store with the given cell: one that decoding the trie path would change.
-        private static ByteBuffer pathToStore(CellData<?, ?> cell)
-        {
-            ByteBuffer storedPath = cell.storedPath();
-            if (storedPath != null)
-                return storedPath;
-            if (!(cell instanceof Cell) || ((Cell<?>) cell).path() == null)
-                return null;
-
-            Cell<?> c = (Cell<?>) cell;
-            ByteBuffer path = c.path().get(0);
-            AbstractType<?> pathType = ((MultiCellCapableType<?>) c.column().type).nameComparator();
-            return pathType.decodesComparableBytesExactly(path, ByteBufferAccessor.instance) ? null : path;
         }
 
         private int serializeLivenessInfo(LivenessInfo livenessInfo, UnsafeBuffer buffer, int inBufferPos)
@@ -1516,7 +1392,7 @@ public class TrieMemtable extends AbstractShardedMemtable
                 case TYPE_CELL_COUNTER:
                     return new TrieCellData.Counter(buffer, inBufferPos);
                 case TYPE_CELL_EXTERNAL_VALUE:
-                    return TrieCellData.external(buffer, inBufferPos, manager);
+                    return new TrieCellData.External(buffer, inBufferPos, manager);
                 case TYPE_LIVENESS_INFO:
                     return deserializeLivenessInfo(buffer, inBufferPos);
                 case TYPE_TOMBSTONE_MARKER_BEFORE_BRANCH:
@@ -1839,15 +1715,13 @@ public class TrieMemtable extends AbstractShardedMemtable
     static class Dumper extends TrieDumperWithPath.DeletionAware<Object, TrieTombstoneMarker>
     {
         final TableMetadata metadata;
-        final Trie<byte[][]> originalClusterings;
         Columns columns;
         int rowKeyLength = 0;
         int partitionKeyLength = 0;
 
-        Dumper(TableMetadata metadata, Trie<byte[][]> originalClusterings)
+        Dumper(TableMetadata metadata)
         {
             this.metadata = metadata;
-            this.originalClusterings = originalClusterings;
         }
 
         @Override
@@ -1862,13 +1736,9 @@ public class TrieMemtable extends AbstractShardedMemtable
             else if (content instanceof LivenessInfo)
             {
                 rowKeyLength = keyPos;
-                Trie<byte[][]> partitionOriginalClusterings = originalClusterings != null
-                                                              ? originalClusterings.tailTrie(ByteComparable.preencoded(TrieBackedPartition.BYTE_COMPARABLE_VERSION, keyBytes, 0, partitionKeyLength))
-                                                              : null;
-                Clustering<?> clustering = OriginalClusterings.clustering(partitionOriginalClusterings,
-                                                                          metadata.comparator,
-                                                                          ByteBufferAccessor.instance,
-                                                                          ByteComparable.preencoded(TrieBackedPartition.BYTE_COMPARABLE_VERSION, keyBytes, partitionKeyLength, keyPos - partitionKeyLength));
+                Clustering<?> clustering = metadata.comparator.clusteringFromByteComparable(ByteBufferAccessor.instance,
+                                                                                            ByteComparable.preencoded(TrieBackedPartition.BYTE_COMPARABLE_VERSION, keyBytes, partitionKeyLength, keyPos - partitionKeyLength),
+                                                                                            TrieBackedPartition.BYTE_COMPARABLE_VERSION);
                 columns = metadata.regularAndStaticColumns().columns(clustering == Clustering.STATIC_CLUSTERING);
                 return content + " at " + clustering.toString(metadata);
             }
