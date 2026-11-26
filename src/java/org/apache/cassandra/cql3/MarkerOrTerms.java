@@ -148,13 +148,16 @@ public interface MarkerOrTerms
             // (NOT IN | IN) (value1, value2, ...)
             assert terms != null;
             return terms.stream()
-                        .map(v -> getTuple(v, options))
+                        .map(v -> getTuple(v, columns.size(), options))
                         .collect(Collectors.toList());
         }
 
-        private static List<ByteBuffer> getTuple(Term value, QueryOptions options)
+        private static List<ByteBuffer> getTuple(Term value, int size, QueryOptions options)
         {
             Term.Terminal terminal = value.bind(options);
+            // a tuple bound to null is handled as a tuple whose elements are all null
+            if (terminal == null)
+                return Collections.nCopies(size, null);
             return (terminal instanceof Term.MultiItemTerminal)
                    ? ((Term.MultiItemTerminal) terminal).getElements()
                    : Collections.singletonList(terminal.get(options.getProtocolVersion()));
