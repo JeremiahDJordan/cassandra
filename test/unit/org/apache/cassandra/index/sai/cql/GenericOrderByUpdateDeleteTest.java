@@ -173,6 +173,32 @@ public class GenericOrderByUpdateDeleteTest extends SAITester
         });
     }
 
+    @Test
+    public void testFilterThenSortRowsUnderRangeTombstoneInSameSSTable() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, r int, v int, PRIMARY KEY (pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(r) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+
+        // A row that the range deletion deletes, then rows written after the range deletion, inside its range, so
+        // the sstable has the range tombstone markers around the live rows.
+        execute("INSERT INTO %s (pk, ck, r, v) VALUES (1, 3, 3, 10)");
+        execute("DELETE FROM %s WHERE pk = 1 AND ck >= 1 AND ck < 9");
+        execute("INSERT INTO %s (pk, ck, r, v) VALUES (1, 1, 3, 12)");
+        execute("INSERT INTO %s (pk, ck, r, v) VALUES (1, 2, 3, 11)");
+        execute("INSERT INTO %s (pk, ck, r, v) VALUES (2, 1, 3, 13)");
+
+        beforeAndAfterFlush(() -> {
+            // without the optimizer the query filters, then sorts
+            for (int level : new int[]{ 1, 0 })
+            {
+                QueryController.QUERY_OPT_LEVEL = level;
+                assertRows(execute("SELECT ck, v FROM %s WHERE r = 3 ORDER BY v ASC LIMIT 10"), row(2, 11), row(1, 12), row(1, 13));
+                assertRows(execute("SELECT ck, v FROM %s WHERE r = 3 ORDER BY v DESC LIMIT 10"), row(1, 13), row(1, 12), row(2, 11));
+            }
+        });
+    }
+
     private void assertRowsInBothOrder(String query, int limit, Object[]... rowsInAscendingOrder)
     {
         assertRows(execute(query + " ASC LIMIT " + limit), rowsInAscendingOrder);
