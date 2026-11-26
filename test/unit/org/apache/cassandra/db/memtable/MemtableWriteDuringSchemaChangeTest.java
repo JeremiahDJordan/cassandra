@@ -42,6 +42,7 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.MemtableParams;
 import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
@@ -192,6 +193,88 @@ public class MemtableWriteDuringSchemaChangeTest extends CQLTester
         assertRows(execute("SELECT pk, ck, a, b, d FROM %s"), expected);
         flush();
         assertRows(execute("SELECT pk, ck, a, b, d FROM %s"), expected);
+    }
+
+    /** A clustering, a set element or a map key with the new field, which a trie memtable keys by its byte-comparable form. */
+    @Test
+    public void testWriteOfAFieldAddedToATypeBeforeTheMemtableSwitch() throws Throwable
+    {
+        checkWriteOfAFieldAddedToATypeBeforeTheMemtableSwitch("frozen<%s>", true, "{a: 1, b: 2, c: 3}",
+                                                              userType("a", 1, "b", 2, "c", 3));
+        checkWriteOfAFieldAddedToATypeBeforeTheMemtableSwitch("frozen<list<frozen<%s>>>", true, "[{a: 1, b: 2, c: 3}]",
+                                                              list(userType("a", 1, "b", 2, "c", 3)));
+        checkWriteOfAFieldAddedToATypeBeforeTheMemtableSwitch("frozen<tuple<int, frozen<%s>>>", true, "(5, {a: 1, b: 2, c: 3})",
+                                                              tuple(5, userType("a", 1, "b", 2, "c", 3)));
+        checkWriteOfAFieldAddedToATypeBeforeTheMemtableSwitch("set<frozen<%s>>", false, "{{a: 1, b: 2, c: 3}}",
+                                                              set(userType("a", 1, "b", 2, "c", 3)));
+        checkWriteOfAFieldAddedToATypeBeforeTheMemtableSwitch("map<frozen<%s>, int>", false, "{{a: 1, b: 2, c: 3}: 7}",
+                                                              map(userType("a", 1, "b", 2, "c", 3), 7));
+    }
+
+    /**
+     * Writes the given literal without its field c, then the literal before the memtable switch of the ALTER TYPE
+     * that adds c, and reads the second write back as the given value.
+     */
+    private void checkWriteOfAFieldAddedToATypeBeforeTheMemtableSwitch(String type, boolean clustering, String literal, Object value) throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int, b int)");
+        String column = String.format(type, udt);
+        String alter = "ALTER TYPE " + KEYSPACE + '.' + udt + " ADD c int";
+        String withoutC = literal.replace(", c: 3", "");
+        if (clustering)
+        {
+            createTable("CREATE TABLE %s (pk int, ck " + column + ", x int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + '\'');
+            execute("INSERT INTO %s (pk, ck, x) VALUES (0, " + withoutC + ", 0)");
+            beforeTheMemtableSwitchOf(alter, () -> execute("INSERT INTO %s (pk, ck, x) VALUES (0, " + literal + ", 1)"));
+            beforeAndAfterFlush(() -> {
+                assertRows(execute("SELECT ck FROM %s WHERE x = 1 ALLOW FILTERING"), row(value));
+                assertRows(execute("SELECT x FROM %s"), row(0), row(1));
+            });
+        }
+        else
+        {
+            createTable("CREATE TABLE %s (pk int, ck int, v " + column + ", PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + '\'');
+            execute("INSERT INTO %s (pk, ck, v) VALUES (0, 0, " + withoutC + ")");
+            beforeTheMemtableSwitchOf(alter, () -> execute("INSERT INTO %s (pk, ck, v) VALUES (0, 1, " + literal + ")"));
+            beforeAndAfterFlush(() -> {
+                assertRows(execute("SELECT v FROM %s WHERE pk = 0 AND ck = 1"), row(value));
+                assertRows(execute("SELECT ck FROM %s"), row(0), row(1));
+            });
+        }
+    }
+
+    /** With a column added in the same schema change, as a node that is behind on the schema can get them. */
+    @Test
+    public void testWriteBeforeTheMemtableSwitchOfAChangeOfTheMemtableClass() throws Throwable
+    {
+        String other = memtable.equals("trie") ? "skiplist" : "trie";
+        TableMetadata before = createTable();
+        TableMetadata after = before.unbuild().addRegularColumn("a", Int32Type.instance).memtable(MemtableParams.get(other)).build();
+
+        beforeTheMemtableSwitchOf(() -> SchemaTestUtil.announceTableUpdate(after),
+                                  () -> execute("INSERT INTO %s (pk, ck, a, b, d) VALUES (0, 1, 1, 2, 4)"));
+
+        assertCurrentMemtableIs(other);
+        assertRows(execute("SELECT pk, ck, a, b, d FROM %s"), row(0, 1, 1, 2, 4));
+    }
+
+    @Test
+    public void testFlushBeforeTheMemtableSwitchOfAChangeOfTheMemtableClass() throws Throwable
+    {
+        String other = memtable.equals("trie") ? "skiplist" : "trie";
+        createTable();
+        execute("INSERT INTO %s (pk, ck, b, d) VALUES (0, 1, 2, 4)");
+
+        beforeTheMemtableSwitchOf("ALTER TABLE %s WITH memtable = '" + other + '\'', this::flush);
+
+        assertCurrentMemtableIs(other);
+        assertRows(execute("SELECT pk, ck, b, d FROM %s"), row(0, 1, 2, 4));
+    }
+
+    private void assertCurrentMemtableIs(String memtable)
+    {
+        Memtable current = getCurrentColumnFamilyStore().getTracker().getView().getCurrentMemtable();
+        assertEquals(memtable.equals("trie") ? TrieMemtable.class : SkipListMemtable.class, current.getClass());
     }
 
     /**

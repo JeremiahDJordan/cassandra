@@ -540,8 +540,8 @@ public interface Memtable extends Comparable<Memtable>, UnfilteredSource, CellSo
 
     /**
      * Whether this memtable cannot take the given update while a memtable created now could, because the update has
-     * columns that were added to the table (or added and dropped again) after this memtable was created. Called for
-     * every write, see {@code ColumnFamilyStore.switchMemtableIfOutdatedFor}.
+     * columns that were added to the table (or added and dropped again), or values of types that were altered, after
+     * this memtable was created. Called for every write, see {@code ColumnFamilyStore.switchMemtableIfOutdatedFor}.
      */
     default boolean predatesColumnsOf(PartitionUpdate update)
     {

@@ -263,6 +263,11 @@ public class TrieMemtable extends AbstractShardedMemtable
         if (current == tableMetadataAtCreation)
             return false;
 
+        // Built with the table's current metadata: it can have values of types changed since (ALTER TYPE ... ADD),
+        // which this memtable's clustering and cell path types can't handle.
+        if (update.metadata() == current)
+            return true;
+
         RegularAndStaticColumns columns = update.columns();
         return predatesAnyOf(columns.statics, current) || predatesAnyOf(columns.regulars, current);
     }
