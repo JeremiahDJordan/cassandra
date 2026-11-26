@@ -1604,4 +1604,17 @@ public class StorageAttachedIndex implements Index
         baseCfs.indexManager.makeIndexNonQueryable(this, Status.BUILD_FAILED);
         logger.warn(indexContext.logMessage("Storage-attached index is no longer queryable. Please restart this node to repair it."));
     }
+
+    public static boolean isStorageAttachedIndexClass(String className)
+    {
+        // Subclasses are storage-attached indexes too. A class that can't be found isn't taken for one.
+        try
+        {
+            return StorageAttachedIndex.class.isAssignableFrom(Class.forName(className, false, StorageAttachedIndex.class.getClassLoader()));
+        }
+        catch (ClassNotFoundException | LinkageError e)
+        {
+            return false;
+        }
+    }
 }
