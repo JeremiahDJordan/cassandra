@@ -18,10 +18,14 @@
 
 package org.apache.cassandra.db.guardrails;
 
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.PageSize;
@@ -30,6 +34,7 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 
 import static java.lang.String.format;
@@ -37,10 +42,20 @@ import static java.lang.String.format;
 /**
  * Tests the guardrail for the page size, {@link Guardrails#pageSize}.
  */
+@RunWith(Parameterized.class)
 public class GuardrailPageSizeTest extends ThresholdTester
 {
     private static final int PAGE_SIZE_WARN_THRESHOLD = 5;
     private static final int PAGE_SIZE_FAIL_THRESHOLD = 10;
+
+    @Parameterized.Parameter
+    public boolean local;
+
+    @Parameterized.Parameters(name = "local={0}")
+    public static Collection<Object> data()
+    {
+        return Arrays.asList(true, false);
+    }
 
     public GuardrailPageSizeTest()
     {
@@ -95,6 +110,14 @@ public class GuardrailPageSizeTest extends ThresholdTester
     }
 
     @Test
+    public void testSelectStatementWithoutPaging() throws Throwable
+    {
+        assertUnpagedValid("SELECT * FROM %s");
+        assertUnpagedValid("SELECT COUNT(*) FROM %s WHERE k=0");
+        assertUnpagedValid("SELECT k, COUNT(*) FROM %s WHERE k=0 GROUP BY k");
+    }
+
+    @Test
     public void testExcludedUsers() throws Throwable
     {
         assertPagingIgnored("SELECT * FROM %s", PAGE_SIZE_WARN_THRESHOLD + 1);
@@ -104,6 +127,11 @@ public class GuardrailPageSizeTest extends ThresholdTester
     private void assertPagingValid(String query, int pageSize) throws Throwable
     {
         assertValid(() -> executeWithPaging(userClientState, query, pageSize));
+    }
+
+    private void assertUnpagedValid(String query) throws Throwable
+    {
+        assertValid(() -> executeWithPaging(userClientState, query, PageSize.NONE));
     }
 
     private void assertPagingIgnored(String query, int pageSize) throws Throwable
@@ -128,6 +156,11 @@ public class GuardrailPageSizeTest extends ThresholdTester
 
     private void executeWithPaging(ClientState state, String query, int pageSize)
     {
+        executeWithPaging(state, query, PageSize.inRows(pageSize));
+    }
+
+    private void executeWithPaging(ClientState state, String query, PageSize pageSize)
+    {
         QueryState queryState = new QueryState(state);
 
         String formattedQuery = formatQuery(query);
@@ -137,12 +170,15 @@ public class GuardrailPageSizeTest extends ThresholdTester
         QueryOptions options = QueryOptions.create(ConsistencyLevel.ONE,
                                                    Collections.emptyList(),
                                                    false,
-                                                   PageSize.inRows(pageSize),
+                                                   pageSize,
                                                    null,
                                                    null,
                                                    ProtocolVersion.CURRENT,
                                                    KEYSPACE);
 
-        statement.executeLocally(queryState, options);
+        if (local)
+            statement.executeLocally(queryState, options);
+        else
+            statement.execute(queryState, options, Dispatcher.RequestTime.forImmediateExecution());
     }
 }
