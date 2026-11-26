@@ -25,10 +25,13 @@ import java.util.stream.Stream;
 
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.TokenSupplier;
+import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.ApacheUpgradePath;
 
@@ -88,15 +91,19 @@ public class ApacheUpgradePathTest extends TestBaseImpl
             for (IInvokableInstance instance : cluster)
                 assertRows(instance.executeInternal(withKeyspace("SELECT deterministic FROM system_schema.functions WHERE keyspace_name = '%s' AND function_name = 'g'")), row(true));
 
+            // an internal table keeps the compaction it was created with: Apache's default, or default_compaction if set
+            String rolesCompaction = "SELECT compaction['class'] FROM system_schema.tables WHERE keyspace_name = 'system_auth' AND table_name = 'roles'";
+            String created = cluster.get(1).callOnInstance(() -> DatabaseDescriptor.getDefaultCompaction() == null
+                                                                 ? SizeTieredCompactionStrategy.class.getName()
+                                                                 : CompactionParams.DEFAULT.klass().getName());
+            assertRows(cluster.get(1).executeInternal(rolesCompaction), row(created));
             restart(cluster.get(1), "NONE");
             assertThat(record(cluster.get(1))).isNull();
             assertThat(record(cluster.get(2))).isEqualTo("CASSANDRA_5");
             awaitSchemaAgreement(cluster);
-            // an internal table keeps the compaction it was created with
-            assertRows(cluster.get(1).executeInternal("SELECT compaction['class'] FROM system_schema.tables WHERE keyspace_name = 'system_auth' AND table_name = 'roles'"),
-                       row("org.apache.cassandra.db.compaction.SizeTieredCompactionStrategy"));
-            assertThat(cluster.get(1).callOnInstance(() -> Schema.instance.getTableMetadata("system_auth", "roles").params.compaction.klass().getSimpleName()))
-            .isEqualTo("SizeTieredCompactionStrategy");
+            assertRows(cluster.get(1).executeInternal(rolesCompaction), row(created));
+            assertThat(cluster.get(1).callOnInstance(() -> Schema.instance.getTableMetadata("system_auth", "roles").params.compaction.klass().getName()))
+            .isEqualTo(created);
         }
     }
 
