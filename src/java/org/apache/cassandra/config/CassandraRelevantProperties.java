@@ -1133,6 +1133,8 @@ public enum CassandraRelevantProperties
     TEST_CASSANDRA_TESTTAG("cassandra.testtag", "cassandra.testtag_IS_UNDEFINED"),
     TEST_COMPRESSION("cassandra.test.compression"),
     TEST_COMPRESSION_ALGO("cassandra.test.compression.algo", "lz4"),
+    /** Directory with the DataStax 4.0 dtest jar that upgrade tests run their 4.0 nodes from. */
+    TEST_DATASTAX_40_DTEST_JAR_DIR("cassandra.test.datastax_40_dtest_jar_dir"),
     TEST_DEBUG_REF_COUNT("cassandra.debugrefcount"),
     TEST_DRIVER_CONNECTION_TIMEOUT_MS("cassandra.test.driver.connection_timeout_ms", "5000"),
     TEST_DRIVER_READ_TIMEOUT_MS("cassandra.test.driver.read_timeout_ms", "12000"),

@@ -292,6 +292,8 @@ final class CC4NodesFileReader
             info.setListenAddressAndPort(cc4.listenAddressAndPort);
         if (cc4.clusterName != null)
             info.setClusterName(cc4.clusterName);
+        if (cc4.gossipGeneration != null)
+            info.setGossipGeneration(cc4.gossipGeneration);
         if (cc4.bootstrapped != null)
         {
             try
@@ -385,6 +387,8 @@ final class CC4NodesFileReader
         InetAddressAndPort listenAddressAndPort;
         @JsonProperty("cluster_name")
         String clusterName;
+        @JsonProperty("gossip_generation")
+        Integer gossipGeneration;
         @JsonProperty("bootstrapped")
         CC4BootstrapState bootstrapped;
         @JsonProperty("truncated_at")
