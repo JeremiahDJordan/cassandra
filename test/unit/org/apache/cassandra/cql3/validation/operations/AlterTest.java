@@ -17,6 +17,7 @@
  */
 package org.apache.cassandra.cql3.validation.operations;
 
+import java.util.Arrays;
 import java.util.UUID;
 
 import org.junit.Assert;
@@ -878,6 +879,98 @@ public class AlterTest extends CQLTester
         assertInvalidMessage(table1, format("ALTER TYPE %s.%s ADD v2 int;", keyspace(), type1));
         assertInvalidMessage(table2, format("ALTER TYPE %s.%s ADD v2 int;", keyspace(), type1));
         assertInvalidMessage(table3, format("ALTER TYPE %s.%s ADD v2 int;", keyspace(), type1));
+    }
+
+    @Test
+    public void testAlterTypeUsedInIndexKeys() throws Throwable
+    {
+        String type1 = createType("CREATE TYPE %s (v1 int)");
+        String type2 = createType("CREATE TYPE %s (v1 frozen<" + type1 + ">)");
+        String sai = "CREATE CUSTOM INDEX ON %s (val) USING 'StorageAttachedIndex'";
+
+        // storage-attached indexes on tables with the UDT in a clustering column, directly, in a frozen UDT, in a
+        // frozen tuple, in a frozen collection and in descending order
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + type1 + ">, val int, PRIMARY KEY (pk, ck));");
+        String index1 = createIndex(sai);
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + type2 + ">, val int, PRIMARY KEY (pk, ck));");
+        String index2 = createIndex(sai);
+        createTable("CREATE TABLE %s (pk int, ck frozen<tuple<int, frozen<" + type1 + ">>>, val int, PRIMARY KEY (pk, ck));");
+        String index3 = createIndex(sai);
+        createTable("CREATE TABLE %s (pk int, ck frozen<list<frozen<" + type1 + ">>>, val int, PRIMARY KEY (pk, ck));");
+        String index4 = createIndex("CREATE INDEX ON %s (val) USING 'sai'");
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + type1 + ">, val int, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck DESC);");
+        String index5 = createIndex(sai);
+
+        // legacy indexes keyed by the UDT: on a frozen UDT column, on a frozen UDT clustering column, on the keys of a
+        // map with frozen UDT keys, on the values of a map with frozen UDT values and on the entries of a map
+        createTable("CREATE TABLE %s (pk int, ck int, val frozen<" + type1 + ">, PRIMARY KEY (pk, ck));");
+        String index6 = createIndex("CREATE INDEX ON %s (val) USING 'legacy_local_table'");
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + type1 + ">, val int, PRIMARY KEY (pk, ck));");
+        String index7 = createIndex("CREATE INDEX ON %s (ck) USING 'legacy_local_table'");
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, val map<frozen<" + type1 + ">, int>);");
+        String index8 = createIndex("CREATE INDEX ON %s (keys(val)) USING 'legacy_local_table'");
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, val map<int, frozen<" + type1 + ">>);");
+        String index9 = createIndex("CREATE INDEX ON %s (values(val)) USING 'legacy_local_table'");
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, val map<int, frozen<" + type1 + ">>);");
+        String index10 = createIndex("CREATE INDEX ON %s (entries(val)) USING 'legacy_local_table'");
+
+        for (String index : Arrays.asList(index1, index2, index3, index4, index5, index6, index7, index8, index9, index10))
+            assertInvalidMessage(index + " on ", format("ALTER TYPE %s.%s ADD v2 int;", keyspace(), type1));
+    }
+
+    @Test
+    public void testAlterTypeUsedOutsideIndexKeys() throws Throwable
+    {
+        String type1 = createType("CREATE TYPE %s (v1 int)");
+
+        // a UDT clustering column without indexes, and with a legacy index on another column
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + type1 + ">, val int, PRIMARY KEY (pk, ck));");
+        String table1 = createTable("CREATE TABLE %s (pk int, ck frozen<" + type1 + ">, val int, PRIMARY KEY (pk, ck));");
+        createIndex("CREATE INDEX ON %s (val) USING 'legacy_local_table'");
+
+        // legacy indexes on the other side of a map: on the keys of a map with frozen UDT values, and on the values of
+        // a map with frozen UDT keys
+        String table2 = createTable("CREATE TABLE %s (pk int PRIMARY KEY, val map<int, frozen<" + type1 + ">>);");
+        createIndex("CREATE INDEX ON %s (keys(val)) USING 'legacy_local_table'");
+        String table3 = createTable("CREATE TABLE %s (pk int PRIMARY KEY, val map<frozen<" + type1 + ">, int>);");
+        createIndex("CREATE INDEX ON %s (values(val)) USING 'legacy_local_table'");
+
+        // storage-attached indexes on a table with a frozen and a non-frozen UDT column: on another column, and on the
+        // frozen UDT column
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, f frozen<" + type1 + ">, n " + type1 + ", val int);");
+        createIndex("CREATE CUSTOM INDEX ON %s (val) USING 'StorageAttachedIndex'");
+        createIndex("CREATE CUSTOM INDEX ON %s (f) USING 'StorageAttachedIndex'");
+
+        execute(format("ALTER TYPE %s.%s ADD v2 int;", keyspace(), type1));
+        execute("INSERT INTO %s (pk, f, n, val) VALUES (0, {v1: 1, v2: 2}, {v1: 1, v2: 2}, 3)");
+        assertRows(execute("SELECT f.v2, n.v2 FROM %s WHERE val = 3"), row(2, 2));
+        execute(format("INSERT INTO %s.%s (pk, ck, val) VALUES (0, {v1: 1, v2: 2}, 3)", keyspace(), table1));
+        assertRows(execute(format("SELECT ck.v2 FROM %s.%s WHERE val = 3", keyspace(), table1)), row(2));
+        execute(format("INSERT INTO %s.%s (pk, val) VALUES (0, {3: {v1: 1, v2: 2}})", keyspace(), table2));
+        assertRows(execute(format("SELECT val FROM %s.%s WHERE val CONTAINS KEY 3", keyspace(), table2)),
+                   row(map(3, userType("v1", 1, "v2", 2))));
+        execute(format("INSERT INTO %s.%s (pk, val) VALUES (0, {{v1: 1, v2: 2}: 3})", keyspace(), table3));
+        assertRows(execute(format("SELECT val FROM %s.%s WHERE val CONTAINS 3", keyspace(), table3)),
+                   row(map(userType("v1", 1, "v2", 2), 3)));
+    }
+
+    @Test
+    public void testAlterTypeUsedInIndexKeysAfterDroppingTheIndexes() throws Throwable
+    {
+        String type1 = createType("CREATE TYPE %s (v1 int)");
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + type1 + ">, val int, PRIMARY KEY (pk, ck));");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s (val) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (pk, ck, val) VALUES (0, {v1: 1}, 1)");
+        flush();
+        String alter = format("ALTER TYPE %s.%s ADD v2 int;", keyspace(), type1);
+        assertInvalidMessage("Drop the indexes, alter the type and create the indexes again", alter);
+
+        dropIndex("DROP INDEX %s." + index);
+        execute(alter);
+        createIndex("CREATE CUSTOM INDEX ON %s (val) USING 'StorageAttachedIndex'");
+        execute("INSERT INTO %s (pk, ck, val) VALUES (0, {v1: 1, v2: 2}, 1)");
+
+        beforeAndAfterFlush(() -> assertRows(execute("SELECT val FROM %s WHERE val = 1 ORDER BY val LIMIT 10"), row(1), row(1)));
     }
 
     @Test

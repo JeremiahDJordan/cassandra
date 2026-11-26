@@ -72,6 +72,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.LocalPartitioner;
 import org.apache.cassandra.dht.OrderPreservingPartitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexBuildDecider;
@@ -1010,5 +1011,19 @@ public class StorageAttachedIndex implements Index
     {
         baseCfs.indexManager.makeIndexNonQueryable(this, Status.BUILD_FAILED);
         logger.warn(indexContext.logMessage("Storage-attached index is no longer queryable. Please restart this node to repair it."));
+    }
+
+    public static boolean isStorageAttachedIndexClass(String className)
+    {
+        // Subclasses are storage-attached indexes too. A class that can't be found isn't taken for one.
+        try
+        {
+            FBUtilities.classForName(className, StorageAttachedIndex.class, "Index");
+            return true;
+        }
+        catch (ConfigurationException | LinkageError e)
+        {
+            return false;
+        }
     }
 }
