@@ -165,6 +165,15 @@ Upgrading
       to load durations in map keys, is no longer needed and is ignored. CREATE TABLE, ALTER TABLE ADD and ALTER TYPE
       still reject such a type for a new column, and slice restrictions and CREATE INDEX on such a column are still
       rejected.
+    - GROUP BY queries with a limit or a page size, at consistency levels that read several replicas, now make short
+      read protection requests when a replica returns as many groups as the limit and stops within a partition or at
+      the end of its data, even when the replicas agree: such a replica may have more groups, and it used to be taken
+      for a replica without more data, so groups were lost. This applies to queries over several partitions, and to
+      queries restricted to one partition when the replicas' digests don't match, and adds one or two requests to each
+      replica for each page. These requests count in the shortReadProtectionRequests table metric, so for GROUP BY
+      queries it doesn't mean that the replicas differ.
+    - The rows of the short read protection requests above add to the rows that replica filtering protection caches,
+      so GROUP BY queries with a filter can now reach the cached_rows_fail_threshold of replica_filtering_protection.
 
 Deprecation
 ---------
