@@ -215,6 +215,74 @@ public class IndexGroupRemovalTest extends SAITester
         }
     }
 
+    @Test
+    public void testUnloadWhileBuildCompletesSSTable() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk text, value text, PRIMARY KEY (pk))");
+        populateOneSSTable();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+
+        Injections.Counter failures = Injections.newCounter("failures_" + System.nanoTime())
+                                                .add(InvokePointBuilder.newInvokePoint()
+                                                                       .onClass(StorageAttachedIndexBuilder.class)
+                                                                       .onMethod("completeSSTable")
+                                                                       .atExceptionExit())
+                                                .build();
+        Injections.Counter completions = Injections.newCounter("completions_" + System.nanoTime())
+                                                   .add(InvokePointBuilder.newInvokePoint()
+                                                                          .onClass(StorageAttachedIndexBuilder.class)
+                                                                          .onMethod("completeSSTable")
+                                                                          .atExit())
+                                                   .build();
+        Injections.inject(failures,
+                          completions,
+                          hold("hold_build_",
+                               InvokePointBuilder.newInvokePoint()
+                                                 .onClass(StorageAttachedIndexGroup.class)
+                                                 .onMethod("onSSTableChanged")
+                                                 .after("INVOKE " + SSTableContextManager.class.getName() + ".update"),
+                               "holdBuild"));
+        try
+        {
+            buildHeld = false;
+            holdBuild = true;
+            createIndexAsync("CREATE CUSTOM INDEX ON %s(value) USING 'StorageAttachedIndex'");
+            StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+            waitForAssert(() -> assertTrue(buildHeld), 60, TimeUnit.SECONDS);
+
+            // the unload of the table (without dropping its data) releases the contexts, unless it waits for the
+            // build's view update
+            AtomicReference<Throwable> unloadFailure = new AtomicReference<>();
+            Thread unload = new Thread(() -> {
+                try
+                {
+                    cfs.invalidate(true, false);
+                }
+                catch (Throwable t)
+                {
+                    unloadFailure.set(t);
+                }
+            });
+            unload.start();
+            waitForAssert(() -> assertTrue(!unload.isAlive() || (!cfs.getTracker().contains(group) && unload.getState() == Thread.State.BLOCKED)),
+                          60, TimeUnit.SECONDS);
+            holdBuild = false;
+            waitForAssert(() -> assertEquals(1, failures.get() + completions.get()), 60, TimeUnit.SECONDS);
+            unload.join(TimeUnit.SECONDS.toMillis(60));
+            assertFalse(unload.isAlive());
+            assertNull(unloadFailure.get());
+
+            assertEquals(0, failures.get());
+            assertEquals(0, group.sstableContextManager().size());
+        }
+        finally
+        {
+            holdBuild = false;
+            Injections.deleteAll();
+        }
+    }
+
     private static Injection hold(String name, InvokePointBuilder at, String method)
     {
         return Injections.newCustom(name + System.nanoTime())

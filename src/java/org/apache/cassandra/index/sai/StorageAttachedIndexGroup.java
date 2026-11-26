@@ -126,8 +126,9 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     private final ColumnFamilyStore baseCfs;
 
     private final SSTableContextManager contextManager;
-    // Held while the views are updated from contexts of the manager, and while removeIndex releases them all. Not the
-    // group's monitor: removeIndex runs under the SecondaryIndexManager's, which onSSTableChanged takes under the group's.
+    // Held while the views are updated from contexts of the manager, and while removeIndex or unload releases them all.
+    // Not the group's monitor: removeIndex runs under the SecondaryIndexManager's, which onSSTableChanged takes under the
+    // group's.
     private final Object contextsLock = new Object();
     private final Version version;
 
@@ -217,7 +218,10 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     {
         baseCfs.getTracker().unsubscribe(this);
 
-        contextManager.clear();
+        synchronized (contextsLock)
+        {
+            contextManager.clear();
+        }
         queryMetrics.release();
         groupMetrics.release();
         stateMetrics.ifPresent(TableStateMetrics::release);
