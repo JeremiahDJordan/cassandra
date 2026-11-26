@@ -18,6 +18,7 @@
 package org.apache.cassandra.cql3.selection;
 
 import java.nio.ByteBuffer;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
@@ -78,7 +79,7 @@ final class SetSelector extends Selector
 
     public ByteBuffer getOutput(ProtocolVersion protocolVersion) throws InvalidRequestException
     {
-        Set<ByteBuffer> buffers = new TreeSet<>(type.getElementsType());
+        Set<ByteBuffer> buffers = new TreeSet<>(Comparator.nullsFirst(type.getElementsType()));
         for (int i = 0, m = elements.size(); i < m; i++)
         {
             buffers.add(elements.get(i).getOutput(protocolVersion));

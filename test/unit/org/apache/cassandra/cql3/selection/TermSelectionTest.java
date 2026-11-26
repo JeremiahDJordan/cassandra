@@ -19,16 +19,20 @@
 package org.apache.cassandra.cql3.selection;
 
 import java.math.BigDecimal;
+import java.nio.ByteBuffer;
 import java.util.*;
 
 import org.junit.Test;
 
 import com.datastax.driver.core.exceptions.InvalidQueryException;
+import com.datastax.driver.core.UDTValue;
 
 import org.apache.cassandra.cql3.*;
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.transport.messages.ResultMessage;
+import org.apache.cassandra.utils.ByteBufferUtil;
 
 import static org.junit.Assert.assertEquals;
 
@@ -571,6 +575,71 @@ public class TermSelectionTest extends CQLTester
     private String typeHintOf(String column)
     {
         return "'" + currentTableMetadata().getColumn(ColumnIdentifier.getInterned(column, false)).type + "'";
+    }
+
+    @Test
+    public void testSetAndMapLiteralsWithNullElements() throws Throwable
+    {
+        String type = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, i2 int, t text, t2 text, u frozen<" + type + ">, u2 frozen<" + type + ">)");
+        execute("INSERT INTO %s (k, i, t, u) VALUES (0, 7, 'x', {a: 1, b: 2})");
+
+        // a null element is kept, as in a list literal, and sorted first
+        assertEquals(pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 2),
+                     selectedValue("SELECT {i, i2} FROM %s"));
+        assertEquals(pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 2),
+                     selectedValue("SELECT {i, i2, i} FROM %s"));
+        assertEquals(pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 2),
+                     selectedValue("SELECT (set<int>){i, i2} FROM %s"));
+        assertEquals(pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 1),
+                     selectedValue("SELECT (map<int, int>){i2: i} FROM %s"));
+        assertEquals(pack(Arrays.asList(ByteBufferUtil.bytes(7), null), 1),
+                     selectedValue("SELECT (map<int, int>){i: i2} FROM %s"));
+
+        // a key given twice is kept once, with the last value
+        assertEquals(pack(Arrays.asList(ByteBufferUtil.bytes(7), ByteBufferUtil.bytes(7)), 1),
+                     selectedValue("SELECT (map<int, int>){i: k, i: i} FROM %s"));
+        assertEquals(pack(Arrays.asList(null, ByteBufferUtil.bytes(0)), 1),
+                     selectedValue("SELECT (map<int, int>){i2: i, i2: k} FROM %s"));
+
+        assertEquals(new HashSet<>(Arrays.asList(null, "x")), executeNet("SELECT {t, t2} FROM %s").one().getSet(0, String.class));
+        assertEquals(2, executeNet("SELECT {u, u2} FROM %s").one().getSet(0, UDTValue.class).size());
+        assertEquals(Collections.singletonMap(null, 7), executeNet("SELECT (map<text, int>){t2: i} FROM %s").one().getMap(0, String.class, Integer.class));
+    }
+
+    @Test
+    public void testSetAndMapLiteralsWithNullElementsAsFunctionArguments() throws Throwable
+    {
+        String fSet = createFunction(KEYSPACE,
+                                     "set<int>",
+                                     "CREATE FUNCTION %s (s set<int>) " +
+                                     "CALLED ON NULL INPUT " +
+                                     "RETURNS int " +
+                                     "LANGUAGE java\n" +
+                                     "AS 'return s.size();';");
+        String fMap = createFunction(KEYSPACE,
+                                     "map<int, int>",
+                                     "CREATE FUNCTION %s (m map<int, int>) " +
+                                     "CALLED ON NULL INPUT " +
+                                     "RETURNS int " +
+                                     "LANGUAGE java\n" +
+                                     "AS 'return m.size();';");
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i int, i2 int)");
+        execute("INSERT INTO %s (k, i) VALUES (0, 7)");
+
+        assertEquals(2, executeNet("SELECT " + fSet + "({i, i2}) FROM %s").one().getInt(0));
+        assertEquals(1, executeNet("SELECT " + fMap + "({i2: i}) FROM %s").one().getInt(0));
+    }
+
+    private ByteBuffer selectedValue(String query) throws Throwable
+    {
+        UntypedResultSet result = execute(query);
+        return result.one().getBytes(result.metadata().get(0).name.toString());
+    }
+
+    private static ByteBuffer pack(List<ByteBuffer> values, int elements)
+    {
+        return CollectionSerializer.pack(values, elements, ProtocolVersion.CURRENT);
     }
 
     @Test

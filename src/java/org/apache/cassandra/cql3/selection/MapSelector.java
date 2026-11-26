@@ -19,6 +19,7 @@ package org.apache.cassandra.cql3.selection;
 
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -182,20 +183,20 @@ final class MapSelector extends Selector
 
     public ByteBuffer getOutput(ProtocolVersion protocolVersion) throws InvalidRequestException
     {
-        Map<ByteBuffer, ByteBuffer> map = new TreeMap<>(type.getKeysType());
+        Map<ByteBuffer, ByteBuffer> map = new TreeMap<>(Comparator.nullsFirst(type.getKeysType()));
         for (int i = 0, m = elements.size(); i < m; i++)
         {
             Pair<Selector, Selector> pair = elements.get(i);
             map.put(pair.left.getOutput(protocolVersion), pair.right.getOutput(protocolVersion));
         }
 
-        List<ByteBuffer> buffers = new ArrayList<>(elements.size() * 2);
+        List<ByteBuffer> buffers = new ArrayList<>(map.size() * 2);
         for (Map.Entry<ByteBuffer, ByteBuffer> entry : map.entrySet())
         {
             buffers.add(entry.getKey());
             buffers.add(entry.getValue());
         }
-        return CollectionSerializer.pack(buffers, elements.size(), protocolVersion);
+        return CollectionSerializer.pack(buffers, map.size(), protocolVersion);
     }
 
     public void reset()
