@@ -209,7 +209,8 @@ public class V1OnDiskFormat implements OnDiskFormat
         return new MemtableIndexWriter(context.getPendingMemtableIndex(tracker),
                                        perIndexComponents,
                                        context.keyFactory(),
-                                       rowMapping);
+                                       rowMapping,
+                                       index.isDropped());
     }
 
     protected Version getExpectedEarliestVersion(IndexContext context, IndexComponentType indexComponentType)

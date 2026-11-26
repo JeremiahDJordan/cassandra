@@ -21,10 +21,16 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.NavigableMap;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.SortedMap;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
 import java.util.stream.Collectors;
@@ -40,12 +46,15 @@ import com.google.common.collect.Sets;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.concurrent.ScheduledExecutors;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.RangeTombstone;
 import org.apache.cassandra.db.RegularAndStaticColumns;
 import org.apache.cassandra.db.WriteContext;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.filter.RowFilter;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
@@ -62,6 +71,7 @@ import org.apache.cassandra.index.sai.metrics.IndexGroupMetrics;
 import org.apache.cassandra.index.sai.metrics.TableQueryMetrics;
 import org.apache.cassandra.index.sai.metrics.TableStateMetrics;
 import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
+import org.apache.cassandra.index.sai.view.View;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -75,7 +85,9 @@ import org.apache.cassandra.notifications.MemtableRenewedNotification;
 import org.apache.cassandra.notifications.SSTableAddedNotification;
 import org.apache.cassandra.notifications.SSTableListChangedNotification;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.lucene.index.CorruptIndexException;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.SAI_TABLE_STATE_METRICS_ENABLED;
@@ -89,6 +101,9 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     private static final Logger logger = LoggerFactory.getLogger(StorageAttachedIndexGroup.class);
 
     public static final Index.Group.Key GROUP_KEY = new Index.Group.Key(StorageAttachedIndexGroup.class);
+
+    /** How often an index that is being built is checked for the end of its build, see {@link #checkAfterBuild}. */
+    private static final long CHECK_AFTER_BUILD_INTERVAL_MS = 100;
 
     private final TableQueryMetrics queryMetrics;
     @SuppressWarnings("OptionalUsedAsFieldOrParameterType")
@@ -357,6 +372,181 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         {
             indices.forEach(index -> index.getIndexContext().discardMemtable(((MemtableDiscardedNotification) notification).memtable));
         }
+    }
+
+    /**
+     * Checks that every index of this group includes the specified SSTables, just added by a stream or import that
+     * built the missing indexes first (see {@link #buildMissingSSTableAttachedIndexes}). An index created after that
+     * build hands them to its running initial build, which builds them before the index becomes queryable; an index
+     * that isn't being built is made non-queryable.
+     */
+    @Override
+    public void checkSSTableAttachedIndexesAfterAdding(Collection<SSTableReader> added)
+    {
+        for (StorageAttachedIndex index : indices)
+        {
+            List<SSTableReader> missing = unindexedLiveSSTables(index, added);
+            if (missing.isEmpty())
+                continue;
+
+            if (baseCfs.indexManager.isIndexBuilding(index.getIndexMetadata().name))
+            {
+                logger.info(index.getIndexContext().logMessage("SSTables {} were added without this index while it is being built. " +
+                                                               "They will be built before it becomes queryable."), descriptors(missing));
+                index.buildBeforeQueryable(missing);
+                checkAfterBuild(index, missing);
+            }
+            else
+            {
+                // The initial build may have built them, and ended, since they were found missing
+                missing = unindexedLiveSSTables(index, missing);
+                if (!missing.isEmpty())
+                    makeNonQueryable(index, missing);
+            }
+        }
+    }
+
+    /**
+     * Once the build of the specified index is over, makes it non-queryable if it still doesn't include some of the
+     * specified SSTables. That covers SSTables added just after its initial build checked the SSTables it had been
+     * handed, which it would otherwise make queryable without them.
+     */
+    private void checkAfterBuild(StorageAttachedIndex index, List<SSTableReader> sstables)
+    {
+        ScheduledExecutors.optionalTasks.schedule(() -> {
+            if (!indices.contains(index))
+                return;
+
+            if (baseCfs.indexManager.isIndexBuilding(index.getIndexMetadata().name))
+            {
+                checkAfterBuild(index, sstables);
+                return;
+            }
+
+            index.forgetBuildBeforeQueryable(sstables);
+            List<SSTableReader> missing = unindexedLiveSSTables(index, sstables);
+            if (!missing.isEmpty())
+                makeNonQueryable(index, missing);
+        }, CHECK_AFTER_BUILD_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+
+    private void makeNonQueryable(StorageAttachedIndex index, List<SSTableReader> missing)
+    {
+        logger.warn(index.getIndexContext().logMessage("SSTables {} were added without this index, " +
+                                                       "which won't be able to return their rows until it's rebuilt."), descriptors(missing));
+        index.makeIndexNonQueryable();
+    }
+
+    /**
+     * @return those of the specified SSTables that are live, but not included by the specified index
+     */
+    List<SSTableReader> unindexedLiveSSTables(StorageAttachedIndex index, Collection<SSTableReader> sstables)
+    {
+        // Ignore the SSTables that a compaction has already replaced, as their replacements are indexed.
+        Set<SSTableReader> live = baseCfs.getTracker().getView().liveSSTables();
+        View view = index.getIndexContext().getView();
+        return sstables.stream()
+                       .filter(sstable -> !sstable.isMarkedCompacted() && live.contains(sstable))
+                       .filter(sstable -> !view.containsSSTableIndex(sstable.descriptor))
+                       .collect(Collectors.toList());
+    }
+
+    private static List<Descriptor> descriptors(Collection<SSTableReader> sstables)
+    {
+        return sstables.stream().map(sstable -> sstable.descriptor).collect(Collectors.toList());
+    }
+
+    /**
+     * Builds the indexes of this group that are missing or incomplete on the specified SSTables, which aren't live yet,
+     * without adding the SSTables to the views of the indexes: the indexes pick them up when they are added to the
+     * table.
+     * <p>
+     * This repeats until no index is missing, in case an index is created while the missing ones are built. An index
+     * that is still incomplete after it's been built (for instance, because its build was stopped) is an error.
+     */
+    @Override
+    public void buildMissingSSTableAttachedIndexes(Collection<SSTableReader> sstables)
+    {
+        try
+        {
+            buildMissingIndexes(sstables);
+        }
+        finally
+        {
+            // The builds cache the descriptors of the SSTables, which may never be added (e.g. if the stream fails).
+            contextManager.forgetUntrackedDescriptors(sstables);
+        }
+    }
+
+    private void buildMissingIndexes(Collection<SSTableReader> sstables)
+    {
+        Map<SSTableReader, Set<StorageAttachedIndex>> built = Collections.emptyMap();
+        while (true)
+        {
+            NavigableMap<SSTableReader, Set<StorageAttachedIndex>> missing = missingIndexes(sstables);
+            if (missing.isEmpty())
+                return;
+
+            for (Map.Entry<SSTableReader, Set<StorageAttachedIndex>> entry : missing.entrySet())
+            {
+                Set<StorageAttachedIndex> justBuilt = built.getOrDefault(entry.getKey(), Collections.emptySet());
+                if (!Collections.disjoint(justBuilt, entry.getValue()))
+                    throw new IllegalStateException(String.format("Storage-attached indexes %s are still incomplete " +
+                                                                  "on SSTable %s after building them",
+                                                                  Sets.intersection(justBuilt, entry.getValue()), entry.getKey().descriptor));
+            }
+
+            if (logger.isInfoEnabled())
+                logger.info("Building storage-attached indexes missing on {} SSTables of {} before adding them: {}",
+                            missing.size(), baseCfs.metadata(),
+                            missing.entrySet()
+                                   .stream()
+                                   .map(e -> e.getKey().descriptor + "=" + e.getValue().stream()
+                                                                                .map(i -> i.getIndexContext().getIndexName())
+                                                                                .sorted()
+                                                                                .collect(Collectors.toList()))
+                                   .collect(Collectors.joining(", ")));
+
+            List<Future<?>> futures = new ArrayList<>();
+            List<SSTableReader> toBuild = new ArrayList<>(missing.keySet());
+            int parallelism = DatabaseDescriptor.getConcurrentCompactors();
+            for (List<SSTableReader> group : StorageAttachedIndex.groupBySize(toBuild, parallelism))
+            {
+                SortedMap<SSTableReader, Set<StorageAttachedIndex>> current = new TreeMap<>(SSTableReader.idComparator);
+                group.forEach(sstable -> current.put(sstable, missing.get(sstable)));
+                futures.add(CompactionManager.instance.submitIndexBuild(new StorageAttachedIndexBuilder(this, current, false, false, false)));
+            }
+            FBUtilities.waitOnFutures(futures);
+
+            built = missing;
+        }
+    }
+
+    /**
+     * @return for each of the specified SSTables that misses some of the indexes of this group, or has some of them
+     * incomplete, those indexes
+     */
+    private NavigableMap<SSTableReader, Set<StorageAttachedIndex>> missingIndexes(Collection<SSTableReader> sstables)
+    {
+        NavigableMap<SSTableReader, Set<StorageAttachedIndex>> missing = new TreeMap<>(SSTableReader.idComparator);
+        Set<StorageAttachedIndex> indexes = ImmutableSet.copyOf(indices);
+        if (indexes.isEmpty())
+            return missing;
+
+        Set<IndexContext> contexts = indexes.stream().map(StorageAttachedIndex::getIndexContext).collect(Collectors.toSet());
+        for (SSTableReader sstable : sstables)
+        {
+            // Load a fresh descriptor, to see the components that are on disk now.
+            IndexDescriptor descriptor = IndexDescriptor.load(sstable, contexts);
+            boolean perSSTableComplete = descriptor.perSSTableComponents().isComplete();
+            for (StorageAttachedIndex index : indexes)
+            {
+                IndexComponents.ForRead perIndex = descriptor.perIndexComponents(index.getIndexContext());
+                if (!perSSTableComplete || !perIndex.isComplete())
+                    missing.computeIfAbsent(sstable, k -> new HashSet<>()).add(index);
+            }
+        }
+        return missing;
     }
 
     void prepareIndexSSTablesForRebuild(Collection<SSTableReader> ss, StorageAttachedIndex index)

@@ -51,7 +51,7 @@ import org.apache.cassandra.schema.MockSchema;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.service.ClientState;
 
-import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
@@ -131,8 +131,8 @@ public abstract class CQLSSTableWriterSAITest
 
         IndexDescriptor indexDescriptor = IndexDescriptor.empty(Descriptor.fromFile(dataFiles[0]));
 
-        IndexContext idx1 = createIndexContext("idx1", UTF8Type.instance);
-        IndexContext idx2 = createIndexContext("idx2", UTF8Type.instance);
+        IndexContext idx1 = createIndexContext(writer.getMetadata().get().indexes.get("idx1").orElseThrow(), UTF8Type.instance);
+        IndexContext idx2 = createIndexContext(writer.getMetadata().get().indexes.get("idx2").orElseThrow(), UTF8Type.instance);
         HashSet<IndexContext> indices = new HashSet<>(Arrays.asList(idx1, idx2));
         SSTableReader sstable = SSTableReader.openNoValidation(null, indexDescriptor.descriptor, writer.getMetadata());
         indexDescriptor.reload(sstable, indices);
@@ -174,24 +174,25 @@ public abstract class CQLSSTableWriterSAITest
 
         File[] dataFiles = dataDir.list(f -> f.name().endsWith('-' + BigFormat.Components.DATA.type.repr));
         assertNotNull(dataFiles);
+        assertEquals(1, dataFiles.length);
 
-        // no indexes built due to withBuildIndexes set to false
-        IndexDescriptor indexDescriptor = IndexDescriptor.empty(Descriptor.fromFile(dataFiles[0]));
-
-        assertFalse(indexDescriptor.perIndexComponents(createIndexContext("idx1", UTF8Type.instance)).isComplete());
-        assertFalse(indexDescriptor.perIndexComponents(createIndexContext("idx2", UTF8Type.instance)).isComplete());
+        // no index is added to the schema or built due to withBuildIndexes set to false
+        assertTrue(writer.getMetadata().get().indexes.isEmpty());
+        File[] indexFiles = dataDir.list(f -> f.name().contains("-SAI+"));
+        assertNotNull(indexFiles);
+        assertEquals(0, indexFiles.length);
     }
 
-    public IndexContext createIndexContext(String name, AbstractType<?> validator)
+    public IndexContext createIndexContext(IndexMetadata config, AbstractType<?> validator)
     {
         return new IndexContext(keyspace,
                                 table,
                                 TableId.generate(),
                                 UTF8Type.instance,
                                 new ClusteringComparator(),
-                                ColumnMetadata.regularColumn("sai", "internal", name, validator),
+                                ColumnMetadata.regularColumn("sai", "internal", config.name, validator),
                                 IndexTarget.Type.SIMPLE,
-                                IndexMetadata.fromSchemaMetadata(name, IndexMetadata.Kind.CUSTOM, null),
+                                config,
                                 MockSchema.newCFS(keyspace));
     }
 }

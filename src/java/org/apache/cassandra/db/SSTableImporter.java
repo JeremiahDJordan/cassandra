@@ -26,6 +26,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.locks.Lock;
 
 import com.google.common.annotations.VisibleForTesting;
 
@@ -256,10 +257,17 @@ public class SSTableImporter
             abortIfDraining();
 
             // Validate existing SSTable-attached indexes, and then build any that are missing:
-            if (!cfs.indexManager.validateSSTableAttachedIndexes(newSSTables, false, options.validateIndexChecksum))
-                cfs.indexManager.buildSSTableAttachedIndexesBlocking(newSSTables);
-
-            cfs.getTracker().addSSTables(newSSTables, OperationType.UNKNOWN);
+            Lock addLock = cfs.indexManager.buildSSTableAttachedIndexesBeforeAdding(newSSTables, Collections.emptySet(), false, options.validateIndexChecksum);
+            try
+            {
+                cfs.getTracker().addSSTables(newSSTables, OperationType.UNKNOWN);
+            }
+            finally
+            {
+                addLock.unlock();
+            }
+            // An SSTable-attached index created since they were validated or built doesn't cover them.
+            cfs.indexManager.checkSSTableAttachedIndexesAfterAdding(newSSTables);
             for (SSTableReader reader : newSSTables)
             {
                 if (options.invalidateCaches && cfs.isRowCacheEnabled())

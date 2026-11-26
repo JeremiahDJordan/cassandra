@@ -38,6 +38,9 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
@@ -52,6 +55,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Iterables;
 import com.google.common.collect.Lists;
+import com.google.common.collect.MapMaker;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.google.common.util.concurrent.FutureCallback;
@@ -194,6 +198,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     // default page size (in rows) when rebuilding the index for a whole partition
     public static final int DEFAULT_PAGE_SIZE = 10000;
 
+    // how many times the SSTable-attached indexes missing on SSTables about to be added are built before giving up
+    private static final int MAX_SSTABLE_ATTACHED_INDEX_BUILDS = 3;
+
     /**
      * All registered indexes.
      */
@@ -231,6 +238,17 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      */
     private final Map<String, AtomicInteger> inProgressBuilds = Maps.newConcurrentMap();
 
+    /**
+     * The index instances that were removed and unregistered, whose builds no longer count under their name.
+     */
+    private final Set<Index> removedIndexes = Collections.newSetFromMap(new MapMaker().weakKeys().makeMap());
+
+    /**
+     * Read: held by {@link #buildSSTableAttachedIndexesBeforeAdding} until the SSTables are added. Write: held while
+     * the initial build of an SSTable-attached index selects the live SSTables.
+     */
+    private final ReadWriteLock sstableAttachedIndexesAddLock = new ReentrantReadWriteLock();
+
     // executes tasks returned by Indexer#addIndexColumn which may require index(es) to be (re)built
     private static final ExecutorPlus asyncExecutor = executorFactory()
             .withJmxInternal()
@@ -259,10 +277,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     {
         // figure out what needs to be added and dropped.
         Indexes tableIndexes = baseCfs.metadata().indexes;
-        indexes.keySet()
-               .stream()
-               .filter(indexName -> !tableIndexes.has(indexName))
-               .forEach(this::removeIndex);
+        // writableIndexes also has the indexes that didn't register themselves
+        Sets.union(indexes.keySet(), writableIndexes.keySet())
+            .immutableCopy()
+            .stream()
+            .filter(indexName -> !tableIndexes.has(indexName))
+            .forEach(this::removeIndex);
 
         // we call add for every index definition in the collection as
         // some may not have been created here yet, only added to schema
@@ -281,7 +301,14 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
     private synchronized Future<Void> createIndex(IndexMetadata indexDef, boolean isNewCF)
     {
+        // an index that didn't register itself isn't dropped first when a schema change replaces it
+        Index unregistered = writableIndexes.get(indexDef.name);
+        if (unregistered != null && !unregistered.getIndexMetadata().equals(indexDef))
+            markIndexRemoved(unregistered);
         final Index index = createInstance(indexDef);
+        // before registering it, so that no write or read reaches the index before it has been told
+        if (!isNewCF)
+            index.onAddedToExistingTable();
         index.register(this);
         if (writableIndexes.put(index.getIndexMetadata().name, index) == null)
             logger.info("Index [{}] registered and writable.", index.getIndexMetadata().name);
@@ -436,6 +463,13 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
             markIndexRemoved(removed);
             executeBlocking(removed.getInvalidateTask(), null);
+        }
+        else
+        {
+            // an index that didn't register itself keeps its build state under its name until its initialization ends
+            Index unregistered = writableIndexes.get(indexName);
+            if (unregistered != null)
+                markIndexRemoved(unregistered);
         }
     }
 
@@ -609,6 +643,157 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     }
 
     /**
+     * @return the SSTable-attached indexes of the index groups of the table, which are the indexes whose components
+     * the flush observers of a new SSTable writer write
+     */
+    public Set<Index> listSSTableAttachedIndexes()
+    {
+        Set<Index> sstableAttachedIndexes = new HashSet<>();
+        for (Index.Group group : indexGroups.values())
+        {
+            for (Index index : group.getIndexes())
+            {
+                if (index.isSSTableAttached())
+                    sstableAttachedIndexes.add(index);
+            }
+        }
+        return sstableAttachedIndexes;
+    }
+
+    /**
+     * Makes sure that every SSTable-attached index of the table is complete on SSTables that aren't live yet (streamed
+     * or imported) before they are added to the table, validating them and building the missing ones. The indexes
+     * are checked again after each build, as one can be created during it, and the SSTables are refused after
+     * {@link #MAX_SSTABLE_ATTACHED_INDEX_BUILDS} builds.
+     * <p>
+     * This returns holding a lock, which the caller must release once it has added the SSTables to the table, or
+     * failed to. Until then, the initial build of an SSTable-attached index doesn't select the live SSTables it builds
+     * (see {@link #selectSSTablesForInitialBuild}), so an index created after the last check builds the SSTables once
+     * they are added.
+     *
+     * @param sstables SSTables that aren't live yet, and are about to be added to the table
+     * @param complete SSTable-attached indexes known to be complete on the SSTables, e.g. because their writers wrote
+     *                 them, which are not validated
+     * @param throwOnIncomplete whether to throw rather than build an index that is incomplete on the SSTables
+     * @param validateChecksum whether to validate the checksums of the index components
+     *
+     * @return the lock to release once the SSTables are added
+     *
+     * @throws IllegalStateException if an index is incomplete on the SSTables and {@code throwOnIncomplete} is true,
+     * or it is still incomplete after the last build
+     * @throws UncheckedIOException if there is a problem validating any on-disk component
+     */
+    public Lock buildSSTableAttachedIndexesBeforeAdding(Collection<SSTableReader> sstables,
+                                                        Set<Index> complete,
+                                                        boolean throwOnIncomplete,
+                                                        boolean validateChecksum)
+    {
+        Lock lock = sstableAttachedIndexesAddLock.readLock();
+        int builds = 0;
+        while (true)
+        {
+            boolean ready = false;
+            lock.lock();
+            try
+            {
+                ready = complete.containsAll(listSSTableAttachedIndexes());
+            }
+            finally
+            {
+                if (!ready)
+                    lock.unlock();
+            }
+            if (ready)
+                return lock;
+
+            Set<Index> indexes = listSSTableAttachedIndexes();
+            if (validateSSTableAttachedIndexes(sstables, throwOnIncomplete || builds == MAX_SSTABLE_ATTACHED_INDEX_BUILDS, validateChecksum))
+            {
+                complete = indexes;
+            }
+            else
+            {
+                buildMissingSSTableAttachedIndexes(sstables);
+                builds++;
+            }
+        }
+    }
+
+    /**
+     * Selects the live SSTables that the initial build of an SSTable-attached index builds, after the SSTables
+     * prepared by {@link #buildSSTableAttachedIndexesBeforeAdding} are added to the table.
+     *
+     * @param select selects the live SSTables to build
+     *
+     * @return the selected SSTables
+     */
+    public <T> T selectSSTablesForInitialBuild(Supplier<T> select)
+    {
+        Lock lock = sstableAttachedIndexesAddLock.writeLock();
+        lock.lock();
+        try
+        {
+            return select.get();
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * As {@link #selectSSTablesForInitialBuild}, but doesn't wait for SSTables prepared by
+     * {@link #buildSSTableAttachedIndexesBeforeAdding} to be added to the table: if any are, this selects nothing and
+     * returns {@code null}. This is for callers that shouldn't wait for an add, such as the pre-join task, which then
+     * leaves the index to its initial build, which selects the SSTables once they are added.
+     *
+     * @param select selects the live SSTables to build
+     *
+     * @return the selected SSTables, or {@code null} if SSTables are being added
+     */
+    public <T> T trySelectSSTablesForInitialBuild(Supplier<T> select)
+    {
+        Lock lock = sstableAttachedIndexesAddLock.writeLock();
+        if (!lock.tryLock())
+            return null;
+
+        try
+        {
+            return select.get();
+        }
+        finally
+        {
+            lock.unlock();
+        }
+    }
+
+    /**
+     * Builds the missing SSTable-attached indexes of each group, see
+     * {@link Index.Group#buildMissingSSTableAttachedIndexes}.
+     */
+    public void buildMissingSSTableAttachedIndexes(Collection<SSTableReader> sstables)
+    {
+        for (Index.Group group : indexGroups.values())
+        {
+            if (group.getIndexes().stream().anyMatch(Index::isSSTableAttached))
+                group.buildMissingSSTableAttachedIndexes(sstables);
+        }
+    }
+
+    /**
+     * Checks the SSTable-attached indexes of each group, see
+     * {@link Index.Group#checkSSTableAttachedIndexesAfterAdding}.
+     */
+    public void checkSSTableAttachedIndexesAfterAdding(Collection<SSTableReader> sstables)
+    {
+        for (Index.Group group : indexGroups.values())
+        {
+            if (group.getIndexes().stream().anyMatch(Index::isSSTableAttached))
+                group.checkSSTableAttachedIndexesAfterAdding(sstables);
+        }
+    }
+
+    /**
      * Incrementally builds indexes for the specified SSTables in a blocking fashion.
      * <p>
      * This is similar to {@link #buildIndexesBlocking}, but it is designed to be used in cases where failure will
@@ -689,17 +874,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * Performs an asynchronous (re)indexing of the specified SSTables for the specified indexes.
      *
      * @param sstables the SSTables to be (re)indexed
-     * @param indexes the indexes to be (re)built for the specified SSTables
+     * @param allIndexes the indexes to be (re)built for the specified SSTables
      * @param isFullRebuild True if this method is invoked as a full index rebuild, false otherwise
      */
-    private java.util.concurrent.Future<?> buildIndexesAsync(Collection<SSTableReader> sstables, Set<Index> indexes, boolean isFullRebuild)
+    private java.util.concurrent.Future<?> buildIndexesAsync(Collection<SSTableReader> sstables, Set<Index> allIndexes, boolean isFullRebuild)
     {
-        if (indexes.isEmpty())
+        if (allIndexes.isEmpty())
             return ImmediateFuture.success(null);
 
         // Mark all indexes as building: this step must happen first, because if any index can't be marked, the whole
-        // process needs to abort
-        markIndexesBuilding(indexes, isFullRebuild, false);
+        // process needs to abort. Only the marked indexes are built: the others were dropped.
+        Set<Index> indexes = markIndexesBuilding(allIndexes, isFullRebuild, false);
+        if (indexes.isEmpty())
+            return ImmediateFuture.success(null);
 
         // Build indexes in a try/catch, so that any index not marked as either built or failed will be marked as failed:
         final Set<Index> builtIndexes = Sets.newConcurrentHashSet();
@@ -833,15 +1020,21 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      * {@link #markIndexBuilt(Index, boolean)} or {@link #markIndexFailed(Index, boolean)} should be always called after
      * the rebuilding has finished, so that the index build state can be correctly managed and the index rebuilt.
      *
-     * @param indexes the index to be marked as building
+     * @param allIndexes the index to be marked as building
      * @param isFullRebuild {@code true} if this method is invoked as a full index rebuild, {@code false} otherwise
      * @param isNewCF {@code true} if this method is invoked when initializing a new table/columnfamily (i.e. loading a CF at startup),
      * {@code false} for all other cases (i.e. newly added index)
+     * @return the indexes marked as building: those that weren't replaced or removed
      */
     @VisibleForTesting
-    public synchronized void markIndexesBuilding(Set<Index> indexes, boolean isFullRebuild, boolean isNewCF)
+    public synchronized Set<Index> markIndexesBuilding(Set<Index> allIndexes, boolean isFullRebuild, boolean isNewCF)
     {
         String keyspaceName = baseCfs.getKeyspaceName();
+        // markIndexBuilt and markIndexFailed ignore an index that has been replaced by another one with the same name,
+        // so it mustn't be counted as building under that name either: its replacement would look as building forever.
+        Set<Index> indexes = allIndexes.stream().filter(index -> !isReplaced(index)).collect(Collectors.toSet());
+        // The same goes for a removed index, whose builds may end after another index of its name is created
+        indexes.removeIf(removedIndexes::contains);
 
         // First step is to validate against concurrent rebuilds; it would be more optimized to do everything on a single
         // step, but we're not really expecting a very high number of indexes, and this isn't on any hot path, so
@@ -870,6 +1063,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                             if (counter.getAndIncrement() == 0 && DatabaseDescriptor.isDaemonInitialized() && !isNewCF)
                                 SystemKeyspace.setIndexRemoved(keyspaceName, indexName);
                         });
+        return indexes;
     }
 
     /**
@@ -882,6 +1076,9 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     public synchronized void markIndexBuilt(Index index, boolean isFullRebuild)
     {
         String indexName = index.getIndexMetadata().name;
+        if (isReplaced(index) || removedIndexes.contains(index))
+            return;
+
         if (isFullRebuild)
             makeIndexQueryable(index, Index.Status.BUILD_SUCCEEDED);
 
@@ -908,6 +1105,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private synchronized void markIndexFailed(Index index, boolean isInitialBuild)
     {
         String indexName = index.getIndexMetadata().name;
+        if (isReplaced(index) || removedIndexes.contains(index))
+            return;
 
         AtomicInteger counter = inProgressBuilds.get(indexName);
         if (counter != null)
@@ -929,6 +1128,16 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
             makeIndexNonQueryable(index, Index.Status.BUILD_FAILED);
         }
+    }
+
+    /**
+     * Whether the index was dropped and replaced by one of the same name, whose build state (kept by index name) its
+     * builds must not change. An index is not replaced while no index of its name is registered.
+     */
+    private boolean isReplaced(Index index)
+    {
+        Index registered = indexes.get(index.getIndexMetadata().name);
+        return registered != null && registered != index;
     }
 
     private void logAndMarkIndexesFailed(Set<Index> indexes, Throwable indexBuildFailure, boolean isInitialBuild)
@@ -954,6 +1163,8 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         writableIndexes.remove(indexName);
         needsFullRebuild.remove(indexName);
         inProgressBuilds.remove(indexName);
+        if (indexes.get(indexName) != index)
+            removedIndexes.add(index);
         // remove existing indexing status
         IndexStatusManager.instance.propagateLocalIndexStatus(keyspace.getName(), indexName, Index.Status.DROPPED);
     }
@@ -1482,6 +1693,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     {
         String name = index.getIndexMetadata().name;
         indexes.put(name, index);
+        removedIndexes.remove(index);
         updatePreparesWrites();
         logger.trace("Registered index {}", name);
 

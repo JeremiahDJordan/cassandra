@@ -272,6 +272,16 @@ public interface Index
     }
 
     /**
+     * Called by {@link SecondaryIndexManager} when this index is created on a table that already exists, before it is
+     * registered and before {@link #getInitializationTask()}; not when the index is added with its table or reloaded.
+     * Index data already on disk for the table's sstables predates the index, even if it is named after it (e.g. left
+     * by a dropped index of the same name). The default does nothing.
+     */
+    default void onAddedToExistingTable()
+    {
+    }
+
+    /**
      * Return a task to perform any initialization work when a new index instance is created.
      * This may involve costly operations such as (re)building the index, and is performed asynchronously
      * by SecondaryIndexManager
@@ -1140,6 +1150,25 @@ public interface Index
         default boolean validateSSTableAttachedIndexes(Collection<SSTableReader> sstables, boolean throwOnIncomplete, boolean validateChecksum)
         {
             return true;
+        }
+
+        /**
+         * Builds the SSTable-attached indexes of this group that are missing or incomplete on the specified SSTables,
+         * which are about to be added to the table (e.g. those of a stream, written without the indexes created while
+         * they were received). {@link #checkSSTableAttachedIndexesAfterAdding} must be called once they are added.
+         *
+         * @throws RuntimeException if an index can't be built, or is still incomplete after it has been built
+         */
+        default void buildMissingSSTableAttachedIndexes(Collection<SSTableReader> sstables)
+        {
+        }
+
+        /**
+         * Checks the SSTable-attached indexes of this group against the specified SSTables, just added to the table
+         * after {@link #buildMissingSSTableAttachedIndexes}: an index created after that build doesn't cover them.
+         */
+        default void checkSSTableAttachedIndexesAfterAdding(Collection<SSTableReader> sstables)
+        {
         }
 
         /**

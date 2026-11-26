@@ -19,14 +19,19 @@
 package org.apache.cassandra.db;
 
 import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.nio.channels.FileChannel;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
@@ -39,19 +44,15 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.cache.RowCacheKey;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
+import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
-import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.BootStrapper;
-import org.apache.cassandra.index.sai.IndexContext;
-import org.apache.cassandra.index.sai.SAITester;
-import org.apache.cassandra.index.sai.disk.format.IndexComponents;
-import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
-import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
-import org.apache.cassandra.index.sai.utils.SAICodecUtils;
-import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
+import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableFormat.Components;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
-import org.apache.cassandra.io.sstable.format.big.BigFormat;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.PathUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -61,9 +62,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
-import static org.apache.lucene.codecs.CodecUtil.FOOTER_MAGIC;
-import static org.apache.lucene.codecs.CodecUtil.writeBEInt;
-import static org.apache.lucene.codecs.CodecUtil.writeBELong;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -892,6 +891,70 @@ public class ImportTest extends CQLTester
         }
     }
 
+    /** A stopped build of the indexes missing on the imported SSTables fails the import; the index stays queryable. */
+    @Test
+    public void mustFailWithoutAffectingIndexWhenSAIBuildIsStoppedTest() throws Throwable
+    {
+        File backupDir = null;
+        Injections.Barrier holdBuild = Injections.newBarrier("hold_import_sai_build", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(StorageAttachedIndexBuilder.class)
+                                                                        .onMethod("indexSSTable"))
+                                                 .build();
+        try
+        {
+            schemaChange(String.format("CREATE TABLE %s.%s (id int primary key, d int)", KEYSPACE, "sai_stopped_test"));
+
+            for (int i = 0; i < 10; i++)
+                execute(String.format("INSERT INTO %s.%s (id, d) values (?, ?)", KEYSPACE, "sai_stopped_test"), i, i);
+
+            ColumnFamilyStore cfs = getColumnFamilyStore(KEYSPACE, "sai_stopped_test");
+            Util.flush(cfs);
+
+            Set<SSTableReader> sstables = cfs.getLiveSSTables();
+            cfs.clearUnsafe();
+
+            backupDir = moveToBackupDir(sstables);
+
+            // The SSTables were written before the index, so the import has to build it on them...
+            createIndexAndWait(String.format("CREATE INDEX idx1 ON %s.%s (d) USING 'sai'", KEYSPACE, "sai_stopped_test"), "idx1");
+            assertTrue(cfs.indexManager.isIndexQueryable("idx1"));
+
+            // ...and that build is stopped, as nodetool stop INDEX_BUILD would.
+            Injections.inject(holdBuild);
+            SSTableImporter importer = new SSTableImporter(cfs);
+            SSTableImporter.Options options = SSTableImporter.Options.options(backupDir.toString())
+                                                                     .copyData(true)
+                                                                     .build();
+            CompletableFuture<List<String>> result = CompletableFuture.supplyAsync(() -> importer.importNewSSTables(options));
+            Util.spinAssertEquals(1L, holdBuild::getCount, 60);
+            CompactionManager.instance.stopCompaction("INDEX_BUILD");
+            holdBuild.countDown();
+            holdBuild.disable();
+
+            assertThatThrownBy(() -> result.get(60, TimeUnit.SECONDS)).hasStackTraceContaining("Failed adding SSTables")
+                                                                      .hasRootCauseInstanceOf(CompactionInterruptedException.class);
+
+            // The SSTables weren't added, and the index is unaffected.
+            assertEquals(0, execute(String.format("SELECT * FROM %s.%s", KEYSPACE, "sai_stopped_test")).size());
+            assertTrue(cfs.indexManager.isIndexQueryable("idx1"));
+            assertEquals(0, execute(String.format("SELECT * FROM %s.%s WHERE d >= 0", KEYSPACE, "sai_stopped_test")).size());
+        }
+        finally
+        {
+            holdBuild.disable();
+            Injections.deleteAll();
+
+            if (backupDir != null)
+            {
+                backupDir.deleteRecursive();
+                backupDir.parent().deleteRecursive();
+            }
+
+            execute(String.format("DROP TABLE IF EXISTS %s.%s", KEYSPACE, "sai_stopped_test"));
+        }
+    }
+
     @Test
     public void skipIndexChecksumOnSAITest() throws Throwable
     {
@@ -911,34 +974,45 @@ public class ImportTest extends CQLTester
 
             File backupDir = moveToBackupDir(sstables);
 
-            File[] dataFiles = backupDir.list(f -> f.name().endsWith('-' + BigFormat.Components.DATA.type.repr));
-
-            Descriptor descriptor = Descriptor.fromFile(dataFiles[0]);
-            IndexDescriptor indexDescriptor = IndexDescriptor.empty(descriptor);
-            IndexContext indexContext = SAITester.createIndexContext("idx1", UTF8Type.instance);
-
-            // corrupt one of index files
-            IndexComponents.ForWrite components = indexDescriptor.newPerIndexComponentsForWrite(indexContext);
-            try (IndexOutputWriter output = components.addOrGet(components.completionMarkerComponent()).openOutput())
+            // corrupt the checksum of the largest SAI file of the sstable
+            File corrupted = Arrays.stream(backupDir.tryList())
+                                   .filter(f -> f.name().contains("-SAI+") && !f.name().endsWith("Complete.db"))
+                                   .max(Comparator.comparingLong(File::length))
+                                   .orElseThrow();
+            try (RandomAccessFile file = new RandomAccessFile(corrupted.toJavaIOFile(), "rw"))
             {
-                SAICodecUtils.writeHeader(output);
-                output.writeByte((byte) 0);
-                // taken from SAICodecUtils#writeFooter
-                writeBEInt(output, FOOTER_MAGIC);
-                writeBEInt(output, 0);
-                writeBELong(output, 123); // some garbage checksum value to prove the point
+                file.seek(file.length() - 1);
+                int last = file.read();
+                file.seek(file.length() - 1);
+                file.write(last ^ 1);
             }
+            // a copy, for the import without validation once the import with validation has failed
+            Path copy = Files.createTempDirectory("importtest");
+            PathUtils.deleteRecursiveOnExit(copy);
+            Path unvalidated = copy.resolve(backupDir.parent().name()).resolve(backupDir.name());
+            Files.createDirectories(unvalidated);
+            for (File file : backupDir.tryList())
+                Files.copy(file.toPath(), unvalidated.resolve(file.name()));
 
             assertEquals(0, execute(String.format("SELECT * FROM %s.%s", KEYSPACE, "sai_test")).size());
 
             SSTableImporter importer = new SSTableImporter(cfs);
-            SSTableImporter.Options options = SSTableImporter.Options.options(backupDir.toString())
+            SSTableImporter.Options validating = SSTableImporter.Options.options(backupDir.toString())
+                                                                        .copyData(true)
+                                                                        .failOnMissingIndex(true)
+                                                                        .validateIndexChecksum(true)
+                                                                        .build();
+            // the checksum is validated, and the import fails
+            assertThatThrownBy(() -> importer.importNewSSTables(validating)).hasStackTraceContaining("Invalid SAI components");
+            assertEquals(0, execute(String.format("SELECT * FROM %s.%s", KEYSPACE, "sai_test")).size());
+
+            SSTableImporter.Options options = SSTableImporter.Options.options(unvalidated.toString())
                                                                      .copyData(true)
                                                                      .failOnMissingIndex(true)
                                                                      .validateIndexChecksum(false)
                                                                      .build();
 
-            // even with corrupted column completion marker (wrong checksum), it will import
+            // without the validation of the checksum, it imports
             assertTrue(importer.importNewSSTables(options).isEmpty());
             assertEquals(10, execute(String.format("SELECT * FROM %s.%s", KEYSPACE, "sai_test")).size());
         }
