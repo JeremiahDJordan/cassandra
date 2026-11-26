@@ -269,11 +269,8 @@ public class TokenAllocation
             if (CassandraRelevantProperties.USE_RANDOM_ALLOCATION_IF_NOT_SUPPORTED.getBoolean())
                 return createRandomStrategy(endpoint);
 
-            throw new ConfigurationException(
-                String.format("Algorithmic token allocation failed: the number of racks in datacenter %s is lower than its replication factor %d.\n" +
-                          "If you are starting a new datacenter, please make sure that the first %d nodes to start are from different racks.\n" +
-                          "If you wish to fall back to random token allocation, please use '" + CassandraRelevantProperties.USE_RANDOM_ALLOCATION_IF_NOT_SUPPORTED + "'.",
-                          dc, replicationStrategy.getReplicationFactor().allReplicas, replicationStrategy.getReplicationFactor().allReplicas));
+            throw new ConfigurationException(String.format("%s\nIf you wish to fall back to random token allocation, set the system property '%s' to true.",
+                                                           e.getMessage(), CassandraRelevantProperties.USE_RANDOM_ALLOCATION_IF_NOT_SUPPORTED.getKey()), e);
         }
     }
 
