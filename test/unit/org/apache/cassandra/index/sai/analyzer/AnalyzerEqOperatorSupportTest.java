@@ -176,6 +176,20 @@ public class AnalyzerEqOperatorSupportTest extends SAITester
         });
     }
 
+    /**
+     * {@code !=} on a column whose index analyzes = as a match and on a column without an index.
+     */
+    @Test
+    public void testNotEqualsOnAnalyzedAndUnindexedColumns()
+    {
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex' WITH OPTIONS = {'case_sensitive': 'false'}");
+        execute("INSERT INTO %s (k, v, f) VALUES (1, 'Quick fox', 'Quick fox')");
+        execute("INSERT INTO %s (k, v, f) VALUES (2, 'Lazy fox', 'Lazy fox')");
+
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE v NOT IN ('quick fox', 'x') AND f != 'lazy fox' ALLOW FILTERING", row(2));
+        assertRowsWithoutWarning("SELECT k FROM %s WHERE f NOT IN ('lazy fox', 'x') AND v != 'quick fox' ALLOW FILTERING", row(2));
+    }
+
     @Test
     public void testNonTokenizedIndexWithMatch()
     {

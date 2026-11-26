@@ -385,12 +385,19 @@ public interface IndexRegistry
         // indexes that serve = as a match (see getEqBehavior), and compares raw values otherwise, also where = is
         // ambiguous, and on primary key columns, as = does where it restricts the key
         if (operator == Operator.NEQ)
-        {
-            if (column.isPrimaryKeyColumn() || getEqBehavior(column, hints).behavior != EqBehavior.MATCH)
-                return Optional.empty();
-            operator = Operator.EQ;
-        }
+            return getNotEqualsAnalyzerIndex(column, hints).flatMap(i -> i.getAnalyzer(value));
+
         return getBestIndexFor(column, operator, hints).flatMap(i -> i.getAnalyzer(value));
+    }
+
+    /**
+     * Returns the index whose analyzer a != on the given column uses (see {@link #getAnalyzerFor}), if any.
+     */
+    default Optional<Index> getNotEqualsAnalyzerIndex(ColumnMetadata column, IndexHints hints)
+    {
+        if (column.isPrimaryKeyColumn() || getEqBehavior(column, hints).behavior != EqBehavior.MATCH)
+            return Optional.empty();
+        return getBestIndexFor(column, Operator.EQ, hints);
     }
 
     Optional<Index> getBestIndexFor(ColumnMetadata column, Operator operator);

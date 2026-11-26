@@ -26,6 +26,7 @@ import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -1271,6 +1272,9 @@ public class RowFilter
         private final Builder root;
         /** The keys of the checks already run for the filter by the root builder, allocated on the first check. */
         private Set<Object> performedChecks;
+        // the column of the last != and the index whose analyzer it uses, as a NOT IN adds a != per value
+        private ColumnMetadata notEqualsColumn;
+        private Optional<Index> notEqualsIndex;
 
         public Builder(boolean needsReconciliation, IndexRegistry indexRegistry, IndexHints indexHints)
         {
@@ -1564,10 +1568,20 @@ public class RowFilter
         private Index.Analyzer analyzer(ColumnMetadata def, Operator op, ByteBuffer value)
         {
             // an IN on an analyzed index is sent as a disjunction of analyzer matches, so an IN compares raw values
-            if (op == Operator.IN)
+            if (op == Operator.IN || indexRegistry == null)
                 return null;
 
-            return indexRegistry == null ? null : indexRegistry.getAnalyzerFor(def, op, value, indexHints).orElse(null);
+            if (op == Operator.NEQ)
+            {
+                if (!def.equals(notEqualsColumn))
+                {
+                    notEqualsIndex = indexRegistry.getNotEqualsAnalyzerIndex(def, indexHints);
+                    notEqualsColumn = def;
+                }
+                return notEqualsIndex.flatMap(i -> i.getAnalyzer(value)).orElse(null);
+            }
+
+            return indexRegistry.getAnalyzerFor(def, op, value, indexHints).orElse(null);
         }
 
         public void addGeoDistanceExpression(ColumnMetadata def, ByteBuffer point, Operator op, ByteBuffer distance)
