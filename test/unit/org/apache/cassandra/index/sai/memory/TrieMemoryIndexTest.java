@@ -115,6 +115,48 @@ public class TrieMemoryIndexTest
         assertEquals(10, valueCount);
     }
 
+    /**
+     * An update of a single value leaves the row in the terms of the new value, each with the row's occurrences of it,
+     * and in no other term, over consecutive updates of the row, with one term per value or several.
+     */
+    @Test
+    public void testUpdateOfSingleValue()
+    {
+        TrieMemoryIndex index = newTrieMemoryIndex(UTF8Type.instance, UTF8Type.instance);
+        DecoratedKey key = makeKey(table, "0");
+        index.add(key, Clustering.EMPTY, UTF8Type.instance.decompose("a"), allocatedBytes -> {}, allocatedBytes -> {});
+        update(index, key, "a", "b");
+        update(index, key, "b", "c");
+        assertEquals(Map.of("c", 1), termFrequencies(index));
+
+        index = new TrieMemoryIndex(newIndexContext(UTF8Type.instance, UTF8Type.instance, Map.of("index_analyzer", "standard")));
+        index.add(key, Clustering.EMPTY, UTF8Type.instance.decompose("x z"), allocatedBytes -> {}, allocatedBytes -> {});
+        update(index, key, "x z", "y y x x");
+        assertEquals(Map.of("x", 2, "y", 2), termFrequencies(index));
+        update(index, key, "y y x x", "w y");
+        assertEquals(Map.of("w", 1, "y", 1), termFrequencies(index));
+    }
+
+    private static void update(TrieMemoryIndex index, DecoratedKey key, String oldValue, String newValue)
+    {
+        index.update(key, Clustering.EMPTY, UTF8Type.instance.decompose(oldValue), UTF8Type.instance.decompose(newValue),
+                     allocatedBytes -> {}, allocatedBytes -> {}, null);
+    }
+
+    private static Map<String, Integer> termFrequencies(TrieMemoryIndex index)
+    {
+        Map<String, Integer> frequencies = new HashMap<>();
+        var iterator = index.iterator();
+        while (iterator.hasNext())
+        {
+            var pair = iterator.next();
+            String term = new String(ByteSourceInverse.readBytes(ByteSource.peekable(TypeUtil.termBytes(pair.left))), StandardCharsets.UTF_8);
+            for (var pkf : pair.right)
+                frequencies.put(term, pkf.frequency);
+        }
+        return frequencies;
+    }
+
     @Test
     public void iteratorShouldReturnAllValuesString()
     {
@@ -480,7 +522,11 @@ public class TrieMemoryIndexTest
 
 
     private IndexContext newIndexContext(AbstractType<?> partitionKeyType, AbstractType<?> columnType)
+    {
+        return newIndexContext(partitionKeyType, columnType, Map.of());
+    }
 
+    private IndexContext newIndexContext(AbstractType<?> partitionKeyType, AbstractType<?> columnType, Map<String, String> indexOptions)
     {
         table = TableMetadata.builder(KEYSPACE, TABLE)
                              .addPartitionKeyColumn(PART_KEY_COL, partitionKeyType)
@@ -492,6 +538,7 @@ public class TrieMemoryIndexTest
         Map<String, String> options = new HashMap<>();
         options.put(IndexTarget.CUSTOM_INDEX_OPTION_NAME, StorageAttachedIndex.class.getCanonicalName());
         options.put("target", REG_COL);
+        options.putAll(indexOptions);
 
         IndexMetadata indexMetadata = IndexMetadata.fromSchemaMetadata("col_index", IndexMetadata.Kind.CUSTOM, options);
         Pair<ColumnMetadata, IndexTarget.Type> target = TargetParser.parse(table, indexMetadata);

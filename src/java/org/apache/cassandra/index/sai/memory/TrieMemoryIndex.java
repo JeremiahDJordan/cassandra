@@ -97,6 +97,7 @@ public class TrieMemoryIndex extends MemoryIndex
     private final LongAdder primaryKeysHeapAllocations;
     private final PrimaryKeysAccumulator primaryKeysAccumulator;
     private final PrimaryKeysRemover primaryKeysRemover;
+    private final SeenPrimaryKeys seenPrimaryKeys = new SeenPrimaryKeys();
     private final Map<PrimaryKey, Integer> docLengths = new HashMap<>();
     private volatile int indexedRows = 0;
     private volatile long totalTermCount = 0;
@@ -193,7 +194,6 @@ public class TrieMemoryIndex extends MemoryIndex
         // A row has one value here: add the terms of the new value, resetting the frequency of each the first time it
         // is seen, then remove the row from the old value's terms that the new value doesn't hold. Add before removing
         // so the row is never missing from the index.
-        Set<PrimaryKeys> seenPrimaryKeys = new HashSet<>();
         primaryKeysAccumulator.seenPrimaryKeys = seenPrimaryKeys;
         primaryKeysRemover.seenPrimaryKeys = seenPrimaryKeys;
         try
@@ -215,6 +215,7 @@ public class TrieMemoryIndex extends MemoryIndex
         {
             primaryKeysAccumulator.seenPrimaryKeys = null;
             primaryKeysRemover.seenPrimaryKeys = null;
+            seenPrimaryKeys.clear();
         }
     }
 
@@ -464,7 +465,7 @@ public class TrieMemoryIndex extends MemoryIndex
     {
         private final LongAdder heapAllocations;
         // the terms of the new single value seen so far during an update (under the lock of the TrieMemoryIndex)
-        private Set<PrimaryKeys> seenPrimaryKeys;
+        private SeenPrimaryKeys seenPrimaryKeys;
 
         PrimaryKeysAccumulator(LongAdder heapAllocations)
         {
@@ -493,7 +494,7 @@ public class TrieMemoryIndex extends MemoryIndex
     {
         private final LongAdder heapAllocations;
         // the terms of the new single value, which keep the key, during an update (under the TrieMemoryIndex lock)
-        private Set<PrimaryKeys> seenPrimaryKeys;
+        private SeenPrimaryKeys seenPrimaryKeys;
 
         PrimaryKeysRemover(LongAdder heapAllocations)
         {
@@ -514,6 +515,42 @@ public class TrieMemoryIndex extends MemoryIndex
             }
             heapAllocations.add(existing.decrementFrequency(neww));
             return existing;
+        }
+    }
+
+    /**
+     * The primary keys of the terms of the new value seen during a single value update, by identity. A value has one
+     * term unless the index is analyzed, so only the terms after the first take a set.
+     */
+    static class SeenPrimaryKeys
+    {
+        private PrimaryKeys first;
+        private Set<PrimaryKeys> others;
+
+        /** Adds the primary keys of a term, and returns whether they weren't seen yet. */
+        boolean add(PrimaryKeys primaryKeys)
+        {
+            if (first == null)
+            {
+                first = primaryKeys;
+                return true;
+            }
+            if (first == primaryKeys)
+                return false;
+            if (others == null)
+                others = new HashSet<>();
+            return others.add(primaryKeys);
+        }
+
+        boolean contains(PrimaryKeys primaryKeys)
+        {
+            return first == primaryKeys || (others != null && others.contains(primaryKeys));
+        }
+
+        void clear()
+        {
+            first = null;
+            others = null;
         }
     }
 
