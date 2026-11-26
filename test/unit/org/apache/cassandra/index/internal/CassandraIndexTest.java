@@ -112,6 +112,25 @@ public class CassandraIndexTest extends CQLTester
     }
 
     @Test
+    public void testWriteOfAFieldAddedToTheTypeOfAClusteringColumn() throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (k int, c frozen<" + udt + ">, v int, PRIMARY KEY (k, c)) WITH memtable = 'trie'");
+        createIndex("CREATE INDEX ON %s (v)");
+        execute("INSERT INTO %s (k, c, v) VALUES (0, {a: 1, b: 2}, 0)");
+        // the index's keys from before the change are then in an sstable, and not in the memtables the reads look in
+        flush();
+        execute("ALTER TYPE " + KEYSPACE + '.' + udt + " ADD d int");
+
+        execute("INSERT INTO %s (k, c, v) VALUES (0, {a: 1, b: 2, d: 3}, 1)");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT c FROM %s WHERE v = 1"), row(userType("a", 1, "b", 2, "d", 3)));
+            assertRows(execute("SELECT c FROM %s WHERE v = 0"), row(userType("a", 1, "b", 2)));
+        });
+    }
+
+    @Test
     public void indexOnFirstClusteringColumn() throws Throwable
     {
         // No update allowed on primary key columns, so this script has no update expression
