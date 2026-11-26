@@ -25,6 +25,7 @@ import org.junit.Test;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.memtable.SkipListMemtable;
@@ -39,6 +40,7 @@ import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.schema.MemtableParams;
 import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.SchemaKeyspaceTables;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
@@ -498,6 +500,68 @@ public class AlterTest extends CQLTester
     {
         createTable("CREATE TABLE %s (k int, c1 int, v int, PRIMARY KEY (k, c1))");
         execute("ALTER TABLE %s RENAME c1 TO \"\"");
+    }
+
+    @Test
+    public void testRenameToDroppedColumnName() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, c int, PRIMARY KEY (pk, ck))");
+        execute("ALTER TABLE %s DROP c");
+        assertInvalidMessage("Cannot rename column ck to c in table '" + KEYSPACE + '.' + currentTable() + "'; a dropped column with that name exists",
+                             "ALTER TABLE %s RENAME ck TO c");
+        assertInvalidMessage("a dropped column with that name exists", "ALTER TABLE %s RENAME pk TO c");
+    }
+
+    @Test
+    public void testLoadSSTablesWithDroppedColumnNamedLikePrimaryKeyColumn() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, c int, v int, PRIMARY KEY (pk, ck))");
+        execute("INSERT INTO %s (pk, ck, c, v) VALUES (1, 1, 1, 1)");
+        flush();
+        execute("ALTER TABLE %s DROP c");
+
+        // a primary key column renamed to the name of the dropped column (ALTER TABLE rejects this rename)
+        SchemaTestUtil.announceTableUpdate(currentTableMetadata().unbuild()
+                                                                 .renamePrimaryKeyColumn(ColumnIdentifier.getInterned("ck", false),
+                                                                                         ColumnIdentifier.getInterned("c", false))
+                                                                 .build());
+
+        // the schema update can switch the memtable; its flush must end before the tracker is reset
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.clearUnsafe();
+        assertTrue(cfs.getLiveSSTables().isEmpty());
+        cfs.loadNewSSTables();
+        assertEquals(1, cfs.getLiveSSTables().size());
+        assertRows(execute("SELECT * FROM %s"), row(1, 1, 1));
+    }
+
+    @Test
+    public void testLoadSSTablesWithDroppedCollectionsNamedLikePrimaryKeyColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, c list<int>, s set<int> static, v int, PRIMARY KEY (pk, ck))");
+        execute("INSERT INTO %s (pk, ck, c, s, v) VALUES (1, 1, [1, 2], {1, 2}, 1)");
+        flush();
+        execute("ALTER TABLE %s DROP c");
+        execute("ALTER TABLE %s DROP s");
+
+        // primary key columns renamed to the names of the dropped non-frozen collections (ALTER TABLE rejects this
+        // rename): the sstable's columns are not read as primary key columns, which can't be non-frozen collections
+        SchemaTestUtil.announceTableUpdate(currentTableMetadata().unbuild()
+                                                                 .renamePrimaryKeyColumn(ColumnIdentifier.getInterned("ck", false),
+                                                                                         ColumnIdentifier.getInterned("c", false))
+                                                                 .renamePrimaryKeyColumn(ColumnIdentifier.getInterned("pk", false),
+                                                                                         ColumnIdentifier.getInterned("s", false))
+                                                                 .build());
+
+        // the schema update can switch the memtable; its flush must end before the tracker is reset
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.clearUnsafe();
+        assertTrue(cfs.getLiveSSTables().isEmpty());
+        cfs.loadNewSSTables();
+        assertEquals(1, cfs.getLiveSSTables().size());
+        assertRows(execute("SELECT * FROM %s"), row(1, 1, 1));
     }
 
     @Test
