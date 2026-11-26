@@ -1735,7 +1735,11 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
 
     public Memtable createMemtable(AtomicReference<CommitLogPosition> commitLogUpperBound)
     {
-        return memtableFactory.create(commitLogUpperBound, metadata, this);
+        // Set here too, as reload sets it only after the table's metadata is updated: a memtable created in between
+        // would be of the old class or configuration, and reload would keep it.
+        Memtable.Factory factory = metadata().params.memtable.factory();
+        memtableFactory = factory;
+        return factory.create(commitLogUpperBound, metadata, this);
     }
 
     // atomically set the upper bound for the commit log

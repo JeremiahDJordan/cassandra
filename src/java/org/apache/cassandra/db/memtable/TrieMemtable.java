@@ -227,8 +227,9 @@ public class TrieMemtable extends AbstractShardedMemtable
         return !actualMetadata.regularAndStaticColumns().equals(withDroppedColumns(metadata.get()).regularAndStaticColumns());
     }
 
-    /// Cells are keyed with the ids of the columns of this memtable's metadata, so a cell of a column that was added
-    /// to the table later cannot be stored. Such a cell reaches this memtable when its write is built after the
+    /// Cells are keyed with the ids of the columns of this memtable's metadata, and clusterings and cell paths are
+    /// read with its types, so a cell of a column that was added to the table later, or a value with a field added
+    /// to its type, cannot be stored or read back. Such a write reaches this memtable when it is built after the
     /// table's metadata reference is updated and applied before `ColumnFamilyStore.reload` switches the memtable.
     @Override
     public boolean predatesColumnsOf(PartitionUpdate update)
@@ -242,6 +243,11 @@ public class TrieMemtable extends AbstractShardedMemtable
         TableMetadata current = metadata.get();
         if (current == tableMetadataAtCreation)
             return false;
+
+        // Built with the table's current metadata: it can have values of types changed since (ALTER TYPE ... ADD),
+        // which this memtable's clustering and cell path types can't handle.
+        if (update.metadata() == current)
+            return true;
 
         RegularAndStaticColumns columns = update.columns();
         return predatesAnyOf(columns.statics, current) || predatesAnyOf(columns.regulars, current);
