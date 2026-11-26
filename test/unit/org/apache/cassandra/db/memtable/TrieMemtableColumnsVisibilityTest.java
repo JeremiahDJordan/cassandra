@@ -16,9 +16,13 @@
 
 package org.apache.cassandra.db.memtable;
 
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.Clustering;
@@ -43,22 +47,32 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertTrue;
 
-/// A read that runs concurrently with a write to a [TrieMemtable] must see the columns of all the data it sees.
+/// A read that runs concurrently with a write to a trie memtable must see the columns of all the data it sees.
 /// Otherwise the read may e.g. miss the static row of a partition, or present rows with columns that are not in the
 /// partition's column header.
 ///
 /// To test this deterministically, the test reads the partition from inside the write: the index transaction's
 /// `commit` is called after the data has been applied to the memtable shard, but before the write completes.
+@RunWith(Parameterized.class)
 public class TrieMemtableColumnsVisibilityTest extends CQLTester
 {
+    @Parameterized.Parameter
+    public String memtableConfig;
+
+    @Parameterized.Parameters(name = "{0}")
+    public static Collection<Object> parameters()
+    {
+        return Arrays.asList("trie", "trie_stage1", "trie_stage2", "trie_stage3");
+    }
+
     @Test
     public void testReadDuringWriteSeesNewColumns() throws Throwable
     {
-        createTable("CREATE TABLE %s (k int, c int, v int, w int, st int static, PRIMARY KEY (k, c)) WITH memtable = 'trie'");
+        createTable("CREATE TABLE %s (k int, c int, v int, w int, st int static, PRIMARY KEY (k, c)) WITH memtable = '" + memtableConfig + '\'');
         disableCompaction();
         ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
         Memtable memtable = cfs.getCurrentMemtable();
-        assertTrue(memtable instanceof TrieMemtable);
+        assertTrue(memtable instanceof TrieMemtable || memtable instanceof AbstractTrieMemtable);
         TableMetadata metadata = cfs.metadata();
 
         // Give the memtable some columns, but not the ones of the update below.

@@ -105,6 +105,14 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
     }
 
     @Override
+    public boolean appliesUpdatesAtomically()
+    {
+        // A failed update leaves the trie without any of the update's rows and deletions, and put() completes the index
+        // transaction under the shard lock.
+        return true;
+    }
+
+    @Override
     public long put(PartitionUpdate update, UpdateTransaction indexer, OpOrder.Group opGroup)
     {
         DecoratedKey key = update.partitionKey();
@@ -509,6 +517,9 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
             acquireWriteLock();
             try
             {
+                // Merge columns before applying the update, because a reader may otherwise miss a column.
+                columns = columns.mergeTo(update.columns());
+                Throwable updateFailure = null;
                 try
                 {
                     indexer.start();
@@ -530,19 +541,29 @@ public abstract class AbstractTrieMemtable extends AbstractShardedMemtable
                     finally
                     {
                         allocator.offHeap().adjust(data.usedSizeOffHeap() - offHeap, opGroup);
-                        allocator.onHeap().adjust((data.usedSizeOnHeap() - onHeap) + updater.heapSize, opGroup);
-                        partitionCount += getUpdaterPartitionsAdded(updater);
+                        allocator.onHeap().adjust(data.usedSizeOnHeap() - onHeap, opGroup);
                     }
-                }
-                finally
-                {
-                    indexer.commit();
+                    // A failed update leaves the trie unchanged, so the update's effects must not be applied.
+                    allocator.onHeap().adjust(updater.heapSize, opGroup);
+                    partitionCount += getUpdaterPartitionsAdded(updater);
                     updateMinTimestamp(update.stats().minTimestamp);
                     updateLiveDataSize(updater.dataSize);
                     updateCurrentOperations(update.operationCount());
-
-                    columns = columns.mergeTo(update.columns());
                     stats = stats.mergeWith(update.stats());
+                }
+                catch (Throwable t)
+                {
+                    updateFailure = t;
+                    throw t;
+                }
+                finally
+                {
+                    // A failed update leaves the trie without any of its rows and deletions, so the indexes must
+                    // not see it either.
+                    if (updateFailure == null)
+                        indexer.commit();
+                    else
+                        abortIndexTransaction(indexer, updateFailure);
                 }
             }
             finally

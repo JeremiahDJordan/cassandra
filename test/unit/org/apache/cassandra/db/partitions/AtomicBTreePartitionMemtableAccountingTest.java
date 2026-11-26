@@ -323,7 +323,7 @@ public class AtomicBTreePartitionMemtableAccountingTest
 
                 OpOrder.Group writeOp = opOrder.getCurrent();
                 Cloner cloner = allocator.cloner(writeOp);
-                partition.addAll(update, cloner, writeOp, indexer);
+                partition.addAll(update, cloner, writeOp, indexer, applied -> {});
                 opOrder.newBarrier().issue();
 
                 assertThat(allocator.onHeap().owns()).isGreaterThanOrEqualTo(0L);
@@ -339,6 +339,7 @@ public class AtomicBTreePartitionMemtableAccountingTest
                 opOrder.newBarrier().issue();
                 OpOrder.Group writeOp = opOrder.getCurrent();
                 Cloner cloner = recreatedAllocator.cloner(writeOp);
+                // the deprecated four-argument form accounts for the update in the allocator as well
                 recreated.addAll(update, cloner, writeOp, indexer);
             }
 

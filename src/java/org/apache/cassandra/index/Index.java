@@ -781,9 +781,28 @@ public interface Index
      * order. This can also include duplicate calls, in cases where a memtable partition is under contention from
      * several updates. In that scenario, the same set of events may be delivered to the Indexer as memtable update
      * which failed due to contention is re-applied.
+     * </p>
+     * On a memtable that applies updates atomically (see {@link Memtable#appliesUpdatesAtomically()}), the events of an
+     * update are delivered together when its transaction commits, after the update is visible and before the next write
+     * to the partition, and not at all if the memtable fails to apply it. On other memtables they are delivered while
+     * the memtable merges the update, unless the Indexer {@linkplain #requiresAtomicUpdates requires atomic updates}
+     * and the memtable can provide them.
      */
     interface Indexer
     {
+        /**
+         * Whether this Indexer must only be told about the updates the memtable applied, once each, in the order it
+         * applied them to the partition: an index that keeps per-row state in memory needs it, as the events of a merge
+         * attempt that loses a CAS race describe a change the memtable never made. Memtables that {@linkplain
+         * Memtable#appliesUpdatesAtomicallyOnRequest apply updates atomically on request} then serialize the writes to
+         * the partition that have such an Indexer. An Indexer that delegates must return true if any of its delegates
+         * does. The default is false.
+         */
+        default boolean requiresAtomicUpdates()
+        {
+            return false;
+        }
+
         /**
          * Notification of the start of a partition update.
          * This event always occurs before any other during the update.

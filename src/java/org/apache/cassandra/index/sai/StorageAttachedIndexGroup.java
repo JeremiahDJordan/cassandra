@@ -53,6 +53,7 @@ import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexerFailures;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
@@ -221,8 +222,21 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                                 .filter(Objects::nonNull)
                                 .collect(Collectors.toSet());
 
+        // Only a memtable that applies updates atomically, always or on request (which this indexer makes, see
+        // requiresAtomicUpdates), delivers events for an update it has already applied. On any other memtable an
+        // indexer failure fails the update before it is applied, so stop at the first one.
+        final boolean deliverToAll = memtable != null && (memtable.appliesUpdatesAtomically() || memtable.appliesUpdatesAtomicallyOnRequest());
+
         return indexers.isEmpty() ? null : new StorageAttachedIndex.IndexerAdapter()
         {
+            // The memtable indexes must see each applied update once, in memtable order: they remove the old values of
+            // a row on update, count the occurrences of a value and keep BM25 document lengths.
+            @Override
+            public boolean requiresAtomicUpdates()
+            {
+                return true;
+            }
+
             @Override
             public void insertRow(Row row)
             {
@@ -253,9 +267,32 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 forEach(indexer -> indexer.rangeTombstone(tombstone));
             }
 
+            // On a memtable that applies updates atomically, delivers the event to every SAI index, then throws the
+            // first failure; otherwise stops at the first failure, which fails the update before it is applied.
             private void forEach(Consumer<Index.Indexer> action)
             {
-                indexers.forEach(action::accept);
+                if (!deliverToAll)
+                {
+                    indexers.forEach(action::accept);
+                    return;
+                }
+
+                IndexerFailures failures = null;
+                for (Index.Indexer indexer : indexers)
+                {
+                    try
+                    {
+                        action.accept(indexer);
+                    }
+                    catch (Throwable t)
+                    {
+                        if (failures == null)
+                            failures = new IndexerFailures(baseCfs);
+                        failures.add(t);
+                    }
+                }
+                if (failures != null)
+                    failures.maybeFail();
             }
         };
     }
