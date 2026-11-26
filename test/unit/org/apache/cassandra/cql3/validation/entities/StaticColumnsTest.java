@@ -301,4 +301,83 @@ public class StaticColumnsTest extends CQLTester
 
         assertRows(execute("SELECT * FROM %s"), row("k1", "c1", null, "v1"));
     }
+
+    /**
+     * Filtering on a static collection ignores its deleted and expired elements and entries; the same filtering on
+     * regular columns (table rt, one row per partition) is the reference.
+     */
+    @Test
+    public void testFilteringStaticCollectionsWithDeletedCells() throws Throwable
+    {
+        String columns = "s text%1$s, sl list<text>%1$s, ss set<text>%1$s, sm map<text, text>%1$s";
+        String st = createTable("CREATE TABLE %s (pk int, ck int, v int, " + String.format(columns, " static") + ", PRIMARY KEY (pk, ck))");
+        String rt = createTable("CREATE TABLE %s (pk int, ck int, v int, " + String.format(columns, "") + ", PRIMARY KEY (pk, ck))");
+        for (int pk = 0; pk < 10; pk++)
+        {
+            execute(String.format("INSERT INTO %s.%s (pk, ck, v) VALUES (?, 0, 1)", KEYSPACE, st), pk);
+            execute(String.format("INSERT INTO %s.%s (pk, ck, v) VALUES (?, 0, 1)", KEYSPACE, rt), pk);
+        }
+        String[][] writes = { { "1", "UPDATE %s SET sl = ['a', 'b'], ss = {'a', 'b'} %s" },
+                              { "1", "UPDATE %s SET sl = sl - ['a'], ss = ss - {'a'} %s" }, // deleted elements
+                              { "2", "UPDATE %s SET sl = ['a'], ss = {'a'} %s" },
+                              { "2", "DELETE sl[0] FROM %s %s" }, // deleted element by index
+                              { "3", "UPDATE %s SET sm = {'k': 'v', 'o': 'x'} %s" },
+                              { "3", "DELETE sm['k'] FROM %s %s" }, // deleted entry
+                              { "4", "UPDATE %s SET sl = ['a'], ss = {'a'}, sm = {'o': 'x'} %s" },
+                              { "4", "UPDATE %s USING TTL 1 SET sl = sl + ['x'], ss = ss + {'x'}, sm['k'] = 'v' %s" }, // expired
+                              { "5", "UPDATE %s SET sl = ['a'], ss = {'a'}, sm = {'k': 'v'} %s" },
+                              { "5", "DELETE sl, ss, sm FROM %s %s" }, // deleted collections
+                              { "6", "UPDATE %s SET s = 'a', sl = [''], ss = {''}, sm = {'k': ''} %s" }, // live empty values
+                              { "7", "UPDATE %s SET s = 'a', sl = ['a', 'b'], ss = {'b'}, sm = {'k': 'v'} %s" },
+                              { "8", "UPDATE %s SET s = 'a' %s" },
+                              { "8", "DELETE s FROM %s %s" } }; // deleted simple cell
+        for (String[] write : writes)
+        {
+            execute(String.format(write[1], KEYSPACE + '.' + st, "WHERE pk = " + write[0]));
+            execute(String.format(write[1], KEYSPACE + '.' + rt, "WHERE pk = " + write[0] + " AND ck = 0"));
+        }
+        Thread.sleep(2000); // let the TTLs expire
+
+        String[] restrictions = { "sl CONTAINS ''", "sl CONTAINS 'a'", "sl CONTAINS 'x'", "sl NOT CONTAINS ''", "sl NOT CONTAINS 'b'",
+                                  "ss CONTAINS ''", "ss CONTAINS 'a'", "ss CONTAINS 'x'", "ss NOT CONTAINS ''", "ss NOT CONTAINS 'x'",
+                                  "sm CONTAINS KEY 'k'", "sm CONTAINS KEY 'o'", "sm NOT CONTAINS KEY 'k'",
+                                  "sm CONTAINS ''", "sm CONTAINS 'v'", "sm NOT CONTAINS ''",
+                                  "sm['k'] = ''", "sm['k'] = 'v'", "sm['k'] != ''", "sm['k'] != 'v'", "sm['k'] < 'w'",
+                                  "s = ''", "s = 'a'", "s != 'a'",
+                                  "sl CONTAINS '' AND sm CONTAINS KEY 'k'",
+                                  "sl NOT CONTAINS '' AND sm NOT CONTAINS KEY 'k'",
+                                  // static and regular restrictions together
+                                  "sl CONTAINS '' AND v = 1", "sl NOT CONTAINS '' AND v = 1", "sm CONTAINS KEY 'k' AND v = 1" };
+        for (int phase = 0; phase < 3; phase++)
+        {
+            if (phase == 1)
+            {
+                flush(KEYSPACE, st);
+                flush(KEYSPACE, rt);
+            }
+            else if (phase == 2)
+            {
+                compact(KEYSPACE, st);
+                compact(KEYSPACE, rt);
+            }
+
+            for (String restriction : restrictions)
+            {
+                String query = "SELECT pk FROM %s.%s WHERE " + restriction + " ALLOW FILTERING";
+                assertRowsIgnoringOrder(execute(String.format(query, KEYSPACE, st)),
+                                        getRows(execute(String.format(query, KEYSPACE, rt))));
+            }
+
+            // the deleted and expired elements and entries don't count
+            assertRowsIgnoringOrder(execute(String.format("SELECT pk FROM %s.%s WHERE sl CONTAINS '' ALLOW FILTERING", KEYSPACE, st)),
+                                    row(6));
+            assertRowsIgnoringOrder(execute(String.format("SELECT pk FROM %s.%s WHERE sl NOT CONTAINS '' ALLOW FILTERING", KEYSPACE, st)),
+                                    row(0), row(1), row(2), row(3), row(4), row(5), row(7), row(8), row(9));
+            assertEmpty(execute(String.format("SELECT pk FROM %s.%s WHERE ss CONTAINS 'x' ALLOW FILTERING", KEYSPACE, st)));
+            assertRowsIgnoringOrder(execute(String.format("SELECT pk FROM %s.%s WHERE sm CONTAINS KEY 'k' ALLOW FILTERING", KEYSPACE, st)),
+                                    row(6), row(7));
+            assertRowsIgnoringOrder(execute(String.format("SELECT pk FROM %s.%s WHERE sm['k'] = '' ALLOW FILTERING", KEYSPACE, st)),
+                                    row(6));
+        }
+    }
 }
