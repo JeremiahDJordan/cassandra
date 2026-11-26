@@ -34,6 +34,7 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.dht.IPartitioner;
@@ -49,6 +50,7 @@ import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
@@ -132,10 +134,14 @@ public class TokenAllocationTest
         testAllocateTokensNetworkStrategy(1, 3);
     }
 
-    @Test(expected = ConfigurationException.class)
+    @Test
     public void testAllocateTokensNetworkStrategyTwoRacks() throws UnknownHostException
     {
-        testAllocateTokensNetworkStrategy(2, 3);
+        assertThatThrownBy(() -> testAllocateTokensNetworkStrategy(2, 3))
+        .isInstanceOf(ConfigurationException.class)
+        .hasMessageContaining("the number of racks 2 in datacenter 1 is lower than its replication factor 3")
+        .hasMessageContaining(CassandraRelevantProperties.USE_RANDOM_ALLOCATION_IF_NOT_SUPPORTED.getKey())
+        .hasCauseInstanceOf(ConfigurationException.class);
     }
 
     @Test
