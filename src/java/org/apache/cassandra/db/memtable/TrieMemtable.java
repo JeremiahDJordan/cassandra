@@ -49,7 +49,9 @@ import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.partitions.TrieBackedPartition;
 import org.apache.cassandra.db.partitions.TriePartitionUpdate;
 import org.apache.cassandra.db.partitions.TriePartitionUpdater;
+import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
+import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.tries.Direction;
 import org.apache.cassandra.db.tries.InMemoryTrie;
@@ -310,8 +312,22 @@ public class TrieMemtable extends AbstractAllocatorMemtable
     public long getEstimatedAverageRowSize()
     {
         if (estimatedAverageRowSize == null || currentOperations.get() > estimatedAverageRowSize.operations * 1.5)
-            estimatedAverageRowSize = new MemtableAverageRowSize(this);
+            estimatedAverageRowSize = new MemtableAverageRowSize(this, TrieMemtable::rowDataSizeForEstimate);
         return estimatedAverageRowSize.rowSize;
+    }
+
+    /**
+     * The size of a row measured the way {@link TriePartitionUpdater} adds to {@link #getLiveDataSize}: the primary key
+     * liveness, the row deletion time and the cells. Rows are read back as {@code BTreeRow}s, whose {@link Row#dataSize}
+     * also counts the clustering, which is part of the trie, and the shadowable flag of the row deletion, and would
+     * make {@link Memtable#estimateRowCount} underestimate.
+     */
+    private static long rowDataSizeForEstimate(Row row)
+    {
+        long size = row.primaryKeyLivenessInfo().dataSize() + row.deletion().time().dataSize();
+        for (ColumnData cd : row)
+            size += cd.dataSize();
+        return size;
     }
 
     /**

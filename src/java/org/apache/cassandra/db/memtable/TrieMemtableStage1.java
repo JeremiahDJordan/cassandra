@@ -313,7 +313,7 @@ public class TrieMemtableStage1 extends AbstractAllocatorMemtable
     public long getEstimatedAverageRowSize()
     {
         if (estimatedAverageRowSize == null || currentOperations.get() > estimatedAverageRowSize.operations * 1.5)
-            estimatedAverageRowSize = new MemtableAverageRowSize(this);
+            estimatedAverageRowSize = new MemtableAverageRowSize(this, Row::dataSize);
         return estimatedAverageRowSize.rowSize;
     }
 
