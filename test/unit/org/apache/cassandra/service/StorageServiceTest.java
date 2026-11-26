@@ -44,6 +44,7 @@ import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.EndpointState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.HeartBeatState;
+import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.locator.EndpointsByRange;
 import org.apache.cassandra.locator.EndpointsByReplica;
@@ -518,6 +519,37 @@ public class StorageServiceTest
         {
             sawUpCall = false;
         }
+    }
+
+    @Test
+    public void testOnJoinNotifiesNetVersionBeforeSchema() throws UnknownHostException
+    {
+        StorageService ss = StorageService.instance;
+        InetAddressAndPort node = InetAddressAndPort.getByName("127.0.0.202");
+        EndpointState epState = new EndpointState(HeartBeatState.empty());
+        epState.addApplicationState(ApplicationState.SCHEMA, ss.valueFactory.schema(UUID.randomUUID()));
+        epState.addApplicationState(ApplicationState.NET_VERSION, ss.valueFactory.networkVersion());
+
+        List<ApplicationState> notified = new ArrayList<>();
+        IEndpointStateChangeSubscriber subscriber = new IEndpointStateChangeSubscriber()
+        {
+            @Override
+            public void onChange(InetAddressAndPort endpoint, ApplicationState state, VersionedValue value)
+            {
+                if (endpoint.equals(node) && (state == ApplicationState.NET_VERSION || state == ApplicationState.SCHEMA))
+                    notified.add(state);
+            }
+        };
+        Gossiper.instance.register(subscriber);
+        try
+        {
+            ss.onJoin(node, epState);
+        }
+        finally
+        {
+            Gossiper.instance.unregister(subscriber);
+        }
+        assertEquals(Arrays.asList(ApplicationState.NET_VERSION, ApplicationState.SCHEMA), notified);
     }
 
     @Test
