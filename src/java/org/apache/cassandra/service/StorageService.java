@@ -3809,9 +3809,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         if (statusValue != null)
             Gossiper.instance.doOnChangeNotifications(endpoint, statusState, statusValue);
 
+        // NET_VERSION next, so the endpoint's messaging version is known when its SCHEMA is handled and the schema
+        // can be pulled from it
+        VersionedValue netVersion = epState.getApplicationState(ApplicationState.NET_VERSION);
+        if (netVersion != null)
+            Gossiper.instance.doOnChangeNotifications(endpoint, ApplicationState.NET_VERSION, netVersion);
+
         for (Map.Entry<ApplicationState, VersionedValue> entry : epState.states())
         {
-            if (entry.getKey() == ApplicationState.STATUS_WITH_PORT || entry.getKey() == ApplicationState.STATUS)
+            if (entry.getKey() == ApplicationState.STATUS_WITH_PORT || entry.getKey() == ApplicationState.STATUS
+                || entry.getKey() == ApplicationState.NET_VERSION)
                 continue;
             Gossiper.instance.doOnChangeNotifications(endpoint, entry.getKey(), entry.getValue());
         }
