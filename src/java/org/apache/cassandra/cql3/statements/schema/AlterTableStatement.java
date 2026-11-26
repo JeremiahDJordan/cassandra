@@ -388,6 +388,15 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
                           table);
             }
 
+            // sstables can still have data of the dropped column, which is read using the name of the column
+            if (null != table.getDroppedColumn(newName.bytes))
+            {
+                throw ire("Cannot rename column %s to %s in table '%s'; a dropped column with that name exists",
+                          oldName,
+                          newName,
+                          table);
+            }
+
             // TODO: some day try and find a way to not rely on Keyspace/IndexManager/Index to find dependent indexes
             Set<IndexMetadata> dependentIndexes = Keyspace.openAndGetStore(table).indexManager.getDependentIndexes(column);
             if (!dependentIndexes.isEmpty())

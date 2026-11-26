@@ -29,7 +29,6 @@ import java.util.Objects;
 import java.util.stream.Collectors;
 
 import com.google.common.collect.ImmutableList;
-import com.google.common.collect.Iterables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -328,12 +327,14 @@ public class SerializationHeader
         private static AbstractType<?> validateType(String description,
                                                     TableMetadata table,
                                                     ByteBuffer columnName,
+                                                    boolean isPrimaryKeyColumn,
                                                     AbstractType<?> type,
                                                     boolean allowImplicitlyFrozenTuples,
                                                     boolean isForOfflineTool)
         {
-            boolean dropped = table.getDroppedColumn(columnName) != null;
-            boolean isPrimaryKeyColumn = Iterables.any(table.primaryKeyColumns(), cd -> cd.name.bytes.equals(columnName));
+            // A regular or static column of the sstable can have the name of a primary key column, renamed to the name
+            // of a dropped column by an earlier version. Its data is the dropped column's.
+            boolean dropped = !isPrimaryKeyColumn && table.getDroppedColumn(columnName) != null;
 
             try
             {
@@ -424,7 +425,7 @@ public class SerializationHeader
             int pkCount = pkColumns.size();
 
             if (pkCount == 1)
-                return validateType(descriptor, table, pkColumns.get(0).name.bytes, fullType, allowImplicitlyFrozenTuples, isForOfflineTool);
+                return validateType(descriptor, table, pkColumns.get(0).name.bytes, true, fullType, allowImplicitlyFrozenTuples, isForOfflineTool);
 
             List<AbstractType<?>> subTypes = fullType.subTypes();
             assert fullType instanceof CompositeType && subTypes.size() == pkCount
@@ -448,6 +449,7 @@ public class SerializationHeader
                 updated.add(validateType(descriptor,
                                          table,
                                          columns.get(i).name.bytes,
+                                         true,
                                          types.get(i),
                                          allowImplicitlyFrozenTuples,
                                          isForOfflineTool));
@@ -471,13 +473,13 @@ public class SerializationHeader
                 for (Map.Entry<ByteBuffer, AbstractType<?>> e : map.entrySet())
                 {
                     ByteBuffer name = e.getKey();
-                    AbstractType<?> type = validateType(descriptor, metadata, name, e.getValue(), sstableVersion.hasImplicitlyFrozenTuples(), isForOfflineTool);
+                    AbstractType<?> type = validateType(descriptor, metadata, name, false, e.getValue(), sstableVersion.hasImplicitlyFrozenTuples(), isForOfflineTool);
                     AbstractType<?> other = typeMap.put(name, type);
                     if (other != null && !other.equals(type))
                         throw new IllegalStateException("Column " + name + " occurs as both regular and static with types " + other + "and " + e.getValue());
 
                     ColumnMetadata column = metadata.getColumn(name);
-                    if (column == null || column.isStatic() != isStatic)
+                    if (column == null || column.isPrimaryKeyColumn() || column.isStatic() != isStatic)
                     {
                         // TODO: this imply we don't read data for a column we don't yet know about, which imply this is theoretically
                         // racy with column addition. Currently, it is up to the user to not write data before the schema has propagated
