@@ -60,6 +60,11 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - Filtering with IN and NOT IN now compares the values with the column type, as = does. A 4-byte IPv4 address and
+      its 16-byte IPv4-mapped IPv6 form (::ffff:a.b.c.d) used to match each other, and decimals that differ only in
+      their scale, like 1.0 and 1.00, used not to. Until every node runs this release, the replicas of an earlier
+      release, and the coordinators of an earlier release that filter the rows they get from the replicas, still filter
+      IN as before.
 
 Deprecation
 ---------

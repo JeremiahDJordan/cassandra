@@ -25,6 +25,7 @@ import java.util.Iterator;
 import java.util.List;
 
 import org.apache.cassandra.db.marshal.*;
+import org.apache.cassandra.serializers.ListSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 public enum Operator
@@ -115,8 +116,8 @@ public enum Operator
 
         public boolean isSatisfiedBy(AbstractType<?> type, ByteBuffer leftOperand, ByteBuffer rightOperand)
         {
-            List<?> inValues = ListType.getInstance(type, false).getSerializer().deserialize(rightOperand);
-            return inValues.contains(type.getSerializer().deserialize(leftOperand));
+            ListSerializer<?> serializer = ListType.getInstance(type, false).getSerializer();
+            return serializer.anyMatch(rightOperand, r -> type.compareForCQL(leftOperand, r) == 0);
         }
     },
     CONTAINS(5)
