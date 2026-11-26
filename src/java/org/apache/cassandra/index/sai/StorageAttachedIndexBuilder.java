@@ -345,7 +345,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 // the group is notified of it, as one added after this check is.
                 View view = index.getIndexContext().getView();
                 missing.removeIf(sstable -> sstable.isMarkedCompacted() || view.containsSSTableIndex(sstable.descriptor));
-                if (missing.isEmpty())
+                // a drop empties the view once the index is out of the group
+                if (missing.isEmpty() || !group.containsIndex(index))
                     continue;
                 throw new IllegalStateException(index.getIndexContext().logMessage(
                     String.format("The full rebuild of the index is over, but %d live SSTable(s) aren't in its view, so it " +
@@ -1534,7 +1535,21 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             // Whatever the descriptor: an index we built must now have the SSTable in its view, or the build failed
             for (StorageAttachedIndex index : existing)
             {
-                if (!sstable.isMarkedCompacted() && !index.getIndexContext().getView().containsSSTableIndex(sstable.descriptor))
+                // the view before the group: a drop empties the view once the index is out of the group
+                boolean inView = index.getIndexContext().getView().containsSSTableIndex(sstable.descriptor);
+                // dropped meanwhile: we drop what we built for it, as above, unless its view has it (the drop cleans
+                // that up)
+                if (!group.containsIndex(index))
+                {
+                    if (incomplete.remove(index))
+                    {
+                        IndexComponents.ForWrite built = indexDescriptor.perIndexComponents(index.getIndexContext()).forWrite();
+                        sstable.unregisterComponents(built.allAsCustomComponents(), componentsTracker);
+                        built.forceDeleteAllComponents();
+                    }
+                    continue;
+                }
+                if (!inView && !sstable.isMarkedCompacted())
                 {
                     logger.warn(index.getIndexContext().logMessage("The index was built on {}, but the SSTable isn't in its view " +
                                                                    "after the build (e.g. it was loaded again while it was being built)"),
