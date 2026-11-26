@@ -125,6 +125,11 @@ Upgrading
       stream or the import, which don't add the SSTables, without making the index non-queryable on the node. Once
       the SSTables are added, an index still missing some of them is built on them by its initial build if that is
       running, and is made non-queryable otherwise, until nodetool rebuild_index or a restart.
+    - Creating a storage-attached index (CREATE INDEX) now also stops a running major compaction of the table, on
+      every node, as it already did for other compactions: nodetool compact fails with a
+      CompactionInterruptedException, and its work is discarded. The initial build of the index waits for the
+      compaction to stop; if it can't stop within 2 minutes, the build fails on that node, and the index needs
+      nodetool rebuild_index there.
 
 5.0.7
 ======
