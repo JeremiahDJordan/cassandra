@@ -24,15 +24,16 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
-import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
+import java.util.TreeSet;
 import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.atomic.LongAdder;
 import java.util.function.ToIntFunction;
 import javax.annotation.Nullable;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.Runnables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -92,7 +93,9 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     private PrimaryKey minimumKey;
     private PrimaryKey maximumKey;
 
-    private final NavigableSet<PrimaryKey> primaryKeys = new ConcurrentSkipListSet<>();
+    // With a vector in a partition key column the static row and the rows of a partition are all indexed: keep their
+    // keys apart (a static key compares equal to the row keys of its partition)
+    private final NavigableSet<PrimaryKey> primaryKeys = new ConcurrentSkipListSet<>(PrimaryKey.STATIC_BEFORE_ROWS);
 
     public VectorMemtableIndex(IndexContext indexContext, Memtable mt)
     {
@@ -105,6 +108,12 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
     public Memtable getMemtable()
     {
         return memtable;
+    }
+
+    @VisibleForTesting
+    public CassandraOnHeapGraph<PrimaryKey> getGraph()
+    {
+        return graph;
     }
 
     @Override
@@ -304,7 +313,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
 
         assert orderer.isANN() : "Only ANN is supported for vector search, received " + orderer;
         // Compute the keys that exist in the current memtable and their corresponding graph ordinals
-        var keysInGraph = new HashSet<PrimaryKey>();
+        var keysInGraph = new TreeSet<PrimaryKey>(PrimaryKey.STATIC_BEFORE_ROWS);
         var relevantOrdinals = new IntHashSet();
 
         var keysInRange = PrimaryKeyListUtil.getKeysInRange(keys, minimumKey, maximumKey);
