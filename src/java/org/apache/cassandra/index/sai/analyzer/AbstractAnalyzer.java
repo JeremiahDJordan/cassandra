@@ -44,6 +44,7 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.utils.Pair;
 import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.util.UnicodeUtil;
 
 public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
 {
@@ -120,6 +121,24 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
             return false;
         }
 
+        /**
+         * @return an upper bound on the total size in bytes of the terms of a value of the given size, so also on the
+         * size of each of them, or -1 if this analyzer has no known bound
+         */
+        default long maxTermsSize(int valueSize)
+        {
+            return -1;
+        }
+
+        /**
+         * @return an upper bound on the size in bytes of each term of a value of the given size, at most
+         * {@link #maxTermsSize(int)}, or -1 if this analyzer has no known bound
+         */
+        default long maxTermSize(int valueSize)
+        {
+            return maxTermsSize(valueSize);
+        }
+
         @Override
         default void close()
         {
@@ -145,6 +164,7 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
             Pair<Analyzer, LuceneCustomAnalyzerConfig> analyzerAndConfig = JSONAnalyzerParser.parse(json);
             final Analyzer analyzer = analyzerAndConfig.left;
             final boolean isNGram = analyzerAndConfig.right != null && analyzerAndConfig.right.isNGram();
+            final int maxTokenLength = LuceneAnalyzer.maxTokenLength(analyzer);
 
             return new AnalyzerFactory()
             {
@@ -170,6 +190,19 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
                 public boolean supportsEquals()
                 {
                     return AnalyzerEqOperatorSupport.supportsEqualsFromOptions(options);
+                }
+
+                // the tokens have at most as many chars as their bytes in the value, of at most 3 bytes each
+                @Override
+                public long maxTermsSize(int valueSize)
+                {
+                    return maxTokenLength < 0 ? -1 : (long) UnicodeUtil.MAX_UTF8_BYTES_PER_CHAR * valueSize;
+                }
+
+                @Override
+                public long maxTermSize(int valueSize)
+                {
+                    return maxTokenLength < 0 ? -1 : (long) UnicodeUtil.MAX_UTF8_BYTES_PER_CHAR * Math.min(valueSize, maxTokenLength);
                 }
             };
         }
@@ -223,6 +256,7 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
                 NonTokenizingAnalyzer a = new NonTokenizingAnalyzer(type, options);
                 a.end();
                 Map<String, String> finalOptions = options;
+                int maxExpansion = a.maxExpansion();
 
                 return new AnalyzerFactory()
                 {
@@ -236,6 +270,12 @@ public abstract class AbstractAnalyzer implements Iterator<ByteBuffer>
                     public boolean supportsEquals()
                     {
                         return supportsEquals;
+                    }
+
+                    @Override
+                    public long maxTermsSize(int valueSize)
+                    {
+                        return (long) maxExpansion * valueSize;
                     }
                 };
             }

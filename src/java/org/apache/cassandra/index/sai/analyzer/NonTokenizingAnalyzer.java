@@ -113,6 +113,23 @@ public class NonTokenizingAnalyzer extends AbstractAnalyzer
         return !options.isCaseSensitive() || options.isNormalized() || options.isAscii();
     }
 
+    /**
+     * The most times larger in bytes than the value its term can be: lower-casing makes a char at most 3 times larger
+     * in any locale (a Lithuanian I before an accent becomes i and a combining dot), NFC normalization a string at most
+     * 3 times (see UAX #15), and ASCII folding a char of 2 bytes or more at most 4 ASCII chars.
+     */
+    int maxExpansion()
+    {
+        int expansion = 1;
+        if (!options.isCaseSensitive())
+            expansion *= 3;
+        if (options.isNormalized())
+            expansion *= 3;
+        if (options.isAscii())
+            expansion *= 2;
+        return expansion;
+    }
+
     @Override
     protected void resetInternal(ByteBuffer input)
     {

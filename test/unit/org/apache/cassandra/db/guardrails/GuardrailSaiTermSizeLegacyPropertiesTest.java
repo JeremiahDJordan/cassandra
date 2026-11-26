@@ -344,6 +344,55 @@ public class GuardrailSaiTermSizeLegacyPropertiesTest extends ValueThresholdTest
     }
 
     /**
+     * The coordinator warns about an analyzed value whose short terms add up to the max analyzed size also when the
+     * value loses to the one at the replica, which doesn't warn then.
+     */
+    @Test
+    public void testLosingAnalyzedValueOverMaxAnalyzedSize() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = {'index_analyzer': 'standard'}");
+        execute("INSERT INTO %s (k, v) VALUES (0, 'w0') USING TIMESTAMP 2");
+
+        String query = "INSERT INTO %s (k, v) VALUES (0, ?) USING TIMESTAMP 1";
+        assertValid(query, ByteBufferUtil.bytes(words(IndexContext.MAX_ANALYZED_SIZE / 4)));
+        assertWarnsNotIndexed(IndexContext.ANALYZED_VALUE_NOT_INDEXED_WARNING, index,
+                              () -> execute(query, ByteBufferUtil.bytes(words(IndexContext.MAX_ANALYZED_SIZE + 4000))));
+    }
+
+    /**
+     * Analyzers whose terms are at most 3 times as large as the value: a value under the thresholds by that bound is
+     * accepted silently, and larger values get the warnings and rejections of their terms.
+     */
+    @Test
+    public void testAnalyzedTermsBoundedByValueSize() throws Throwable
+    {
+        String standardTokenizer = "{'index_analyzer': '{\"tokenizer\": {\"name\": \"standard\", " +
+                                   "\"args\": {\"maxTokenLength\": \"2000\"}}, \"filters\": [{\"name\": \"lowercase\"}]}'}";
+        for (String options : new String[]{ standardTokenizer, "{'case_sensitive': 'false'}" })
+        {
+            createTable("CREATE TABLE %s (k int PRIMARY KEY, v text)");
+            createIndex("CREATE CUSTOM INDEX ON %s (v) USING 'StorageAttachedIndex' WITH OPTIONS = " + options);
+
+            // a word of U+023A (2 bytes each) is a term of U+2C65 (3 bytes each)
+            String query = "INSERT INTO %s (k, v) VALUES (0, ?)";
+            assertValid(query, word('\u023A', WARN_THRESHOLD / 6));
+            assertValid(query, word('\u023A', WARN_THRESHOLD / 3));
+            int warned = 3 * (WARN_THRESHOLD / 3 + 1);
+            assertWarns(() -> execute(query, word('\u023A', WARN_THRESHOLD / 3 + 1)),
+                        String.format("Value of column 'v' has size %s, this exceeds the warning threshold of %s.", warned, WARN_THRESHOLD));
+            int failed = 3 * (FAIL_THRESHOLD / 3 + 1);
+            assertFails(() -> execute(query, word('\u023A', FAIL_THRESHOLD / 3 + 1)),
+                        String.format("Value of column 'v' has size %s, this exceeds the failure threshold of %s.", failed, FAIL_THRESHOLD));
+        }
+    }
+
+    private static ByteBuffer word(char letter, int length)
+    {
+        return ByteBufferUtil.bytes(String.valueOf(letter).repeat(length));
+    }
+
+    /**
      * An analyzed value under the term size warning threshold whose terms add up to the max analyzed size isn't indexed,
      * and the replica warns, for an internal write.
      */

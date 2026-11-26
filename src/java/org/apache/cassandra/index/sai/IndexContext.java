@@ -605,10 +605,24 @@ public class IndexContext
         // TypeUtil#asIndexBytes), whatever the size of the value, so only the guardrail applies to them.
         long maxTermSize = maxTermSize();
         boolean hasMaxTermSize = (isLiteral() || isVector()) && (state == null || state.isOrdinaryUser());
-        boolean overMaxTermSize = hasMaxTermSize && !fitsMaxTermSize(cellBuffer, maxTermSize);
-        // an analyzer can make a term larger than the value, so its terms are checked whatever the size of the value
-        if (!isAnalyzed && !overMaxTermSize && !termSizeGuardrail.triggersOn(cellBuffer.remaining(), state))
-            return;
+        if (isAnalyzed)
+        {
+            // An analyzer can make a term larger than the value, so its terms are checked unless it bounds them by the
+            // size of the value under every limit below. Analyzers with a bound only take text, whose on-disk size is
+            // its size.
+            long maxTermsBound = analyzerFactory.maxTermsSize(cellBuffer.remaining());
+            long maxTermBound = analyzerFactory.maxTermSize(cellBuffer.remaining());
+            if (maxTermsBound >= 0 && maxTermsBound < MAX_ANALYZED_SIZE
+                && (!hasMaxTermSize || maxTermBound <= maxTermSize)
+                && !termSizeGuardrail.triggersOn(maxTermBound, state))
+                return;
+        }
+        else
+        {
+            boolean overMaxTermSize = hasMaxTermSize && !fitsMaxTermSize(cellBuffer, maxTermSize);
+            if (!overMaxTermSize && !termSizeGuardrail.triggersOn(cellBuffer.remaining(), state))
+                return;
+        }
 
         AbstractAnalyzer analyzer = getAnalyzerFactory().create();
         analyzer.reset(cellBuffer.duplicate());

@@ -30,7 +30,14 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.index.sai.disk.io.BytesRefUtil;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.lucene.analysis.Analyzer;
+import org.apache.lucene.analysis.TokenFilterFactory;
 import org.apache.lucene.analysis.TokenStream;
+import org.apache.lucene.analysis.core.LowerCaseFilterFactory;
+import org.apache.lucene.analysis.core.StopFilterFactory;
+import org.apache.lucene.analysis.custom.CustomAnalyzer;
+import org.apache.lucene.analysis.standard.StandardAnalyzer;
+import org.apache.lucene.analysis.standard.StandardTokenizer;
+import org.apache.lucene.analysis.standard.StandardTokenizerFactory;
 import org.apache.lucene.analysis.tokenattributes.TermToBytesRefAttribute;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.BytesRefBuilder;
@@ -146,6 +153,33 @@ public class LuceneAnalyzer extends AbstractAnalyzer
         {
             throw Throwables.cleaned(ex);
         }
+    }
+
+    /**
+     * The maximum length in chars of the tokens of the given analyzer if they are disjoint parts of the value, whose
+     * case changing keeps their length: a standard tokenizer followed by lower-case and stop filters only, as in the
+     * built-in standard analyzer. -1 for any other analyzer.
+     */
+    static int maxTokenLength(Analyzer analyzer)
+    {
+        if (analyzer.getClass() == StandardAnalyzer.class)
+            return ((StandardAnalyzer) analyzer).getMaxTokenLength();
+
+        if (!(analyzer instanceof CustomAnalyzer))
+            return -1;
+
+        CustomAnalyzer customAnalyzer = (CustomAnalyzer) analyzer;
+        if (!customAnalyzer.getCharFilterFactories().isEmpty()
+            || customAnalyzer.getTokenizerFactory().getClass() != StandardTokenizerFactory.class)
+            return -1;
+
+        for (TokenFilterFactory filter : customAnalyzer.getTokenFilterFactories())
+        {
+            if (filter.getClass() != LowerCaseFilterFactory.class && filter.getClass() != StopFilterFactory.class)
+                return -1;
+        }
+
+        return ((StandardTokenizer) customAnalyzer.getTokenizerFactory().create()).getMaxTokenLength();
     }
 
     @Override

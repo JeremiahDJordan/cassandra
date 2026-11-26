@@ -31,6 +31,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import com.google.common.base.Charsets;
@@ -235,6 +236,40 @@ public class LuceneAnalyzerTest
                       "{\"synonyms\": \"as => like\", \"analyzer\":\"" + ClassLoadingTestNonAssignable.class.getName() + "\"}}]}";
         assertThatThrownBy(() -> tokenize("irrelevant text", json)).isInstanceOf(RuntimeException.class);
         assertFalse(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class));
+    }
+
+    @Test
+    public void testMaxTermsSize() throws Exception
+    {
+        // a token of the standard tokenizer has at most its max length in chars, of at most 3 bytes each
+        AbstractAnalyzer.AnalyzerFactory standard = analyzerFactory("standard");
+        assertEquals(30, standard.maxTermsSize(10));
+        assertEquals(30, standard.maxTermSize(10));
+        assertEquals(3000, standard.maxTermsSize(1000));
+        assertEquals(765, standard.maxTermSize(1000));
+        String word = "\u023A".repeat(300);
+        assertEquals(Arrays.asList("\u2C65".repeat(255), "\u2C65".repeat(45)), tokenize(word, "standard"));
+
+        String json = "{\"tokenizer\":{\"name\":\"standard\", \"args\":{\"maxTokenLength\":\"10\"}}," +
+                      "\"filters\":[{\"name\":\"lowercase\"}, {\"name\":\"stop\"}]}";
+        AbstractAnalyzer.AnalyzerFactory custom = analyzerFactory(json);
+        assertEquals(3000, custom.maxTermsSize(1000));
+        assertEquals(30, custom.maxTermSize(1000));
+
+        for (String unbounded : Arrays.asList("whitespace",
+                                              "{\"tokenizer\":{\"name\":\"keyword\"}}",
+                                              "{\"tokenizer\":{\"name\":\"standard\"}, \"filters\":[{\"name\":\"porterstem\"}]}",
+                                              "{\"tokenizer\":{\"name\":\"standard\"}, \"charFilters\":[{\"name\":\"htmlstrip\"}]}"))
+        {
+            AbstractAnalyzer.AnalyzerFactory factory = analyzerFactory(unbounded);
+            assertEquals(unbounded, -1, factory.maxTermsSize(10));
+            assertEquals(unbounded, -1, factory.maxTermSize(10));
+        }
+    }
+
+    private static AbstractAnalyzer.AnalyzerFactory analyzerFactory(String json)
+    {
+        return AbstractAnalyzer.fromOptions("v", UTF8Type.instance, Map.of(LuceneAnalyzer.INDEX_ANALYZER, json));
     }
 
     public static List<String> tokenize(String testString, String json) throws Exception
