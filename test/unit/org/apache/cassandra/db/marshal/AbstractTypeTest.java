@@ -65,6 +65,7 @@ import org.apache.cassandra.cql3.AssignmentTestable;
 import org.apache.cassandra.cql3.ColumnIdentifier;
 import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.Constants;
+import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.cql3.Json;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.Term;
@@ -382,6 +383,42 @@ public class AbstractTypeTest
             assertThat(type.testAssignment(null, new ColumnSpecification(null, null, null, type))).isEqualTo(AssignmentTestable.TestResult.EXACT_MATCH);
             assertThat(type.testAssignment(type)).isEqualTo(AssignmentTestable.TestResult.EXACT_MATCH);
         });
+    }
+
+    @Test
+    public void containsSetOrMap()
+    {
+        AbstractType<?> set = SetType.getInstance(Int32Type.instance, true);
+        AbstractType<?> map = MapType.getInstance(Int32Type.instance, Int32Type.instance, true);
+        AbstractType<?> list = ListType.getInstance(Int32Type.instance, true);
+
+        assertThat(Int32Type.instance.containsSetOrMap()).isFalse();
+        assertThat(list.containsSetOrMap()).isFalse();
+        assertThat(list.freeze().containsSetOrMap()).isFalse();
+        assertThat(set.containsSetOrMap()).isTrue();
+        assertThat(set.freeze().containsSetOrMap()).isTrue();
+        assertThat(map.containsSetOrMap()).isTrue();
+        assertThat(map.freeze().containsSetOrMap()).isTrue();
+
+        assertThat(ListType.getInstance(new TupleType(List.of(Int32Type.instance, set.freeze())), true).containsSetOrMap()).isTrue();
+        assertThat(ListType.getInstance(ListType.getInstance(map.freeze(), false), true).containsSetOrMap()).isTrue();
+        assertThat(new TupleType(List.of(Int32Type.instance, list.freeze())).containsSetOrMap()).isFalse();
+        assertThat(userType(true, Int32Type.instance, map.freeze()).containsSetOrMap()).isTrue();
+        assertThat(userType(false, Int32Type.instance, map.freeze()).containsSetOrMap()).isTrue();
+        assertThat(userType(true, Int32Type.instance, list.freeze()).containsSetOrMap()).isFalse();
+        assertThat(ReversedType.getInstance(map.freeze()).containsSetOrMap()).isTrue();
+        assertThat(ReversedType.getInstance(new TupleType(List.of(set.freeze()))).containsSetOrMap()).isTrue();
+        assertThat(ReversedType.getInstance(Int32Type.instance).containsSetOrMap()).isFalse();
+        assertThat(VectorType.getInstance(Int32Type.instance, 2).containsSetOrMap()).isFalse();
+        assertThat(VectorType.getInstance(set.freeze(), 2).containsSetOrMap()).isTrue();
+    }
+
+    private static UserType userType(boolean isMultiCell, AbstractType<?>... fieldTypes)
+    {
+        List<FieldIdentifier> fieldNames = new ArrayList<>();
+        for (int i = 0; i < fieldTypes.length; i++)
+            fieldNames.add(FieldIdentifier.forUnquoted("f" + i));
+        return new UserType("ks", ByteBufferUtil.bytes("udt"), fieldNames, List.of(fieldTypes), isMultiCell);
     }
 
     @Test

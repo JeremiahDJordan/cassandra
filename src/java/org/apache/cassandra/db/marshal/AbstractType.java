@@ -104,6 +104,9 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
 
     private final int hashCode;
 
+    // computed on first use, see containsSetOrMap()
+    private volatile Boolean containsSetOrMap;
+
     protected AbstractType(ComparisonType comparisonType)
     {
         this(comparisonType, false, ImmutableList.of());
@@ -777,6 +780,23 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
         // Note that non-complex types have no subtypes, so will return false, and UserType overrides this to return
         // true if the provided name matches.
         return subTypes().stream().anyMatch(t -> t.referencesUserType(name, accessor));
+    }
+
+    /**
+     * Whether this type, unwrapped, is or contains a set or a map, at any depth.
+     */
+    public final boolean containsSetOrMap()
+    {
+        Boolean contains = containsSetOrMap;
+        if (contains == null)
+        {
+            AbstractType<?> type = unwrap();
+            contains = type instanceof SetType
+                       || type instanceof MapType
+                       || type.subTypes().stream().anyMatch(AbstractType::containsSetOrMap);
+            containsSetOrMap = contains;
+        }
+        return contains;
     }
 
     /**

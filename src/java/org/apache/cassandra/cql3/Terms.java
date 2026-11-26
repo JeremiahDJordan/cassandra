@@ -276,7 +276,7 @@ public interface Terms
     public static ByteBuffer sortSetsAndMaps(AbstractType<?> type, ByteBuffer value)
     {
         type = type.unwrap();
-        if (value == null || !value.hasRemaining() || !containsSetOrMap(type))
+        if (value == null || !value.hasRemaining() || !type.containsSetOrMap())
             return value;
 
         if (type instanceof ListType)
@@ -295,19 +295,5 @@ public interface Terms
             return vectorType.decomposeRaw(elements);
         }
         return value;
-    }
-
-    private static boolean containsSetOrMap(AbstractType<?> type)
-    {
-        type = type.unwrap();
-        if (type instanceof SetType || type instanceof MapType)
-            return true;
-
-        for (AbstractType<?> subType : type.subTypes())
-        {
-            if (containsSetOrMap(subType))
-                return true;
-        }
-        return false;
     }
 }
