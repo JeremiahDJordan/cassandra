@@ -1136,16 +1136,20 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
                     try (UnfilteredRowIterator partition = page.next())
                     {
-                        Set<Index.Indexer> indexers = indexGroups.values().stream()
-                                                                 .map(g -> g.indexerFor(indexes::contains,
-                                                                                        key,
-                                                                                        partition.columns(),
-                                                                                        nowInSec,
-                                                                                        ctx,
-                                                                                        IndexTransaction.Type.UPDATE,
-                                                                                        null))
-                                                                 .filter(Objects::nonNull)
-                                                                 .collect(Collectors.toSet());
+                        Set<Index.Indexer> indexers = new HashSet<>(indexGroups.size());
+
+                        for (Index.Group g : indexGroups.values())
+                        {
+                            Index.Indexer indexerFor = g.indexerFor(indexes::contains,
+                                                                    key,
+                                                                    partition.columns(),
+                                                                    nowInSec,
+                                                                    ctx,
+                                                                    IndexTransaction.Type.UPDATE,
+                                                                    null);
+                            if (indexerFor != null)
+                                indexers.add(indexerFor);
+                        }
 
                         // Short-circuit empty partitions if static row is processed or isn't read
                         if (!readStatic && partition.isEmpty() && partition.staticRow().isEmpty())
@@ -1506,18 +1510,22 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         if (!hasIndexes())
             return UpdateTransaction.NO_OP;
 
-        Index.Indexer[] indexers = listIndexGroups().stream()
-                                                    .map(g -> g.indexerFor(writableIndexSelector(),
-                                                                           update.partitionKey(),
-                                                                           update.columns(),
-                                                                           nowInSec,
-                                                                           ctx,
-                                                                           IndexTransaction.Type.UPDATE,
-                                                                           memtable))
-                                                    .filter(Objects::nonNull)
-                                                    .toArray(Index.Indexer[]::new);
+        List<Index.Indexer> indexers = new ArrayList<>(indexGroups.size());
 
-        return indexers.length == 0 ? UpdateTransaction.NO_OP : new WriteTimeTransaction(indexers);
+        for (Index.Group g : indexGroups.values())
+        {
+            Index.Indexer indexer = g.indexerFor(writableIndexSelector(),
+                                                 update.partitionKey(),
+                                                 update.columns(),
+                                                 nowInSec,
+                                                 ctx,
+                                                 IndexTransaction.Type.UPDATE,
+                                                 memtable);
+            if (indexer != null)
+                indexers.add(indexer);
+        }
+
+        return indexers.isEmpty() ? UpdateTransaction.NO_OP : new WriteTimeTransaction(indexers.toArray(Index.Indexer[]::new));
     }
 
     private Predicate<Index> writableIndexSelector()
