@@ -173,7 +173,8 @@ public class TrieBackedPartition implements Partition
     }
 
     /// Create a row with the given properties and content, making sure to copy all off-heap data to keep it alive when
-    /// the given access mode requires it.
+    /// the given access mode requires it. The cells are keyed with the column ids of `metadata`. Partitions copied to
+    /// the heap, which reads get, report `droppedColumnsSource`, the table's current metadata.
     public static TrieBackedPartition create(DecoratedKey partitionKey,
                                              RegularAndStaticColumns columnMetadata,
                                              EncodingStats encodingStats,
@@ -558,7 +559,7 @@ public class TrieBackedPartition implements Partition
         @Override
         public TableMetadata metadata()
         {
-            return metadata;
+            return TrieBackedPartition.this.metadata();
         }
 
         @Override
@@ -602,7 +603,7 @@ public class TrieBackedPartition implements Partition
     private UnfilteredRowIterator unfilteredIterator(ColumnFilter selection, ByteComparable[] bounds, boolean reversed)
     {
         if (bounds.length == 0)
-            return UnfilteredRowIterators.noRowsIterator(metadata, partitionKey, staticRow(), partitionLevelDeletion(), reversed);
+            return UnfilteredRowIterators.noRowsIterator(metadata(), partitionKey, staticRow(), partitionLevelDeletion(), reversed);
 
         DeletionAwareTrie<Object, TrieTombstoneMarker> slicedTrie =
             trie.intersect(TrieSet.ranges(BYTE_COMPARABLE_VERSION, bounds));
@@ -675,6 +676,12 @@ public class TrieBackedPartition implements Partition
                                  TableMetadata droppedColumnsSource)
         {
             super(partitionKey, columns, stats, rowCountIncludingStatic, tombstoneCount, trie, metadata, droppedColumnsSource);
+        }
+
+        @Override
+        public TableMetadata metadata()
+        {
+            return droppedColumnsSource;
         }
 
         /// Copies the row to the heap as a `BTreeRow`, built directly from the trie cells. Readers of memtable data
