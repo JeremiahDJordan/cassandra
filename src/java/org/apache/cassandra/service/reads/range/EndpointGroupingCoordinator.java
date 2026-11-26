@@ -233,7 +233,7 @@ public class EndpointGroupingCoordinator
         {
             endpointContexts.computeIfAbsent(replica.endpoint(),
                                              k -> new EndpointQueryContext(replica.endpoint(),
-                                                                           command.createLimitedCounter(false))).add(handler);
+                                                                           command.createLimitedCounter(false).countingFullRowSize())).add(handler);
         }
         return new SingleRangeResponse(resolver, handler, NoopReadRepair.instance);
     }
