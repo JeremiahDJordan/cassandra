@@ -43,6 +43,9 @@ import org.apache.cassandra.db.SinglePartitionReadQuery;
 import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
+import org.apache.cassandra.inject.Injections;
+import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.transport.Dispatcher;
@@ -311,6 +314,41 @@ public class NonStrictFilteringQueryTest extends SAITester
         finally
         {
             Guardrails.instance.setQueryFiltersThreshold(warnThreshold, failThreshold);
+        }
+    }
+
+    /**
+     * Downgrading the consistency level of top-K queries plans their index query again only if their row filter isn't
+     * strict.
+     */
+    @Test
+    public void testTopKQueriesPlanTheirIndexQueryOnceIfStrict() throws Throwable
+    {
+        Injections.Counter plans = Injections.newCounter("index_query_plans")
+                                             .add(InvokePointBuilder.newInvokePoint()
+                                                                    .onClass(StorageAttachedIndexQueryPlan.class)
+                                                                    .onMethod("create"))
+                                             .build();
+        Injections.inject(plans);
+        try
+        {
+            String table = keyspace + '.' + currentTable();
+            SelectStatement select = (SelectStatement) parseStatement("SELECT * FROM " + table + " WHERE a = 1 ORDER BY v LIMIT 10");
+            for (ConsistencyLevel consistency : new ConsistencyLevel[]{ ConsistencyLevel.ONE, ConsistencyLevel.QUORUM })
+            {
+                plans.reset();
+                ReadQuery query = select.getQuery(options(consistency), FBUtilities.nowInSeconds());
+                assertThat(query.isTopK()).isTrue();
+                assertThat(query.rowFilter().needsReconciliation()).isFalse();
+
+                // with non-strict filtering, the restriction and the ordering are an intersection of mutable columns
+                boolean strict = !nonStrict || consistency == ConsistencyLevel.ONE;
+                assertThat(plans.get()).isEqualTo(strict ? 1L : 2L);
+            }
+        }
+        finally
+        {
+            Injections.deleteAll();
         }
     }
 

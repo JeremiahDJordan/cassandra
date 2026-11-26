@@ -649,7 +649,15 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         RowFilter rowFilter = restrictions.getRowFilter(indexRegistry, options, state, selectOptions);
         DataLimits dataLimits = getDataLimits(state, userLimit, perPartitionLimit, userOffset, aggregationSpec);
 
-        ReadQuery query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec);
+        // A top-K read is downgraded to a consistency level without reconciliation below. If its filter is strict, it
+        // reads the same way with the filter of the downgraded level, so it's built with that filter from the start.
+        RowFilter queryFilter = rowFilter.hasOrdering()
+                                && rowFilter.needsReconciliation()
+                                && rowFilter.isStrict()
+                                && !options.getConsistency().isSerialConsistency()
+                                ? rowFilter.withoutReconciliation()
+                                : rowFilter;
+        ReadQuery query = getReadQuery(options, state, columnFilter, queryFilter, dataLimits, nowInSec);
 
         // Whether the read uses an index is decided from its index query plan rather than from the restrictions, which
         // don't say whether an index serves the restrictions nested in disjunctions: it doesn't serve those with a
@@ -678,10 +686,15 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
                 ClientWarn.instance.warn(String.format(TOPK_CONSISTENCY_LEVEL_WARNING, supplied, downgrade));
 
                 // The row filter was built for the requested consistency level, which needs reconciliation, so it
-                // would ask the replicas to relax their filtering (see RowFilter#isStrict). Build the query again
-                // with the filter of the downgraded consistency level, which doesn't need reconciliation. The
-                // filter is derived from the one we have, so that its validations and guardrails don't run twice.
-                if (rowFilter.needsReconciliation())
+                // would ask the replicas to relax their filtering (see RowFilter#isStrict). The query reads with the
+                // filter of the downgraded consistency level, which doesn't need reconciliation: it was built with it
+                // if the filter is strict, and is built again otherwise. The filter is derived from the one we have,
+                // so that its validations and guardrails don't run twice.
+                if (queryFilter != rowFilter)
+                {
+                    rowFilter = queryFilter;
+                }
+                else if (rowFilter.needsReconciliation())
                 {
                     rowFilter = rowFilter.withoutReconciliation();
                     query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec);
@@ -693,6 +706,11 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
 
             // We don't support aggregation for top-k queries because we don't support paging.
             checkFalse(aggregationSpec != null, TOPK_AGGREGATION_ERROR);
+        }
+        else if (queryFilter != rowFilter && !query.isEmpty())
+        {
+            // an ordering that no index serves isn't top-K, so the read keeps the filter of its consistency level
+            query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec);
         }
 
         // Reject the DataStax-only parts of the filter (operators, OR...) while there are nodes that can't
