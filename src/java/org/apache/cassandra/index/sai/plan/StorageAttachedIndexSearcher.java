@@ -288,7 +288,8 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
         // the partition whose deletions computeNext holds or drops, and the tombstones it holds for it
         private DecoratedKey currentHeldPartition;
         private long heldTombstones;
-        // the purge that the read applies before it counts tombstones (ReadCommand#withoutPurgeableTombstones)
+        // the purge that the read applies before it counts tombstones (ReadCommand#withoutPurgeableTombstones), only
+        // used for filters with a static expression
         private final UnaryOperator<UnfilteredRowIterator> purge;
 
         private PrimaryKey lastKey;
@@ -306,7 +307,7 @@ public class StorageAttachedIndexSearcher implements Index.Searcher
             this.executionController = executionController;
             this.keyFactory = controller.primaryKeyFactory();
             this.fetchedRowsCounter = new CountFetchedTransformation(queryContext, command.nowInSec());
-            this.purge = command.partitionPurger(cfs, executionController);
+            this.purge = command.rowFilter().hasStaticExpression() ? command.partitionPurger(cfs, executionController) : null;
 
             this.firstPrimaryKey = controller.firstPrimaryKey();
 
