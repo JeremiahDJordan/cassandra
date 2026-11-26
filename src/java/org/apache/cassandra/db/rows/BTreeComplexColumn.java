@@ -151,12 +151,6 @@ public class BTreeComplexColumn extends ComplexColumnData
     }
 
     @Override
-    public int liveDataSize(long nowInSec)
-    {
-        return complexDeletion.isLive() ? dataSize() : 0;
-    }
-
-    @Override
     public long unsharedHeapSize()
     {
         long heapSize = EMPTY_SIZE + BTree.sizeOnHeapOf(cells) + complexDeletion.unsharedHeapSize();
