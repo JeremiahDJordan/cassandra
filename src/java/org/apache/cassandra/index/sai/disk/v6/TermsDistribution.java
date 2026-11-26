@@ -192,11 +192,13 @@ public class TermsDistribution
      */
     private @Nonnull Bucket interpolate(@Nonnull ByteComparable term)
     {
-        int bucketIndex = indexOfBucketContaining(term);
+        int searchResult = searchHistogram(term);
+        int bucketIndex = indexOfBucketContaining(searchResult);
         Bucket bucket = getBucket(bucketIndex);
         Bucket prevBucket = getBucket(bucketIndex - 1);
 
-        if (prevBucket.term == null)
+        // A term found in the histogram is the maximum term of its bucket, so the whole bucket is on its left side.
+        if (prevBucket.term == null || searchResult >= 0)
             return new Bucket(term, bucket.cumulativePointCount, bucket.cumulativeRowCount);
 
         ByteComparable bucketMinTerm = prevBucket.term;
@@ -347,24 +349,27 @@ public class TermsDistribution
      * scale of the rounded difference within the range of an int. All the differences of an estimate are computed in
      * the same context with {@link #subtract}, so that rounding keeps their order.
      */
-    public static MathContext subtractionContext(BigDecimal... values)
+    public static MathContext subtractionContext(BigDecimal a, BigDecimal b, BigDecimal c, BigDecimal d)
     {
-        long minScale = Long.MAX_VALUE;
-        long maxScale = Long.MIN_VALUE;
-        long maxExponent = Long.MIN_VALUE;
-        for (BigDecimal value : values)
-        {
-            minScale = Math.min(minScale, value.scale());
-            maxScale = Math.max(maxScale, value.scale());
-            maxExponent = Math.max(maxExponent, exponent(value));
-        }
+        long minScale = Math.min(Math.min(a.scale(), b.scale()), Math.min(c.scale(), d.scale()));
+        long maxScale = Math.max(Math.max(a.scale(), b.scale()), Math.max(c.scale(), d.scale()));
         if (maxScale - minScale <= MAX_EXACT_SUBTRACTION_SCALE_GAP)
             return MathContext.UNLIMITED;
+
+        long maxExponent = Math.max(Math.max(exponent(a), exponent(b)), Math.max(exponent(c), exponent(d)));
 
         // A difference is below 10^(maxExponent + 1), so rounding it to this many digits gives it a scale of at least
         // Integer.MIN_VALUE.
         long precision = Math.max(MathContext.DECIMAL64.getPrecision(), maxExponent + 1 + Integer.MIN_VALUE);
         return new MathContext((int) precision, RoundingMode.HALF_EVEN);
+    }
+
+    /**
+     * @see #subtractionContext(BigDecimal, BigDecimal, BigDecimal, BigDecimal)
+     */
+    public static MathContext subtractionContext(BigDecimal a, BigDecimal b, BigDecimal c)
+    {
+        return subtractionContext(a, b, c, c);
     }
 
     /**
@@ -451,9 +456,21 @@ public class TermsDistribution
      */
     private int indexOfBucketContaining(@Nonnull ByteComparable b)
     {
+        return indexOfBucketContaining(searchHistogram(b));
+    }
+
+    private static int indexOfBucketContaining(int searchResult)
+    {
+        return (searchResult >= -1) ? searchResult : -(searchResult + 1);
+    }
+
+    /**
+     * @return the result of {@link Collections#binarySearch} for the bucket of the given term in the histogram
+     */
+    private int searchHistogram(@Nonnull ByteComparable b)
+    {
         Bucket needle = new Bucket(b, 0, 0);
-        int index = Collections.binarySearch(histogram, needle, (b1, b2) -> ByteComparable.compare(b1.term, b2.term, byteComparableVersion));
-        return (index >= -1) ? index : -(index + 1);
+        return Collections.binarySearch(histogram, needle, (b1, b2) -> ByteComparable.compare(b1.term, b2.term, byteComparableVersion));
     }
 
     /**

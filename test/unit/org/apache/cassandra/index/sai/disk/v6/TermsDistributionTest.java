@@ -157,6 +157,60 @@ public class TermsDistributionTest
 
 
     @Test
+    public void testRangeBoundsAtBucketTerms()
+    {
+        // A bound that is the term of a bucket gives the same estimate as a bound not in the histogram that converts to
+        // the same value: a term that only differs after the first NON_NUMBER_RESOLUTION_BYTES bytes. The first term
+        // is left out: a bound before it is before the histogram.
+        AbstractType<String> type = UTF8Type.instance;
+        var builder = new TermsDistribution.Builder(type, VERSION, 10, 0, SAIUtil.currentVersion());
+        for (int i = 0; i < 1000; i++)
+            builder.add(encode(String.format("%020d-term", i)), 1 + i % 3);
+        var td = builder.build();
+
+        int bucketTerms = 0;
+        for (int i = 1; i < 1000; i++)
+        {
+            ByteComparable term = encode(String.format("%020d-term", i));
+            ByteComparable sameValue = encode(String.format("%020d-ter", i));
+            if (td.histogram.stream().anyMatch(bucket -> ByteComparable.compare(bucket.term, term, VERSION) == 0))
+                bucketTerms++;
+
+            assertEquals(td.estimateNumRowsInRange(null, sameValue), td.estimateNumRowsInRange(null, term));
+            assertEquals(td.estimateNumRowsInRange(sameValue, null), td.estimateNumRowsInRange(term, null));
+        }
+        assertTrue(bucketTerms > 1);
+
+        // With most frequent terms, a bound that is the term of a bucket counts all the rows up to it.
+        var withMft = new TermsDistribution.Builder(type, VERSION, 10, 20, SAIUtil.currentVersion());
+        long[] cumulativeRowCounts = new long[1000];
+        for (int i = 0; i < 1000; i++)
+        {
+            long rowCount = i % 25 == 0 ? 100 : 1 + i % 3;
+            cumulativeRowCounts[i] = (i == 0 ? 0 : cumulativeRowCounts[i - 1]) + rowCount;
+            withMft.add(encode(String.format("%020d-term", i)), rowCount);
+        }
+        td = withMft.build();
+
+        bucketTerms = 0;
+        int frequentBucketTerms = 0;
+        for (int i = 0; i < 1000; i++)
+        {
+            ByteComparable term = encode(String.format("%020d-term", i));
+            if (td.histogram.stream().noneMatch(bucket -> ByteComparable.compare(bucket.term, term, VERSION) == 0))
+                continue;
+            bucketTerms++;
+            if (td.mostFrequentTerms.containsKey(term))
+                frequentBucketTerms++;
+
+            assertEquals(cumulativeRowCounts[i], td.estimateNumRowsInRange(null, term));
+            assertEquals(cumulativeRowCounts[999] - cumulativeRowCounts[i], td.estimateNumRowsInRange(term, null));
+        }
+        assertTrue(bucketTerms > 1);
+        assertTrue(frequentBucketTerms > 0);
+    }
+
+    @Test
     public void testFractionalBuckets()
     {
         // Test if we get reasonable range estimates when selecting a fraction of a single bucket:
@@ -532,6 +586,11 @@ public class TermsDistributionTest
     private ByteComparable encode(int value)
     {
         return v -> Int32Type.instance.asComparableBytes(Int32Type.instance.decompose(value), v);
+    }
+
+    private ByteComparable encode(String value)
+    {
+        return SAIUtil.currentVersion().onDiskFormat().encodeForTrie(UTF8Type.instance.decompose(value), UTF8Type.instance);
     }
 
     private ByteComparable encode(double value)
