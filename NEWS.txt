@@ -115,10 +115,9 @@ Upgrading
       empty, and their files are used as before; an index created on an existing table (CREATE INDEX ... USING 'sai')
       deletes the files of its name on the table's sstables that weren't built for its definition, so that it also
       builds over such files from the data. Files written before the upgrade can still be used by an index of the same
-      name and another definition on sstables imported or streamed once it exists, on a node that receives DROP INDEX
-      and CREATE INDEX as one schema change (e.g. it was down), and after a restart that follows a CREATE INDEX that
-      couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes concerned. Older
-      versions ignore the content of the marker.
+      name and another definition on sstables imported or streamed once it exists, and after a restart that follows a
+      CREATE INDEX that couldn't list the sstable files (an error is logged): run nodetool rebuild_index on the nodes
+      concerned. Older versions ignore the content of the marker.
     - A node that receives SSTables by streaming (repair, rebuild, bootstrap, decommission...) without entire-SSTable
       streaming, or by nodetool import, builds only the storage-attached indexes those SSTables are missing before
       adding them. A failure or stop of that build (nodetool stop INDEX_BUILD, a major compaction...) fails the
