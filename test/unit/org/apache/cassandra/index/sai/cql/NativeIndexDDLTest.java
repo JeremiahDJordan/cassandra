@@ -23,12 +23,19 @@ package org.apache.cassandra.index.sai.cql;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 import java.util.stream.LongStream;
@@ -54,8 +61,10 @@ import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.compaction.CompactionInterruptedException;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ReversedType;
@@ -66,11 +75,13 @@ import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.SAIUtil;
+import org.apache.cassandra.index.sai.SSTableIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
+import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
 import org.apache.cassandra.index.sai.disk.v1.bitpack.NumericValuesWriter;
@@ -82,6 +93,7 @@ import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
@@ -98,6 +110,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.Mockito.when;
 
@@ -671,6 +685,240 @@ public class NativeIndexDDLTest extends SAITester
     }
 
     @Test
+    public void shouldRejectQueriesAfterTruncateThatKeepsUnindexedSSTable() throws Throwable
+    {
+        verifyTruncateAfterIndexInitializationFailure(KeptSSTable.NOT_INDEXED);
+    }
+
+    @Test
+    public void shouldMakeIndexQueryableAfterTruncateThatKeepsIndexedSSTable() throws Throwable
+    {
+        verifyTruncateAfterIndexInitializationFailure(KeptSSTable.INDEXED);
+    }
+
+    @Test
+    public void shouldMakeIndexQueryableAfterTruncateThatKeepsIndexedSSTableNotYetInView() throws Throwable
+    {
+        verifyTruncateAfterIndexInitializationFailure(KeptSSTable.INDEXED_NOT_YET_IN_VIEW);
+    }
+
+    private enum KeptSSTable
+    {
+        NOT_INDEXED,
+        INDEXED,
+        // flushed with the index, and live but not yet added to the index view when the truncation ends
+        INDEXED_NOT_YET_IN_VIEW
+    }
+
+    private static volatile Tracker heldFlushTracker;
+    private static volatile CountDownLatch flushHeld;
+    private static volatile CountDownLatch flushReleased;
+
+    @SuppressWarnings("unused") // called by the injection of holdFlush
+    public static void holdFlushOf(Tracker tracker) throws InterruptedException
+    {
+        if (tracker != heldFlushTracker)
+            return;
+
+        heldFlushTracker = null;
+        flushHeld.countDown();
+        flushReleased.await(60, TimeUnit.SECONDS);
+    }
+
+    /**
+     * Holds the next flush of the current table at the entry of the given {@link Tracker} method.
+     */
+    private void holdFlush(String trackerMethod) throws Throwable
+    {
+        heldFlushTracker = getCurrentColumnFamilyStore().getTracker();
+        flushHeld = new CountDownLatch(1);
+        flushReleased = new CountDownLatch(1);
+        Injections.inject(Injections.newCustom("hold_flush_" + trackerMethod)
+                                    .add(InvokePointBuilder.newInvokePoint().onClass(Tracker.class).onMethod(trackerMethod).atEntry())
+                                    .add(ActionBuilder.newActionBuilder().actions()
+                                                      .doAction(Expression.expr(NativeIndexDDLTest.class.getName())
+                                                                          .method("holdFlushOf")
+                                                                          .args(Expression.THIS)))
+                                    .build());
+    }
+
+    private static void releaseFlush()
+    {
+        heldFlushTracker = null;
+        if (flushReleased != null)
+            flushReleased.countDown();
+    }
+
+    private void verifyTruncateAfterIndexInitializationFailure(KeptSSTable kept) throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+
+        int rowCount = 10;
+        for (int i = 0; i < rowCount; i++)
+            execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', " + i + ", '0')");
+        flush();
+
+        String index = kept == KeptSSTable.NOT_INDEXED ? null : createIndexWithFailedInitialBuild();
+
+        // hold the truncation after it has picked the time before which it drops SSTables
+        Injections.Barrier delayTruncate = Injections.newBarrier("delayTruncate", 2, false)
+                                                     .add(InvokePointBuilder.newInvokePoint().onClass(ColumnFamilyStore.class).onMethod("runWithCompactionsDisabled"))
+                                                     .build();
+        Injections.inject(delayTruncate);
+        try
+        {
+            CompletableFuture<Void> truncate = CompletableFuture.runAsync(() -> truncate(false));
+            waitForAssert(() -> assertEquals(1, delayTruncate.getCount()));
+
+            for (int i = rowCount; i < rowCount * 2; i++)
+                execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', " + i + ", '0')");
+
+            CompletableFuture<Void> heldFlush = null;
+            if (kept == KeptSSTable.INDEXED_NOT_YET_IN_VIEW)
+            {
+                holdFlush("notifyAdded");
+                heldFlush = CompletableFuture.runAsync(this::flush);
+                assertTrue(flushHeld.await(30, TimeUnit.SECONDS));
+            }
+            else
+            {
+                flush();
+            }
+
+            if (kept == KeptSSTable.NOT_INDEXED)
+                index = createIndexWithFailedInitialBuild();
+
+            assertFalse(truncate.isDone());
+            delayTruncate.countDown();
+            truncate.get(30, TimeUnit.SECONDS);
+            if (heldFlush != null)
+            {
+                assertTrue(isIndexQueryable(KEYSPACE, index));
+                releaseFlush();
+                heldFlush.get(30, TimeUnit.SECONDS);
+            }
+            assertEquals(1, getCurrentColumnFamilyStore().getLiveSSTables().size());
+
+            if (kept == KeptSSTable.NOT_INDEXED)
+                assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+            else
+                assertEquals(rowCount, executeNet("SELECT id1 FROM %s WHERE v1>=0").all().size());
+        }
+        finally
+        {
+            releaseFlush();
+            delayTruncate.countDown();
+        }
+    }
+
+    @Test
+    public void shouldRejectQueriesAfterTruncateThatKeepsSSTableWhoseIndexFailsToLoad() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+        String index = createIndex(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+        waitForIndexQueryable(index);
+
+        int rowCount = 10;
+        for (int i = 0; i < rowCount; i++)
+            execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', " + i + ", '0')");
+        flush();
+
+        Injections.Counter loadFailures = Injections.newCounter("fail_sstable_index_load")
+                                                    .add(InvokePointBuilder.newInvokePoint().onClass(SSTableIndex.class).onMethod("createSearchableIndex").atEntry())
+                                                    .withLastActionBuilder(action -> action.actions().doThrow(RuntimeException.class, Expression.quote("Injected failure!")))
+                                                    .build();
+        loadFailures.disable();
+        Injections.inject(loadFailures);
+
+        // hold the truncation after it has picked the time before which it drops SSTables
+        Injections.Barrier delayTruncate = Injections.newBarrier("delayTruncate", 2, false)
+                                                     .add(InvokePointBuilder.newInvokePoint().onClass(ColumnFamilyStore.class).onMethod("runWithCompactionsDisabled"))
+                                                     .build();
+        Injections.inject(delayTruncate);
+        try
+        {
+            CompletableFuture<Void> truncate = CompletableFuture.runAsync(() -> truncate(false));
+            waitForAssert(() -> assertEquals(1, delayTruncate.getCount()));
+
+            // the kept SSTable has complete index components that fail to load
+            loadFailures.reset();
+            loadFailures.enable();
+            for (int i = rowCount; i < rowCount * 2; i++)
+                execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', " + i + ", '0')");
+            flush();
+            assertEquals(1, loadFailures.get());
+            assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+
+            assertFalse(truncate.isDone());
+            delayTruncate.countDown();
+            truncate.get(30, TimeUnit.SECONDS);
+            // the truncation loaded the kept SSTable again
+            assertTrue(loadFailures.get() > 1);
+            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+            assertEquals(1, cfs.getLiveSSTables().size());
+            assertTrue(IndexDescriptor.isIndexBuildCompleteOnDisk(cfs.getLiveSSTables().iterator().next(), getIndexContext(index)));
+            assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+        }
+        finally
+        {
+            loadFailures.disable();
+            delayTruncate.countDown();
+        }
+    }
+
+    @Test
+    public void shouldRejectQueriesAfterTruncateBeforeInitialBuildFlushesMemtable() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        disableCompaction(KEYSPACE);
+
+        // hold the truncation after it has replaced the memtable
+        Injections.Barrier delayTruncate = Injections.newBarrier("delayTruncate", 2, false)
+                                                     .add(InvokePointBuilder.newInvokePoint().onClass(ColumnFamilyStore.class).onMethod("runWithCompactionsDisabled"))
+                                                     .build();
+        Injections.inject(delayTruncate);
+        try
+        {
+            CompletableFuture<Void> truncate = CompletableFuture.runAsync(() -> truncate(false));
+            waitForAssert(() -> assertEquals(1, delayTruncate.getCount()));
+
+            // rows written before the index is created, which its memtable index doesn't have, flushed when the
+            // index is created; that flush is held before its SSTable is added to the table
+            int rowCount = 10;
+            for (int i = 0; i < rowCount; i++)
+                execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', " + i + ", '0')");
+            holdFlush("replaceFlushed");
+            CompletableFuture<String> index = CompletableFuture.supplyAsync(() -> createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "v1")));
+            assertTrue(flushHeld.await(30, TimeUnit.SECONDS));
+
+            assertFalse(truncate.isDone());
+            delayTruncate.countDown();
+            truncate.get(30, TimeUnit.SECONDS);
+            assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+
+            releaseFlush();
+            waitForIndexQueryable(index.get(30, TimeUnit.SECONDS));
+            assertEquals(rowCount, executeNet("SELECT id1 FROM %s WHERE v1>=0").all().size());
+        }
+        finally
+        {
+            releaseFlush();
+            delayTruncate.countDown();
+        }
+    }
+
+    private String createIndexWithFailedInitialBuild() throws Throwable
+    {
+        Injections.inject(failNDIInitialializaion);
+        String index = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+        waitForIndexBuilds(index);
+        assertThatThrownBy(() -> executeNet("SELECT id1 FROM %s WHERE v1>=0")).isInstanceOf(ReadFailureException.class);
+        return index;
+    }
+
+    @Test
     public void testAwaitInitialIndexBuilds() throws Throwable
     {
         // setup table and SAI
@@ -986,6 +1234,14 @@ public class NativeIndexDDLTest extends SAITester
                     waitForCompactions();
                     
                     waitForTableIndexesQueryable();
+
+                    // the paused builds go on and see the stop: a truncation doesn't fail them
+                    for (ColumnIdentifier column : Arrays.asList(V1_COLUMN_IDENTIFIER, V2_COLUMN_IDENTIFIER))
+                    {
+                        String index = IndexMetadata.generateDefaultIndexName(currentTable(), column);
+                        waitForAssert(() -> assertFalse(isIndexBuilding(KEYSPACE, index)), 30, TimeUnit.SECONDS);
+                    }
+                    assertEquals("Indexes not queryable after the truncation", Collections.emptySet(), getNotQueryableIndexes());
                 }
                 finally
                 {
@@ -1009,6 +1265,12 @@ public class NativeIndexDDLTest extends SAITester
 
             assertEquals("Segment memory limiter should revert to zero after truncate.", 0L, getSegmentBufferUsedBytes());
             assertEquals("There should be no segment builders in progress.", 0L, getColumnIndexBuildsInProgress());
+
+            for (int i = 0; i < 10; i++)
+                execute("INSERT INTO %s (id1, v1, v2) VALUES ('n" + i + "', 1, '1');");
+            flush();
+            assertEquals(10, executeNet("SELECT id1 FROM %s WHERE v1 = 1").all().size());
+            assertEquals(10, executeNet("SELECT id1 FROM %s WHERE v2 = '1'").all().size());
         }
         finally
         {
@@ -1729,7 +1991,6 @@ public class NativeIndexDDLTest extends SAITester
         createTable(CREATE_TABLE_TEMPLATE);
         disableCompaction(KEYSPACE);
 
-        // Create data and initial index
         int num = 100;
         for (int i = 0; i < num; i++)
             execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', 0, '0');");
@@ -1739,23 +2000,18 @@ public class NativeIndexDDLTest extends SAITester
         String indexName = createIndex(String.format(CREATE_INDEX_TEMPLATE, "v1"));
         waitForTableIndexesQueryable();
 
-        // Set up logging appender to capture log messages BEFORE starting rebuild
-        ch.qos.logback.classic.Logger logger = (ch.qos.logback.classic.Logger) LoggerFactory.getLogger(StorageAttachedIndexBuilder.class);
-        InMemoryAppender appender = new InMemoryAppender();
-        logger.addAppender(appender);
-        Level originalLevel = logger.getLevel();
-        logger.setLevel(Level.INFO);
+        AtomicBoolean interrupted = new AtomicBoolean(false);
 
+        Injections.Barrier delayIndexRebuild = Injections.newBarrier("delayIndexRebuild", 2, false)
+                                                         .add(InvokePointBuilder.newInvokePoint()
+                                                                                .onClass(StorageAttachedIndexWriter.class)
+                                                                                .onMethod("startPartition")
+                                                                                .atEntry())
+                                                         .build();
+
+        Injections.inject(delayIndexRebuild);
         try
         {
-            // Set up barrier to delay index rebuild - use newBarrier instead of newBarrierAwait
-            Injections.Barrier delayIndexRebuild = Injections.newBarrier("delayIndexRebuild", 2, false)
-                                                             .add(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("build"))
-                                                             .build();
-
-            Injections.inject(delayIndexRebuild);
-
-            // Start index rebuild in background (isInitialBuild=false)
             Thread rebuildThread = new Thread(() -> {
                 try
                 {
@@ -1763,39 +2019,200 @@ public class NativeIndexDDLTest extends SAITester
                 }
                 catch (Exception e)
                 {
-                    // Expected to be interrupted
-                    NativeIndexDDLTest.logger.info("Rebuild thread caught exception: {}", e.getMessage());
+                    interrupted.set(true);
                 }
             });
             rebuildThread.start();
 
-            // Wait for rebuild to reach the barrier
             waitForAssert(() -> assertEquals(1, delayIndexRebuild.getCount()), 5000, TimeUnit.MILLISECONDS);
+            waitForAssert(() -> assertTrue("Index rebuild should be running", getCompactionTasks() > 0), 5000, TimeUnit.MILLISECONDS);
 
-            // Stop the rebuild (this should trigger the INFO log we check later)
             CompactionManager.instance.stopCompaction(OperationType.INDEX_BUILD.name());
-            
-            // Let the rebuild continue and hit the stop
             delayIndexRebuild.countDown();
 
-            // Wait for rebuild thread to complete
             rebuildThread.join(10000);
+            waitForCompactions();
 
-            delayIndexRebuild.disable();
-
-            // Add small delay to allow async logging to complete
-            Thread.sleep(500);
-
-            // Verify that the INFO log was generated
-            verifyIndexBuildLog(appender, Level.INFO, "Stop requested while building indexes", true);
+            assertTrue("Expected rebuild to be interrupted by stopCompaction", interrupted.get());
         }
         finally
         {
-            logger.setLevel(originalLevel);
-            logger.detachAppender(appender);
+            delayIndexRebuild.disable();
+            Injections.deleteAll();
         }
+
+        // the SSTable was left out of the index
+        assertFalse("Expect index not built", SystemKeyspace.isIndexBuilt(KEYSPACE, indexName));
+        assertFalse("Expect index not queryable", getCurrentColumnFamilyStore().indexManager.isIndexQueryable(indexName));
+
+        rebuildIndexes(indexName);
+        waitForTableIndexesQueryable();
+        ResultSet rows = executeNet("SELECT id1 FROM %s WHERE v1>=0");
+        assertEquals(num, rows.all().size());
     }
 
+
+    /**
+     * An SSTable is imported after a truncate picked its cutoff and before it stops the operations of the table, and its
+     * index build is held after its writers exist: the truncate keeps the SSTable and stops the build, which fails the
+     * import rather than leave the SSTable out of a queryable index.
+     */
+    @Test
+    public void testImportBuildStoppedByTruncateThatKeepsTheSSTable() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        int num = 100;
+        for (int i = 0; i < num; i++)
+            execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', 0, '0');");
+        flush();
+        SSTableReader source = getCurrentColumnFamilyStore().getLiveSSTables().iterator().next();
+        Path saved = Files.createTempDirectory("truncate-import");
+        for (File file : source.descriptor.directory.tryList())
+            if (file.isFile() && file.name().startsWith(source.descriptor.filenamePart() + '-'))
+                Files.copy(file.toPath(), saved.resolve(file.name()));
+
+        createTable(CREATE_TABLE_TEMPLATE);
+        String indexName = createIndex(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+        waitForTableIndexesQueryable();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        for (String name : saved.toFile().list())
+            Files.copy(saved.resolve(name), cfs.getDirectories().getDirectoryForNewSSTables().toPath().resolve(name));
+
+        Injections.Barrier truncateHeld = Injections.newBarrier("truncateHeld", 2, false)
+                                                    .add(InvokePointBuilder.newInvokePoint()
+                                                                           .onClass(ColumnFamilyStore.class)
+                                                                           .onMethod("runWithCompactionsDisabled")
+                                                                           .atEntry())
+                                                    .build();
+        Injections.Barrier buildHeld = Injections.newBarrier("buildHeld", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(StorageAttachedIndexWriter.class)
+                                                                        .onMethod("startPartition")
+                                                                        .atEntry())
+                                                 .build();
+        Injections.inject(truncateHeld, buildHeld);
+        try
+        {
+            AtomicReference<Throwable> truncateFailure = new AtomicReference<>();
+            Thread truncate = start(cfs::truncateBlocking, truncateFailure);
+            waitForAssert(() -> assertEquals(1, truncateHeld.getCount()), 10, TimeUnit.SECONDS);
+            AtomicReference<Throwable> loadFailure = new AtomicReference<>();
+            Thread load = start(cfs::loadNewSSTables, loadFailure);
+            waitForAssert(() -> assertEquals(1, buildHeld.getCount()), 10, TimeUnit.SECONDS);
+
+            truncateHeld.countDown();
+            truncate.join(60000);
+            assertNull(truncateFailure.get());
+            buildHeld.countDown();
+
+            load.join(60000);
+            assertStopped(loadFailure.get());
+        }
+        finally
+        {
+            truncateHeld.disable();
+            buildHeld.disable();
+            Injections.deleteAll();
+        }
+        assertEquals(1, cfs.getLiveSSTables().size());
+        assertFalse("Expect index not queryable", cfs.indexManager.isIndexQueryable(indexName));
+
+        rebuildIndexes(indexName);
+        waitForTableIndexesQueryable();
+        assertEquals(num, executeNet("SELECT id1 FROM %s WHERE v1>=0").all().size());
+    }
+
+    /**
+     * A rebuild is held after its writers exist, while a truncate that picked its cutoff before an SSTable was flushed
+     * stops it: the truncate keeps that SSTable, so the rebuild fails rather than leave it out of a queryable index.
+     */
+    @Test
+    public void testRebuildStoppedByTruncateThatKeepsAnSSTable() throws Throwable
+    {
+        createTable(CREATE_TABLE_TEMPLATE);
+        String indexName = createIndex(String.format(CREATE_INDEX_TEMPLATE, "v1"));
+        waitForTableIndexesQueryable();
+        for (int i = 0; i < 50; i++)
+            execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', 0, '0');");
+        flush();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+        Injections.Barrier truncateHeld = Injections.newBarrier("truncateHeld", 2, false)
+                                                    .add(InvokePointBuilder.newInvokePoint()
+                                                                           .onClass(ColumnFamilyStore.class)
+                                                                           .onMethod("runWithCompactionsDisabled")
+                                                                           .atEntry())
+                                                    .build();
+        Injections.inject(truncateHeld);
+        // the rebuild runs one builder per SSTable
+        Injections.Barrier rebuildHeld = Injections.newBarrier("rebuildHeld", 3, false)
+                                                   .add(InvokePointBuilder.newInvokePoint()
+                                                                          .onClass(StorageAttachedIndexWriter.class)
+                                                                          .onMethod("startPartition")
+                                                                          .atEntry())
+                                                   .build();
+        try
+        {
+            AtomicReference<Throwable> truncateFailure = new AtomicReference<>();
+            Thread truncate = start(cfs::truncateBlocking, truncateFailure);
+            waitForAssert(() -> assertEquals(1, truncateHeld.getCount()), 10, TimeUnit.SECONDS);
+
+            // newer than the cutoff of the truncate, which keeps it
+            for (int i = 50; i < 80; i++)
+                execute("INSERT INTO %s (id1, v1, v2) VALUES ('" + i + "', 0, '0');");
+            flush();
+
+            Injections.inject(rebuildHeld);
+            AtomicReference<Throwable> rebuildFailure = new AtomicReference<>();
+            Thread rebuild = start(() -> rebuildIndexes(indexName), rebuildFailure);
+            waitForAssert(() -> assertEquals(1, rebuildHeld.getCount()), 10, TimeUnit.SECONDS);
+
+            truncateHeld.countDown();
+            truncate.join(60000);
+            assertNull(truncateFailure.get());
+            rebuildHeld.countDown();
+
+            rebuild.join(60000);
+            assertStopped(rebuildFailure.get());
+        }
+        finally
+        {
+            truncateHeld.disable();
+            rebuildHeld.disable();
+            Injections.deleteAll();
+        }
+        assertEquals(1, cfs.getLiveSSTables().size());
+        assertFalse("Expect index not built", SystemKeyspace.isIndexBuilt(KEYSPACE, indexName));
+        assertFalse("Expect index not queryable", cfs.indexManager.isIndexQueryable(indexName));
+
+        rebuildIndexes(indexName);
+        waitForTableIndexesQueryable();
+        assertEquals(30, executeNet("SELECT id1 FROM %s WHERE v1>=0").all().size());
+    }
+
+    /** Runs the provided operation in a new thread, recording what it throws. */
+    private static Thread start(Runnable operation, AtomicReference<Throwable> failure)
+    {
+        Thread thread = new Thread(() -> {
+            try
+            {
+                operation.run();
+            }
+            catch (Throwable t)
+            {
+                failure.set(t);
+            }
+        });
+        thread.start();
+        return thread;
+    }
+
+    /** The operation failed because an index build was stopped. */
+    private static void assertStopped(Throwable failure)
+    {
+        assertNotNull("Expected the operation to fail", failure);
+        assertThat(com.google.common.base.Throwables.getRootCause(failure)).isInstanceOf(CompactionInterruptedException.class);
+    }
 
     private static class InMemoryAppender extends AppenderBase<ILoggingEvent>
     {

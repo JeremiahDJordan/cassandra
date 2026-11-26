@@ -355,6 +355,11 @@ public class StorageAttachedIndexWriter implements SSTableFlushObserver
             // If the token/offset files have already been written successfully, they can be reused later.
             perSSTableWriter.abort(accumulator);
         }
+
+        // If the abort was from an index error, propagate the error upstream so index builds, compactions, and
+        // flushes can handle it correctly.
+        if (fromIndex)
+            throw Throwables.unchecked(accumulator);
     }
 
     private void addRow(Row row) throws IOException, TrieSpaceExhaustedException
