@@ -110,6 +110,14 @@ public class GuardrailPageSizeTest extends ThresholdTester
     }
 
     @Test
+    public void testSelectStatementWithoutPaging() throws Throwable
+    {
+        assertUnpagedValid("SELECT * FROM %s");
+        assertUnpagedValid("SELECT COUNT(*) FROM %s WHERE k=0");
+        assertUnpagedValid("SELECT k, COUNT(*) FROM %s WHERE k=0 GROUP BY k");
+    }
+
+    @Test
     public void testExcludedUsers() throws Throwable
     {
         assertPagingIgnored("SELECT * FROM %s", PAGE_SIZE_WARN_THRESHOLD + 1);
@@ -119,6 +127,11 @@ public class GuardrailPageSizeTest extends ThresholdTester
     private void assertPagingValid(String query, int pageSize) throws Throwable
     {
         assertValid(() -> executeWithPaging(userClientState, query, pageSize));
+    }
+
+    private void assertUnpagedValid(String query) throws Throwable
+    {
+        assertValid(() -> executeWithPaging(userClientState, query, PageSize.NONE));
     }
 
     private void assertPagingIgnored(String query, int pageSize) throws Throwable
@@ -143,6 +156,11 @@ public class GuardrailPageSizeTest extends ThresholdTester
 
     private void executeWithPaging(ClientState state, String query, int pageSize)
     {
+        executeWithPaging(state, query, PageSize.inRows(pageSize));
+    }
+
+    private void executeWithPaging(ClientState state, String query, PageSize pageSize)
+    {
         QueryState queryState = new QueryState(state);
 
         String formattedQuery = formatQuery(query);
@@ -152,7 +170,7 @@ public class GuardrailPageSizeTest extends ThresholdTester
         QueryOptions options = QueryOptions.create(ConsistencyLevel.ONE,
                                                    Collections.emptyList(),
                                                    false,
-                                                   PageSize.inRows(pageSize),
+                                                   pageSize,
                                                    null,
                                                    null,
                                                    ProtocolVersion.CURRENT,
