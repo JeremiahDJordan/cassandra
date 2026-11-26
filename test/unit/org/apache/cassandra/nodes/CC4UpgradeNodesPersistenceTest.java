@@ -24,6 +24,7 @@ import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.LinkedHashMap;
@@ -46,6 +47,7 @@ import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.CassandraVersion;
+import org.apache.cassandra.utils.StorageCompatibilityMode;
 import org.msgpack.jackson.dataformat.MessagePackFactory;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -65,6 +67,10 @@ public class CC4UpgradeNodesPersistenceTest extends CQLTester
         originalMetadataDir = DatabaseDescriptor.getMetadataDirectory();
         DatabaseDescriptor.setMetadataDirectory(new File(tempDir));
         persistence = new CC4UpgradeNodesPersistence();
+        // as on the first start after CC4, system.local has no gossip generation. Let the running node's pending saves
+        // of its own local information finish first, as they would write over the changes the tests make.
+        Nodes.getInstance().awaitInflightUpdateCompletion();
+        QueryProcessor.executeInternal("DELETE gossip_generation FROM system.local WHERE key = 'local'");
     }
 
     @After
@@ -112,12 +118,10 @@ public class CC4UpgradeNodesPersistenceTest extends CQLTester
     }
 
     @Test
-    public void testLoadLocalMigratesFromCC4KeepsGossipGeneration() throws Exception
+    public void testLoadSkipsCC4FilesWithoutGossipGeneration() throws Exception
     {
-        // the CC4 files have no gossip generation; system.local has one. Let the running node's pending saves of its
-        // own local information finish first, as they would write its (unset) generation over this one.
-        Nodes.getInstance().awaitInflightUpdateCompletion();
         QueryProcessor.executeInternal("INSERT INTO system.local (key, gossip_generation) VALUES ('local', ?)", 1234);
+        UUID hostId = new NodesPersistence().loadLocal().getHostId();
 
         Map<String, Object> cc4Local = new LinkedHashMap<>();
         cc4Local.put("host_id", serializeUUID(UUID.randomUUID()));
@@ -125,8 +129,8 @@ public class CC4UpgradeNodesPersistenceTest extends CQLTester
         writeMsgpack(nodesDir.resolve("local"), cc4Local);
 
         LocalInfo loaded = persistence.loadLocal();
+        assertThat(loaded.getHostId()).isEqualTo(hostId);
         assertThat(loaded.getGossipGeneration()).isEqualTo(1234);
-        assertThat(new NodesPersistence().loadLocal().getGossipGeneration()).isEqualTo(1234);
     }
 
     @Test
@@ -224,7 +228,113 @@ public class CC4UpgradeNodesPersistenceTest extends CQLTester
         }
     }
 
+    @Test
+    public void testLoadSkipsCC4FilesNotNewerThanSystemTables() throws Exception
+    {
+        QueryProcessor.executeInternal("INSERT INTO system.local (key, gossip_generation) VALUES ('local', ?)", 2000);
+        UUID hostId = new NodesPersistence().loadLocal().getHostId();
+        InetAddressAndPort peer = InetAddressAndPort.getByNameOverrideDefaults("10.0.0.11", 7000);
+        writeCC4LocalAndPeer(UUID.randomUUID(), 2000, peer);
+
+        assertThat(persistence.loadLocal().getHostId()).isEqualTo(hostId);
+        assertThat(persistence.loadPeers().map(PeerInfo::getPeerAddressAndPort)).doesNotContain(peer);
+        assertThat(new NodesPersistence().loadLocal().getGossipGeneration()).isEqualTo(2000);
+    }
+
+    @Test
+    public void testLoadMigratesCC4FilesNewerThanSystemTables() throws Exception
+    {
+        QueryProcessor.executeInternal("INSERT INTO system.local (key, gossip_generation) VALUES ('local', ?)", 1000);
+        InetAddressAndPort removed = InetAddressAndPort.getByNameOverrideDefaults("10.0.0.12", 7000);
+        PeerInfo removedPeer = new PeerInfo();
+        removedPeer.setPeerAddressAndPort(removed);
+        removedPeer.setHostId(UUID.randomUUID());
+        NodesPersistence basePersistence = new NodesPersistence();
+        basePersistence.savePeer(removedPeer);
+        UUID hostId = UUID.randomUUID();
+        InetAddressAndPort peer = InetAddressAndPort.getByNameOverrideDefaults("10.0.0.13", 7000);
+        writeCC4LocalAndPeer(hostId, 2000, peer);
+
+        try
+        {
+            assertThat(persistence.loadLocal().getHostId()).isEqualTo(hostId);
+            assertThat(persistence.loadPeers().map(PeerInfo::getPeerAddressAndPort)).containsExactly(peer);
+            LocalInfo local = basePersistence.loadLocal();
+            assertThat(local.getHostId()).isEqualTo(hostId);
+            assertThat(local.getGossipGeneration()).isEqualTo(2000);
+            assertThat(basePersistence.loadPeers().map(PeerInfo::getPeerAddressAndPort)).contains(peer).doesNotContain(removed);
+        }
+        finally
+        {
+            basePersistence.deletePeer(removed);
+            basePersistence.deletePeer(peer);
+        }
+    }
+
+    @Test
+    public void testLoadMigratesEmptyCC4Peers() throws Exception
+    {
+        QueryProcessor.executeInternal("INSERT INTO system.local (key, gossip_generation) VALUES ('local', ?)", 1000);
+        InetAddressAndPort removed = InetAddressAndPort.getByNameOverrideDefaults("10.0.0.14", 7000);
+        PeerInfo removedPeer = new PeerInfo();
+        removedPeer.setPeerAddressAndPort(removed);
+        removedPeer.setHostId(UUID.randomUUID());
+        NodesPersistence basePersistence = new NodesPersistence();
+        basePersistence.savePeer(removedPeer);
+        writeCC4LocalAndPeer(UUID.randomUUID(), 2000, null);
+
+        try
+        {
+            persistence.loadLocal();
+            assertThat(persistence.loadPeers()).isEmpty();
+        }
+        finally
+        {
+            basePersistence.deletePeer(removed);
+        }
+    }
+
+    @Test
+    public void testNodesDirectoryArchivedOnlyInModesAfterCC4() throws Exception
+    {
+        StorageCompatibilityMode mode = DatabaseDescriptor.getStorageCompatibilityMode();
+        try
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.HCD_1);
+            persistence.loadPeers();
+            assertThat(nodesDir).isDirectory();
+
+            DatabaseDescriptor.setStorageCompatibilityMode(StorageCompatibilityMode.UPGRADING);
+            persistence.loadPeers();
+            assertThat(nodesDir).doesNotExist();
+            assertThat(tempDir.resolve("nodes.migrated")).isDirectory();
+        }
+        finally
+        {
+            DatabaseDescriptor.setStorageCompatibilityMode(mode);
+        }
+    }
+
     // ---- Helpers to write CC4-format msgpack data ----
+
+    private void writeCC4LocalAndPeer(UUID hostId, int gossipGeneration, InetAddressAndPort peer) throws IOException
+    {
+        Map<String, Object> cc4Local = new LinkedHashMap<>();
+        cc4Local.put("host_id", serializeUUID(hostId));
+        cc4Local.put("cluster_name", "MigrateCluster");
+        cc4Local.put("gossip_generation", gossipGeneration);
+        writeMsgpack(nodesDir.resolve("local"), cc4Local);
+
+        List<Map<String, Object>> cc4Peers = new ArrayList<>();
+        if (peer != null)
+        {
+            Map<String, Object> cc4Peer = new LinkedHashMap<>();
+            cc4Peer.put("host_id", serializeUUID(UUID.randomUUID()));
+            cc4Peer.put("peer", serializeAddress(peer));
+            cc4Peers.add(cc4Peer);
+        }
+        writeMsgpack(nodesDir.resolve("peers"), cc4Peers);
+    }
 
     private static ObjectMapper createWriteMapper()
     {
