@@ -701,6 +701,12 @@ public class TrieIndexSSTableReader extends SSTableReader
     }
 
     @Override
+    public boolean isEstimationInformative()
+    {
+        return true;
+    }
+
+    @Override
     public UnfilteredRowIterator iterator(DecoratedKey key,
                                           Slices slices,
                                           ColumnFilter selectedColumns,
