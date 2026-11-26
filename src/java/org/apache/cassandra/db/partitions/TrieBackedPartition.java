@@ -371,9 +371,12 @@ public class TrieBackedPartition implements Partition
         return rowCount;
     }
 
+    /// Encoded with the types of `metadata()`, which for a memtable partition read after ALTER TYPE ... ADD is the
+    /// table's current metadata: the read's values can have the new field, and a value without it encodes the same
+    /// with either type.
     public ByteComparable path(ClusteringPrefix<?> clustering)
     {
-        return metadata.comparator.asByteComparable(clustering);
+        return metadata().comparator.asByteComparable(clustering);
     }
 
     @Override
@@ -617,8 +620,8 @@ public class TrieBackedPartition implements Partition
         int index = 0;
         for (Slice slice : slices)
         {
-            bounds[index++] = metadata.comparator.asByteComparable(slice.start());
-            bounds[index++] = metadata.comparator.asByteComparable(slice.end());
+            bounds[index++] = path(slice.start());
+            bounds[index++] = path(slice.end());
         }
         return unfilteredIterator(selection, bounds, reversed);
     }
@@ -633,8 +636,8 @@ public class TrieBackedPartition implements Partition
         int indexInc = reversed ? -2 : +2;
         for (Clustering<?> clustering : clusteringsInQueryOrder)
         {
-            bounds[index + 0] = metadata.comparator.asByteComparable(clustering.asStartBound());
-            bounds[index + 1] = metadata.comparator.asByteComparable(clustering.asEndBound());
+            bounds[index + 0] = path(clustering.asStartBound());
+            bounds[index + 1] = path(clustering.asEndBound());
             index += indexInc;
         }
         return unfilteredIterator(selection, bounds, reversed);

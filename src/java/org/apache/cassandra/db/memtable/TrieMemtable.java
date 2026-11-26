@@ -39,6 +39,7 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.BufferDecoratedKey;
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.DataRange;
@@ -459,9 +460,11 @@ public class TrieMemtable extends AbstractShardedMemtable
     public Cell<?> getCellForKey(DecoratedKey partitionKey, Clustering<?> clustering, ColumnMetadata column)
     {
         TableMetadata metadata = metadata();
+        // The clustering can be a value of the table's current types, see TrieBackedPartition.path.
+        ClusteringComparator comparator = this.metadata.get().comparator;
         ByteComparable key = v -> ByteSource.concat(
             partitionKey.asComparableBytes(v),
-            metadata.comparator.asByteComparable(clustering).asComparableBytes(v),
+            comparator.asByteComparable(clustering).asComparableBytes(v),
             TrieBackedRow.columnKey(clustering == Clustering.STATIC_CLUSTERING ? metadata.staticColumns()
                                                                                : metadata.regularColumns(),
                                     column));
