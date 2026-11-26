@@ -99,6 +99,8 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     private final ColumnFamilyStore baseCfs;
 
     private final SSTableContextManager contextManager;
+    // Held while the views are updated from contexts of the manager, and while removeIndex releases them all
+    private final Object contextsLock = new Object();
     private final Version version;
 
 
@@ -152,13 +154,18 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
             // and unsure there is not more reference to it. When that's done, we can safely remove the component files
             // on disk. Note that we copy the contexts list because we're going to clear the manager, and we need to
             // make sure this does not clear the `contexts` collection below (since it exists to be used after the clear).
-            Collection<SSTableContext> contexts = new ArrayList<>(contextManager.allContexts());
-            contexts.forEach(context -> {
-                var components = context.usedPerSSTableComponents();
-                context.sstable.unregisterComponents(components.allAsCustomComponents(), baseCfs.getTracker());
-            });
+            // The views aren't updated anymore once the group has no index (see onSSTableChanged).
+            Collection<SSTableContext> contexts;
+            synchronized (contextsLock)
+            {
+                contexts = new ArrayList<>(contextManager.allContexts());
+                contexts.forEach(context -> {
+                    var components = context.usedPerSSTableComponents();
+                    context.sstable.unregisterComponents(components.allAsCustomComponents(), baseCfs.getTracker());
+                });
 
-            contextManager.clear();
+                contextManager.clear();
+            }
 
             contexts.forEach(context -> {
                 SSTableWatcher.instance.onIndexDropped(baseCfs.metadata(), context.usedPerSSTableComponents().forWrite());
@@ -383,25 +390,31 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     public synchronized Set<StorageAttachedIndex> onSSTableChanged(Collection<SSTableReader> removed, Iterable<SSTableReader> added,
                                                             Set<StorageAttachedIndex> indexes, boolean validate)
     {
-        Optional<Set<SSTableContext>> optValid = contextManager.update(removed, added, validate, indices);
-        if (optValid.isEmpty())
-        {
-            // This means at least one sstable had invalid per-sstable components, so mark all indexes non-queryable.
-            indices.forEach(StorageAttachedIndex::makeIndexNonQueryable);
-            return indexes;
-        }
-
         Set<StorageAttachedIndex> incomplete = new HashSet<>();
-
-        for (StorageAttachedIndex index : indexes)
+        synchronized (contextsLock)
         {
-            Set<SSTableContext> invalid = index.getIndexContext().onSSTableChanged(removed, optValid.get(), validate);
+            // The last index was dropped, which released the contexts (see removeIndex)
+            if (indices.isEmpty())
+                return incomplete;
 
-            if (!invalid.isEmpty())
+            Optional<Set<SSTableContext>> optValid = contextManager.update(removed, added, validate, indices);
+            if (optValid.isEmpty())
             {
-                // Mark the index non-queryable, as its view may be compromised, and incomplete, for our callers.
-                index.makeIndexNonQueryable();
-                incomplete.add(index);
+                // This means at least one sstable had invalid per-sstable components, so mark all indexes non-queryable.
+                indices.forEach(StorageAttachedIndex::makeIndexNonQueryable);
+                return indexes;
+            }
+
+            for (StorageAttachedIndex index : indexes)
+            {
+                Set<SSTableContext> invalid = index.getIndexContext().onSSTableChanged(removed, optValid.get(), validate);
+
+                if (!invalid.isEmpty())
+                {
+                    // Mark the index non-queryable, as its view may be compromised, and incomplete, for our callers.
+                    index.makeIndexNonQueryable();
+                    incomplete.add(index);
+                }
             }
         }
         return incomplete;
