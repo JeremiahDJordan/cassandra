@@ -180,11 +180,18 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
 
         DataLimits newLimits = cmd.limits().forShortReadRetry(toQuery);
 
-        AbstractBounds<PartitionPosition> bounds = cmd.dataRange().keyRange();
-        AbstractBounds<PartitionPosition> newBounds = bounds.inclusiveRight()
-                                                      ? new Range<>(lastPartitionKey, bounds.right)
-                                                      : new ExcludingBounds<>(lastPartitionKey, bounds.right);
-        DataRange newDataRange = cmd.dataRange().forSubRange(newBounds);
+        // lastPartitionKey is null when the replica hasn't returned any partition of the range, as, with endpoint
+        // grouping, when the replica reached the limit before getting to the range (see EndpointGroupingCoordinator):
+        // read the range again
+        DataRange newDataRange = cmd.dataRange();
+        if (lastPartitionKey != null)
+        {
+            AbstractBounds<PartitionPosition> bounds = newDataRange.keyRange();
+            AbstractBounds<PartitionPosition> newBounds = bounds.inclusiveRight()
+                                                          ? new Range<>(lastPartitionKey, bounds.right)
+                                                          : new ExcludingBounds<>(lastPartitionKey, bounds.right);
+            newDataRange = newDataRange.forSubRange(newBounds);
+        }
 
         ReplicaPlan.ForRangeRead replicaPlan = ReplicaPlans.forSingleReplicaRead(Keyspace.open(command.metadata().keyspace), cmd.dataRange().keyRange(), source, 1);
         return executeReadCommand(cmd.withUpdatedLimitsAndDataRange(newLimits, newDataRange), ReplicaPlan.shared(replicaPlan));
