@@ -80,7 +80,8 @@ class TableMetadataRefCache
         MapDifference<String, TableMetadata> indexesDiff = previous.tables.indexesDiff(updated.tables);
 
         boolean hasCreatedOrDroppedTablesOrViews = tablesDiff.created.size() > 0 || tablesDiff.dropped.size() > 0 || viewsDiff.created.size() > 0 || viewsDiff.dropped.size() > 0;
-        boolean hasCreatedOrDroppedIndexes = !indexesDiff.entriesOnlyOnRight().isEmpty() || !indexesDiff.entriesOnlyOnLeft().isEmpty();
+        boolean hasCreatedOrDroppedIndexes = !indexesDiff.entriesOnlyOnRight().isEmpty() || !indexesDiff.entriesOnlyOnLeft().isEmpty()
+                                             || indexesDiff.entriesDiffering().values().stream().anyMatch(diff -> !isSameIndex(previous, updated, diff.leftValue(), diff.rightValue()));
 
         Map<TableId, TableMetadataRef> metadataRefs = hasCreatedOrDroppedTablesOrViews ? Maps.newHashMap(this.metadataRefs) : this.metadataRefs;
         Map<Pair<String, String>, TableMetadataRef> metadataRefsByName = hasCreatedOrDroppedTablesOrViews ? Maps.newHashMap(this.metadataRefsByName) : this.metadataRefsByName;
@@ -105,15 +106,35 @@ class TableMetadataRefCache
         viewsDiff.altered.forEach(diff -> metadataRefs.get(diff.after.metadata.id).set(diff.after.metadata));
         indexesDiff.entriesDiffering()
                    .values()
-                   .stream()
-                   .map(MapDifference.ValueDifference::rightValue)
-                   .forEach(indexTable -> indexMetadataRefs.get(Pair.create(indexTable.keyspace, indexTable.indexName().get())).set(indexTable));
+                   .forEach(diff -> {
+                       TableMetadata indexTable = diff.rightValue();
+                       Pair<String, String> key = Pair.create(indexTable.keyspace, indexTable.indexName().get());
+                       // An index dropped and created again with the same name in one schema change, with another
+                       // definition or on another table.
+                       if (!isSameIndex(previous, updated, diff.leftValue(), indexTable))
+                       {
+                           indexMetadataRefs.put(key, new TableMetadataRef(indexTable));
+                           return;
+                       }
+                       // Every build of an index table has a new LocalPartitioner, and its tokens only compare with
+                       // tokens of the same instance: keep the one that the index's keys are decorated with.
+                       TableMetadataRef ref = indexMetadataRefs.get(key);
+                       ref.set(indexTable.unbuild().partitioner(ref.get().partitioner).build());
+                   });
 
         // Avoid re-wrapping the map if no changes
         return new TableMetadataRefCache(
             hasCreatedOrDroppedTablesOrViews ? unmodifiableMap(metadataRefs) : metadataRefs,
             hasCreatedOrDroppedTablesOrViews ? unmodifiableMap(metadataRefsByName) : metadataRefsByName,
             hasCreatedOrDroppedIndexes ? unmodifiableMap(indexMetadataRefs) : indexMetadataRefs);
+    }
+
+    /** Whether the index tables are of the same definition of the index, on the same table. */
+    private static boolean isSameIndex(KeyspaceMetadata previous, KeyspaceMetadata updated, TableMetadata before, TableMetadata after)
+    {
+        String name = after.indexName().get();
+        return before.id.equals(after.id)
+               && previous.tables.getNullable(before.id).indexes.get(name).equals(updated.tables.getNullable(after.id).indexes.get(name));
     }
 
     private void putRef(Map<TableId, TableMetadataRef> metadataRefs,
