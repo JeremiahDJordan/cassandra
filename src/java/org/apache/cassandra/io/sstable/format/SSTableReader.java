@@ -1358,6 +1358,15 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
     }
 
     /**
+     * Returns whether methods like {@link #estimatedKeys()} or {@link #estimatedKeysForRanges(Collection)} can return
+     * sensible estimations.
+     */
+    public boolean isEstimationInformative()
+    {
+        return indexSummary.size() > 2;
+    }
+
+    /**
      * Returns the number of entries in the IndexSummary.  At full sampling, this is approximately 1/INDEX_INTERVALth of
      * the keys in this SSTable.
      */
