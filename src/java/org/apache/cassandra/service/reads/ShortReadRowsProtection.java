@@ -335,7 +335,8 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     /**
      * Whether a replica response of the given size reached the byte limit of the read. The requests of short read
      * protection keep that limit (see {@link DataLimits#forShortReadRetry}), and the replica stops after the row that
-     * reaches it. The unmerged counter of the replica's responses counts the same rows, so it counts the same bytes.
+     * reaches it. The unmerged counter of the replica's responses counts the same rows, at no fewer bytes (see
+     * {@link DataLimits.Counter#countingFullRowSize()}).
      */
     private boolean reachedBytesLimit(int fetchedBytes)
     {

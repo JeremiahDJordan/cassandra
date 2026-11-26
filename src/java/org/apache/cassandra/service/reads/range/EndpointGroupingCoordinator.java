@@ -196,7 +196,7 @@ public class EndpointGroupingCoordinator
         {
             endpointContexts.computeIfAbsent(replica.endpoint(),
                                              k -> new EndpointQueryContext(replica.endpoint(),
-                                                                           command.createLimitedCounter(false),
+                                                                           command.createLimitedCounter(false).countingFullRowSize(),
                                                                            requestTime,
                                                                            requestSensors,
                                                                            execTimeAccumulator)).add(handler);

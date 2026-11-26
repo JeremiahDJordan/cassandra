@@ -21,7 +21,14 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicBoolean;
 
+import net.bytebuddy.ByteBuddy;
+import net.bytebuddy.dynamic.loading.ClassLoadingStrategy;
+import net.bytebuddy.implementation.MethodDelegation;
+import net.bytebuddy.implementation.bind.annotation.SuperCall;
+import net.bytebuddy.implementation.bind.annotation.This;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -31,6 +38,7 @@ import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.statements.SelectStatement;
 import org.apache.cassandra.db.ConsistencyLevel;
+import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.impl.RowUtil;
 import org.apache.cassandra.service.ClientState;
@@ -42,6 +50,8 @@ import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static java.lang.String.format;
+import static net.bytebuddy.matcher.ElementMatchers.named;
+import static net.bytebuddy.matcher.ElementMatchers.takesArguments;
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
 import static org.junit.Assert.assertEquals;
 
@@ -64,6 +74,7 @@ public class BytePagingLiveDataSizeTest extends TestBaseImpl
     public static void setupCluster() throws IOException
     {
         cluster = init(Cluster.build(3)
+                              .withInstanceInitializer(BBHelper::install)
                               .withConfig(config -> config.set("aggregation_subpage_size", "1KiB"))
                               .start());
     }
@@ -97,6 +108,41 @@ public class BytePagingLiveDataSizeTest extends TestBaseImpl
         testPaging("m map<int, int>",
                    "UPDATE %s SET m = m + {1: 1, 2: 2, 3: 3} WHERE pk = ? AND ck = ?",
                    "DELETE m[1], m[2] FROM %s WHERE pk = ? AND ck = ?");
+    }
+
+    /**
+     * A replica that counts more bytes for the rows it reads than the coordinator, as replicas of earlier releases do,
+     * stops its pages early. It holds deletions of rows that the other replicas return after its last row, so the
+     * coordinator has to read on from it.
+     */
+    @Test
+    public void testReplicaCountingMoreBytes()
+    {
+        String table = createTable("m map<int, int>");
+        write("UPDATE %s USING TTL 60 SET m = m + {1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7, 8: 8, 9: 9, 10: 10} WHERE pk = ? AND ck = ?", table);
+        write("UPDATE %s SET m = m + {11: 11} WHERE pk = ? AND ck = ?", table);
+        for (int pk = 0; pk < PARTITIONS; pk++)
+            for (int ck = 0; ck < ROWS; ck += 3)
+                cluster.get(2).executeInternal(format("DELETE FROM %s WHERE pk = ? AND ck = ?", table), pk, ck);
+
+        cluster.get(2).runOnInstance(() -> BBHelper.countFullRowSize.set(true));
+        try
+        {
+            for (String query : new String[]{ "SELECT * FROM %s WHERE pk = 0", "SELECT * FROM %s" })
+            {
+                String select = format(query, table);
+                List<String> expected = execute(select, "ALL", Integer.MAX_VALUE, false);
+                assertEquals(select, (ROWS - (ROWS + 2) / 3) * (query.contains("WHERE") ? 1 : PARTITIONS), expected.size());
+                assertEquals(select, expected, execute(select, "ALL", PAGE_SIZE_IN_BYTES, true));
+            }
+
+            List<String> count = execute(format("SELECT COUNT(*) FROM %s", table), "ALL", 1000, false);
+            assertEquals(Collections.singletonList(Arrays.toString(new Object[]{ (long) (ROWS - (ROWS + 2) / 3) * PARTITIONS })), count);
+        }
+        finally
+        {
+            cluster.get(2).runOnInstance(() -> BBHelper.countFullRowSize.set(false));
+        }
     }
 
     /**
@@ -136,7 +182,7 @@ public class BytePagingLiveDataSizeTest extends TestBaseImpl
     private static String createTable(String columns)
     {
         String table = KEYSPACE + ".t" + tables++;
-        cluster.schemaChange(format("CREATE TABLE %s (pk int, ck int, %s, PRIMARY KEY (pk, ck))", table, columns));
+        cluster.schemaChange(format("CREATE TABLE %s (pk int, ck int, %s, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'", table, columns));
         return table;
     }
 
@@ -173,5 +219,27 @@ public class BytePagingLiveDataSizeTest extends TestBaseImpl
             while (pagingState != null);
             return rows;
         });
+    }
+
+    public static class BBHelper
+    {
+        static final AtomicBoolean countFullRowSize = new AtomicBoolean();
+
+        static void install(ClassLoader cl, int node)
+        {
+            if (node != 2)
+                return;
+            new ByteBuddy().rebase(BTreeRow.class)
+                           .method(named("liveDataSize").and(takesArguments(1)))
+                           .intercept(MethodDelegation.to(BBHelper.class))
+                           .make()
+                           .load(cl, ClassLoadingStrategy.Default.INJECTION);
+        }
+
+        @SuppressWarnings("unused")
+        public static int liveDataSize(long nowInSec, @This BTreeRow row, @SuperCall Callable<Integer> zuper) throws Exception
+        {
+            return countFullRowSize.get() ? row.dataSize() : zuper.call();
+        }
     }
 }
