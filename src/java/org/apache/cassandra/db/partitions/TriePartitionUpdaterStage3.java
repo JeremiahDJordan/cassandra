@@ -192,16 +192,28 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
         if (updated == null)
             currentPartition.markInsertedRows(-1);
 
-        // Do not issue an update for a row deleted by a range or partition tombstone
-        if (indexer != UpdateTransaction.NO_OP && updated != existing && marker.pointDeletion() != null)
+        if (indexer != UpdateTransaction.NO_OP && updated != existing)
         {
             Clustering<?> clustering = clusteringForCurrentKey();
             if (updated != null)
+            {
+                // The row keeps newer data. Report the cells the deletion removed, as TriePartitionUpdaterLegacyIndex
+                // does for any deletion.
                 indexer.onUpdated(existing.toRow(clustering, DeletionTime.LIVE),
                                   updated.toRow(clustering, DeletionTime.LIVE));
-            else
+            }
+            else if (marker.pointDeletion() != null)
+            {
                 indexer.onUpdated(existing.toRow(clustering, DeletionTime.LIVE),
                                   BTreeRow.emptyDeletedRow(clustering, Row.Deletion.regular(deletion)));
+            }
+            else
+            {
+                // Do not issue an update for a row deleted by a range or partition tombstone. Report the removal
+                // without a deletion, as TriePartitionUpdaterLegacyIndex does, so that it only reaches the indexes
+                // that ask for it (Index.Indexer#removeRowData).
+                indexer.onUpdated(existing.toRow(clustering, DeletionTime.LIVE), BTreeRow.emptyRow(clustering));
+            }
         }
         return updated;
     }

@@ -21,6 +21,7 @@ package org.apache.cassandra.index.sai.memory;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.List;
@@ -231,6 +232,17 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
     @Override
     public void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup)
     {
+        update(key, clustering, oldValue, newValue, memtable, opGroup, true);
+    }
+
+    @Override
+    public void remove(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, Memtable memtable, OpOrder.Group opGroup)
+    {
+        update(key, clustering, oldValue, null, memtable, opGroup, false);
+    }
+
+    private void update(DecoratedKey key, Clustering clustering, ByteBuffer oldValue, ByteBuffer newValue, Memtable memtable, OpOrder.Group opGroup, boolean countWrite)
+    {
         int oldRemaining = oldValue == null ? 0 : oldValue.remaining();
         int newRemaining = newValue == null ? 0 : newValue.remaining();
         if (oldRemaining == 0 && newRemaining == 0)
@@ -259,12 +271,24 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
                                                                 if (sensors != null)
                                                                     sensors.incrementSensor(sensorContext, Type.INDEX_WRITE_BYTES, allocatedBytes);
                                                             });
-        writeCount.increment();
+        if (countWrite)
+            writeCount.increment();
         onIndexUpdated();
     }
 
     @Override
     public void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup)
+    {
+        update(key, clustering, oldValues, newValues, memtable, opGroup, true);
+    }
+
+    @Override
+    public void remove(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Memtable memtable, OpOrder.Group opGroup)
+    {
+        update(key, clustering, oldValues, Collections.emptyIterator(), memtable, opGroup, false);
+    }
+
+    private void update(DecoratedKey key, Clustering clustering, Iterator<ByteBuffer> oldValues, Iterator<ByteBuffer> newValues, Memtable memtable, OpOrder.Group opGroup, boolean countWrite)
     {
         RequestSensors sensors = requestTracker.get();
 
@@ -287,7 +311,8 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
                                                                 if (sensors != null)
                                                                     sensors.incrementSensor(sensorContext, Type.INDEX_WRITE_BYTES, allocatedBytes);
                                                             });
-        writeCount.increment();
+        if (countWrite)
+            writeCount.increment();
     }
 
     public KeyRangeIterator search(QueryContext queryContext, Expression expression, AbstractBounds<PartitionPosition> keyRange)
