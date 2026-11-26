@@ -431,6 +431,100 @@ public class SkipListAtomicUpdatesTest extends SAITester
     }
 
     /**
+     * A write that only sets or deletes cells of columns no SAI index is on, regular or static, doesn't wait for the
+     * partition's lock: a racing write of an indexed column, which takes the lock, completes while it is paused.
+     */
+    @Test
+    public void testNoLockForWritesOfUnindexedColumns() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, w int, s int static, t int static, l list<int>, " +
+                    "PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(s) USING 'sai'");
+        execute("INSERT INTO %s (pk, ck, v, w, s, t, l) VALUES (0, 0, 1, 1, 1, 1, [0]) USING TIMESTAMP 10");
+
+        String[] writes = { "UPDATE %s USING TIMESTAMP TS SET w = TS WHERE pk = 0 AND ck = 0",
+                            "UPDATE %s USING TIMESTAMP TS SET t = TS WHERE pk = 0",
+                            "DELETE w FROM %s USING TIMESTAMP TS WHERE pk = 0 AND ck = 0",
+                            "UPDATE %s USING TIMESTAMP TS SET l = l + [TS] WHERE pk = 0 AND ck = 0",
+                            "INSERT INTO %s (pk, ck, w) VALUES (0, 1, TS) USING TIMESTAMP TS" };
+        long timestamp = 10;
+        for (String write : writes)
+        {
+            timestamp += 10;
+            assertTrue(write, racePausedWrite(timestamp, write.replace("TS", String.valueOf(timestamp)),
+                                              "UPDATE %s USING TIMESTAMP ? SET v = ? WHERE pk = 0 AND ck = 0",
+                                              timestamp + 1, (int) timestamp + 1));
+        }
+
+        for (String source : new String[]{ "memtable", "sstable" })
+        {
+            if (source.equals("sstable"))
+                flush();
+            assertRows(execute("SELECT ck, v, w, t, l FROM %s WHERE v = 61"), row(0, 61, null, 30, List.of(0, 50)));
+            assertEquals(source, Set.of(), cks("SELECT ck FROM %s WHERE v = 51"));
+            assertEquals(source, Set.of(0, 1), cks("SELECT ck FROM %s WHERE s = 1"));
+        }
+    }
+
+    /**
+     * A write that may change an SAI index entry waits for the partition's lock: a write of an indexed column, regular
+     * or static, and a partition, range, row or collection deletion, whatever columns it writes. So does any write to
+     * a table with an SAI index on a primary key column, which indexes every row.
+     */
+    @Test
+    public void testLockForWritesThatMayChangeAnIndexEntry() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, w int, s int static, l list<int>, PRIMARY KEY (pk, ck)) " +
+                    "WITH memtable = '" + memtable + "'");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        createIndex("CREATE INDEX ON %s(s) USING 'sai'");
+        execute("INSERT INTO %s (pk, ck, v, w, s, l) VALUES (0, 0, 1, 1, 1, [0]) USING TIMESTAMP 10");
+
+        String[] writes = { "UPDATE %s USING TIMESTAMP TS SET v = TS WHERE pk = 0 AND ck = 0",
+                            "UPDATE %s USING TIMESTAMP TS SET s = TS WHERE pk = 0",
+                            "UPDATE %s USING TIMESTAMP TS SET l = [TS] WHERE pk = 0 AND ck = 0",
+                            "BEGIN BATCH " +
+                            "DELETE FROM %1$s USING TIMESTAMP TP WHERE pk = 0 AND ck = 1; " +
+                            "INSERT INTO %1$s (pk, ck, w) VALUES (0, 1, TS) USING TIMESTAMP TS; " +
+                            "APPLY BATCH",
+                            "DELETE FROM %s USING TIMESTAMP TS WHERE pk = 0 AND ck > 0",
+                            "DELETE FROM %s USING TIMESTAMP TS WHERE pk = 0" };
+        long timestamp = 10;
+        for (String write : writes)
+        {
+            timestamp += 10;
+            String paused = write.replace("TS", String.valueOf(timestamp)).replace("TP", String.valueOf(timestamp - 1));
+            assertFalse(write, racePausedWrite(timestamp, paused,
+                                               "UPDATE %s USING TIMESTAMP ? SET v = ? WHERE pk = 0 AND ck = 0",
+                                               timestamp + 1, (int) timestamp + 1));
+        }
+
+        createTable("CREATE TABLE %s (pk int, ck int, w int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
+        createIndex("CREATE INDEX ON %s(ck) USING 'sai'");
+        execute("INSERT INTO %s (pk, ck, w) VALUES (0, 0, 1) USING TIMESTAMP 10");
+        assertFalse(racePausedWrite(20, "UPDATE %s USING TIMESTAMP 20 SET w = 2 WHERE pk = 0 AND ck = 0",
+                                    "UPDATE %s USING TIMESTAMP 30 SET w = 3 WHERE pk = 0 AND ck = 0"));
+    }
+
+    /**
+     * A write that changes no index entry makes the memtable one of the indexes' memtables, which queries ordered by an
+     * index read the matching rows from: a row whose indexed value is in an sstable reads the column the memtable holds.
+     */
+    @Test
+    public void testWriteOfUnindexedColumnIsQueried() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, w int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
+        createIndex("CREATE INDEX ON %s(v) USING 'sai'");
+        execute("INSERT INTO %s (pk, ck, v, w) VALUES (0, 0, 1, 1)");
+        flush();
+
+        execute("UPDATE %s SET w = 2 WHERE pk = 0 AND ck = 0");
+        assertRows(execute("SELECT w FROM %s WHERE v = 1"), row(2));
+        assertRows(execute("SELECT w FROM %s ORDER BY v LIMIT 1"), row(2));
+    }
+
+    /**
      * A write with SAI (which takes the partition's lock) is paused before its CAS, and a write without index
      * transaction (as ColumnFamilyStore.apply(update, ctx, false) makes, or a write that started before the index was
      * registered) changes the partition first, without waiting for the lock. The first write then loses its CAS under

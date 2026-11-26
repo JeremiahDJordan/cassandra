@@ -2137,8 +2137,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         for (Index.Group g : indexGroups.values())
         {
             Index.Indexer indexer = g.indexerFor(writableIndexSelector(),
-                                                 update.partitionKey(),
-                                                 update.columns(),
+                                                 update,
                                                  nowInSec,
                                                  ctx,
                                                  IndexTransaction.Type.UPDATE,

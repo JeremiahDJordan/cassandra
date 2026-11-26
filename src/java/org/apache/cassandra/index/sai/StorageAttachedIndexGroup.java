@@ -62,6 +62,7 @@ import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexerFailures;
@@ -92,6 +93,7 @@ import org.apache.cassandra.notifications.MemtableDiscardedNotification;
 import org.apache.cassandra.notifications.MemtableRenewedNotification;
 import org.apache.cassandra.notifications.SSTableAddedNotification;
 import org.apache.cassandra.notifications.SSTableListChangedNotification;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
@@ -243,6 +245,86 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
     public boolean containsIndex(Index index)
     {
         return index instanceof StorageAttachedIndex && indices.contains(index);
+    }
+
+    @Override
+    public Index.Indexer indexerFor(Predicate<Index> indexSelector,
+                                    PartitionUpdate update,
+                                    long nowInSec,
+                                    WriteContext ctx,
+                                    IndexTransaction.Type transactionType,
+                                    Memtable memtable)
+    {
+        // Spares the partition lock of a skip-list memtable (see requiresAtomicUpdates) to an update that can't change
+        // a memtable index. Not for a trie memtable: it has no such lock, and reading the deletions of a trie update
+        // costs more than the indexer.
+        if (transactionType == IndexTransaction.Type.UPDATE
+            && memtable != null
+            && !memtable.appliesUpdatesAtomically()
+            && changesNoIndexEntry(indexSelector, update)
+            && initializeMemtableIndexes(indexSelector, update.columns(), memtable))
+            return null;
+
+        return indexerFor(indexSelector, update.partitionKey(), update.columns(), nowInSec, ctx, transactionType, memtable);
+    }
+
+    /**
+     * Whether the update only writes or deletes cells of regular and static columns that none of the selected indexes
+     * is on, with no partition, range, row or complex deletion, so no index entry can change.
+     */
+    private boolean changesNoIndexEntry(Predicate<Index> indexSelector, PartitionUpdate update)
+    {
+        if (!update.deletionInfo().isLive())
+            return false;
+
+        RegularAndStaticColumns columns = update.columns();
+        boolean selected = false;
+        for (StorageAttachedIndex index : indices)
+        {
+            if (!indexSelector.test(index))
+                continue;
+            if (mayIndex(index, columns))
+                return false;
+            selected = true;
+        }
+        if (!selected)
+            return false;
+
+        if (hasRowOrComplexDeletion(update.staticRow()))
+            return false;
+        for (Row row : update.rows())
+            if (hasRowOrComplexDeletion(row))
+                return false;
+        return true;
+    }
+
+    private static boolean hasRowOrComplexDeletion(Row row)
+    {
+        return !row.deletion().isLive() || row.hasComplexDeletion();
+    }
+
+    /**
+     * Gives the selected indexes a memtable index for the memtable, as queries only read the memtables of the indexes
+     * (see QueryView) and this one gets data of indexed rows. Returns false if one of them, created since
+     * {@link #changesNoIndexEntry}, is on a column of the update.
+     */
+    private boolean initializeMemtableIndexes(Predicate<Index> indexSelector, RegularAndStaticColumns columns, Memtable memtable)
+    {
+        for (StorageAttachedIndex index : indices)
+        {
+            if (!indexSelector.test(index))
+                continue;
+            if (mayIndex(index, columns))
+                return false;
+            index.getIndexContext().initializeMemtableIndex(memtable);
+        }
+        return true;
+    }
+
+    private static boolean mayIndex(StorageAttachedIndex index, RegularAndStaticColumns columns)
+    {
+        ColumnMetadata column = index.getIndexContext().getDefinition();
+        return column.isPrimaryKeyColumn() || columns.contains(column);
     }
 
     @Override

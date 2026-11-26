@@ -1088,6 +1088,21 @@ public interface Index
                            Memtable memtable);
 
         /**
+         * Creates a new {@code Indexer} object for a partition update on the regular write path. By default, the one
+         * {@link #indexerFor(Predicate, DecoratedKey, RegularAndStaticColumns, long, WriteContext, IndexTransaction.Type, Memtable)}
+         * creates for the key and columns of the update; a group may use the update to tell that it needs none.
+         */
+        default Indexer indexerFor(Predicate<Index> indexSelector,
+                                   PartitionUpdate update,
+                                   long nowInSec,
+                                   WriteContext ctx,
+                                   IndexTransaction.Type transactionType,
+                                   Memtable memtable)
+        {
+            return indexerFor(indexSelector, update.partitionKey(), update.columns(), nowInSec, ctx, transactionType, memtable);
+        }
+
+        /**
          * Returns a new {@link QueryPlan} for the specified {@link RowFilter}, or {@code null} if none of the indexes in
          * this group supports the expression in the row filter.
          *
