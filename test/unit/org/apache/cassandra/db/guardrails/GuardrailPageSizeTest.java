@@ -18,10 +18,14 @@
 
 package org.apache.cassandra.db.guardrails;
 
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.PageSize;
@@ -30,6 +34,7 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 
 import static java.lang.String.format;
@@ -37,10 +42,20 @@ import static java.lang.String.format;
 /**
  * Tests the guardrail for the page size, {@link Guardrails#pageSize}.
  */
+@RunWith(Parameterized.class)
 public class GuardrailPageSizeTest extends ThresholdTester
 {
     private static final int PAGE_SIZE_WARN_THRESHOLD = 5;
     private static final int PAGE_SIZE_FAIL_THRESHOLD = 10;
+
+    @Parameterized.Parameter
+    public boolean local;
+
+    @Parameterized.Parameters(name = "local={0}")
+    public static Collection<Object> data()
+    {
+        return Arrays.asList(true, false);
+    }
 
     public GuardrailPageSizeTest()
     {
@@ -143,6 +158,9 @@ public class GuardrailPageSizeTest extends ThresholdTester
                                                    ProtocolVersion.CURRENT,
                                                    KEYSPACE);
 
-        statement.executeLocally(queryState, options);
+        if (local)
+            statement.executeLocally(queryState, options);
+        else
+            statement.execute(queryState, options, Dispatcher.RequestTime.forImmediateExecution());
     }
 }

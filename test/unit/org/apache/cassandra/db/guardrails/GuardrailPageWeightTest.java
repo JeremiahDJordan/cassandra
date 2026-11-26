@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.db.guardrails;
 
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 
 import org.apache.cassandra.config.DataStorageSpec;
@@ -25,6 +27,8 @@ import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.service.ClientWarn;
 import org.junit.Before;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.cql3.CQLStatement;
 import org.apache.cassandra.cql3.PageSize;
@@ -33,6 +37,7 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.Dispatcher;
 import org.apache.cassandra.transport.ProtocolVersion;
 
 import static java.lang.String.format;
@@ -42,10 +47,20 @@ import static org.apache.cassandra.config.DataStorageSpec.DataStorageUnit.KIBIBY
 /**
  * Tests the guardrail for the page size, {@link Guardrails#pageSize}.
  */
+@RunWith(Parameterized.class)
 public class GuardrailPageWeightTest extends ThresholdTester
 {
     private static final int PAGE_WEIGHT_WARN_THRESHOLD_KIB = 4;
     private static final int PAGE_WEIGHT_FAIL_THRESHOLD_KIB = 7;
+
+    @Parameterized.Parameter
+    public boolean local;
+
+    @Parameterized.Parameters(name = "local={0}")
+    public static Collection<Object> data()
+    {
+        return Arrays.asList(true, false);
+    }
 
     public GuardrailPageWeightTest()
     {
@@ -159,7 +174,10 @@ public class GuardrailPageWeightTest extends ThresholdTester
                                                    ProtocolVersion.CURRENT,
                                                    KEYSPACE);
 
-        statement.executeLocally(queryState, options);
+        if (local)
+            statement.executeLocally(queryState, options);
+        else
+            statement.execute(queryState, options, Dispatcher.RequestTime.forImmediateExecution());
     }
 
     private int toBytes(int kib)
