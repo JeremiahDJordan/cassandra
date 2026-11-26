@@ -132,7 +132,6 @@ public abstract class RangeCommandIterator extends AbstractIterator<RowIterator>
                 // else, sends the next batch of concurrent queries (after having close the previous iterator)
                 if (sentQueryIterator != null)
                 {
-                    liveReturned += counter.counted();
                     sentQueryIterator.close();
 
                     // It's not the first batch of queries and we're not done, so we we can use what has been

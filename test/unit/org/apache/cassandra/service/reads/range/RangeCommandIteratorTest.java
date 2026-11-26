@@ -33,6 +33,7 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadCommand;
 import org.apache.cassandra.db.RowUpdateBuilder;
+import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -128,6 +129,41 @@ public class RangeCommandIteratorTest
         replicaPlans = replicaPlanIterator(keyRange, keyspace, true);
         data = RangeCommandIterator.create(replicaPlans, command, 1, 1, vnodeCount, System.nanoTime(), ReadTracker.NOOP);
         verifyRangeCommandIterator(data, rows, 1, vnodeCount);
+    }
+
+    /**
+     * The rows of a batch are counted once to size the next batch: with 10 rows in each of 5 ranges and LIMIT 40, a first
+     * batch of 1 range gets 10 rows, so the second batch has the 3 ranges that should have the 30 remaining rows.
+     */
+    @Test
+    public void testConcurrencyFactorAfterFirstBatch()
+    {
+        new TokenUpdater().withKeys("b", "c", "d", "e").update();
+        int vnodeCount = 5;
+
+        Keyspace keyspace = Keyspace.open(KEYSPACE1);
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF_STANDARD1);
+        cfs.clearUnsafe();
+
+        for (String prefix : new String[]{ "a", "b", "c", "d", "e" })
+        {
+            for (int i = 0; i < 10; ++i)
+            {
+                RowUpdateBuilder builder = new RowUpdateBuilder(cfs.metadata(), 10, prefix + i);
+                builder.clustering("c");
+                builder.add("val", String.valueOf(i));
+                builder.build().applyUnsafe();
+            }
+        }
+
+        PartitionRangeReadCommand command = (PartitionRangeReadCommand) Util.cmd(cfs).withLimit(40).build();
+        CloseableIterator<ReplicaPlan.ForRangeRead> replicaPlans = replicaPlanIterator(command.dataRange().keyRange(), keyspace, false);
+        RangeCommandIterator data = RangeCommandIterator.create(replicaPlans, command, 1, 1000, vnodeCount, System.nanoTime(), ReadTracker.NOOP);
+        PartitionIterator limited = command.limits().filter(data, command.nowInSec(), command.selectsFullPartition(), command.metadata().enforceStrictLiveness());
+
+        assertEquals(40, Util.size(limited));
+        assertEquals(2, data.batchesRequested());
+        assertEquals(4, data.rangesQueried());
     }
 
     @Test
