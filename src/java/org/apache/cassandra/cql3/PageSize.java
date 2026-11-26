@@ -131,10 +131,13 @@ public class PageSize
     }
 
     /**
-     * Exercise the guardrail for this page size.
+     * Exercise the guardrail for this page size, if it is defined.
      */
     public void guard(String what, ClientState state)
     {
+        if (!isDefined())
+            return;
+
         if (unit == PageUnit.ROWS)
             Guardrails.pageSize.guard(size, what, false, state);
         else if (unit == PageUnit.BYTES)
