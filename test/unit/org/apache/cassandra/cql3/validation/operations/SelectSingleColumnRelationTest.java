@@ -791,6 +791,27 @@ public class SelectSingleColumnRelationTest extends CQLTester
     }
 
     @Test
+    public void testInRestrictionsComparedAsEqualityWithAllowFiltering() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, i inet, d decimal)");
+        execute("INSERT INTO %s (k, i, d) VALUES (1, '127.0.0.1', 1.0)");
+        // the 16-byte IPv4-mapped form of 127.0.0.1, which the column type tells apart from the 4-byte one
+        execute("INSERT INTO %s (k, i, d) VALUES (2, blobAsInet(0x00000000000000000000ffff7f000001), 1.00)");
+        execute("INSERT INTO %s (k, i, d) VALUES (3, '10.0.0.1', 2)");
+
+        beforeAndAfterFlush(() -> {
+            assertRows(execute("SELECT k FROM %s WHERE i = '127.0.0.1' ALLOW FILTERING"), row(1));
+            assertRows(execute("SELECT k FROM %s WHERE i IN ('127.0.0.1') ALLOW FILTERING"), row(1));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE i IN ('127.0.0.1', '10.0.0.1') ALLOW FILTERING"), row(1), row(3));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE i NOT IN ('127.0.0.1') ALLOW FILTERING"), row(2), row(3));
+
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE d = 1 ALLOW FILTERING"), row(1), row(2));
+            assertRowsIgnoringOrder(execute("SELECT k FROM %s WHERE d IN (1) ALLOW FILTERING"), row(1), row(2));
+            assertRows(execute("SELECT k FROM %s WHERE d NOT IN (1) ALLOW FILTERING"), row(3));
+        });
+    }
+
+    @Test
     public void testClusteringSlicesWithNotIn()
     {
         createTable("CREATE TABLE %s (a text, b int, c int, d int, primary key(a, b, c))");

@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.function.Predicate;
 
 import com.google.common.collect.Range;
 
@@ -129,6 +130,41 @@ public class ListSerializer<T> extends CollectionSerializer<List<T>>
                 throw new MarshalException("Unexpected extraneous bytes after list value");
 
             return l;
+        }
+        catch (BufferUnderflowException | IndexOutOfBoundsException e)
+        {
+            throw new MarshalException("Not enough bytes to read a list");
+        }
+    }
+
+    public boolean anyMatch(ByteBuffer serializedList, Predicate<ByteBuffer> predicate)
+    {
+        return anyMatch(serializedList, ByteBufferAccessor.instance, predicate);
+    }
+
+    public <V> boolean anyMatch(V input, ValueAccessor<V> accessor, Predicate<V> predicate)
+    {
+        try
+        {
+            int s = readCollectionSize(input, accessor, ProtocolVersion.V3);
+            int offset = sizeOfCollectionSize(s, ProtocolVersion.V3);
+
+            for (int i = 0; i < s; i++)
+            {
+                int size = accessor.getInt(input, offset);
+                offset += TypeSizes.INT_SIZE;
+
+                if (size < 0)
+                    continue;
+
+                V value = accessor.slice(input, offset, size);
+
+                if (predicate.test(value))
+                    return true;
+
+                offset += size;
+            }
+            return false;
         }
         catch (BufferUnderflowException | IndexOutOfBoundsException e)
         {

@@ -141,6 +141,11 @@ Upgrading
       other rows if it satisfies the OR. Before, it only returned rows that satisfied both sides without indexes,
       and with SAI it could return fewer rows with LIMIT or paging than without. Run such queries only once every
       node runs this release, because each replica filters the rows it returns.
+    - Filtering with IN and NOT IN now compares the values with the column type, as = does. A 4-byte IPv4 address and
+      its 16-byte IPv4-mapped IPv6 form (::ffff:a.b.c.d) used to match each other, and decimals that differ only in
+      their scale, like 1.0 and 1.00, used not to. Until every node runs this release, the replicas of an earlier
+      release, and the coordinators of an earlier release that filter the rows they get from the replicas, still filter
+      IN as before.
 
 Deprecation
 ---------
