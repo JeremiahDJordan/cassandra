@@ -18,16 +18,25 @@
 
 package org.apache.cassandra.index.sai.plan;
 
+import java.math.BigDecimal;
+import java.math.BigInteger;
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.Operator;
+import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.DecimalType;
+import org.apache.cassandra.db.marshal.InetAddressType;
+import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.index.sai.SAITester;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotEquals;
+import static org.junit.Assert.assertTrue;
 import static org.assertj.core.api.Assertions.assertThat;
 
 public class ExpressionTest
@@ -115,6 +124,42 @@ public class ExpressionTest
         assertEquals(Expression.Op.AUTOMATON, makeExpression(Operator.LIKE_SUFFIX, "abc").getOp());
         assertEquals(Expression.Op.AUTOMATON, makeExpression(Operator.LIKE_CONTAINS, "abc").getOp());
         assertEquals(Expression.Op.PREFIX, makeExpression(Operator.LIKE_PREFIX, "abc").getOp());
+    }
+
+    @Test
+    public void testPostFilterDecimalVarintAndInetValues() throws Exception
+    {
+        // values equal to the bound but serialized differently: 2.50 for 2.5, and 1 with a redundant sign byte
+        DecimalType decimal = DecimalType.instance;
+        assertPostFilter(decimal, decimal.decompose(new BigDecimal("2.5")), decimal.decompose(new BigDecimal("2.50")),
+                         decimal.decompose(new BigDecimal("1")), decimal.decompose(new BigDecimal("4")));
+        IntegerType varint = IntegerType.instance;
+        assertPostFilter(varint, varint.decompose(BigInteger.ONE), ByteBuffer.wrap(new byte[]{ 0, 1 }),
+                         varint.decompose(BigInteger.valueOf(-300)), varint.decompose(BigInteger.valueOf(300)));
+        InetAddressType inet = InetAddressType.instance;
+        assertPostFilter(inet, inet.decompose(InetAddress.getByName("127.0.0.2")), inet.decompose(InetAddress.getByName("127.0.0.2")),
+                         inet.decompose(InetAddress.getByName("127.0.0.1")), inet.decompose(InetAddress.getByName("127.0.0.3")));
+    }
+
+    private static void assertPostFilter(AbstractType<?> type, ByteBuffer bound, ByteBuffer value, ByteBuffer lower, ByteBuffer upper)
+    {
+        assertTrue(makeExpression(type, Operator.EQ, bound).isSatisfiedBy(value));
+        assertFalse(makeExpression(type, Operator.NEQ, bound).isSatisfiedBy(value));
+        assertTrue(makeExpression(type, Operator.GTE, bound).isSatisfiedBy(value));
+        assertFalse(makeExpression(type, Operator.GT, bound).isSatisfiedBy(value));
+        assertTrue(makeExpression(type, Operator.LTE, bound).isSatisfiedBy(value));
+        assertFalse(makeExpression(type, Operator.LT, bound).isSatisfiedBy(value));
+        assertTrue(makeExpression(type, Operator.GT, lower).add(Operator.LT, upper).isSatisfiedBy(value));
+        assertFalse(makeExpression(type, Operator.GT, upper).isSatisfiedBy(value));
+        assertFalse(makeExpression(type, Operator.GT, lower).add(Operator.LT, upper).add(Operator.NEQ, bound).isSatisfiedBy(value));
+        assertTrue(makeExpression(type, Operator.GT, lower).add(Operator.LT, upper).add(Operator.NEQ, upper).isSatisfiedBy(value));
+    }
+
+    private static Expression makeExpression(AbstractType<?> type, Operator op, ByteBuffer value)
+    {
+        Expression expression = new Expression(SAITester.createIndexContext("col", type));
+        expression.add(op, value);
+        return expression;
     }
 
     private static Expression makeExpression(Operator op)

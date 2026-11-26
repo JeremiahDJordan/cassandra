@@ -386,12 +386,12 @@ public class Expression
             return false;
         }
 
-        // The encoded form of a literal value isn't used to check it (validateStringValue and comparePostFilter compare
-        // literal values as they are), and can be costly to compute (the canonical form of a frozen value). Vectors,
-        // which TypeUtil.isLiteral takes for frozen values, need their decomposed vector.
-        Value value = TypeUtil.isLiteral(validator) && !validator.isVector()
-                      ? new Value(columnValue, columnValue, null)
-                      : new Value(columnValue, validator);
+        // The encoded form of a value isn't used to check it (validateStringValue and comparePostFilter compare values
+        // as they are), and can be costly to compute (the canonical form of a frozen value, decimals, varints and inet
+        // addresses). Vectors need their decomposed vector.
+        Value value = validator.isVector()
+                      ? new Value(columnValue, validator)
+                      : new Value(columnValue, columnValue, null);
 
         if (operation == Op.BOUNDED_ANN)
         {
@@ -446,7 +446,7 @@ public class Expression
         for (ByteBuffer term : exclusions)
         {
             if (TypeUtil.isLiteral(validator) ? holdsTerm(value.raw, term)
-                                              : TypeUtil.comparePostFilter(new Value(term, validator), value, validator) == 0)
+                                              : TypeUtil.comparePostFilter(new Value(term, term, null), value, validator) == 0)
                 return false;
         }
 
