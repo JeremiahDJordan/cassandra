@@ -208,6 +208,7 @@ public class RowFilter
         // A tree can have children without expressions, e.g. after SAI removed the expressions it handles from a
         // disjunction. Those are always satisfied, so they don't make a partition without matching rows a non-match.
         final boolean filterNonStaticColumns = rowLevelOperation.hasExpressions();
+        final boolean filterStaticColumns = hasStaticExpression();
 
         return new Transformation<>()
         {
@@ -220,8 +221,19 @@ public class RowFilter
                 pk = partition.partitionKey();
                 hasMatchingRow = false;
 
+                // As for the other rows (see applyToRow), the expressions expect a static row without deleted cells:
+                // otherwise a deleted cell would be seen as an empty value, and a deleted or expired element of a
+                // static collection as a live element.
+                Row staticRow = partition.staticRow();
+                if (filterStaticColumns)
+                {
+                    staticRow = staticRow.purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
+                    if (staticRow == null)
+                        staticRow = Rows.EMPTY_STATIC_ROW;
+                }
+
                 // Short-circuit all partitions that won't match based on static and partition keys
-                if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow()))
+                if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), staticRow))
                 {
                     partition.close();
                     return null;
