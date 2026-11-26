@@ -68,7 +68,10 @@ public class KeyRangeTermIterator extends KeyRangeIterator
     @SuppressWarnings("resource")
     public static KeyRangeTermIterator build(final Expression e, QueryView view, AbstractBounds<PartitionPosition> keyRange, QueryContext queryContext, boolean defer)
     {
-        KeyRangeIterator rangeIterator = buildRangeIterator(e.searchedRanges(), view, keyRange, queryContext, defer);
+        Expression searched = e.withoutUnindexedEmptyBounds();
+        KeyRangeIterator rangeIterator = searched == null
+                                         ? KeyRangeIterator.empty()
+                                         : buildRangeIterator(searched.searchedRanges(), view, keyRange, queryContext, defer);
         return new KeyRangeTermIterator(rangeIterator, view.sstableIndexes, queryContext);
     }
 

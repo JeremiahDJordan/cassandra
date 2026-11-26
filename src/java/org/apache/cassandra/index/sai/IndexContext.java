@@ -523,6 +523,8 @@ public class IndexContext
     // (not matching precisely will lead to false negatives)
     // 3. or includes everything if the expression is of a value without terms, which matches no indexed value
     // (see Expression#isWithoutTerms).
+    // 4. or includes everything if the expression's value is an empty value that the index doesn't store, which
+    // matches no indexed value (see Expression#hasUnindexedEmptyValue).
     // The negations on a collection index (NOT CONTAINS, NOT CONTAINS KEY and m[k] != v) include everything, because
     // the index can match keys whose collection no longer holds the value (see IndexContext#canSubtractMatches).
     //
@@ -542,7 +544,8 @@ public class IndexContext
             || TypeUtil.isInetAddress(expression.validator)
             || !version.onDiskFormat().indexFeatureSet().isRowAware()
             || !canSubtractMatches(expression)
-            || expression.isWithoutTerms())
+            || expression.isWithoutTerms()
+            || expression.hasUnindexedEmptyValue())
         {
             return allKeys;
         }
