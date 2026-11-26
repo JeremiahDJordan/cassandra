@@ -1267,8 +1267,10 @@ public class RowFilter
         private final IndexRegistry indexRegistry;
         private final IndexHints indexHints;
         private final OptimizerOptions optimizerOptions;
-        /** The keys of the checks already run for this filter, shared with its sub-builders, see {@link #checkOnce}. */
-        private final Set<Object> performedChecks;
+        /** The builder of the whole filter, which keeps the checks run for its sub-builders too, see {@link #checkOnce}. */
+        private final Builder root;
+        /** The keys of the checks already run for the filter by the root builder, allocated on the first check. */
+        private Set<Object> performedChecks;
 
         public Builder(boolean needsReconciliation, IndexRegistry indexRegistry, IndexHints indexHints)
         {
@@ -1277,20 +1279,20 @@ public class RowFilter
 
         public Builder(boolean needsReconciliation, IndexRegistry indexRegistry, IndexHints indexHints, OptimizerOptions optimizerOptions)
         {
-            this(needsReconciliation, indexRegistry, indexHints, optimizerOptions, new HashSet<>(2));
+            this(needsReconciliation, indexRegistry, indexHints, optimizerOptions, null);
         }
 
         private Builder(boolean needsReconciliation,
                         IndexRegistry indexRegistry,
                         IndexHints indexHints,
                         OptimizerOptions optimizerOptions,
-                        Set<Object> performedChecks)
+                        @Nullable Builder root)
         {
             this.needsReconciliation = needsReconciliation;
             this.indexRegistry = indexRegistry;
             this.indexHints = indexHints;
             this.optimizerOptions = optimizerOptions;
-            this.performedChecks = performedChecks;
+            this.root = root == null ? this : root;
         }
 
         public RowFilter build()
@@ -1308,6 +1310,14 @@ public class RowFilter
          */
         public void checkOnce(Object key, Runnable check)
         {
+            if (root != this)
+            {
+                root.checkOnce(key, check);
+                return;
+            }
+
+            if (performedChecks == null)
+                performedChecks = new HashSet<>(2);
             if (performedChecks.add(key))
                 check.run();
         }
@@ -1444,7 +1454,7 @@ public class RowFilter
                 // If we're in disjunction mode, we must not pass the current builder to addToRowFilter.
                 // We create a new conjunction sub-builder instead and add all expressions there.
                 // it's part of the same filter: the checks it runs are shared (see #checkOnce)
-                var builder = new Builder(needsReconciliation, indexRegistry, indexHints, optimizerOptions, performedChecks);
+                var builder = new Builder(needsReconciliation, indexRegistry, indexHints, optimizerOptions, root);
                 addToRowFilterDelegate.accept(builder);
 
                 if (builder.current.expressions.size() == 1 && builder.current.children.isEmpty())

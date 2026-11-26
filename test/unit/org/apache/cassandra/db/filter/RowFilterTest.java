@@ -540,6 +540,14 @@ public class RowFilterTest
         builder.addAllAsConjunction(b -> b.checkOnce("c", runs::incrementAndGet));
         builder.checkOnce("c", runs::incrementAndGet);
         assertEquals(3, runs.get());
+
+        // the first check of a filter can run in a sub-builder
+        builder = new RowFilter.Builder(false, null, IndexHints.NONE);
+        current.set(builder, new RowFilter.FilterElement.Builder(true));
+        builder.addAllAsConjunction(b -> b.checkOnce("a", runs::incrementAndGet));
+        builder.addAllAsConjunction(b -> b.checkOnce("a", runs::incrementAndGet));
+        builder.checkOnce("a", runs::incrementAndGet);
+        assertEquals(4, runs.get());
     }
 
     @Test
