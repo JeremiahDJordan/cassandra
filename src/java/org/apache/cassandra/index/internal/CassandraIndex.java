@@ -24,10 +24,12 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
 import com.google.common.collect.ImmutableSet;
+import com.google.common.util.concurrent.Uninterruptibles;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -42,6 +44,7 @@ import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.filter.RowFilter;
+import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -56,6 +59,7 @@ import org.apache.cassandra.index.internal.keys.KeysSearcher;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.sensors.Context;
 import org.apache.cassandra.sensors.RequestSensors;
@@ -65,6 +69,7 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Refs;
 
+import static org.apache.cassandra.config.CassandraRelevantProperties.CESSATION_WAIT_SECONDS;
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
 
 /**
@@ -669,6 +674,41 @@ public abstract class CassandraIndex implements Index
         indexCfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.INDEX_REMOVED);
         indexCfs.readOrdering.awaitNewBarrier();
         indexCfs.invalidate();
+        // stop the compactions scheduled or started since the first interruption (e.g. after the flush) and wait for
+        // their files to be deleted, so that an index re-created with the same name doesn't load them from the same
+        // directory
+        CompactionManager.instance.active.cancelScheduledTasksAffecting(cfss, (sstable) -> true, TableOperation.StopTrigger.INVALIDATE_INDEX);
+        CompactionManager.instance.interruptCompactionForCFs(cfss, (sstable) -> true, true, TableOperation.StopTrigger.INVALIDATE_INDEX);
+        waitForSSTablesDeleted();
+    }
+
+    /**
+     * Waits, at most for the cessation wait, for the transactions of the stopped compactions of the invalidated index
+     * table to drop and release its sstables, including the ones they wrote, which deletes their files, and then for the
+     * deletions queued so far. The transactions do that after they stop marking the sstables as compacting, and after
+     * the compactions stop counting as running.
+     */
+    private void waitForSSTablesDeleted()
+    {
+        long start = System.nanoTime();
+        long delay = TimeUnit.SECONDS.toNanos(CESSATION_WAIT_SECONDS.getInt(60));
+        // canonical, as in the sstable descriptors
+        Set<File> directories = new HashSet<>();
+        for (File directory : indexCfs.getDirectories().getCFDirectories())
+            directories.add(directory.toCanonical());
+        while (SSTableReader.hasGlobalReference(directories))
+        {
+            if (System.nanoTime() - start >= delay)
+            {
+                logger.warn("Timed out waiting for the sstables of {} to be released; an index created again with " +
+                            "the same name may load them", indexCfs.metadata);
+                return;
+            }
+            Uninterruptibles.sleepUninterruptibly(10, TimeUnit.MILLISECONDS);
+        }
+
+        if (!LifecycleTransaction.waitForDeletions(delay - (System.nanoTime() - start), TimeUnit.NANOSECONDS))
+            logger.warn("Timed out waiting for the deletions of the sstables of {}", indexCfs.metadata);
     }
 
     private boolean isBuilt()
