@@ -53,17 +53,28 @@ public class DeserializationHelper
     private ColumnFilter.Tester tester;
 
     private final boolean hasDroppedColumns;
+    private final boolean mayHaveDroppedColumnsNewerThanDrop;
     private final Map<ByteBuffer, DroppedColumn> droppedColumns;
     private DroppedColumn currentDroppedComplex;
 
 
     public DeserializationHelper(TableMetadata metadata, int version, Flag flag, ColumnFilter columnsToFetch)
     {
+        this(metadata, version, flag, columnsToFetch, true);
+    }
+
+    /**
+     * @param mayHaveDroppedColumnsNewerThanDrop false if the data cannot have cells newer than the drop of a dropped
+     * column that {@code columnsToFetch} does not fetch
+     */
+    public DeserializationHelper(TableMetadata metadata, int version, Flag flag, ColumnFilter columnsToFetch, boolean mayHaveDroppedColumnsNewerThanDrop)
+    {
         this.flag = flag;
         this.version = version;
         this.columnsToFetch = columnsToFetch;
         this.droppedColumns = metadata.droppedColumns;
         this.hasDroppedColumns = droppedColumns.size() > 0;
+        this.mayHaveDroppedColumnsNewerThanDrop = hasDroppedColumns && mayHaveDroppedColumnsNewerThanDrop;
     }
 
     public DeserializationHelper(TableMetadata metadata, int version, Flag flag)
@@ -73,7 +84,18 @@ public class DeserializationHelper
 
     public boolean includes(ColumnMetadata column)
     {
-        return columnsToFetch == null || columnsToFetch.fetches(column);
+        if (columnsToFetch == null)
+            return true;
+
+        if (!columnsToFetch.fetches(column))
+            return false;
+
+        // A filter that fetches all columns accepts any column, including a dropped one, whose cells that are newer
+        // than the drop are kept. Such a column is not part of the fetched columns, which the result of a read must
+        // only contain (for instance to be serialized), so it is skipped.
+        return !mayHaveDroppedColumnsNewerThanDrop
+               || !columnsToFetch.fetchesAllColumns(column.isStatic())
+               || columnsToFetch.fetchedColumns().contains(column);
     }
 
     public boolean includes(Cell<?> cell, LivenessInfo rowLiveness)
