@@ -185,11 +185,12 @@ public class TrieMemoryIndex extends MemoryIndex
         final PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
         try
         {
-            if (analyzerTransformsValue)
+            if (analyzerTransformsValue || TypeUtil.hasNonUniqueSerialization(indexContext.getValidator()))
             {
-                // Because an update can add and remove the same term, we collect the set of the seen PrimaryKeys
-                // objects touched by the new values and pass it to the remover to prevent removing the PrimaryKey from
-                // the PrimaryKeys object if it was updated during the add part of this update.
+                // Because an update can add and remove the same term (from an analyzer, or the canonical form of values
+                // written differently), we collect the set of the seen PrimaryKeys objects touched by the new values and
+                // pass it to the remover to prevent removing the PrimaryKey from the PrimaryKeys object if it was
+                // updated during the add part of this update.
                 var seenPrimaryKeys = new HashSet<PrimaryKeys>();
                 primaryKeysAccumulator.setSeenPrimaryKeys(seenPrimaryKeys);
                 primaryKeysRemover.setSeenPrimaryKeys(seenPrimaryKeys);
@@ -257,7 +258,7 @@ public class TrieMemoryIndex extends MemoryIndex
     {
         // The terms the sstable writers produce (see SegmentBuilder#analyzeAndAdd), so a value is indexed the same way
         // in memtables and sstables.
-        value = TypeUtil.asIndexBytes(value, indexContext.getValidator());
+        value = indexContext.asIndexTerm(value);
         List<ByteBuffer> terms = ByteLimitedMaterializer.materializeTokens(indexContext.getAnalyzerFactory().create(), value, indexContext, primaryKey);
         final long initialSizeOnHeap = data.usedSizeOnHeap();
         final long initialSizeOffHeap = data.usedSizeOffHeap();

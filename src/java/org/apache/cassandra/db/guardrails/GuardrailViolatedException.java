@@ -26,4 +26,12 @@ public class GuardrailViolatedException extends InvalidRequestException
     {
         super(message);
     }
+
+    /** The same violation with the given message, caused by this one; the guardrail has already logged its own. */
+    public GuardrailViolatedException withMessage(String message)
+    {
+        GuardrailViolatedException e = new GuardrailViolatedException(message);
+        e.initCause(this);
+        return e;
+    }
 }
