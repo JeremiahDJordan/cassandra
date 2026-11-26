@@ -356,6 +356,9 @@ public abstract class DataLimits
         // false means we do not propagate our stop signals onto the iterator, we only count
         protected boolean enforceLimits = true;
 
+        // true means we count the bytes of rows at their full size, see countingFullRowSize()
+        private boolean countsFullRowSize;
+
         protected Counter(int nowInSec, boolean assumeLiveData, boolean enforceStrictLiveness)
         {
             this.nowInSec = nowInSec;
@@ -367,6 +370,22 @@ public abstract class DataLimits
         {
             this.enforceLimits = false;
             return this;
+        }
+
+        /**
+         * Counts the bytes of rows with {@link Row#dataSize()} instead of {@link Row#liveDataSize(int)}, for the
+         * responses of replicas, which hold the rows before purge. No replica, of this release or an earlier one,
+         * counts more bytes for a row, so a response that this counts under the byte limit didn't stop at it.
+         */
+        public Counter countingFullRowSize()
+        {
+            this.countsFullRowSize = true;
+            return this;
+        }
+
+        protected int rowSize(Row row)
+        {
+            return countsFullRowSize ? row.dataSize() : row.liveDataSize(nowInSec);
         }
 
         public PartitionIterator applyTo(PartitionIterator partitions)
@@ -638,14 +657,14 @@ public abstract class DataLimits
             {
                 rowsInCurrentPartition = 0;
                 hasLiveStaticRow = !staticRow.isEmpty() && isLive(staticRow);
-                staticRowBytes = hasLiveStaticRow && bytesLimit != NO_LIMIT ? staticRow.liveDataSize(nowInSec) : 0;
+                staticRowBytes = hasLiveStaticRow && bytesLimit != NO_LIMIT ? rowSize(staticRow) : 0;
             }
 
             @Override
             public Row applyToRow(Row row)
             {
                 if (isLive(row))
-                    incrementRowCount(bytesLimit != NO_LIMIT ? row.liveDataSize(nowInSec) : 0);
+                    incrementRowCount(bytesLimit != NO_LIMIT ? rowSize(row) : 0);
                 return row;
             }
 
@@ -1132,7 +1151,7 @@ public abstract class DataLimits
                     }
                     hasReturnedRowsFromCurrentPartition = false;
                     hasLiveStaticRow = !staticRow.isEmpty() && isLive(staticRow);
-                    staticRowBytes = hasLiveStaticRow ? staticRow.liveDataSize(nowInSec) : 0;
+                    staticRowBytes = hasLiveStaticRow ? rowSize(staticRow) : 0;
                 }
                 currentPartitionKey = partitionKey;
                 // If we are done we need to preserve the groupInCurrentPartition and rowsCountedInCurrentPartition
@@ -1198,7 +1217,7 @@ public abstract class DataLimits
                 if (isLive(row))
                 {
                     hasUnfinishedGroup = true;
-                    incrementRowCount(bytesLimit != NO_LIMIT ? row.liveDataSize(nowInSec) : 0);
+                    incrementRowCount(bytesLimit != NO_LIMIT ? rowSize(row) : 0);
                     hasReturnedRowsFromCurrentPartition = true;
                 }
 
