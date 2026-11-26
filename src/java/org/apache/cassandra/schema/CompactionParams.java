@@ -128,12 +128,14 @@ public final class CompactionParams
     private final CompactionStrategyOptions strategyOptions;
     private final boolean isEnabled;
     private final TombstoneOption tombstoneOption;
+    private final boolean onlyPurgeRepairedTombstones;
 
     private CompactionParams(Class<? extends CompactionStrategy> klass, Map<String, String> options, boolean isEnabled, TombstoneOption tombstoneOption)
     {
         this.strategyOptions = new CompactionStrategyOptions(klass, options, true);
         this.isEnabled = isEnabled;
         this.tombstoneOption = tombstoneOption;
+        this.onlyPurgeRepairedTombstones = Boolean.parseBoolean(options().get(CompactionStrategyOptions.ONLY_PURGE_REPAIRED_TOMBSTONES));
     }
 
     public static CompactionParams create(Class<? extends CompactionStrategy> klass, Map<String, String> options)
@@ -211,6 +213,14 @@ public final class CompactionParams
     public boolean isEnabled()
     {
         return isEnabled;
+    }
+
+    /**
+     * Whether tombstones can only be removed from repaired sstables (see {@link CompactionStrategyOptions#ONLY_PURGE_REPAIRED_TOMBSTONES}).
+     */
+    public boolean onlyPurgeRepairedTombstones()
+    {
+        return onlyPurgeRepairedTombstones;
     }
 
     public static CompactionParams fromMap(Map<String, String> map)

@@ -97,7 +97,6 @@ import org.apache.cassandra.db.compaction.CompactionStrategy;
 import org.apache.cassandra.db.compaction.CompactionStrategyContainer;
 import org.apache.cassandra.db.compaction.CompactionStrategyFactory;
 import org.apache.cassandra.db.compaction.CompactionStrategyManager;
-import org.apache.cassandra.db.compaction.CompactionStrategyOptions;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.compaction.unified.Environment;
@@ -3669,8 +3668,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
 
         // Here we need to ask the CSM for the parameters in case they were changed over JMX without changing the schema,
         // for now the CSM has the up-to-date copy of the params
-        CompactionParams params = strategyContainer.getCompactionParams();
-        return Boolean.parseBoolean(params.options().get(CompactionStrategyOptions.ONLY_PURGE_REPAIRED_TOMBSTONES));
+        return strategyContainer.getCompactionParams().onlyPurgeRepairedTombstones();
     }
 
     @Override
