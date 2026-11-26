@@ -29,6 +29,7 @@ import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.transform.MoreRows;
@@ -48,6 +49,7 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     private final DecoratedKey partitionKey;
 
     private Clustering<?> lastClustering; // clustering of the last observed row
+    private boolean hasObservedMarkers; // whether any range tombstone marker was observed
 
     private int lastCounted = 0; // last seen recorded # before attempting to fetch more rows
     private int lastFetched = 0; // # rows returned by last attempt to get more (or by the original read command)
@@ -71,6 +73,13 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     {
         lastClustering = row.clustering();
         return row;
+    }
+
+    @Override
+    public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
+    {
+        hasObservedMarkers = true;
+        return marker;
     }
 
     /*
@@ -112,6 +121,15 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
          * the moreContents() call.
          */
         if (singleResultCounter.rowsCountedInCurrentPartition() == 0)
+            return null;
+
+        /*
+         * A replica that returned range tombstone markers but no row of the partition has read all of it. The previous
+         * branch misses it when the partition's count doesn't start at zero (a done GROUP BY counter, or a page that
+         * continues the partition). Without a row to start after, the request would read the partition from its start
+         * and return its markers again.
+         */
+        if (lastClustering == null && hasObservedMarkers)
             return null;
 
         /*

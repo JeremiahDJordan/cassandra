@@ -94,6 +94,32 @@ public class GroupByTest extends TestBaseImpl
     }
 
     @Test
+    public void groupByWithPerPartitionLimitAndSrpOnPartitionWithOnlyRangeTombstones() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(2).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck int, v int, PRIMARY KEY (pk, ck)) WITH read_repair = 'NONE'"));
+            // partition 2 comes before partition 4 in token order
+            for (int i = 1; i <= 2; i++)
+            {
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck, v) VALUES (2, 2, 1) USING TIMESTAMP 0"));
+                cluster.get(i).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck, v) VALUES (2, 5, 1) USING TIMESTAMP 0"));
+            }
+            cluster.get(1).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 2 WHERE pk = 4 AND ck < 1"));
+            cluster.get(2).executeInternal(withKeyspace("DELETE FROM %s.tbl USING TIMESTAMP 1 WHERE pk = 4 AND ck < 2"));
+
+            for (String filter : new String[]{ "", "WHERE v = 1 " })
+            {
+                String query = withKeyspace("SELECT pk, ck, count(*) FROM %s.tbl " + filter + "GROUP BY pk, ck PER PARTITION LIMIT 1 LIMIT 2" +
+                                            (filter.isEmpty() ? "" : " ALLOW FILTERING"));
+                assertRows(cluster.coordinator(1).execute(query, ConsistencyLevel.ALL), row(2, 2, 1L));
+                for (int i = 1; i <= 4; i++)
+                    assertRows(cluster.coordinator(1).executeWithPaging(query, ConsistencyLevel.ALL, i), row(2, 2, 1L));
+            }
+        }
+    }
+
+    @Test
     public void testGroupByWithAggregatesAndPaging() throws Throwable
     {
         try (Cluster cluster = init(builder().withNodes(2).withConfig((cfg) -> cfg.set("enable_user_defined_functions", "true")).start()))
