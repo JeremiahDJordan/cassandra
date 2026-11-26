@@ -583,6 +583,61 @@ public class Expression
     }
 
     /**
+     * Whether a bound of this expression is an empty value that the index doesn't store. Indexes on non-literal types
+     * don't index empty values (see {@link TypeUtil#skipsEmptyValue}, CASSANDRA-20313), and their index structures
+     * can't encode an empty term, so such an expression must not be searched as it is.
+     * See {@link #withoutUnindexedEmptyBounds()}.
+     */
+    public boolean hasUnindexedEmptyValue()
+    {
+        return isUnindexedEmpty(lower) || isUnindexedEmpty(upper);
+    }
+
+    private boolean isUnindexedEmpty(Bound bound)
+    {
+        return bound != null && !bound.value.raw.hasRemaining() && TypeUtil.skipsEmptyValue(validator);
+    }
+
+    /**
+     * Returns the expression to search the index with for an equality or a range with an empty value the index
+     * doesn't store (see {@link #hasUnindexedEmptyValue()}). An empty value sorts first, so an equality on it matches
+     * nothing, an empty lower bound is dropped and an empty upper bound matches nothing. Rows whose value is empty
+     * aren't found.
+     *
+     * @return {@code null} if nothing can match, the expression without its empty lower bound, or this expression
+     */
+    public Expression withoutUnindexedEmptyBounds()
+    {
+        if (!hasUnindexedEmptyValue())
+            return this;
+
+        switch (operation)
+        {
+            case EQ:
+            case CONTAINS_KEY:
+            case CONTAINS_VALUE:
+                return null;
+            case RANGE:
+                // The bounds are in the order of the index, which is the reverse of the order of the column's values
+                // for a descending clustering column (see #add).
+                boolean reversed = context.getDefinition().isReversedType();
+                if (isUnindexedEmpty(reversed ? lower : upper))
+                    return null;
+
+                Expression result = new Expression(context);
+                result.operation = operation;
+                result.lower = reversed ? lower : null;
+                result.upper = reversed ? null : upper;
+                result.lowerInclusive = lowerInclusive;
+                result.upperInclusive = upperInclusive;
+                result.exclusions.addAll(exclusions);
+                return result;
+            default:
+                return this;
+        }
+    }
+
+    /**
      * Returns an expression that matches keys not matched by this expression.
      */
     public Expression negated()
