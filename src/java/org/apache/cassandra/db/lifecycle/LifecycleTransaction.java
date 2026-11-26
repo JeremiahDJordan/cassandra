@@ -19,12 +19,16 @@ package org.apache.cassandra.db.lifecycle;
 
 import java.nio.file.Path;
 import java.util.*;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BiPredicate;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Predicate;
 import com.google.common.collect.*;
 import com.google.common.util.concurrent.Runnables;
+import com.google.common.util.concurrent.Uninterruptibles;
 
 import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.io.util.File;
@@ -754,6 +758,29 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     public static void waitForDeletions()
     {
         FBUtilities.waitOnFuture(ScheduledExecutors.nonPeriodicTasks.schedule(Runnables.doNothing(), 0, TimeUnit.MILLISECONDS));
+    }
+
+    /**
+     * Waits, at most for {@code timeout}, for the deletions queued so far.
+     *
+     * @return false if the deletions didn't finish in time
+     */
+    public static boolean waitForDeletions(long timeout, TimeUnit unit)
+    {
+        Future<?> deletions = ScheduledExecutors.nonPeriodicTasks.schedule(Runnables.doNothing(), 0, TimeUnit.MILLISECONDS);
+        try
+        {
+            Uninterruptibles.getUninterruptibly(deletions, timeout, unit);
+            return true;
+        }
+        catch (TimeoutException e)
+        {
+            return false;
+        }
+        catch (ExecutionException e)
+        {
+            throw Throwables.cleaned(e);
+        }
     }
 
     // a class representing the current state of the reader within this transaction, encoding the actions both logged
