@@ -16,6 +16,7 @@
 
 package org.apache.cassandra.db.memtable;
 
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collection;
 
@@ -25,16 +26,23 @@ import org.junit.runners.Parameterized;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
+import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.btree.BTreeSet;
@@ -42,6 +50,7 @@ import org.apache.cassandra.utils.btree.BTreeSet;
 import static org.apache.cassandra.inject.Expression.expr;
 import static org.apache.cassandra.inject.Expression.quote;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -102,6 +111,47 @@ public class MemtableReadDuringSchemaChangeTest extends CQLTester
         execute("INSERT INTO %s (pk, ck, d) VALUES (0, 2, 6)");
         assertRows(execute("INSERT INTO %s (pk, ck, d) VALUES (0, 2, 7) IF NOT EXISTS"), row(false, 0, 2, null, 6));
         assertLocalReadsReportTheCurrentTable();
+    }
+
+    /** The clustering bounds of the reads are values of the type with the new field. */
+    @Test
+    public void testReadOfAClusteringAfterAFieldIsAddedToItsType() throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + udt + ">, x int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + '\'');
+        execute("INSERT INTO %s (pk, ck, x) VALUES (0, {a: 1, b: 2}, 0)");
+
+        afterSchemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " ADD c int", () -> {
+            execute("INSERT INTO %s (pk, ck, x) VALUES (0, {a: 1, b: 2, c: 3}, 1)");
+            assertRows(execute("SELECT x FROM %s WHERE pk = 0 AND ck = {a: 1, b: 2}"), row(0));
+            assertRows(execute("SELECT x FROM %s WHERE pk = 0 AND ck = {a: 1, b: 2, c: 3}"), row(1));
+            assertRows(execute("SELECT x FROM %s WHERE pk = 0 AND ck > {a: 1, b: 2}"), row(1));
+            assertRows(execute("UPDATE %s SET x = 2 WHERE pk = 0 AND ck = {a: 1, b: 2} IF x = 0"), row(true));
+        });
+
+        assertRows(execute("SELECT x FROM %s"), row(2), row(1));
+    }
+
+    /** SAI looks up the cells of the rows it orders by their keys, which can be values of the new type. */
+    @Test
+    public void testCellLookupAfterAFieldIsAddedToTheTypeOfTheClustering() throws Throwable
+    {
+        String udt = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (pk int, ck frozen<" + udt + ">, x int, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + '\'');
+        execute("INSERT INTO %s (pk, ck, x) VALUES (0, {a: 1, b: 2}, 0)");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Memtable before = cfs.getTracker().getView().getCurrentMemtable();
+
+        afterSchemaChange("ALTER TYPE " + KEYSPACE + '.' + udt + " ADD c int", () -> {
+            TableMetadata metadata = cfs.metadata();
+            DecoratedKey key = Util.dk(Int32Type.instance.decompose(0));
+            ColumnMetadata x = metadata.getColumn(ColumnIdentifier.getInterned("x", false));
+            ByteBuffer one = Int32Type.instance.decompose(1);
+            ByteBuffer two = Int32Type.instance.decompose(2);
+            Cell<?> old = before.getCellForKey(key, Clustering.make(TupleType.buildValue(one, two, null)), x);
+            assertEquals(Int32Type.instance.decompose(0), old.buffer());
+            assertNull(before.getCellForKey(key, Clustering.make(TupleType.buildValue(one, two, Int32Type.instance.decompose(3))), x));
+        });
     }
 
     /** A range read and a read of the static row only, which reads no slice of the partition. */
