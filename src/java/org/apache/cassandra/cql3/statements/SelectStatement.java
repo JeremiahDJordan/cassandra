@@ -416,9 +416,6 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     {
         if (SchemaConstants.isUserKeyspace(table.keyspace))
             Guardrails.readConsistencyLevels.guard(EnumSet.of(options.getConsistency()), queryState.getClientState());
-
-        PageSize pageSize = options.getPageSize();
-        pageSize.guard(table(), queryState.getClientState());
     }
 
     /**
