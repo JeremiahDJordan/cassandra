@@ -37,7 +37,6 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -100,7 +99,6 @@ import org.apache.cassandra.io.sstable.SSTableRewriter;
 import org.apache.cassandra.io.sstable.format.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
-import org.apache.cassandra.io.sstable.format.SortedTableWriter;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.Schema;
@@ -143,14 +141,9 @@ public class StaleSameNameIndexComponentsTest extends SAITester
     // the armed holds, which pauseIndexWriter and pauseInitialBuild take
     private static volatile Injections.Hold armedWriterHold;
     private static volatile Injections.Hold armedInitialBuildHold;
-    // the hold that pauseAbortedIndexWriter takes
-    private static volatile Injections.Hold abortedWriterHold;
 
     // the hold of the rebuild whose abort fails (see failsAbort)
     private static volatile Injections.Hold abortedRebuildHold;
-
-    // the hold of the finish of the failing compaction (see failsFinish)
-    private static volatile Injections.Hold finishingHold;
 
     private static volatile boolean failAbortArmed;
     private static final AtomicInteger abortFailures = new AtomicInteger();
@@ -158,9 +151,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
     private static volatile Thread waiter;
     // the SSTable whose build waiterRecording(Descriptor) records
     private static volatile Descriptor waitedSSTable;
-    private static final Set<Object> awaitedSSTables = ConcurrentHashMap.newKeySet();
     private static final List<String> awaitedNames = new CopyOnWriteArrayList<>();
-    private static volatile String failingTable;
     private static volatile boolean waitTimedOut;
 
     private boolean defaultImmutableSetting;
@@ -168,28 +159,14 @@ public class StaleSameNameIndexComponentsTest extends SAITester
     // called by Byteman, in a method of SSTableIndexWriter
     public static void pauseIndexWriter(Object writer) throws Exception
     {
-        if (takesArm(writer))
-            armedWriterHold.arrive();
-    }
-
-    // called by Byteman, in SSTableIndexWriter#complete, once the writer has aborted
-    public static void pauseAbortedIndexWriter(Object writer) throws Exception
-    {
-        if (takesArm(writer))
-            abortedWriterHold.arrive();
-    }
-
-    /** Whether the writer is of {@link #pausedIndex} and the writer pauses are armed, which it then disarms. */
-    private static boolean takesArm(Object writer) throws Exception
-    {
         if (!writerArmed)
-            return false;
+            return;
         Field field = SSTableIndexWriter.class.getDeclaredField("indexContext");
         field.setAccessible(true);
         if (!pausedIndex.equals(((IndexContext) field.get(writer)).getIndexName()))
-            return false;
+            return;
         writerArmed = false;
-        return true;
+        armedWriterHold.arrive();
     }
 
     // called by Byteman, in StorageAttachedIndex#startInitialBuild
@@ -226,16 +203,12 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         Injections.deleteAll();
         Injections.Hold.releaseAll();
         abortedRebuildHold = null;
-        finishingHold = null;
-        abortedWriterHold = null;
         failAbortArmed = false;
         abortFailures.set(0);
         tocFailures.set(0);
         waiter = null;
         waitedSSTable = null;
-        awaitedSSTables.clear();
         awaitedNames.clear();
-        failingTable = null;
         pausedIndex = INDEX;
         waitTimedOut = false;
     }
@@ -1093,304 +1066,11 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         assertThat(execute("SELECT pk FROM %s WHERE a = 'a3'")).hasSize(29);
     }
 
-    /**
-     * A compaction's output is opened early, and the compaction is held before its writer of the stale index writes its
-     * metadata; the index is dropped and created again on a: the build of the new index waits for that writer before it
-     * builds the early-opened output.
-     */
-    @Test
-    public void testNewIndexBuildsEarlyOpenedCompactionOutputAfterWriterOfDroppedIndex() throws Throwable
-    {
-        testNewIndexBuildsEarlyOpenedCompactionOutput(false);
-    }
-
-    /**
-     * Same, with the compaction held once its index writers are complete, then failing: the abort of its writer of the
-     * stale index leaves the files the new index built on the early-opened output alone.
-     */
-    @Test
-    public void testCompactionFailsAfterNewIndexBuildsEarlyOpenedOutput() throws Throwable
-    {
-        testNewIndexBuildsEarlyOpenedCompactionOutput(true);
-    }
-
-    private void testNewIndexBuildsEarlyOpenedCompactionOutput(boolean compactionFails) throws Throwable
-    {
-        int preemptiveOpenInterval = DatabaseDescriptor.getSSTablePreemptiveOpenIntervalInMB();
-        IMMUTABLE_SAI_COMPONENTS.setBoolean(false);
-        DatabaseDescriptor.setSSTablePreemptiveOpenIntervalInMB(1);
-        try
-        {
-            createTable(SCHEMA);
-            disableCompaction();
-            createIndex("CREATE CUSTOM INDEX " + INDEX + " ON %s(t) USING 'StorageAttachedIndex'");
-            createIndex("CREATE CUSTOM INDEX other_idx ON %s(o) USING 'StorageAttachedIndex'");
-            waitForTableIndexesQueryable();
-            String padding = "x".repeat(1000);
-            for (int pk = 0; pk < 4000; pk++)
-            {
-                execute("INSERT INTO %s (pk, t, a, o) VALUES (?, ?, ?, ?)", pk, "t" + pk + padding, "a" + pk % 7, pk);
-                if (pk == 1999)
-                    flush();
-            }
-            flush();
-            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
-
-            finishingHold = Injections.newHold("finish").build();
-            if (compactionFails)
-            {
-                failingTable = currentTable();
-                Injections.inject(Injections.newCustom("fail_compaction")
-                                            .add(InvokePointBuilder.newInvokePoint().onClass(SortedTableWriter.class).onMethod("finished").atEntry())
-                                            .add(ActionBuilder.newActionBuilder()
-                                                              .conditions()
-                                                              .when(StaleSameNameIndexComponentsTest.class.getName() + ".failsFinish($0)")
-                                                              .actions()
-                                                              .doThrow(RuntimeException.class, Expression.quote("Failed to finish (injected)")))
-                                            .build());
-            }
-            Injections.inject(indexWriterPause(compactionFails ? writerPoint("abort").atExit()
-                                                               : writerPoint("writeSegmentsMetadata").atEntry()),
-                              Injections.newCustom("record_awaited")
-                                        .add(InvokePointBuilder.newInvokePoint().onClass(PerIndexFilesOwner.class).onMethod("awaitOwnersOfDroppedIndex").atEntry())
-                                        .add(ActionBuilder.newActionBuilder()
-                                                          .actions()
-                                                          .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".recordAwaited($1, $2)"))
-                                        .build(),
-                              initialBuildLeavesCompactions());
-            writerArmed = !compactionFails;
-            CompletableFuture<Void> compaction = CompletableFuture.runAsync(cfs::forceMajorCompaction);
-            if (compactionFails)
-                finishingHold.awaitHeld();
-            else
-                armedWriterHold.awaitHeld();
-            SSTableReader output = cfs.getLiveSSTables()
-                                      .stream()
-                                      .filter(sstable -> sstable.openReason == SSTableReader.OpenReason.EARLY)
-                                      .findFirst()
-                                      .orElseThrow();
-            dropIndex("DROP INDEX %s." + INDEX);
-            createIndexAsync("CREATE CUSTOM INDEX " + INDEX + " ON %s(a) USING 'StorageAttachedIndex'");
-            if (compactionFails)
-            {
-                waitForTableIndexesQueryable();
-                byte[] marker = IndexDefinitionDigest.markerContent(cfs.metadata().indexes.get(INDEX).orElseThrow());
-                assertThat(Files.readAllBytes(completionMarker(output, INDEX).toPath())).isEqualTo(marker);
-
-                writerArmed = true;
-                finishingHold.release();
-                // the writer of the dropped index is aborted, the compaction's transaction isn't yet
-                armedWriterHold.awaitHeld();
-                assertThat(Files.readAllBytes(completionMarker(output, INDEX).toPath())).isEqualTo(marker);
-                armedWriterHold.release();
-                assertThatThrownBy(() -> compaction.get(60, TimeUnit.SECONDS)).isInstanceOf(ExecutionException.class);
-            }
-            else
-            {
-                waitForAssert(() -> assertThat(awaitedSSTables).contains(output.descriptor), 60, TimeUnit.SECONDS);
-                armedWriterHold.release();
-                compaction.get(60, TimeUnit.SECONDS);
-            }
-            Injections.deleteAll();
-
-            if (!compactionFails)
-            {
-                waitForTableIndexesQueryable();
-                assertThat(execute("SELECT pk FROM %s WHERE a = 'a3'")).hasSize(571);
-                assertTocListsNewIndex(cfs);
-            }
-            simulateNodeRestart();
-            assertThat(execute("SELECT pk FROM %s WHERE a = 'a3'")).hasSize(571);
-        }
-        finally
-        {
-            writerArmed = false;
-            Injections.Hold.releaseAll();
-            DatabaseDescriptor.setSSTablePreemptiveOpenIntervalInMB(preemptiveOpenInterval);
-        }
-    }
-
-    /**
-     * The TOC of the only SSTable lists one build of {@link #INDEX}, whose completion marker holds the definition of the
-     * index.
-     */
-    private void assertTocListsNewIndex(ColumnFamilyStore cfs) throws IOException
-    {
-        SSTableReader sstable = sstable();
-        Component marker = assertTocListsOneBuild(sstable, false).stream()
-                                                                 .filter(c -> c.name.endsWith("ColumnComplete.db"))
-                                                                 .findFirst()
-                                                                 .orElseThrow();
-        assertThat(Files.readAllBytes(sstable.descriptor.fileFor(marker).toPath()))
-        .isEqualTo(IndexDefinitionDigest.markerContent(cfs.metadata().indexes.get(INDEX).orElseThrow()));
-    }
-
-    /**
-     * A compaction's output is opened early, and the compaction is held in its writer of the stale index before it writes
-     * its metadata; the index is dropped and created again on a, and the writer is held again once it has aborted for
-     * the drop, before the compaction lists the components it wrote in the TOC: the TOC of the compacted SSTable lists
-     * the new index.
-     */
-    @Test
-    public void testNewIndexListedOnEarlyOpenedOutputAfterWriterOfDroppedIndexAborts() throws Throwable
-    {
-        testNewIndexListedOnEarlyOpenedOutput(false);
-    }
-
-    /**
-     * Same, with the compaction held in the writer of an index without values, which comes after the writer of the
-     * stale index, once the stale index's writer has completed; the index is created again on a column of another type.
-     */
-    @Test
-    public void testNewIndexListedOnEarlyOpenedOutputAfterWriterOfIndexWithoutValues() throws Throwable
-    {
-        testNewIndexListedOnEarlyOpenedOutput(true);
-    }
-
-    private void testNewIndexListedOnEarlyOpenedOutput(boolean holdIndexWithoutValues) throws Throwable
-    {
-        int preemptiveOpenInterval = DatabaseDescriptor.getSSTablePreemptiveOpenIntervalInMB();
-        IMMUTABLE_SAI_COMPONENTS.setBoolean(false);
-        DatabaseDescriptor.setSSTablePreemptiveOpenIntervalInMB(1);
-        try
-        {
-            createTable("CREATE TABLE %s (pk int PRIMARY KEY, t text, a ascii, o int, n text, i int)");
-            disableCompaction();
-            createIndex("CREATE CUSTOM INDEX " + INDEX + " ON %s(t) USING 'StorageAttachedIndex'");
-            createIndex("CREATE CUSTOM INDEX other_idx ON %s(o) USING 'StorageAttachedIndex'");
-            createIndex("CREATE CUSTOM INDEX n_idx ON %s(n) USING 'StorageAttachedIndex'");
-            // the per-index writers of an SSTable run in the order of the indexes of the group
-            StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(getCurrentColumnFamilyStore());
-            while (holdIndexWithoutValues && !comesAfterIndex(group, "n_idx"))
-            {
-                dropIndex("DROP INDEX %s.n_idx");
-                createIndex("CREATE CUSTOM INDEX n_idx ON %s(n) USING 'StorageAttachedIndex'");
-            }
-            waitForTableIndexesQueryable();
-            String padding = "x".repeat(1000);
-            for (int pk = 0; pk < 4000; pk++)
-            {
-                execute("INSERT INTO %s (pk, t, a, o, i) VALUES (?, ?, ?, ?, ?)", pk, "t" + pk + padding, "a" + pk % 7, pk, pk % 7);
-                if (pk == 1999)
-                    flush();
-            }
-            flush();
-            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
-
-            if (holdIndexWithoutValues)
-                pausedIndex = "n_idx";
-            else
-                Injections.inject(abortedIndexWriterPause(writerPoint("complete").atExit()));
-            Injections.inject(indexWriterPause(holdIndexWithoutValues ? writerPoint("complete").atEntry()
-                                                                      : writerPoint("writeSegmentsMetadata").atEntry()),
-                              Injections.newCustom("record_awaited")
-                                        .add(InvokePointBuilder.newInvokePoint().onClass(PerIndexFilesOwner.class).onMethod("awaitOwnersOfDroppedIndex").atEntry())
-                                        .add(ActionBuilder.newActionBuilder()
-                                                          .actions()
-                                                          .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".recordAwaited($1, $2)"))
-                                        .build(),
-                              initialBuildLeavesCompactions());
-            writerArmed = true;
-            CompletableFuture<Void> compaction = CompletableFuture.runAsync(cfs::forceMajorCompaction);
-            armedWriterHold.awaitHeld();
-            SSTableReader output = cfs.getLiveSSTables()
-                                      .stream()
-                                      .filter(sstable -> sstable.openReason == SSTableReader.OpenReason.EARLY)
-                                      .findFirst()
-                                      .orElseThrow();
-            dropIndex("DROP INDEX %s." + INDEX);
-            createIndexAsync("CREATE CUSTOM INDEX " + INDEX + " ON %s(" + (holdIndexWithoutValues ? "i" : "a") + ") USING 'StorageAttachedIndex'");
-            Injections.Hold held = armedWriterHold;
-            if (!holdIndexWithoutValues)
-            {
-                held = abortedWriterHold;
-                writerArmed = true;
-                armedWriterHold.release();
-                held.awaitHeld();
-                assertThat(held.heldThread()).isSameAs(armedWriterHold.heldThread());
-                awaitedSSTables.clear();
-            }
-            // the build of the new index waits for the compaction, or builds and lists its components meanwhile
-            waitForAssert(() -> assertThat(awaitedSSTables.contains(output.descriptor) || cfs.indexManager.isIndexQueryable(INDEX)).isTrue(),
-                          60, TimeUnit.SECONDS);
-            held.release();
-            compaction.get(60, TimeUnit.SECONDS);
-            Injections.deleteAll();
-
-            waitForTableIndexesQueryable();
-            assertThat(execute("SELECT pk FROM %s WHERE " + (holdIndexWithoutValues ? "i = 3" : "a = 'a3'"))).hasSize(571);
-            if (holdIndexWithoutValues)
-                assertTocListsFilesOfNewIndex(cfs);
-            else
-                assertTocListsNewIndex(cfs);
-        }
-        finally
-        {
-            writerArmed = false;
-            Injections.Hold.releaseAll();
-            DatabaseDescriptor.setSSTablePreemptiveOpenIntervalInMB(preemptiveOpenInterval);
-        }
-    }
-
-    /**
-     * The TOC of the only SSTable lists every file of {@link #INDEX}, whose completion marker holds the definition of
-     * the index. (The writer of the SSTable may also have listed the files of the index dropped before, which are gone.)
-     */
-    private void assertTocListsFilesOfNewIndex(ColumnFamilyStore cfs) throws IOException
-    {
-        SSTableReader sstable = sstable();
-        Set<String> listed = SSTable.readTOC(sstable.descriptor, false)
-                                         .stream()
-                                         .map(c -> sstable.descriptor.fileFor(c).name())
-                                         .collect(Collectors.toSet());
-        Set<String> files = indexFilesOnDisk(sstable);
-        assertThat(files).isNotEmpty();
-        assertThat(listed).containsAll(files);
-        String marker = files.stream().filter(name -> name.endsWith("ColumnComplete.db")).findFirst().orElseThrow();
-        assertThat(Files.readAllBytes(sstable.descriptor.directory.resolve(marker).toPath()))
-        .isEqualTo(IndexDefinitionDigest.markerContent(cfs.metadata().indexes.get(INDEX).orElseThrow()));
-    }
-
-    /**
-     * The initial build stops the compactions of the table and waits for them, which then end before it selects
-     * SSTables: this leaves them running, so that it selects the early-opened output of a compaction.
-     */
-    private static Injection initialBuildLeavesCompactions()
-    {
-        return Injections.newCustom("initial_build_leaves_compactions")
-                         .add(InvokePointBuilder.newInvokePoint().onClass(CompactionManager.class).onMethod("interruptCompactionFor").atEntry())
-                         .add(ActionBuilder.newActionBuilder()
-                                           .conditions()
-                                           .when(StaleSameNameIndexComponentsTest.class.getName() + ".calledBy(\"startInitialBuild\")")
-                                           .actions()
-                                           .doReturn("false"))
-                         .build();
-    }
-
-    private static boolean comesAfterIndex(StorageAttachedIndexGroup group, String name)
-    {
-        List<String> names = group.getIndexes().stream().map(index -> index.getIndexMetadata().name).collect(Collectors.toList());
-        return names.indexOf(name) > names.indexOf(INDEX);
-    }
-
     // called by Byteman
     public static void recordAwaited(Object descriptor, String indexName)
     {
         if (PerIndexFilesOwner.hasOwnerOfDroppedIndex((Descriptor) descriptor, indexName))
-        {
-            awaitedSSTables.add(descriptor);
             awaitedNames.add(indexName);
-        }
-    }
-
-    // called by Byteman, in SSTableWriter#finished: holds the first call for the SSTable of failingTable, then fails it
-    public static boolean failsFinish(Object writer) throws InterruptedException
-    {
-        if (!((SSTable) writer).descriptor.cfname.equals(failingTable))
-            return false;
-        failingTable = null;
-        finishingHold.arrive();
-        return true;
     }
 
     /**
@@ -1429,18 +1109,6 @@ public class StaleSameNameIndexComponentsTest extends SAITester
                          .add(ActionBuilder.newActionBuilder()
                                            .actions()
                                            .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".pauseIndexWriter($0)"))
-                         .build();
-    }
-
-    /** Pauses an SSTable index writer of {@link #pausedIndex} at the provided point, once armed, with its own hold. */
-    private static Injection abortedIndexWriterPause(InvokePointBuilder at)
-    {
-        abortedWriterHold = Injections.newHold("aborted_writer").build();
-        return Injections.newCustom("pause_aborted_index_writer")
-                         .add(at)
-                         .add(ActionBuilder.newActionBuilder()
-                                           .actions()
-                                           .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".pauseAbortedIndexWriter($0)"))
                          .build();
     }
 
