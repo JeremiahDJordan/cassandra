@@ -26,6 +26,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import com.google.common.base.Ticker;
+import io.netty.buffer.PooledByteBufAllocator;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.service.StorageService;
 import org.junit.Before;
@@ -143,7 +144,7 @@ public class RateLimitingTest extends CQLTester
     }
 
     @Test
-    public void shouldReleaseBuffersOfOverloadedMultiFrameMessages() throws Exception
+    public void shouldReleaseBuffersOfOverloadedMessages() throws Exception
     {
         int payloadSize = FrameEncoder.Payload.MAX_SIZE * 3;
         try (SimpleClient client = client().connect(false, true))
@@ -157,7 +158,7 @@ public class RateLimitingTest extends CQLTester
 
             // The first query takes the one available permit, and the others breach the limit.
             client.execute(queryMessage(payloadSize));
-            long used = BufferPools.forNetworking().usedSizeInBytes();
+            long used = networkBytesInUse();
             for (int i = 0; i < 10; i++)
             {
                 try
@@ -170,13 +171,21 @@ public class RateLimitingTest extends CQLTester
                     assertTrue(Throwables.anyCauseMatches(e, cause -> cause instanceof OverloadedException));
                 }
             }
-            long usedAfter = BufferPools.forNetworking().usedSizeInBytes();
+            long usedAfter = networkBytesInUse();
             assertTrue("network buffers in use grew from " + used + " to " + usedAfter, usedAfter < used + payloadSize);
         }
         finally
         {
             StorageService.instance.setNativeTransportRateLimitingEnabled(false);
         }
+    }
+
+    /**
+     * Bytes in use by the allocator of pre-V5 connections and by the buffer pool of V5 connections.
+     */
+    private static long networkBytesInUse()
+    {
+        return ((PooledByteBufAllocator) CBUtil.allocator).pinnedDirectMemory() + BufferPools.forNetworking().usedSizeInBytes();
     }
 
     private void testBytesInFlightOverload(int payloadSize) throws Exception
