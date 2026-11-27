@@ -145,6 +145,20 @@ public class DiskBoundaryManagerTest extends CQLTester
     }
 
     @Test
+    public void testNoLocalRanges() throws Throwable
+    {
+        ClusterMetadataTestHelper.addEndpoint(InetAddressAndPort.getByName("127.0.0.20"), t(0), "otherdc", "rack1");
+        String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'NetworkTopologyStrategy', 'otherdc': 1}");
+        String table = createTable(keyspace, "CREATE TABLE %s (id int PRIMARY KEY, x text)");
+        execute("INSERT INTO " + keyspace + '.' + table + " (id, x) VALUES (1, 'a')");
+        ColumnFamilyStore cfs = Keyspace.open(keyspace).getColumnFamilyStore(table);
+        Util.flush(cfs);
+
+        Assert.assertNull(cfs.getDiskBoundaries().positions);
+        assertFalse(cfs.hasMisplacedSSTables());
+    }
+
+    @Test
     public void testGetDisksInBounds()
     {
         List<PartitionPosition> pps = new ArrayList<>();
