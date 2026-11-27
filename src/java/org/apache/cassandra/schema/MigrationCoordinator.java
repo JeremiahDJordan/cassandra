@@ -606,9 +606,22 @@ public class MigrationCoordinator
 
     void announce(UUID schemaVersion)
     {
+        // not synchronized as a whole: gossip notifications take this coordinator's lock while holding the gossiper's
+        markLocalVersionReceived(schemaVersion);
         if (gossiper.isEnabled())
             gossiper.addLocalApplicationState(ApplicationState.SCHEMA, StorageService.instance.valueFactory.schema(schemaVersion));
         SchemaDiagnostics.versionAnnounced(Schema.instance);
+    }
+
+    /**
+     * Marks the local schema version as received if endpoints we have not pulled from reported it before it became ours,
+     * for example after merging the schema of an endpoint with another version.
+     */
+    private synchronized void markLocalVersionReceived(UUID schemaVersion)
+    {
+        VersionInfo info = versionInfo.get(schemaVersion);
+        if (info != null)
+            info.markReceived();
     }
 
     private CompletableFuture<Void> submitToMigrationIfNotShutdown(Runnable task)
