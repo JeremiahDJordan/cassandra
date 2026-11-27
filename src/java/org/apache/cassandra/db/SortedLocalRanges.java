@@ -42,7 +42,7 @@ import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 
 /**
- * This class contains the local ranges for a given table, sorted.  At least one range is always present.
+ * This class contains the local ranges for a given table, sorted. It is empty if the node has no local ranges.
  */
 public class SortedLocalRanges
 {
@@ -60,13 +60,17 @@ public class SortedLocalRanges
         this.realm = realm;
         this.ringVersion = ringVersion;
 
-        if (ranges == null || ranges.isEmpty())
+        if (ranges == null)
         {
             IPartitioner partitioner = realm.getPartitioner();
             var range = new Splitter.WeightedRange(1.0,
                                                    new Range<>(partitioner.getMinimumToken(),
                                                                partitioner.getMinimumToken()));
             this.ranges = List.of(range);
+        }
+        else if (ranges.isEmpty())
+        {
+            this.ranges = ranges;
         }
         else
         {
