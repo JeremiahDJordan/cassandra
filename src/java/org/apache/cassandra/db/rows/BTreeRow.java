@@ -843,7 +843,15 @@ public class BTreeRow extends AbstractRow
                 if (activeDeletion.supersedes(existingComplex.complexDeletion()))
                 {
                     Object[] cells = BTree.transformAndFilter(existingComplex.tree(), (ColumnData cd) -> removeShadowed(cd, recordDeletion));
-                    return BTree.isEmpty(cells) ? null : new BTreeComplexColumn(existingComplex.column, cells, DeletionTime.LIVE);
+                    if (BTree.isEmpty(cells))
+                    {
+                        // The column's data size counts its complex deletion even when live, so release the dropped
+                        // column's deletion (and wrapper) through delete.
+                        if (recordDeletion != ColumnData.noOp)
+                            recordDeletion.delete(new BTreeComplexColumn(existingComplex.column, cells, existingComplex.complexDeletion()));
+                        return null;
+                    }
+                    return new BTreeComplexColumn(existingComplex.column, cells, DeletionTime.LIVE);
                 }
             }
 
