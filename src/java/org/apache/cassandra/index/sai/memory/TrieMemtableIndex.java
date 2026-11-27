@@ -76,7 +76,7 @@ import org.apache.cassandra.utils.concurrent.OpOrder;
 public class TrieMemtableIndex extends AbstractMemtableIndex
 {
     private final ShardBoundaries boundaries;
-    private final MemoryIndex[] rangeIndexes;
+    private final TrieMemoryIndex[] rangeIndexes;
     private final IndexContext indexContext;
     private final AbstractType<?> validator;
     private final LongAdder writeCount = new LongAdder();
@@ -96,7 +96,7 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
     {
         super(indexContext, memtable);
         this.boundaries = indexContext.columnFamilyStore().localRangeSplits(shardCount);
-        this.rangeIndexes = new MemoryIndex[boundaries.shardCount()];
+        this.rangeIndexes = new TrieMemoryIndex[boundaries.shardCount()];
         this.indexContext = indexContext;
         this.validator = indexContext.getValidator();
         for (int shard = 0; shard < boundaries.shardCount(); shard++)
@@ -426,20 +426,59 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
     /**
      * Estimates the number of rows matching the given query predicate.
      * <p>
-     * This method provides a fast approximation by calculating the matching row count from a subset of shards.
-     * The number of shards taken for the computation is determined dynamically depending on the number of indexed
-     * and matching rows – the more rows found in the shard, the fewer shards are needed to get a reliable estimate.
+     * An exact predicate counts the rows of its term in every shard, and a negation subtracts them from the row count
+     * of the memtable.
      * <p>
-     * This approach assumes that data is uniformly distributed across shards, which may not
+     * A range, prefix or pattern provides a fast approximation by calculating the matching row count from a subset of
+     * shards. The number of shards taken for the computation is determined dynamically depending on the number of
+     * indexed and matching rows – the more rows found in the shard, the fewer shards are needed to get a reliable
+     * estimate.
+     * <p>
+     * This approach assumes that the shards match the same fraction of their indexed rows, which may not
      * always be accurate but provides a quick estimate with minimal computational overhead.
      * The estimate is particularly useful for query planning and optimization decisions where
      * speed is more important than precision.</p>
      *
      * @param expression the search expression/predicate to match against indexed terms
-     * @return an estimated number of matching rows extrapolated from the first few shards;
+     * @return an estimated number of matching rows
      */
     @Override
     public long estimateMatchingRowsCount(Expression expression)
+    {
+        switch (expression.getOp())
+        {
+            case MATCH:
+            case EQ:
+            case CONTAINS_KEY:
+            case CONTAINS_VALUE:
+                return estimateNumRowsMatchingExact(expression);
+            case NOT_EQ:
+            case NOT_CONTAINS_KEY:
+            case NOT_CONTAINS_VALUE:
+                // The search returns all the rows when it can't subtract the matches of the negated expression
+                if (TypeUtil.supportsRounding(expression.validator) || !IndexContext.canSubtractMatches(expression))
+                    return Memtable.estimateRowCount(memtable);
+                else
+                    // need to clamp at 0, because row count is imprecise
+                    return Math.max(0, Memtable.estimateRowCount(memtable) - estimateNumRowsMatchingExact(expression));
+            case RANGE:
+            case PREFIX:
+            case AUTOMATON:
+                return estimateNumRowsMatchingRange(expression);
+            default:
+                throw new IllegalArgumentException("Unsupported expression: " + expression);
+        }
+    }
+
+    private long estimateNumRowsMatchingExact(Expression expression)
+    {
+        long matchingRows = 0;
+        for (TrieMemoryIndex memoryIndex : rangeIndexes)
+            matchingRows += memoryIndex.estimateNumRowsMatchingExact(expression);
+        return matchingRows;
+    }
+
+    private long estimateNumRowsMatchingRange(Expression expression)
     {
         // Control how many shards are taken for estimating the number of keys matching the query expression.
         // Shards are taken until we reach at least MIN_MATCHING_ROWS matching rows
@@ -471,7 +510,11 @@ public class TrieMemtableIndex extends AbstractMemtableIndex
         }
 
         assert processedShards >= 1 : "Must process at least one shard for estimating matching rows count";
-        return Math.round(matchingRows * (double) (shardCount()) / processedShards);
+        if (processedShards == shardCount())
+            return matchingRows;
+        // the shards don't hold the same number of rows; concurrent deletions can leave the processed shards with
+        // fewer indexed rows than matching rows
+        return Math.round(matchingRows * (double) getRowCount() / Math.max(indexedRows, matchingRows));
     }
 
     @Override
