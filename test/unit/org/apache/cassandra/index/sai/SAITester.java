@@ -33,6 +33,7 @@ import java.util.List;
 import java.util.Objects;
 import java.util.Random;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -368,10 +369,20 @@ public class SAITester extends CQLTester
     {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable());
         cfs.indexManager.listIndexes().forEach(index -> ((StorageAttachedIndexGroup)cfs.indexManager.getIndexGroup(index)).reset());
+        // as a node starts, its indexes are building from before their initial builds (SecondaryIndexManager#createIndex)
+        Set<Index> notBuilding = cfs.indexManager.listIndexes()
+                                                 .stream()
+                                                 .filter(index -> !cfs.indexManager.isIndexBuilding(index.getIndexMetadata().name))
+                                                 .collect(Collectors.toSet());
+        cfs.indexManager.markIndexesBuilding(notBuilding, true, true);
         cfs.indexManager.listIndexes().forEach(cfs.indexManager::buildIndex);
         cfs.indexManager.executePreJoinTasksBlocking(true);
         if (wait)
         {
+            // the pre-join task can make an index queryable before its initial build is over
+            waitForAssert(() -> assertTrue(cfs.indexManager.listIndexes()
+                                                           .stream()
+                                                           .noneMatch(index -> cfs.indexManager.isIndexBuilding(index.getIndexMetadata().name))));
             waitForTableIndexesQueryable();
         }
     }
@@ -910,6 +921,21 @@ public class SAITester extends CQLTester
     protected void rebuildIndexes(String... indexes)
     {
         ColumnFamilyStore.rebuildSecondaryIndex(KEYSPACE, currentTable(), indexes);
+    }
+
+    protected static CompletableFuture<Throwable> rebuildAsync(ColumnFamilyStore cfs, String index)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(index));
+                return null;
+            }
+            catch (Throwable t)
+            {
+                return t;
+            }
+        });
     }
 
     protected void reloadSSTableIndex()
