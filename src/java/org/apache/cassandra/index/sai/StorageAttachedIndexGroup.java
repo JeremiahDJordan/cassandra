@@ -1041,7 +1041,7 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
         {
             try
             {
-                synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+                synchronized (StorageAttachedIndex.sameNameFilesLock(sstable.descriptor))
                 {
                     if (!StorageAttachedIndex.hasStorageAttachedIndexNamed(sstable.metadata(), indexName))
                         deleteFiles(sstable, components);

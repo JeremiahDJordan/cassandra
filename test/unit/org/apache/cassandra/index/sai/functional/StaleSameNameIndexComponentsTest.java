@@ -38,6 +38,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
@@ -45,6 +46,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 import com.google.common.base.Predicates;
+import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
@@ -94,6 +96,7 @@ import org.apache.cassandra.io.sstable.KeyIterator;
 import org.apache.cassandra.io.sstable.SSTableFlushObserver;
 import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.SSTableRewriter;
+import org.apache.cassandra.io.sstable.SequenceBasedSSTableId;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.format.SSTableWriter;
@@ -2729,7 +2732,7 @@ public class StaleSameNameIndexComponentsTest extends SAITester
                                     .add(InvokePointBuilder.newInvokePoint().onClass(PerIndexFilesOwner.class).onMethod("tryOwn").atExit())
                                     .add(ActionBuilder.newActionBuilder()
                                                       .actions()
-                                                      .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".holdFirstOwner()"))
+                                                      .doAction(StaleSameNameIndexComponentsTest.class.getName() + ".holdFirstOwner($1)"))
                                     .build());
         CompletableFuture<Throwable> buildX = CompletableFuture.supplyAsync(() -> partialBuildHoldingFirstOwner(group, sstable, "x_idx"));
         CompletableFuture<Throwable> buildY = CompletableFuture.supplyAsync(() -> partialBuildHoldingFirstOwner(group, sstable, "y_idx"));
@@ -2752,6 +2755,54 @@ public class StaleSameNameIndexComponentsTest extends SAITester
         assertThat(execute("SELECT pk FROM %s WHERE t = ?", "t3" + "x".repeat(300))).hasSize(1);
     }
 
+    /**
+     * The files of an SSTable whose same-name files lock is held are owned once the lock is released, those of an SSTable
+     * mapped to another lock right away, and an index created on an existing table waits for every lock.
+     */
+    @Test
+    public void testSameNameFilesLocks() throws Throwable
+    {
+        createTable(SCHEMA);
+        insertRows();
+        flush();
+        Descriptor descriptor = sstable().descriptor;
+        Descriptor locked = descriptor;
+        for (int id = 1; id < 1000 && StorageAttachedIndex.sameNameFilesLock(locked) == StorageAttachedIndex.sameNameFilesLock(descriptor); id++)
+            locked = new Descriptor(descriptor.version, descriptor.directory, descriptor.ksname, descriptor.cfname, new SequenceBasedSSTableId(id));
+        Object lock = StorageAttachedIndex.sameNameFilesLock(locked);
+        assertThat(lock).isNotSameAs(StorageAttachedIndex.sameNameFilesLock(descriptor));
+
+        CountDownLatch held = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CompletableFuture<Void> holder = CompletableFuture.runAsync(() -> {
+            synchronized (lock)
+            {
+                held.countDown();
+                Uninterruptibles.awaitUninterruptibly(release);
+            }
+        });
+        try
+        {
+            assertThat(held.await(60, TimeUnit.SECONDS)).isTrue();
+            CompletableFuture.supplyAsync(() -> PerIndexFilesOwner.tryOwn(descriptor, INDEX, () -> false)).get(10, TimeUnit.SECONDS).close();
+            Descriptor lockedDescriptor = locked;
+            CompletableFuture<PerIndexFilesOwner> owner = CompletableFuture.supplyAsync(() -> PerIndexFilesOwner.tryOwn(lockedDescriptor, INDEX, () -> false));
+            CompletableFuture<Void> created = CompletableFuture.runAsync(() -> createIndex("CREATE INDEX " + INDEX + " ON %s(a) USING 'sai'"));
+            assertThatThrownBy(() -> created.get(1, TimeUnit.SECONDS)).isInstanceOf(TimeoutException.class);
+            assertThat(owner).isNotDone();
+            release.countDown();
+            owner.get(60, TimeUnit.SECONDS).close();
+            created.get(60, TimeUnit.SECONDS);
+        }
+        finally
+        {
+            release.countDown();
+        }
+        holder.get(60, TimeUnit.SECONDS);
+        waitForTableIndexesQueryable();
+        assertBuiltFromData();
+    }
+
     private static Throwable partialBuildHoldingFirstOwner(StorageAttachedIndexGroup group, SSTableReader sstable, String index)
     {
         holdsFirstOwner.set(true);
@@ -2767,16 +2818,17 @@ public class StaleSameNameIndexComponentsTest extends SAITester
 
     // called by Byteman, when PerIndexFilesOwner#tryOwn returns: holds the first ownership a marked build takes, without
     // the lock of the owners
-    public static void holdFirstOwner() throws InterruptedException
+    public static void holdFirstOwner(Descriptor descriptor) throws InterruptedException
     {
         if (!holdsFirstOwner.get())
             return;
         holdsFirstOwner.set(false);
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        Object lock = StorageAttachedIndex.sameNameFilesLock(descriptor);
+        synchronized (lock)
         {
             firstOwnersHeld.countDown();
             while (firstOwnersRelease.getCount() > 0)
-                StorageAttachedIndex.SAME_NAME_FILES_LOCK.wait(100);
+                lock.wait(100);
         }
     }
 

@@ -17,9 +17,9 @@
 package org.apache.cassandra.index.sai.disk;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.BooleanSupplier;
 import javax.annotation.Nullable;
@@ -33,12 +33,12 @@ import static org.apache.cassandra.utils.Clock.Global.nanoTime;
  * An owner of the per-index files of an index on an SSTable, while it may write or delete them by name: a build of the
  * index on an existing SSTable, or a writer of the index. An index created again with the same name uses the same file
  * names without immutable components, so a build of an index waits, before it touches the files of an SSTable, until
- * no owner of a dropped index of the same name is left for it. Guarded by
- * {@link StorageAttachedIndex#SAME_NAME_FILES_LOCK}.
+ * no owner of a dropped index of the same name is left for it. The owners of an SSTable are guarded by
+ * {@link StorageAttachedIndex#sameNameFilesLock} of the SSTable.
  */
 public final class PerIndexFilesOwner implements AutoCloseable
 {
-    private static final Map<Descriptor, List<PerIndexFilesOwner>> owners = new HashMap<>();
+    private static final Map<Descriptor, List<PerIndexFilesOwner>> owners = new ConcurrentHashMap<>();
 
     private final Descriptor descriptor;
     private final String indexName;
@@ -62,7 +62,7 @@ public final class PerIndexFilesOwner implements AutoCloseable
                                                       String indexName,
                                                       BooleanSupplier isIndexDropped)
     {
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        synchronized (StorageAttachedIndex.sameNameFilesLock(descriptor))
         {
             if (isIndexDropped.getAsBoolean())
                 return null;
@@ -84,14 +84,15 @@ public final class PerIndexFilesOwner implements AutoCloseable
                                                     TimeUnit unit) throws InterruptedException
     {
         long deadline = nanoTime() + unit.toNanos(timeout);
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        Object lock = StorageAttachedIndex.sameNameFilesLock(descriptor);
+        synchronized (lock)
         {
             while (hasOwnerOfDroppedIndex(descriptor, indexName))
             {
                 long remaining = deadline - nanoTime();
                 if (remaining <= 0)
                     return false;
-                StorageAttachedIndex.SAME_NAME_FILES_LOCK.wait(Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)));
+                lock.wait(Math.max(1, TimeUnit.NANOSECONDS.toMillis(remaining)));
             }
             return true;
         }
@@ -102,7 +103,7 @@ public final class PerIndexFilesOwner implements AutoCloseable
      */
     public static boolean hasOwnerOfDroppedIndex(Descriptor descriptor, String indexName)
     {
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        synchronized (StorageAttachedIndex.sameNameFilesLock(descriptor))
         {
             for (PerIndexFilesOwner owner : owners.getOrDefault(descriptor, List.of()))
             {
@@ -116,7 +117,8 @@ public final class PerIndexFilesOwner implements AutoCloseable
     @Override
     public void close()
     {
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        Object lock = StorageAttachedIndex.sameNameFilesLock(descriptor);
+        synchronized (lock)
         {
             if (released)
                 return;
@@ -125,7 +127,7 @@ public final class PerIndexFilesOwner implements AutoCloseable
             ofSSTable.remove(this);
             if (ofSSTable.isEmpty())
                 owners.remove(descriptor);
-            StorageAttachedIndex.SAME_NAME_FILES_LOCK.notifyAll();
+            lock.notifyAll();
         }
     }
 }

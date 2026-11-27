@@ -391,7 +391,7 @@ public class SSTableIndex implements Comparable<SSTableIndex>
                 {
                     // A storage-attached index created since with the same name has deleted these files already (see
                     // StorageAttachedIndex#onAddedToExistingTable), and its own have the same names.
-                    synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+                    synchronized (StorageAttachedIndex.sameNameFilesLock(sstable.descriptor))
                     {
                         if (!StorageAttachedIndex.hasStorageAttachedIndexNamed(sstable.metadata(), indexContext.getIndexName()))
                             SSTableWatcher.instance.onIndexDropped(sstable.metadata(), perIndexComponents.forWrite());

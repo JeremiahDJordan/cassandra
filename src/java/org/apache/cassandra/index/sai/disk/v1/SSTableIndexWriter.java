@@ -219,7 +219,7 @@ public class SSTableIndexWriter implements PerIndexWriter
 
             // No completion marker once the index is dropped: an index of the same name created since may have
             // deleted some of these files (see StorageAttachedIndex#onAddedToExistingTable)
-            synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+            synchronized (StorageAttachedIndex.sameNameFilesLock(perIndexComponents.descriptor()))
             {
                 if (maybeAbort())
                     return;
@@ -279,7 +279,7 @@ public class SSTableIndexWriter implements PerIndexWriter
         // Once this writer has released its files after the completion marker, nothing owns the files of a dropped index
         // unless a build of it still does: they may then be the files of a new index of the same name. An aborted flush
         // or compaction deletes all the files of its SSTable anyway.
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        synchronized (StorageAttachedIndex.sameNameFilesLock(perIndexComponents.descriptor()))
         {
             if (isIndexDropped.getAsBoolean() &&
                 !PerIndexFilesOwner.hasOwnerOfDroppedIndex(perIndexComponents.descriptor(), indexContext.getIndexName()))

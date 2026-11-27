@@ -937,7 +937,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         Set<StorageAttachedIndex> dropped = new HashSet<>();
         // the files of every index are owned at once, and none while waiting, so that two builds of the SSTable taking
         // the indexes in different orders can't wait for each other
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        synchronized (StorageAttachedIndex.sameNameFilesLock(sstable.descriptor))
         {
             boolean waits = false;
             try
@@ -1000,7 +1000,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
      */
     private void ownFilesOfOtherIndexes(SSTableReader sstable, Set<StorageAttachedIndex> indexes, Map<StorageAttachedIndex, PerIndexFilesOwner> owners)
     {
-        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        synchronized (StorageAttachedIndex.sameNameFilesLock(sstable.descriptor))
         {
             for (StorageAttachedIndex index : Set.copyOf(indexes))
             {

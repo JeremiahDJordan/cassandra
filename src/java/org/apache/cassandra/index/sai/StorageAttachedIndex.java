@@ -349,14 +349,39 @@ public class StorageAttachedIndex implements Index
     // Used to build indexes on newly added SSTables:
     private static final StorageAttachedIndexBuildingSupport INDEX_BUILDER_SUPPORT = new StorageAttachedIndexBuildingSupport();
 
+    // the locks of sameNameFilesLock, by SSTable
+    private static final Object[] SAME_NAME_FILES_LOCKS = new Object[64];
+    static
+    {
+        for (int i = 0; i < SAME_NAME_FILES_LOCKS.length; i++)
+            SAME_NAME_FILES_LOCKS[i] = new Object();
+    }
+
     /**
-     * Serializes the discarding of the components of an index name ({@link #onAddedToExistingTable}) with the deletion
-     * of the files of a dropped index once its last reader is released ({@link SSTableIndex#release}), with the
-     * completion of the components an index builds ({@link SSTableIndexWriter#complete}), and with the builds and writers
-     * that own the files of an index on an SSTable ({@link PerIndexFilesOwner}): all go by file names, which an index
-     * created again with the same name reuses.
+     * @return the lock that serializes, for the provided SSTable, the discarding of the components of an index name
+     * ({@link #onAddedToExistingTable}, which goes over the SSTables of a table and takes the locks of all of them) with
+     * the deletion of the files of a dropped index once its last reader is released ({@link SSTableIndex#release}), with
+     * the completion of the components an index builds ({@link SSTableIndexWriter#complete}), and with the builds and
+     * writers that own the files of an index on an SSTable ({@link PerIndexFilesOwner}): all go by file names, which an
+     * index created again with the same name reuses.
      */
-    public static final Object SAME_NAME_FILES_LOCK = new Object();
+    public static Object sameNameFilesLock(Descriptor descriptor)
+    {
+        return SAME_NAME_FILES_LOCKS[Math.floorMod(descriptor.hashCode(), SAME_NAME_FILES_LOCKS.length)];
+    }
+
+    private static void withAllSameNameFilesLocks(int from, Runnable task)
+    {
+        if (from == SAME_NAME_FILES_LOCKS.length)
+        {
+            task.run();
+            return;
+        }
+        synchronized (SAME_NAME_FILES_LOCKS[from])
+        {
+            withAllSameNameFilesLocks(from + 1, task);
+        }
+    }
 
     /** How many times the initial build of an index builds the sstables it missed, see buildSSTablesMissedByInitialBuild. */
     @VisibleForTesting
@@ -726,8 +751,7 @@ public class StorageAttachedIndex implements Index
     public void onAddedToExistingTable()
     {
         addedToExistingTable = true;
-        synchronized (SAME_NAME_FILES_LOCK)
-        {
+        withAllSameNameFilesLocks(0, () -> {
             // The live SSTables, and the sources a running compaction has written out of the live set: it restores them
             // if it is stopped. The instances of the canonical set first, as those are the ones it restores.
             Set<SSTableReader> sstables = Sets.newHashSet(baseCfs.getSSTables(SSTableSet.CANONICAL));
@@ -768,7 +792,7 @@ public class StorageAttachedIndex implements Index
             StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
             if (group != null)
                 group.forgetCachedComponentsOfName(indexContext.getIndexName());
-        }
+        });
     }
 
     /**
