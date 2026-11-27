@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.concurrent.ForkJoinPool;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import org.junit.Assert;
@@ -37,10 +38,12 @@ import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.CompactionStrategyFactory;
 import org.apache.cassandra.db.compaction.ShardManager;
 import org.apache.cassandra.db.compaction.UnifiedCompactionStrategy;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.FBUtilities;
 import org.mockito.Mockito;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /// This tests UnifiedWithRange aggregates that pre-split compactions into shards and is used by CNDB.
 public class RangedAggregatesTest extends ShardingTestBase
@@ -90,6 +93,47 @@ public class RangedAggregatesTest extends ShardingTestBase
         populate(rowCount, compact);
         var originals = new HashSet<>(cfs.getLiveSSTables());
 
+        int totalTaskCount = runRangedAggregates(cfs, numShards, aggregateParallelism, 0);
+        assertEquals(numOutputSSTables, totalTaskCount);
+
+
+        // make sure the partial aggregates are not deleting sstables
+        Assert.assertTrue(cfs.getLiveSSTables().containsAll(originals));
+        cfs.getTracker().removeUnsafe(originals);
+
+        verifySharding(numShards, rowCount, numOutputSSTables, cfs);
+        cfs.truncateBlocking();
+    }
+
+    @Test
+    public void testFullyExpiredInputSSTableIsKept() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, t int, v int, PRIMARY KEY (k, t)) WITH gc_grace_seconds = 0");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+
+        int rows = 1000;
+        for (int i = 0; i < rows; i++)
+            execute("INSERT INTO %s (k, t, v) VALUES (?, 0, ?) USING TTL 1", i, i);
+        flush();
+        long maxLocalDeletionTime = cfs.getLiveSSTables().stream().mapToLong(SSTableReader::getMaxLocalDeletionTime).max().getAsLong();
+        waitForAssert(() -> assertTrue(FBUtilities.nowInSeconds() > maxLocalDeletionTime), 30, TimeUnit.SECONDS);
+
+        for (int i = 0; i < rows; i++)
+            execute("INSERT INTO %s (k, t, v) VALUES (?, 1, ?)", i, i);
+        flush();
+        var originals = new HashSet<>(cfs.getLiveSSTables());
+
+        runRangedAggregates(cfs, 4, 4, FBUtilities.nowInSeconds());
+
+        // the fully expired sstable is an input of every part, so no part may delete it
+        Assert.assertTrue(cfs.getLiveSSTables().containsAll(originals));
+    }
+
+    /// Splits the maximal compaction into ranged aggregates and runs the tasks of each in turn.
+    /// @return the number of tasks run
+    private static int runRangedAggregates(ColumnFamilyStore cfs, int numShards, int aggregateParallelism, long gcBefore)
+    {
         Controller mockController = Mockito.mock(Controller.class);
         Mockito.when(mockController.getNumShards(Mockito.anyDouble())).thenReturn(numShards);
         Mockito.when(mockController.parallelizeOutputShards()).thenReturn(true);
@@ -126,7 +170,7 @@ public class RangedAggregatesTest extends ShardingTestBase
         {
             // execute each partial aggregate separately because we can only mark the inputs compacting once
             List<AbstractCompactionTask> tasks = new ArrayList<>();
-            strategy.createAndAddTasks(0, maximal, tasks, strategy);
+            strategy.createAndAddTasks(gcBefore, maximal, tasks, strategy);
             totalTaskCount += tasks.size();
             List<Future<?>> futures = tasks.stream()
                                            .map(t -> ForkJoinPool.commonPool()
@@ -136,14 +180,6 @@ public class RangedAggregatesTest extends ShardingTestBase
                                            .collect(Collectors.toList());
             FBUtilities.waitOnFutures(futures);
         }
-        assertEquals(numOutputSSTables, totalTaskCount);
-
-
-        // make sure the partial aggregates are not deleting sstables
-        Assert.assertTrue(cfs.getLiveSSTables().containsAll(originals));
-        cfs.getTracker().removeUnsafe(originals);
-
-        verifySharding(numShards, rowCount, numOutputSSTables, cfs);
-        cfs.truncateBlocking();
+        return totalTaskCount;
     }
 }

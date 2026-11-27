@@ -37,7 +37,7 @@ public class ExpirationTask extends AbstractCompactionTask
     @Override
     protected void runMayThrow() throws Exception
     {
-        FullyExpiredSSTablesIndexNotifier.notifyIndexes(realm, transaction.originals(), transaction.opId());
+        FullyExpiredSSTablesIndexNotifier.notifyIndexes(realm, transaction.originals(), null, transaction.opId());
         transaction.obsoleteOriginals();
         transaction.prepareToCommit();
         transaction.commit();
