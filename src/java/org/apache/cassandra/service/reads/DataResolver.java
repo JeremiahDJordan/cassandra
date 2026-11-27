@@ -157,18 +157,28 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         return index.supportsReplicaFilteringProtection(command.rowFilter());
     }
 
+    private DataLimits.Counter newMergedResultCounter()
+    {
+        return command.limits().newCounter(command.nowInSec(), true, command.selectsFullPartition(), enforceStrictLiveness);
+    }
+
     protected class ResolveContext
     {
         public final E replicas;
         private final DataLimits.Counter mergedResultCounter;
+        // the counter of the merged rows that are in the result, see ShortReadPartitionsProtection#resultRowsCounter
+        private final DataLimits.Counter resultRowsCounter;
 
         private ResolveContext(E replicas)
         {
+            this(replicas, null);
+        }
+
+        private ResolveContext(E replicas, DataLimits.Counter resultRowsCounter)
+        {
             this.replicas = replicas;
-            this.mergedResultCounter = command.limits().newCounter(command.nowInSec(),
-                                                                   true,
-                                                                   command.selectsFullPartition(),
-                                                                   enforceStrictLiveness);
+            this.mergedResultCounter = newMergedResultCounter();
+            this.resultRowsCounter = resultRowsCounter == null ? mergedResultCounter : resultRowsCounter;
 
             // In case of top-k query, do not trim reconciled rows here because QueryPlan#postProcessor() needs to compare all rows
             if (command.isTopK())
@@ -187,6 +197,11 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         public DataLimits.Counter mergedResultCounter()
         {
             return mergedResultCounter;
+        }
+
+        public DataLimits.Counter resultRowsCounter()
+        {
+            return resultRowsCounter;
         }
 
         public boolean needShortReadProtection()
@@ -220,9 +235,11 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                               command,
                                               new ShortReadPartitionsProtection(command,
                                                                                 context.replicas.get(i),
+                                                                                originalResponse,
                                                                                 () -> responses.clearUnsafe(i),
                                                                                 singleResultCounter,
                                                                                 context.mergedResultCounter(),
+                                                                                context.resultRowsCounter(),
                                                                                 queryStartNanoTime),
                                               singleResultCounter);
         }
@@ -264,14 +281,18 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         //   3) After a "complete" row is materialized, it must pass the row filter supplied by the original query
         //      before it counts against the limit.
 
-        // We need separate contexts, as each context has his own counter
-        ResolveContext firstPhaseContext = new ResolveContext(replicas);
+        // We need separate contexts, as each context has his own counter. The merged result counter of the first phase
+        // counts the merged rows before the row filter, so replica filtering protection counts in a counter of its own
+        // the rows that it knows to be in the result.
+        DataLimits.Counter completeRowsCounter = newMergedResultCounter().onlyCount();
+        ResolveContext firstPhaseContext = new ResolveContext(replicas, completeRowsCounter);
         ResolveContext secondPhaseContext = new ResolveContext(replicas);
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(replicaPlan().keyspace(),
                                                                              command,
                                                                              replicaPlan().consistencyLevel(),
                                                                              queryStartNanoTime,
                                                                              firstPhaseContext.replicas,
+                                                                             completeRowsCounter,
                                                                              DatabaseDescriptor.getCachedReplicaRowsWarnThreshold(),
                                                                              DatabaseDescriptor.getCachedReplicaRowsFailThreshold());
 

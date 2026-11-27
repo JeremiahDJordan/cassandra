@@ -18,20 +18,27 @@
 
 package org.apache.cassandra.service.reads;
 
+import java.util.NoSuchElementException;
+import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 
 import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringBound;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.RangeTombstoneBoundMarker;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.WrappingUnfilteredRowIterator;
 import org.apache.cassandra.db.transform.MoreRows;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.locator.Replica;
@@ -44,12 +51,16 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     private final Replica source;
     private final DataLimits.Counter singleResultCounter; // unmerged per-source counter
     private final DataLimits.Counter mergedResultCounter; // merged end-result counter
+    private final DataLimits.Counter resultRowsCounter; // see ShortReadPartitionsProtection#resultRowsCounter
     private final Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor;
     private final TableMetadata metadata;
     private final DecoratedKey partitionKey;
+    private final BooleanSupplier hasNextPartition; // whether the replica's response has a partition after this one
+    private final boolean inFirstResponse; // whether the partition is from the replica's response to the command
 
     private Clustering<?> lastClustering; // clustering of the last observed row
     private boolean hasObservedMarkers; // whether any range tombstone marker was observed
+    private ClusteringBound<?> lastClosingBound; // bound of the last observed item, if it is a marker that closes an RT
 
     private int lastCounted = 0; // last seen recorded # before attempting to fetch more rows
     private int lastFetched = 0; // # rows returned by last attempt to get more (or by the original read command)
@@ -57,21 +68,26 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
 
     ShortReadRowsProtection(DecoratedKey partitionKey, ReadCommand command, Replica source,
                             Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor,
-                            DataLimits.Counter singleResultCounter, DataLimits.Counter mergedResultCounter)
+                            DataLimits.Counter singleResultCounter, DataLimits.Counter mergedResultCounter,
+                            DataLimits.Counter resultRowsCounter, BooleanSupplier hasNextPartition, boolean inFirstResponse)
     {
         this.command = command;
         this.source = source;
         this.commandExecutor = commandExecutor;
         this.singleResultCounter = singleResultCounter;
         this.mergedResultCounter = mergedResultCounter;
+        this.resultRowsCounter = resultRowsCounter;
         this.metadata = command.metadata();
         this.partitionKey = partitionKey;
+        this.hasNextPartition = hasNextPartition;
+        this.inFirstResponse = inFirstResponse;
     }
 
     @Override
     public Row applyToRow(Row row)
     {
         lastClustering = row.clustering();
+        lastClosingBound = null;
         return row;
     }
 
@@ -79,6 +95,7 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     public RangeTombstoneMarker applyToMarker(RangeTombstoneMarker marker)
     {
         hasObservedMarkers = true;
+        lastClosingBound = marker.isClose(command.isReversed()) ? marker.closeBound(command.isReversed()) : null;
         return marker;
     }
 
@@ -101,7 +118,18 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
          * Can only take the short cut if there is no per partition limit set. Otherwise it's possible to hit false
          * positives due to some rows being uncounted for in certain scenarios (see CASSANDRA-13911).
          */
-        if (command.limits().isCounterBelowLimits(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+        if (command.limits().isReplicaExhausted(singleResultCounter) && command.limits().perPartitionCount() == DataLimits.NO_LIMIT)
+            return null;
+
+        /*
+         * A replica without a per partition limit only goes on to another partition once this one has no more rows. A
+         * GROUP BY response needs this: the replica that returned as many groups as the limit isn't exhausted, as far
+         * as the counter can tell, even when its last group is followed by the partition that closed it.
+         */
+        if (command.limits().perPartitionCount() == DataLimits.NO_LIMIT && hasNextPartition.getAsBoolean())
+            return null;
+
+        if (isCompleteWithLastRow())
             return null;
 
         /*
@@ -124,10 +152,10 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
             return null;
 
         /*
-         * A replica that returned range tombstone markers but no row of the partition has read all of it. The previous
-         * branch misses it when the partition's count doesn't start at zero (a done GROUP BY counter, or a page that
-         * continues the partition). Without a row to start after, the request would read the partition from its start
-         * and return its markers again.
+         * If the replica returned range tombstone markers but no rows in the partition, the merged result needs nothing
+         * more of it: either the replica read the whole partition, or its limits stopped as the partition started, or,
+         * in the partition a page continues, at the first row of the next group, where the merged result's open group,
+         * the page's continued group, ends as well.
          */
         if (lastClustering == null && hasObservedMarkers)
             return null;
@@ -186,7 +214,107 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
         Tracing.trace("Requesting {} extra rows from {} for short read protection", lastQueried, source);
 
         SinglePartitionReadCommand cmd = makeFetchAdditionalRowsReadCommand(lastQueried);
-        return UnfilteredPartitionIterators.getOnlyElement(commandExecutor.apply(cmd), cmd);
+        UnfilteredRowIterator rows = UnfilteredPartitionIterators.getOnlyElement(commandExecutor.apply(cmd), cmd);
+        return null == lastClosingBound ? rows : new RowsAfterClosingBound(rows, lastClosingBound);
+    }
+
+    /**
+     * Skips the items of a short read protection response up to the RT closing bound that the replica returned last.
+     * The response starts after the last row that the replica returned, so it repeats the RT bound markers between that
+     * row and that closing bound: the bound where the RT ends, or the bound that RTBoundCloser adds where the replica
+     * stopped in the RT, which can be right before a row that the replica read without returning it. An RT that is
+     * still open at that closing bound is opened again at the same position.
+     */
+    private static final class RowsAfterClosingBound extends WrappingUnfilteredRowIterator
+    {
+        private final ClusteringBound<?> closingBound;
+        private boolean isPastClosingBound;
+        private Unfiltered next;
+        private Unfiltered afterNext;
+
+        private RowsAfterClosingBound(UnfilteredRowIterator wrapped, ClusteringBound<?> closingBound)
+        {
+            super(wrapped);
+            this.closingBound = closingBound;
+        }
+
+        @Override
+        public boolean hasNext()
+        {
+            if (null != next)
+                return true;
+
+            if (null != afterNext)
+            {
+                next = afterNext;
+                afterNext = null;
+            }
+            else if (!isPastClosingBound)
+            {
+                skipToClosingBound();
+            }
+            else if (wrapped.hasNext())
+            {
+                next = wrapped.next();
+            }
+            return null != next;
+        }
+
+        private void skipToClosingBound()
+        {
+            isPastClosingBound = true;
+            DeletionTime openDeletion = null;
+            while (wrapped.hasNext())
+            {
+                Unfiltered unfiltered = wrapped.next();
+                int cmp = metadata().comparator.compare(unfiltered.clustering(), closingBound);
+                if (isReverseOrder() ? cmp < 0 : cmp > 0)
+                {
+                    if (null == openDeletion)
+                    {
+                        next = unfiltered;
+                    }
+                    else
+                    {
+                        next = new RangeTombstoneBoundMarker(closingBound.invert(), openDeletion);
+                        afterNext = unfiltered;
+                    }
+                    return;
+                }
+
+                if (unfiltered.isRangeTombstoneMarker())
+                {
+                    RangeTombstoneMarker marker = (RangeTombstoneMarker) unfiltered;
+                    openDeletion = marker.isOpen(isReverseOrder()) ? marker.openDeletionTime(isReverseOrder()) : null;
+                }
+            }
+        }
+
+        @Override
+        public Unfiltered next()
+        {
+            if (!hasNext())
+                throw new NoSuchElementException();
+
+            Unfiltered unfiltered = next;
+            next = null;
+            return unfiltered;
+        }
+    }
+
+    /**
+     * Whether the merged result needs no more rows from the replica, whose last row so far is the last row of this
+     * partition (see DataLimits#isCompleteWithLastRowOf). GROUP BY responses need this: a replica that returned as many
+     * groups as the limit isn't exhausted, as far as its counter can tell, also when the replicas agree.
+     */
+    boolean isCompleteWithLastRow()
+    {
+        return command.limits().isCompleteWithLastRowOf(resultRowsCounter,
+                                                        inFirstResponse && lastQueried == 0 ? singleResultCounter : null,
+                                                        lastClustering == null ? null : partitionKey,
+                                                        lastClustering,
+                                                        metadata.comparator,
+                                                        command.isReversed());
     }
 
     private SinglePartitionReadCommand makeFetchAdditionalRowsReadCommand(int toQuery)

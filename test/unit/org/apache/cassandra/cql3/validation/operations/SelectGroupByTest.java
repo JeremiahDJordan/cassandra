@@ -535,6 +535,63 @@ public class SelectGroupByTest extends CQLTester
     }
 
     @Test
+    public void testGroupByWithLimitAfterRangeTombstone() throws Throwable
+    {
+        for (boolean flush : new boolean[]{ false, true })
+        {
+            createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b, c))");
+            execute("INSERT INTO %s (a, b, c, d) VALUES (1, 0, 0, 0) USING TIMESTAMP 1");
+            execute("DELETE FROM %s USING TIMESTAMP 2 WHERE a = 1 AND b = 1");
+            execute("INSERT INTO %s (a, b, c, d) VALUES (1, 1, 0, 0) USING TIMESTAMP 3");
+            execute("INSERT INTO %s (a, b, c, d) VALUES (2, 0, 0, 0) USING TIMESTAMP 1");
+            if (flush)
+                flush();
+
+            // the row that ends the first group follows the opening bound of the range tombstone
+            assertRows(execute("SELECT a, b, count(*) FROM %s WHERE a = 1 GROUP BY a, b LIMIT 1"),
+                       row(1, 0, 1L));
+            assertRows(execute("SELECT a, b, count(*) FROM %s WHERE a = 1 GROUP BY a, b"),
+                       row(1, 0, 1L),
+                       row(1, 1, 1L));
+            assertRows(execute("SELECT a, b, count(*) FROM %s GROUP BY a, b PER PARTITION LIMIT 1"),
+                       row(1, 0, 1L),
+                       row(2, 0, 1L));
+
+            for (int pageSize = 1; pageSize < 4; pageSize++)
+            {
+                assertRowsNet(executeNetWithPaging("SELECT a, b, count(*) FROM %s WHERE a = 1 GROUP BY a, b LIMIT 1", pageSize),
+                              row(1, 0, 1L));
+                assertRowsNet(executeNetWithPaging("SELECT a, b, count(*) FROM %s WHERE a = 1 GROUP BY a, b", pageSize),
+                              row(1, 0, 1L),
+                              row(1, 1, 1L));
+                assertRowsNet(executeNetWithPaging("SELECT a, b, count(*) FROM %s GROUP BY a, b", pageSize),
+                              row(1, 0, 1L),
+                              row(1, 1, 1L),
+                              row(2, 0, 1L));
+            }
+        }
+    }
+
+    @Test
+    public void testGroupByWithPagingBeforePartitionWithOnlyRangeTombstone() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b int, c int, d int, PRIMARY KEY (a, b, c))");
+        execute("INSERT INTO %s (a, b, c, d) VALUES (2, 5, 1, 0)");
+        execute("DELETE FROM %s WHERE a = 3 AND b = 1");
+
+        beforeAndAfterFlush(() -> {
+            // partition 3 follows partition 2 and has only a range tombstone
+            for (int pageSize = 1; pageSize < 4; pageSize++)
+            {
+                assertRowsNet(executeNetWithPaging("SELECT a, count(*) FROM %s GROUP BY a", pageSize),
+                              row(2, 1L));
+                assertRowsNet(executeNetWithPaging("SELECT a, b, count(*) FROM %s GROUP BY a, b", pageSize),
+                              row(2, 5, 1L));
+            }
+        });
+    }
+
+    @Test
     public void testGroupByWithRangeNamesQueryWithoutPaging() throws Throwable
     {
         createTable("CREATE TABLE %s (a int, b int, c int, d int, primary key (a, b, c))");
