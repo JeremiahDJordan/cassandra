@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.db.memtable;
 
+import java.util.function.ToLongFunction;
+
 import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.rows.Row;
@@ -31,8 +33,11 @@ class MemtableAverageRowSize
     public final long rowSize;
     public final long operations;
 
-
-    public MemtableAverageRowSize(Memtable memtable)
+    /**
+     * @param rowDataSize the size of a row, which must be measured the same way as {@link Memtable#getLiveDataSize()},
+     *                    because {@link Memtable#estimateRowCount} divides the latter by the average of the former
+     */
+    public MemtableAverageRowSize(Memtable memtable, ToLongFunction<Row> rowDataSize)
     {
         DataRange range = DataRange.allData(memtable.metadata().partitioner);
         ColumnFilter columnFilter = ColumnFilter.allRegularColumnsBuilder(memtable.metadata(), true).build();
@@ -51,7 +56,7 @@ class MemtableAverageRowSize
                     if (uRow.isRow())
                     {
                         rowCount++;
-                        totalSize += ((Row) uRow).dataSize();
+                        totalSize += rowDataSize.applyAsLong((Row) uRow);
                     }
                 }
             }

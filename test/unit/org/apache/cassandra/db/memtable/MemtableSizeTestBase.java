@@ -225,6 +225,7 @@ public abstract class MemtableSizeTestBase extends CQLTester
 
         long rowSize = memtable.getEstimatedAverageRowSize();
         double expectedRowSize = (double) memtable.getLiveDataSize() / (partitions * rowsPerPartition);
-        Assert.assertEquals(expectedRowSize, rowSize, (partitions * rowsPerPartition) * 0.05);  // 5% accuracy
+        // 5% of the row size, plus a byte as getEstimatedAverageRowSize() truncates
+        Assert.assertEquals(expectedRowSize, rowSize, expectedRowSize * 0.05 + 1);
     }
 }

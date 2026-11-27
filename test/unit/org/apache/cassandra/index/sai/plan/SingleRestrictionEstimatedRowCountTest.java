@@ -97,9 +97,9 @@ public class SingleRestrictionEstimatedRowCountTest extends SAITester
                 QueryController.QUERY_OPT_USE_TERM_STATS = useTermStats;
 
                 RowCountTest test = new RowCountTest(Operator.NEQ, 25);
-                test.doTest(version, INT, 95, 99);
-                test.doTest(version, DECIMAL, 95, 99);
-                test.doTest(version, VARINT, 95, 99);
+                test.doTest(version, INT, 95, 100);
+                test.doTest(version, DECIMAL, 95, 100);
+                test.doTest(version, VARINT, 95, 100);
 
                 test = new RowCountTest(Operator.LT, 50);
                 test.doTest(version, INT, 40, 60);
@@ -181,7 +181,7 @@ public class SingleRestrictionEstimatedRowCountTest extends SAITester
 
             long totalRows = controller.planFactory.tableMetrics.rows;
             assertEquals(0, cfs.metrics().liveSSTableCount.getValue().intValue());
-            assertEquals(97, totalRows);
+            assertEquals(100, totalRows);
 
             Plan plan = controller.buildPlan();
             assert plan instanceof Plan.RowsIteration;
