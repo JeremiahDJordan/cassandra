@@ -21,6 +21,7 @@ package org.apache.cassandra.index.sai.plan;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.AbstractMap;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -33,13 +34,18 @@ import org.apache.cassandra.cql3.CQL3Type;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.ReadCommand;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.memtable.AbstractShardedMemtable;
+import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.db.memtable.ShardBoundaries;
 import org.apache.cassandra.db.memtable.TrieMemtable;
+import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.index.sai.SAIUtil;
 import org.apache.cassandra.index.sai.disk.format.Version;
+import org.apache.cassandra.index.sai.memory.MemtableIndex;
 
 
 import static org.apache.cassandra.cql3.CQL3Type.Native.DECIMAL;
@@ -137,6 +143,48 @@ public class SingleRestrictionEstimatedRowCountTest extends SAITester
                 test.doTest(version, VARINT, 1, maxExpectedRows);
             }
         }
+    }
+
+    /**
+     * The memtable estimates of NOT CONTAINS, NOT CONTAINS KEY and != count the rows of the memtable once, with the
+     * first memtable shard empty or holding a single row. The row count of the memtable is itself an estimate.
+     */
+    @Test
+    public void testMemtableNegationEstimatesWithUnevenShards()
+    {
+        for (int firstShardRows : new int[]{ 0, 1 })
+        {
+            createTable("CREATE TABLE %s (pk int PRIMARY KEY, st set<text>, mk map<text, text>, n int) WITH memtable = '" + memtableDef + "'");
+            String setIndex = createIndex("CREATE CUSTOM INDEX ON %s(st) USING 'StorageAttachedIndex'");
+            String mapIndex = createIndex("CREATE CUSTOM INDEX ON %s(KEYS(mk)) USING 'StorageAttachedIndex'");
+            String intIndex = createIndex("CREATE CUSTOM INDEX ON %s(n) USING 'StorageAttachedIndex'");
+            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+            ShardBoundaries boundaries = cfs.localRangeSplits(TrieMemtable.getDefaultShardCount());
+            int[] shardRows = { firstShardRows, 199 };
+            int[] written = new int[shardRows.length];
+            int ones = 0;
+            for (int pk = 0; !Arrays.equals(written, shardRows); pk++)
+            {
+                int shard = boundaries.getShardForKey(cfs.decorateKey(Int32Type.instance.decompose(pk)));
+                if (shard >= shardRows.length || written[shard] == shardRows[shard])
+                    continue;
+                written[shard]++;
+                ones += pk % 2;
+                execute("INSERT INTO %s (pk, st, mk, n) VALUES (?, {'a'}, {'a': 'x'}, ?)", pk, pk % 2);
+            }
+
+            long rows = Memtable.estimateRowCount(cfs.getCurrentMemtable());
+            assertEquals(rows, memtableEstimate(setIndex, Operator.NOT_CONTAINS, "b"));
+            assertEquals(rows, memtableEstimate(mapIndex, Operator.NOT_CONTAINS_KEY, "b"));
+            assertEquals(rows - ones, memtableEstimate(intIndex, Operator.NEQ, "1"));
+        }
+    }
+
+    private long memtableEstimate(String index, Operator operator, String value)
+    {
+        IndexContext context = getIndexContext(index);
+        MemtableIndex memtableIndex = context.getLiveMemtables().get(getCurrentColumnFamilyStore().getCurrentMemtable());
+        return memtableIndex.estimateMatchingRowsCount(new Expression(context).add(operator, context.getValidator().fromString(value)));
     }
 
     void createTables()

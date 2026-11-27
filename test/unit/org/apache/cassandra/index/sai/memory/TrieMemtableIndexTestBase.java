@@ -47,6 +47,7 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.ListType;
 import org.apache.cassandra.db.memtable.AbstractAllocatorMemtable;
 import org.apache.cassandra.db.memtable.AbstractShardedMemtable;
+import org.apache.cassandra.db.memtable.ShardBoundaries;
 import org.apache.cassandra.db.memtable.TrieMemtable;
 import org.apache.cassandra.dht.AbstractBounds;
 import org.apache.cassandra.dht.BootStrapper;
@@ -212,6 +213,35 @@ public abstract class TrieMemtableIndexTestBase extends SAITester
 
             assertEquals(expectedKeys, foundKeys);
         }
+    }
+
+    @Test
+    public void unevenShardsEstimateTest()
+    {
+        memtableIndex = new TrieMemtableIndex(indexContext, memtable);
+        ShardBoundaries boundaries = cfs.localRangeSplits(memtableIndex.shardCount());
+
+        // the first shard holds 400 rows, enough to stop the estimate there, and the other shards 50 rows each
+        int[] shardRows = new int[memtableIndex.shardCount()];
+        int rows = 0;
+        for (int pk = 0; rows < 400 + 50 * (shardRows.length - 1); pk++)
+        {
+            int shard = boundaries.getShardForKey(makeKey(cfs.metadata(), pk));
+            if (shardRows[shard] < (shard == 0 ? 400 : 50))
+            {
+                addRow(pk, shardRows[shard]++ % 50);
+                rows++;
+            }
+        }
+        assertEquals(rows, memtableIndex.getRowCount());
+
+        Expression all = new Expression(indexContext);
+        all.add(Operator.GTE, Int32Type.instance.decompose(0));
+        assertEquals(rows, memtableIndex.estimateMatchingRowsCount(all));
+
+        Expression half = new Expression(indexContext);
+        half.add(Operator.LT, Int32Type.instance.decompose(25));
+        assertEquals(rows / 2.0, memtableIndex.estimateMatchingRowsCount(half), 10);
     }
 
     @Test
