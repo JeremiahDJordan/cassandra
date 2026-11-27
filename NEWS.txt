@@ -59,43 +59,47 @@ Upgrading
     - The hostname column in system_views.clients will no longer perform a reverse DNS lookup and will instead
       return the same value as the address column. This avoids the risk of client connections overwhelming
       DNS. (CASSANDRA-21539)
-
-4.0.20
-======
-
-Upgrading
----------
-    - This release addresses a security vulnerability in the LZ4 dependency, documented in CASSANDRA-21052. For users
-      who did not use LZ4 native libraries, this will now fallback to a safer but less performant pure Java
-      implementation. During startup, a warning will be logged if the LZ4 native library is not available.
-
-4.0.14
-======
-
-Upgrading
----------
-    - This release introduces safeguards and observability into possible data loss scenarios when nodes have a 
-      divergent view of the cluster. This happens around edge-cases on unsafe bootstrapping, decommissions, or when a 
-      node has a corrupted topology. Two configuration options have been added: `log_out_of_token_range_requests`,
-      enabled by default, and `reject_out_of_token_range_requests`, disabled by default (Apache Cassandra 4.0 enables
-      both). The former will make nodes log requests they receive that don't belong in their current or pending token
-      ranges. The latter will reject those requests altogether, which prevents the vast majority of eventual data loss
-      that can occur, but may also incur small windows of degraded availability during range movements in an unhealthy
-      cluster. Both options apply to streaming, mutations, hints, single-partition reads, read-repair, and Paxos
-      operations. Logging these requests is recommended in all situations, and operators are encouraged to be aware
-      when such events occur and to investigate if writes have only been received on incorrect nodes. See
-      CASSANDRA-13704 for further details. Transactional Cluster Metadata in version 5.1 will remove all such
-      edge-cases, providing appropriate guarantees.
-
-4.0.11
-======
-
-Upgrading
----------
-    - Please beware that if you use Ec2Snitch or Ec2MultiRegionSnitch, by default it will 
-      communicate with AWS IMDS of version 2. This change is transparent, there does not need 
-      to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
-      Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - A role's password can now be changed at most once every 5 seconds (CASSANDRA-21202). ALTER ROLE and ALTER USER
+      ... WITH PASSWORD fail with an OverloadedException ("Password for role ... can only be changed every 5000ms")
+      if the password was set less than 5 seconds before, also by the CREATE ROLE or CREATE USER that created the
+      role. Scripts that create a role and then change its password, or change it twice, must wait in between. The
+      interval is set with -Dcassandra.role_password_update_min_interval_in_ms; 0 disables the check.
+    - TRUNCATE now fails with a TruncateException when it can't stop the compactions of the table (CASSANDRA-21527),
+      instead of logging the failure and skipping the truncation. A coordinator of an earlier release reports such
+      a failure of a replica of this release with the reason UNKNOWN.
+    - Only SELECT, DESCRIBE and ALTER can be granted on system keyspaces and their tables: GRANT ALL and GRANT
+      MODIFY on them, for example, are refused with an UnauthorizedException, and GRANT ... ON ALL KEYSPACES no
+      longer applies to the system keyspaces (CASSANDRA-20090). system_traces is readable by every role.
+    - Snapshot names that contain the path separator (/), and the names . and .., are refused (CASSANDRA-21389).
+      With -Dcassandra.snapshot.validation=true, a snapshot name must also be at most 255 characters long and use only
+      letters, digits and - _ . +.
+    - A table name can be at most 222 characters long, so that the table's directory name fits the file name
+      limit (CASSANDRA-20389). Before, DataStax 4.0 didn't check the length of table names.
+    - In commitlog_archiving.properties, precision=NANOSECONDS is rejected at startup, restore_point_in_time is
+      compared with the mutations' timestamps in microseconds, and it accepts milliseconds and microseconds, e.g.
+      2012:04:30 20:43:12.633 or 2012:04:30 20:43:12.633123 (CASSANDRA-19448). For embedders, the CommitLogArchiver
+      constructor takes the restore point in microseconds, its public restorePointInTime and precision fields are
+      gone, and the CommitLog MBean's RestorePointInTime is in microseconds.
+    - The short option of nodetool import --copy-data is -cd instead of -p, which also meant --port
+      (CASSANDRA-20214).
+    - The classes named in the schema and in the configuration (custom indexes, compaction strategies,
+      compressors, types, memtables, authenticators, authorizers, role managers, network authorizers, internode
+      authenticators and key provider factories) are checked to be of the expected type before they are initialized
+      (CASSANDRA-21525), so the static initializer of a wrong class doesn't run. Some of the errors for a wrong class
+      change, e.g. to "... must extend or implement ..." for a key provider factory.
+    - cqlsh prints "ATTENTION: All commands will be saved to history file ..." when it starts on a terminal; use
+      --disable-history or disabled = true in the [history] section of cqlshrc to keep no history
+      (CASSANDRA-21180). It also prints "WARNING: cqlsh was built against ..., but this server is ..." when the
+      server's release version isn't the one cqlsh was built with (CASSANDRA-18745). Scripts that compare cqlsh's
+      output may need updating.
+    - Two non-frozen collections are compatible only if their values are serialization-compatible, not only
+      value-compatible (CASSANDRA-16905): for example, a non-frozen map<int, varint> is no longer compatible with a
+      map<int, bigint>. This applies where the type of a column is checked against an earlier type of the column,
+      such as in schema changes and sstable headers.
+    - The transaction logs of SSTable operations (the *_txn_*.log files) no longer include the Statistics.db file
+      in the timestamp of their REMOVE records (CASSANDRA-18119). Earlier DataStax 4.0 builds can't verify such a log
+      and don't start while one is left by a crash. Before going back to an earlier build, start the node on this
+      release and let it finish its leftover transaction logs, or stop it cleanly.
     - Storage-attached indexes (SAI) on a clustering column ordered DESC now behave as on the same column ordered ASC,
       as Apache Cassandra 5.0's do. An index on a DESC text, varchar, ascii or boolean clustering column, or on a DESC
       frozen tuple or UDT clustering column, indexes the empty value, so c = '' or c IN ('', 'a') find the rows whose
@@ -209,6 +213,44 @@ Upgrading
       the replicas return the same groups, no such request is made, except for queries with a PER PARTITION LIMIT.
     - The rows of the short read protection requests above add to the rows that replica filtering protection caches,
       so GROUP BY queries with a filter can now reach the cached_rows_fail_threshold of replica_filtering_protection.
+
+4.0.20
+======
+
+Upgrading
+---------
+    - This release addresses a security vulnerability in the LZ4 dependency, documented in CASSANDRA-21052. For users
+      who did not use LZ4 native libraries, this will now fallback to a safer but less performant pure Java
+      implementation. During startup, a warning will be logged if the LZ4 native library is not available.
+
+4.0.14
+======
+
+Upgrading
+---------
+    - This release introduces safeguards and observability into possible data loss scenarios when nodes have a 
+      divergent view of the cluster. This happens around edge-cases on unsafe bootstrapping, decommissions, or when a 
+      node has a corrupted topology. Two configuration options have been added: `log_out_of_token_range_requests`,
+      enabled by default, and `reject_out_of_token_range_requests`, disabled by default (Apache Cassandra 4.0 enables
+      both). The former will make nodes log requests they receive that don't belong in their current or pending token
+      ranges. The latter will reject those requests altogether, which prevents the vast majority of eventual data loss
+      that can occur, but may also incur small windows of degraded availability during range movements in an unhealthy
+      cluster. Both options apply to streaming, mutations, single-partition reads, read-repair, and Paxos operations;
+      hints for ranges the node doesn't own are logged and sent on to their replicas, not rejected. Logging these
+      requests is recommended in all situations, and operators are encouraged to be aware when such events occur and to
+      investigate if writes have only been received on incorrect nodes. See
+      CASSANDRA-13704 for further details. Transactional Cluster Metadata in version 5.1 will remove all such
+      edge-cases, providing appropriate guarantees.
+
+4.0.11
+======
+
+Upgrading
+---------
+    - Please beware that if you use Ec2Snitch or Ec2MultiRegionSnitch, by default it will 
+      communicate with AWS IMDS of version 2. This change is transparent, there does not need 
+      to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
+      Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
 
 Deprecation
 ---------
