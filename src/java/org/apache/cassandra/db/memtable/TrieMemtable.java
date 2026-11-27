@@ -687,6 +687,11 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                     allocator.offHeap().adjust(data.usedSizeOffHeap() - offHeap, opGroup);
                     allocator.onHeap().adjust((data.usedSizeOnHeap() - onHeap) + updater.heapSize, opGroup);
                     partitionCount += updater.partitionsAdded;
+                    // A failed merge leaves the trie unchanged, so the update's effects must not be applied.
+                    updateMinTimestamp(update.stats().minTimestamp);
+                    updateLiveDataSize(updater.dataSize);
+                    updateCurrentOperations(update.operationCount());
+                    stats = stats.mergeWith(update.stats());
                 }
                 catch (Throwable t)
                 {
@@ -695,12 +700,7 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                 }
                 finally
                 {
-                    updateMinTimestamp(update.stats().minTimestamp);
-                    updateLiveDataSize(updater.dataSize);
-                    updateCurrentOperations(update.operationCount());
-
                     columns = columns.mergeTo(update.columns());
-                    stats = stats.mergeWith(update.stats());
                     // Last, so that a failure in Indexer#finish doesn't skip the updates above. A failed merge leaves
                     // the trie without any of the update's rows and deletions, so the indexes must not see it either.
                     if (mergeFailure == null)
