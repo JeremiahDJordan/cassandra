@@ -1729,6 +1729,15 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
     }
 
     /**
+     * @return true if a global reference exists for a physical sstable in one of the given directories, that is until
+     * all its readers are released and, if it is obsolete, its files deleted.
+     */
+    public static boolean hasGlobalReference(Collection<File> directories)
+    {
+        return GlobalTidy.exists(directories);
+    }
+
+    /**
      * One instance per SSTableReader we create.
      * <p>
      * We can create many InstanceTidiers (one for every time we reopen an sstable with MOVED_START for example),
@@ -2066,6 +2075,16 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
         public static boolean exists(Descriptor descriptor)
         {
             return lookup.containsKey(descriptor);
+        }
+
+        static boolean exists(Collection<File> directories)
+        {
+            for (Descriptor descriptor : lookup.keySet())
+            {
+                if (directories.contains(descriptor.directory))
+                    return true;
+            }
+            return false;
         }
 
         private static boolean hasTidier(Descriptor descriptor)
