@@ -105,6 +105,7 @@ public class LegacyOnDiskFormatTest
     @After
     public void teardown()
     {
+        sstable.selfRef().release();
         temporaryFolder.delete();
     }
 
@@ -148,20 +149,20 @@ public class LegacyOnDiskFormatTest
     public void canCreateAndUsePrimaryKeyMapWithLegacyFormat() throws Throwable
     {
         var perSSTableComponents = indexDescriptor.perSSTableComponents();
-        PrimaryKeyMap.Factory primaryKeyMapFactory = perSSTableComponents.onDiskFormat().newPrimaryKeyMapFactory(perSSTableComponents, pkFactory, sstable);
+        try (PrimaryKeyMap.Factory primaryKeyMapFactory = perSSTableComponents.onDiskFormat().newPrimaryKeyMapFactory(perSSTableComponents, pkFactory, sstable);
+             PrimaryKeyMap primaryKeyMap = primaryKeyMapFactory.newPerSSTablePrimaryKeyMap())
+        {
+            long countFromFactory = primaryKeyMapFactory.count();
 
-        long countFromFactory = primaryKeyMapFactory.count();
+            long countFromMap = primaryKeyMap.count();
+            assertEquals(countFromFactory, countFromMap);
 
-        PrimaryKeyMap primaryKeyMap = primaryKeyMapFactory.newPerSSTablePrimaryKeyMap();
+            PrimaryKey expected = pkFactory.createTokenOnly(Murmur3Partitioner.instance.decorateKey(Int32Type.instance.decompose(23)).getToken());
 
-        long countFromMap = primaryKeyMap.count();
-        assertEquals(countFromFactory, countFromMap);
+            PrimaryKey primaryKey = primaryKeyMap.primaryKeyFromRowId(0);
 
-        PrimaryKey expected = pkFactory.createTokenOnly(Murmur3Partitioner.instance.decorateKey(Int32Type.instance.decompose(23)).getToken());
-
-        PrimaryKey primaryKey = primaryKeyMap.primaryKeyFromRowId(0);
-
-        assertEquals(expected, primaryKey);
+            assertEquals(expected, primaryKey);
+        }
     }
 
     @Test
@@ -171,19 +172,24 @@ public class LegacyOnDiskFormatTest
 
         final MetadataSource source = MetadataSource.loadMetadata(components);
 
-        var sstableContext = SSTableContext.create(sstable, indexDescriptor.perSSTableComponents());
-        List<SegmentMetadata> metadatas = SegmentMetadata.load(source, intContext, sstableContext);
+        try (var sstableContext = SSTableContext.create(sstable, indexDescriptor.perSSTableComponents()))
+        {
+            List<SegmentMetadata> metadatas = SegmentMetadata.load(source, intContext, sstableContext);
 
-        BKDReader bkdReader = new BKDReader(intContext,
-                                            components.get(IndexComponentType.KD_TREE).createFileHandle(),
-                                            metadatas.get(0).getIndexRoot(IndexComponentType.KD_TREE),
-                                            components.get(IndexComponentType.KD_TREE_POSTING_LISTS).createFileHandle(),
-                                            metadatas.get(0).getIndexRoot(IndexComponentType.KD_TREE_POSTING_LISTS));
-
-        Expression expression = new Expression(intContext).add(Operator.LT, Int32Type.instance.decompose(10));
-        BKDReader.IntersectVisitor query = bkdQueryFrom(expression, bkdReader.getNumDimensions(), bkdReader.getBytesPerDimension());
-        PostingList postingList = bkdReader.intersect(query, QueryEventListeners.NO_OP_BKD_LISTENER, new QueryContext());
-        assertNotNull(postingList);
+            try (BKDReader bkdReader = new BKDReader(intContext,
+                                                     components.get(IndexComponentType.KD_TREE).createFileHandle(),
+                                                     metadatas.get(0).getIndexRoot(IndexComponentType.KD_TREE),
+                                                     components.get(IndexComponentType.KD_TREE_POSTING_LISTS).createFileHandle(),
+                                                     metadatas.get(0).getIndexRoot(IndexComponentType.KD_TREE_POSTING_LISTS)))
+            {
+                Expression expression = new Expression(intContext).add(Operator.LT, Int32Type.instance.decompose(10));
+                BKDReader.IntersectVisitor query = bkdQueryFrom(expression, bkdReader.getNumDimensions(), bkdReader.getBytesPerDimension());
+                try (PostingList postingList = bkdReader.intersect(query, QueryEventListeners.NO_OP_BKD_LISTENER, new QueryContext()))
+                {
+                    assertNotNull(postingList);
+                }
+            }
+        }
     }
 
     @Test
@@ -193,27 +199,32 @@ public class LegacyOnDiskFormatTest
 
         final MetadataSource source = MetadataSource.loadMetadata(components);
 
-        var sstableContext = SSTableContext.create(sstable, indexDescriptor.perSSTableComponents());
-        SegmentMetadata metadata = SegmentMetadata.load(source, textContext, sstableContext).get(0);
+        try (var sstableContext = SSTableContext.create(sstable, indexDescriptor.perSSTableComponents()))
+        {
+            SegmentMetadata metadata = SegmentMetadata.load(source, textContext, sstableContext).get(0);
 
-        long root = metadata.getIndexRoot(IndexComponentType.TERMS_DATA);
-        Map<String,String> map = metadata.componentMetadatas.get(IndexComponentType.TERMS_DATA).attributes;
-        String footerPointerString = map.get(SAICodecUtils.FOOTER_POINTER);
-        long footerPointer = footerPointerString == null ? -1 : Long.parseLong(footerPointerString);
+            long root = metadata.getIndexRoot(IndexComponentType.TERMS_DATA);
+            Map<String,String> map = metadata.componentMetadatas.get(IndexComponentType.TERMS_DATA).attributes;
+            String footerPointerString = map.get(SAICodecUtils.FOOTER_POINTER);
+            long footerPointer = footerPointerString == null ? -1 : Long.parseLong(footerPointerString);
 
-        ByteComparable.Version byteComparableVersion = components.byteComparableVersionFor(IndexComponentType.TERMS_DATA);
-        TermsReader termsReader = new TermsReader(textContext,
-                                                  components.get(IndexComponentType.TERMS_DATA).createFileHandle(),
-                                                  byteComparableVersion,
-                                                  components.get(IndexComponentType.POSTING_LISTS).createFileHandle(),
-                                                  root,
-                                                  footerPointer,
-                                                  Version.AA); // These tests are for AA, so no need to parameterize
-        Expression expression = new Expression(textContext).add(Operator.EQ, UTF8Type.instance.decompose("10"));
-        ByteComparable term = ByteComparable.preencoded(byteComparableVersion, expression.lower.value.encoded);
+            ByteComparable.Version byteComparableVersion = components.byteComparableVersionFor(IndexComponentType.TERMS_DATA);
+            try (TermsReader termsReader = new TermsReader(textContext,
+                                                           components.get(IndexComponentType.TERMS_DATA).createFileHandle(),
+                                                           byteComparableVersion,
+                                                           components.get(IndexComponentType.POSTING_LISTS).createFileHandle(),
+                                                           root,
+                                                           footerPointer,
+                                                           Version.AA)) // These tests are for AA, so no need to parameterize
+            {
+                Expression expression = new Expression(textContext).add(Operator.EQ, UTF8Type.instance.decompose("10"));
+                ByteComparable term = ByteComparable.preencoded(byteComparableVersion, expression.lower.value.encoded);
 
-        PostingList result = termsReader.exactMatch(term, QueryEventListeners.NO_OP_TRIE_LISTENER, new QueryContext());
-
-        assertEquals(1, result.size());
+                try (PostingList result = termsReader.exactMatch(term, QueryEventListeners.NO_OP_TRIE_LISTENER, new QueryContext()))
+                {
+                    assertEquals(1, result.size());
+                }
+            }
+        }
     }
 }
