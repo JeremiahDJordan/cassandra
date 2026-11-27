@@ -724,4 +724,28 @@ public class ViewTest extends ViewAbstractTest
 
         return executeView("SELECT * FROM %s");
     }
+
+    /**
+     * Moving the rows of a view to another view partition leaves an expired primary key liveness info on their old view
+     * rows. A view row is dead without a live primary key liveness info, so a read of the old partition doesn't read
+     * those rows again (see ReadCommand#mayNeedRowsReadAgain).
+     */
+    @Test
+    public void testReadOfMovedRowsReadsPartitionOnce() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int, c int, v int, x int, y int, PRIMARY KEY (k, c))");
+        createView("CREATE MATERIALIZED VIEW %s AS SELECT * FROM %s WHERE v IS NOT NULL AND k IS NOT NULL AND c IS NOT NULL PRIMARY KEY (v, k, c)");
+        ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(currentView());
+        cfs.disableAutoCompaction();
+        for (int k = 0; k < 10; k++)
+            updateView("INSERT INTO %s (k, c, v, x) VALUES (?, 1, 1, ?)", k, k);
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+        for (int k = 0; k < 10; k++)
+            updateView("UPDATE %s SET v = 2 WHERE k = ? AND c = 1", k);
+        cfs.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
+
+        long reads = cfs.metric.sstablesPerReadHistogram.cf.getCount();
+        assertRows(executeView("SELECT k, c, y FROM %s WHERE v = 1"));
+        assertEquals(reads + 1, cfs.metric.sstablesPerReadHistogram.cf.getCount());
+    }
 }

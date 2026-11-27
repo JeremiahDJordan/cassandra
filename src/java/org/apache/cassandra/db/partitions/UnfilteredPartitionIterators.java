@@ -23,6 +23,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.NoSuchElementException;
+import java.util.function.Function;
 
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.Digest;
@@ -229,6 +230,15 @@ public abstract class UnfilteredPartitionIterators
 
     public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators)
     {
+        return mergeLazily(iterators, UnfilteredRowIterators::merge);
+    }
+
+    /**
+     * @param merger merges the versions of a partition
+     */
+    public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators,
+                                                          final Function<List<UnfilteredRowIterator>, UnfilteredRowIterator> merger)
+    {
         assert !iterators.isEmpty();
 
         if (iterators.size() == 1)
@@ -251,7 +261,7 @@ public abstract class UnfilteredPartitionIterators
                 {
                     protected UnfilteredRowIterator initializeIterator()
                     {
-                        return UnfilteredRowIterators.merge(toMerge);
+                        return merger.apply(toMerge);
                     }
                 };
             }

@@ -383,7 +383,7 @@ public class BTreeRow extends AbstractRow
             boolean isShadowed = mayHaveShadowed && activeDeletion.deletes(cell);
             boolean isSkippable = !queriedByUserTester.test(column);
 
-            if (isForDropped || isShadowed || (isSkippable && cell.timestamp() < rowLiveness.timestamp()))
+            if (isForDropped || isShadowed || (isSkippable && DeserializationHelper.dropsOlderNotQueriedCells(rowLiveness) && cell.timestamp() < rowLiveness.timestamp()))
                 return null;
 
             // We should apply the same "optimization" as in Cell.deserialize to avoid discrepances

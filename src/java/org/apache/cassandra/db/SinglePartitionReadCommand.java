@@ -29,6 +29,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+import javax.annotation.Nullable;
+
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Sets;
 
@@ -58,6 +60,7 @@ import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -910,7 +913,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
             List<UnfilteredRowIterator> iterators = inputCollector.finalizeIterators(cfs, nowInSec(), controller.oldestUnrepairedTombstone());
 
-            UnfilteredRowIterator result = withSSTablesIterated(iterators, cfs.metric, metricsCollector);
+            UnfilteredRowIterator result = withSSTablesIterated(mergeReadingAgain(iterators, cfs, view, rowTransformer, controller), cfs.metric, metricsCollector);
 
             if (metricsCollector.getMergedSSTables() > DatabaseDescriptor.getSSTablesPerReadLogThreshold())
                 noSpamLogger.info("The following query '{}' has read {} SSTables.", this.toCQLString(), metricsCollector.getMergedSSTables());
@@ -982,12 +985,10 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
      * Note that we cannot use the Transformations framework because they greedily get the static row, which
      * would cause all iterators to be initialized and hence all sstables to be accessed.
      */
-    private UnfilteredRowIterator withSSTablesIterated(List<UnfilteredRowIterator> iterators,
+    private UnfilteredRowIterator withSSTablesIterated(UnfilteredRowIterator merged,
                                                        TableMetrics metrics,
                                                        SSTableReadMetricsCollector metricsCollector)
     {
-        UnfilteredRowIterator merged = UnfilteredRowIterators.merge(iterators);
-
         if (!merged.isEmpty())
         {
             DecoratedKey key = merged.partitionKey();
@@ -1030,6 +1031,12 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
     {
         ImmutableBTreePartition result = null;
         SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
+        DroppingRows droppingRows = mayNeedRowsReadAgain() ? new DroppingRows() : null;
+        // The sources applied the column filter: applying it to the merged rows would drop cells against their merged
+        // liveness info, which isn't the liveness info of each source
+        ColumnFilter mergedRowsFilter = columnFilter().allFetchedColumnsAreQueried()
+                                        ? columnFilter()
+                                        : ColumnFilter.selection(columnFilter().fetchedColumns());
 
         Tracing.trace("Merging memtable contents");
         for (Memtable memtable : view.memtables)
@@ -1041,9 +1048,10 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
                 UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable))
                                                                        : iter;
-                result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false),
+                result = add(DroppingRows.apply(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false), droppingRows),
                              result,
                              filter,
+                             mergedRowsFilter,
                              false,
                              controller);
             }
@@ -1091,6 +1099,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                                                                            filter.isReversed()),
                                      result,
                                      filter,
+                                     mergedRowsFilter,
                                      sstable.isRepaired(),
                                      controller);
                     }
@@ -1099,9 +1108,10 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                         UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(sstable.getId()))
                                                                                : iter;
 
-                        result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false),
+                        result = add(DroppingRows.apply(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false), droppingRows),
                                      result,
                                      filter,
+                                     mergedRowsFilter,
                                      sstable.isRepaired(),
                                      controller);
                     }
@@ -1116,9 +1126,10 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     continue;
                 UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(sstable.getId()))
                                                                        : iter;
-                result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false),
+                result = add(DroppingRows.apply(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false), droppingRows),
                              result,
                              filter,
+                             mergedRowsFilter,
                              sstable.isRepaired(),
                              controller);
             }
@@ -1137,10 +1148,45 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         cfs.metric.topReadPartitionSSTableCount.addSample(key.getKey(), metricsCollector.getMergedSSTables());
         StorageHook.instance.reportRead(cfs.metadata.id, partitionKey());
 
-        return result.unfilteredIterator(columnFilter(), Slices.ALL, clusteringIndexFilter().isReversed());
+        UnfilteredRowIterator iterator = result.unfilteredIterator(mergedRowsFilter, Slices.ALL, clusteringIndexFilter().isReversed());
+        if (droppingRows != null && droppingRows.seen)
+        {
+            iterator = Transformation.apply(iterator, new Transformation<>()
+            {
+                @Override
+                protected Row applyToRow(Row row)
+                {
+                    return mayNeedReadAgain(row) ? readAgain(cfs, view, rowTransformer, controller, partitionKey(), row) : row;
+                }
+            });
+        }
+        return iterator;
     }
 
-    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, boolean isRepaired, ReadExecutionController controller)
+    /**
+     * Records whether a row of the sources it is applied to has a liveness info that drops cells (see
+     * {@link ReadCommand#mayNeedRowsReadAgain}): the rows of the read whose merged liveness info isn't live are then read
+     * again.
+     */
+    private static final class DroppingRows extends Transformation<UnfilteredRowIterator>
+    {
+        private boolean seen;
+
+        private static UnfilteredRowIterator apply(UnfilteredRowIterator iter, @Nullable DroppingRows droppingRows)
+        {
+            return droppingRows == null ? iter : Transformation.apply(iter, droppingRows);
+        }
+
+        @Override
+        protected Row applyToRow(Row row)
+        {
+            if (DeserializationHelper.dropsOlderNotQueriedCells(row.primaryKeyLivenessInfo()))
+                seen = true;
+            return row;
+        }
+    }
+
+    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, ColumnFilter mergedRowsFilter, boolean isRepaired, ReadExecutionController controller)
     {
         if (!isRepaired)
             controller.updateMinOldestUnrepairedTombstone(iter.stats().minLocalDeletionTime);
@@ -1149,7 +1195,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         if (result == null)
             return ImmutableBTreePartition.create(iter, maxRows);
 
-        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(Arrays.asList(iter, result.unfilteredIterator(columnFilter(), Slices.ALL, filter.isReversed()))))
+        // the merged rows are kept as merged, as at the end of the read (see queryMemtableAndSSTablesInTimestampOrder)
+        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(Arrays.asList(iter, result.unfilteredIterator(mergedRowsFilter, Slices.ALL, filter.isReversed()))))
         {
             return ImmutableBTreePartition.create(merged, maxRows);
         }
@@ -1163,8 +1210,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         // According to the CQL semantics a row exists if at least one of its columns is not null (including the primary key columns).
         // Having the queried columns not null is unfortunately not enough to prove that a row exists as some column deletion
         // for the queried columns can exist on another node.
-        // For CQL tables it is enough to have the primary key liveness and the queried columns as the primary key liveness prove that
-        // the row exists even if all the other columns are deleted.
+        // For CQL tables it is enough to have a live primary key liveness and the queried columns as the live primary key liveness
+        // proves that the row exists even if all the other columns are deleted.
         // COMPACT tables do not have primary key liveness and by consequence we are forced to get  all the fetched columns to ensure that
         // we can return the correct result if the queried columns are deleted on another node but one of the non-queried columns is not.
         RegularAndStaticColumns columns = metadata().isCompactTable() ? columnFilter().fetchedColumns() : columnFilter().queriedColumns();
@@ -1260,7 +1307,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 return true;
 
             // Note that compact tables will always have an empty primary key liveness info.
-            if (!metadata().isCompactTable() && (row.primaryKeyLivenessInfo().isEmpty() || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp))
+            // An expired primary key liveness info doesn't prove the row exists; older cells may still keep it alive.
+            if (!metadata().isCompactTable() && (!row.primaryKeyLivenessInfo().isLive(nowInSec()) || row.primaryKeyLivenessInfo().timestamp() <= sstableTimestamp))
                 return false;
         }
 
