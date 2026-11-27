@@ -226,6 +226,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      */
     private final Map<String, AtomicInteger> inProgressBuilds = Maps.newConcurrentMap();
 
+    /**
+     * The indexes whose running build must not make them queryable, see {@link #invalidateRunningBuilds}.
+     */
+    private final Set<String> invalidatedBuilds = Sets.newConcurrentHashSet();
+
     // executes tasks returned by Indexer#addIndexColumn which may require index(es) to be (re)built
     private static final ListeningExecutorService asyncExecutor = MoreExecutors.listeningDecorator(
     new JMXEnabledThreadPoolExecutor(1,
@@ -312,8 +317,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         // if there's no initialization, just mark as built (if it should be queryable) and return:
         if (initialBuildTask == null)
         {
-            if (IndexBuildDecider.instance.isIndexQueryableAfterInitialBuild(baseCfs))
-                markIndexBuilt(index, true);
+            if (IndexBuildDecider.instance.isIndexQueryableAfterInitialBuild(baseCfs) && !markIndexBuilt(index, true))
+            {
+                IllegalStateException failure = failedDuringBuild(Collections.singleton(index));
+                logAndMarkIndexesFailed(Collections.singleton(index), failure, true);
+                return Futures.immediateFailedFuture(failure);
+            }
 
             return Futures.immediateFuture(null);
         }
@@ -332,8 +341,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
             @Override
             public void onSuccess(Object o)
             {
-                if (IndexBuildDecider.instance.isIndexQueryableAfterInitialBuild(baseCfs))
-                    markIndexBuilt(index, true);
+                if (IndexBuildDecider.instance.isIndexQueryableAfterInitialBuild(baseCfs) && !markIndexBuilt(index, true))
+                {
+                    IllegalStateException failure = failedDuringBuild(Collections.singleton(index));
+                    try
+                    {
+                        logAndMarkIndexesFailed(Collections.singleton(index), failure, true);
+                    }
+                    finally
+                    {
+                        initialization.setException(failure);
+                    }
+                    return;
+                }
 
                 initialization.set(o);
             }
@@ -661,10 +681,30 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                @Override
                                public void onSuccess(Object o)
                                {
-                                   groupedIndexes.forEach(i -> markIndexBuilt(i, isFullRebuild));
-                                   logger.info("Index build of {} completed", Index.joinNames(groupedIndexes));
-                                   builtIndexes.addAll(groupedIndexes);
-                                   build.set(o);
+                                   Set<Index> failed = new HashSet<>();
+                                   for (Index index : groupedIndexes)
+                                   {
+                                       if (markIndexBuilt(index, isFullRebuild))
+                                           builtIndexes.add(index);
+                                       else
+                                           failed.add(index);
+                                   }
+                                   if (failed.isEmpty())
+                                   {
+                                       logger.info("Index build of {} completed", Index.joinNames(groupedIndexes));
+                                       build.set(o);
+                                       return;
+                                   }
+                                   IllegalStateException failure = failedDuringBuild(failed);
+                                   try
+                                   {
+                                       logAndMarkIndexesFailed(failed, failure, false);
+                                   }
+                                   finally
+                                   {
+                                       unbuiltIndexes.addAll(failed);
+                                       build.setException(failure);
+                                   }
                                }
                            }, MoreExecutors.directExecutor());
                            futures.add(build);
@@ -784,6 +824,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                             if (isFullRebuild)
                             {
                                 needsFullRebuild.remove(indexName);
+                                invalidatedBuilds.remove(indexName);
                                 makeIndexNonQueryable(index, Index.Status.FULL_REBUILD_STARTED);
                             }
 
@@ -798,12 +839,27 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      *
      * @param index the index to be marked as built
      * @param isFullRebuild {@code true} if this method is invoked as a full index rebuild, {@code false} otherwise
+     * @return {@code false}, without marking the index, if it is a full rebuild that was invalidated while it ran (see
+     * {@link #invalidateRunningBuilds}): the caller marks it failed
      */
-    public synchronized void markIndexBuilt(Index index, boolean isFullRebuild)
+    public synchronized boolean markIndexBuilt(Index index, boolean isFullRebuild)
     {
         String indexName = index.getIndexMetadata().name;
+        // the flag is the registered instance's, see invalidateRunningBuilds
+        boolean registered = indexes.get(indexName) == index;
+        if (isFullRebuild && registered && invalidatedBuilds.remove(indexName))
+            return false;
+
         if (isFullRebuild)
+        {
             makeIndexQueryable(index, Index.Status.BUILD_SUCCEEDED);
+            // invalidated meanwhile, maybe after the index was made non-queryable (see invalidateRunningBuilds)
+            if (registered && invalidatedBuilds.remove(indexName))
+            {
+                makeIndexNonQueryable(index, Index.Status.BUILD_FAILED);
+                return false;
+            }
+        }
 
         AtomicInteger counter = inProgressBuilds.get(indexName);
         if (counter != null)
@@ -816,6 +872,37 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                     SystemKeyspace.setIndexBuilt(baseCfs.keyspace.getName(), indexName);
             }
         }
+        return true;
+    }
+
+    /**
+     * Fails the full build of the specified index that is running, if a build of it is in progress, when it completes:
+     * the index lost data that build may have built already, so the build must not make it queryable. Not
+     * synchronized, as {@link #makeIndexNonQueryable}: indexes call it under their own locks.
+     */
+    public void invalidateRunningBuilds(Index index)
+    {
+        String indexName = index.getIndexMetadata().name;
+        AtomicInteger builds = inProgressBuilds.get(indexName);
+        if (builds != null && builds.get() > 0 && indexes.get(indexName) == index)
+            invalidatedBuilds.add(indexName);
+    }
+
+    /**
+     * Forgets what invalidated the running build of the specified index so far (see {@link #invalidateRunningBuilds}),
+     * when that build looks for what it still has to build: it builds what the index lost before then.
+     */
+    public synchronized void forgetRunningBuildInvalidations(Index index)
+    {
+        String indexName = index.getIndexMetadata().name;
+        if (indexes.get(indexName) == index)
+            invalidatedBuilds.remove(indexName);
+    }
+
+    private static IllegalStateException failedDuringBuild(Collection<Index> indexes)
+    {
+        return new IllegalStateException(String.format("Index %s lost data while it was being built, and needs a full rebuild",
+                                                       Index.joinNames(indexes)));
     }
 
     /**
@@ -874,6 +961,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         writableIndexes.remove(indexName);
         needsFullRebuild.remove(indexName);
         inProgressBuilds.remove(indexName);
+        invalidatedBuilds.remove(indexName);
         // remove existing indexing status
         propagateLocalIndexStatus(keyspace.getName(), indexName, Index.Status.DROPPED);
     }

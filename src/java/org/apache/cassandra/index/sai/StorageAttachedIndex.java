@@ -471,6 +471,9 @@ public class StorageAttachedIndex implements Index
 
         for (int builds = 0; ; builds++)
         {
+            // What the index lost so far (e.g. components found invalid as the build loaded them) is missing from its
+            // view, and built below: only what it loses from now on fails the initial build.
+            baseCfs.indexManager.forgetRunningBuildInvalidations(this);
             // Usually, every sstable is in the view: don't reload the index on all of them to find that out.
             View view = indexContext.getView();
             boolean anyMissing = false;
@@ -1095,6 +1098,8 @@ public class StorageAttachedIndex implements Index
      */
     public void makeIndexNonQueryable()
     {
+        // a build of the index that is running may have built data the index no longer serves
+        baseCfs.indexManager.invalidateRunningBuilds(this);
         baseCfs.indexManager.makeIndexNonQueryable(this, Status.BUILD_FAILED);
         logger.warn(indexContext.logMessage("Storage-attached index is no longer queryable. Please restart this node to repair it."));
     }

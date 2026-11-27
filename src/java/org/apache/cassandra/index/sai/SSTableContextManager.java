@@ -19,7 +19,9 @@ package org.apache.cassandra.index.sai;
 
 import java.lang.invoke.MethodHandles;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
@@ -70,8 +72,25 @@ public class SSTableContextManager
      * has invalid/missing components, then an empty optional is returned (and all invalid sstable will have had their
      * context removed, after a call to onInvalid).
      */
-    @SuppressWarnings("resource")
+    @VisibleForTesting
     public Optional<Set<SSTableContext>> update(Collection<SSTableReader> removed, Iterable<SSTableReader> added, boolean validate, Set<StorageAttachedIndex> indices)
+    {
+        return update(removed, added, validate, indices, new HashMap<>());
+    }
+
+    /**
+     * As {@link #update(Collection, Iterable, boolean, Set)}, also reporting the indexes that can't serve an added
+     * SSTable.
+     *
+     * @param unloadable to add the indexes that have complete components on an added SSTable whose per-SSTable
+     *                   components are incomplete, with those SSTables: they can't load them (see below)
+     */
+    @SuppressWarnings("resource")
+    public Optional<Set<SSTableContext>> update(Collection<SSTableReader> removed,
+                                                Iterable<SSTableReader> added,
+                                                boolean validate,
+                                                Set<StorageAttachedIndex> indices,
+                                                Map<StorageAttachedIndex, Set<SSTableReader>> unloadable)
     {
         release(removed);
 
@@ -105,6 +124,14 @@ public class SSTableContextManager
                 // not ready yet. We know a future call of this method will be triggered for that sstable once the
                 // index finishes building.
                 logger.debug("Skipped tracking sstable {} because per sstable components are not complete (components={})", sstable, perSSTableComponents.all());
+                // An index with complete components here was built on per-SSTable components that are gone
+                // (deleted by a full rebuild of another index): it can't load the sstable. Our caller decides, once
+                // the views are updated, whether it can stay queryable.
+                for (StorageAttachedIndex index : indices)
+                {
+                    if (indexDescriptor.perIndexComponents(index.getIndexContext()).isComplete())
+                        unloadable.computeIfAbsent(index, i -> new HashSet<>()).add(sstable);
+                }
                 continue;
             }
 
