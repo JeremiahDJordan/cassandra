@@ -18,7 +18,9 @@
 package org.apache.cassandra.db.commitlog;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import org.junit.Assert;
@@ -30,6 +32,7 @@ import org.apache.cassandra.config.Config;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.ColumnIdentifier;
+import org.apache.cassandra.db.Clustering;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.Mutation;
@@ -39,10 +42,14 @@ import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.serializers.CollectionSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.KillerForTests;
 
 import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
+import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
+import static org.apache.cassandra.utils.ByteBufferUtil.bytes;
 
 public class CommitLogReaderTest extends CQLTester
 {
@@ -159,6 +166,25 @@ public class CommitLogReaderTest extends CQLTester
             readCount, testHandler.seenMutationCount());
 
         confirmReadOrder(testHandler, samples / 2);
+    }
+
+    @Test
+    public void testReadCollectionClusteringsWithEmptyElements() throws Throwable
+    {
+        createTable("CREATE TABLE %s (a int, b frozen<set<int>>, c frozen<map<int, int>>, PRIMARY KEY (a, b, c))");
+        ByteBuffer set = CollectionSerializer.pack(Arrays.asList(EMPTY_BYTE_BUFFER, bytes(1)), 2, ProtocolVersion.V3);
+        ByteBuffer map = CollectionSerializer.pack(Arrays.asList(EMPTY_BYTE_BUFFER, bytes(1), bytes(2), EMPTY_BYTE_BUFFER), 2, ProtocolVersion.V3);
+        execute("INSERT INTO %s (a, b, c) VALUES (0, ?, ?)", set, map);
+
+        CommitLogReader reader = new CommitLogReader();
+        TestCLRHandler testHandler = new TestCLRHandler(currentTableMetadata());
+        for (File f : getCommitLogs())
+            reader.readCommitLogSegment(testHandler, f, CommitLogReader.ALL_MUTATIONS, false);
+
+        Assert.assertFalse(testHandler.sawStopOnErrorCheck);
+        Assert.assertEquals(1, testHandler.seenMutationCount());
+        PartitionUpdate update = testHandler.seenMutations.get(0).getPartitionUpdate(currentTableMetadata());
+        Assert.assertEquals(Clustering.make(set, map), update.rows().iterator().next().clustering());
     }
 
     /**
