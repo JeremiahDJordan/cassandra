@@ -315,6 +315,79 @@ public class VectorMemtableIndexTest extends SAITester
         }
     }
 
+    /**
+     * A row is in the postings of the vector it is indexed under only, and once, whatever its cells and the order they
+     * arrive in. Rows with the same vector share its postings.
+     */
+    @Test
+    public void testUpdateKeepsRowInPostingsOfItsVectorOnce()
+    {
+        memtableIndex = new VectorMemtableIndex(indexContext, cfs.getCurrentMemtable());
+        ColumnMetadata column = indexContext.getDefinition();
+        long nowInSec = FBUtilities.nowInSeconds();
+        ByteBuffer shared = randomVectorSerialized();
+        ByteBuffer other = randomVectorSerialized();
+        for (int pk = 0; pk < 5; pk++)
+            update(pk, BufferCell.live(column, 10, shared));
+        assertPostings(shared, 0, 1, 2, 3, 4);
+
+        // the same vector again, and the same cell again
+        update(0, BufferCell.live(column, 20, shared));
+        update(0, BufferCell.live(column, 20, shared));
+        // another vector, then back
+        update(1, BufferCell.live(column, 20, other));
+        assertPostings(shared, 0, 2, 3, 4);
+        assertPostings(other, 1);
+        update(1, BufferCell.live(column, 30, shared));
+        // deleted, then written again
+        update(2, BufferCell.tombstone(column, 20, nowInSec));
+        assertPostings(shared, 0, 1, 3, 4);
+        update(2, BufferCell.live(column, 30, shared));
+        // expired, then written again
+        update(3, BufferCell.expiring(column, 20, 1, nowInSec - 10, shared));
+        assertPostings(shared, 0, 1, 2, 4);
+        update(3, BufferCell.live(column, 30, shared));
+        // removed, then written again, and an older cell after that
+        memtableIndex.remove(makeKey(cfs.metadata(), 4), Clustering.EMPTY, shared, cfs.getCurrentMemtable(), new OpOrder().start());
+        assertPostings(shared, 0, 1, 2, 3);
+        update(4, BufferCell.live(column, 30, shared));
+        update(4, BufferCell.live(column, 25, other));
+
+        assertPostings(shared, 0, 1, 2, 3, 4);
+        assertPostings(other);
+        for (int pk = 0; pk < 5; pk++)
+            assertIndexedUnder(pk, shared);
+
+        // concurrent writes of different rows with the same vectors
+        IntStream.range(5, 1000).parallel().forEach(pk -> update(pk, BufferCell.live(column, 10, pk % 2 == 0 ? shared : other)));
+        assertPostings(shared, IntStream.range(0, 1000).filter(pk -> pk < 5 || pk % 2 == 0).boxed().toArray(Integer[]::new));
+        assertPostings(other, IntStream.range(5, 1000).filter(pk -> pk % 2 != 0).boxed().toArray(Integer[]::new));
+    }
+
+    /**
+     * Without a cell to reconcile, as for a vector in a primary key column, a key indexed again under the same vector
+     * is in its postings once.
+     */
+    @Test
+    public void testIndexAddsKeyToPostingsOnce()
+    {
+        memtableIndex = new VectorMemtableIndex(indexContext, cfs.getCurrentMemtable());
+        ByteBuffer vector = randomVectorSerialized();
+        addRow(0, vector);
+        addRow(1, vector);
+        addRow(0, vector);
+        assertPostings(vector, 0, 1);
+    }
+
+    private void assertPostings(ByteBuffer vector, Integer... pks)
+    {
+        List<Integer> keys = memtableIndex.getGraph().keysOf(vector).stream()
+                                          .map(key -> Int32Type.instance.compose(key.partitionKey().getKey()))
+                                          .sorted()
+                                          .collect(Collectors.toList());
+        assertEquals(List.of(pks), keys);
+    }
+
     @Test
     public void preFlushWithRowIdClaimedByTwoVectorsTest()
     {

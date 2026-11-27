@@ -71,6 +71,14 @@ public class VectorPostings<T>
     }
 
     /**
+     * Adds a key that the caller knows isn't in this postings list, without looking for it.
+     */
+    public void addAbsent(T key)
+    {
+        postings.add(key);
+    }
+
+    /**
      * Whether two keys are the same: a static key compares equal to the row keys of its partition but is a key of its
      * own (with a vector in a partition key column, the static row and the rows of a partition have the same vector).
      */

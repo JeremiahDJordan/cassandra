@@ -18,14 +18,21 @@
 
 package org.apache.cassandra.index.sai.cql;
 
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.marshal.FloatType;
+import org.apache.cassandra.db.marshal.VectorType;
+import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
+import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 
 import static org.apache.cassandra.index.sai.cql.VectorTypeTest.assertContainsInt;
@@ -346,6 +353,55 @@ public class VectorUpdateDeleteTest extends VectorTester.VersionedWithChecksums
                 });
             }
         }
+    }
+
+    // Rows and static rows with the same vector share its postings in the memtable index, each once, whatever the
+    // history of their writes.
+    @Test
+    public void rowsWithSameVectorInPostingsOnceTest() throws Throwable
+    {
+        for (String memtable : new String[]{ "skiplist", "trie" })
+        {
+            createTable("CREATE TABLE %s (pk int, ck int, s vector<float, 2> static, val vector<float, 2>, PRIMARY KEY(pk, ck)) WITH memtable = '" + memtable + "'");
+            String index = createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function': 'euclidean'}");
+            String staticIndex = createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex' WITH OPTIONS = {'similarity_function': 'euclidean'}");
+            disableCompaction();
+
+            for (int pk = 0; pk < 3; pk++)
+            {
+                execute("INSERT INTO %s (pk, ck, s, val) VALUES (?, 0, [1.0, 1.0], [1.0, 1.0])", pk);
+                execute("INSERT INTO %s (pk, ck, val) VALUES (?, 1, [1.0, 1.0])", pk);
+            }
+            // the same vector again
+            execute("UPDATE %s SET s = [1.0, 1.0], val = [1.0, 1.0] WHERE pk = 0 AND ck = 0");
+            // another vector, then back
+            execute("UPDATE %s SET s = [2.0, 2.0], val = [2.0, 2.0] WHERE pk = 1 AND ck = 1");
+            execute("UPDATE %s SET s = [1.0, 1.0], val = [1.0, 1.0] WHERE pk = 1 AND ck = 1");
+            // deleted, then written again
+            execute("DELETE s FROM %s WHERE pk = 2");
+            execute("DELETE FROM %s WHERE pk = 2 AND ck = 0");
+            execute("UPDATE %s SET s = [1.0, 1.0], val = [1.0, 1.0] WHERE pk = 2 AND ck = 0");
+
+            assertPostingsSize(index, 6, 0);
+            assertPostingsSize(staticIndex, 3, 0);
+            beforeAndAfterFlush(() -> {
+                assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s ORDER BY val ANN OF [1.0, 1.0] LIMIT 10"),
+                                        row(0, 0), row(0, 1), row(1, 0), row(1, 1), row(2, 0), row(2, 1));
+                assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s ORDER BY s ANN OF [1.0, 1.0] LIMIT 10"),
+                                        row(0, 0), row(0, 1), row(1, 0), row(1, 1), row(2, 0), row(2, 1));
+            });
+        }
+    }
+
+    private void assertPostingsSize(String index, int withVector, int withOtherVector)
+    {
+        IndexContext context = getIndexContext(index);
+        VectorMemtableIndex memtableIndex = (VectorMemtableIndex) context.getLiveMemtables().get(getCurrentColumnFamilyStore().getCurrentMemtable());
+        VectorType<Float> type = VectorType.getInstance(FloatType.instance, 2);
+        Collection<PrimaryKey> keys = memtableIndex.getGraph().keysOf(type.decompose(List.of(1.0f, 1.0f)));
+        assertEquals(withVector, keys.size());
+        assertEquals(withVector, new HashSet<>(keys).size());
+        assertEquals(withOtherVector, memtableIndex.getGraph().keysOf(type.decompose(List.of(2.0f, 2.0f))).size());
     }
 
     @Test

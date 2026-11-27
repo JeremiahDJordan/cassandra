@@ -186,7 +186,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
 
     /**
      * Same as {@link #update(DecoratedKey, Clustering, Cell, Memtable, OpOrder.Group)}, leaving the graph inserts to
-     * the caller, see {@link CassandraOnHeapGraph#add(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}.
+     * the caller, see {@link CassandraOnHeapGraph#addAbsent(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}.
      *
      * @param graphInserts where the graph inserts are left for the caller, or null to do them here
      */
@@ -210,6 +210,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
         }
 
         boolean changed = false;
+        boolean addedWithoutLooking = false;
         synchronized (indexed)
         {
             if (indexed.isSupersededBy(cell, serializer))
@@ -229,10 +230,15 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
                     else
                     {
                         // add the new vector before removing the old one, so we don't have a window where the row is
-                        // not in the index at all
+                        // not in the index at all; the row is only in the postings of the vector it is indexed under,
+                        // so not in those of the new one yet, unless an earlier update of the row failed after adding it
+                        // to the postings of its new vector and before recording that vector
                         updateKeyBounds(primaryKey);
                         primaryKeys.add(primaryKey);
-                        bytesUsed += graph.add(value, primaryKey, graphInserts);
+                        boolean look = indexed.mayBeInOtherPostings;
+                        indexed.mayBeInOtherPostings = true;
+                        bytesUsed += look ? graph.add(value, primaryKey, graphInserts) : graph.addAbsent(value, primaryKey, graphInserts);
+                        addedWithoutLooking = !look;
                         if (oldVector == null)
                             writeCount.increment();
                         else
@@ -260,6 +266,8 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
                 }
 
                 indexed.set(cell, newVector);
+                if (addedWithoutLooking)
+                    indexed.mayBeInOtherPostings = false;
             }
         }
 
@@ -829,6 +837,8 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
         private long localDeletionTime;
         // the vector the row is indexed under, the instance held by the graph for the row, or null if none
         private VectorFloat<?> vector;
+        // whether an update of the row failed while changing its postings, which may then hold the row elsewhere
+        private boolean mayBeInOtherPostings;
 
         boolean isSupersededBy(Cell<?> cell, VectorType.VectorSerializer serializer)
         {

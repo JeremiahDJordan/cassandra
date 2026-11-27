@@ -150,7 +150,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
     private final ConcurrentMap<VectorFloat<?>, VectorPostings<T>> postingsMap;
     private final DenseIntMap<VectorPostings<T>> postingsByOrdinal;
     private final NonBlockingHashMap<T, VectorFloat<?>> vectorsByKey;
-    // the graph inserts of the vectors added by add(ByteBuffer, Object, PendingInserts) that aren't done yet
+    // the graph inserts of the vectors added by addAbsent(ByteBuffer, Object, PendingInserts) that aren't done yet
     private final ConcurrentMap<VectorPostings<T>, GraphInsert> pendingInserts = new ConcurrentHashMap<>();
     // the pending inserts that searches score, counted from before they're ready until after they leave pendingInserts:
     // a count of 0 means none, which ConcurrentHashMap#isEmpty can't tell while entries come and go
@@ -265,20 +265,34 @@ public class CassandraOnHeapGraph<T> implements Accountable
      */
     public long add(ByteBuffer term, T key)
     {
-        return add(term, key, null);
+        return add(term, key, false, null);
     }
 
     /**
-     * Adds the given vector for the key, as {@link #add(ByteBuffer, Object)} does, but leaves the graph insert of a
-     * vector new to the graph to the caller, which does it with {@link PendingInserts#complete} once it no longer holds
-     * the memtable's locks. Until then, {@link #search} scores the vector itself, and a caller that adds a key to it
-     * waits in its own {@link PendingInserts#complete} until the vector has its ordinal.
+     * Adds the given vector for a key that the caller knows isn't in the postings of the vector, as
+     * {@link #add(ByteBuffer, Object)} does, but leaves the graph insert of a vector new to the graph to the caller,
+     * which does it with {@link PendingInserts#complete} once it no longer holds the memtable's locks. Until then,
+     * {@link #search} scores the vector itself, and a caller that adds a key to it waits in its own
+     * {@link PendingInserts#complete} until the vector has its ordinal.
      *
      * @param inserts where the graph inserts are left for the caller, or null to do them here
      * @return the incremental bytes used by adding the given vector to the index, without those of a graph insert left
      * to the caller
      */
+    public long addAbsent(ByteBuffer term, T key, @Nullable PendingInserts inserts)
+    {
+        return add(term, key, true, inserts);
+    }
+
+    /**
+     * Same as {@link #addAbsent(ByteBuffer, Object, PendingInserts)}, for a key that may be in the postings of the vector.
+     */
     public long add(ByteBuffer term, T key, @Nullable PendingInserts inserts)
+    {
+        return add(term, key, false, inserts);
+    }
+
+    private long add(ByteBuffer term, T key, boolean keyIsAbsent, @Nullable PendingInserts inserts)
     {
         assert term != null && term.remaining() != 0;
 
@@ -388,7 +402,12 @@ public class CassandraOnHeapGraph<T> implements Accountable
                 inserts.awaited(pending);
         }
         // postings list already exists, just add the new key (if it's not already in the list)
-        if (postings.add(key))
+        if (keyIsAbsent)
+        {
+            postings.addAbsent(key);
+            bytesUsed += postings.bytesPerPosting();
+        }
+        else if (postings.add(key))
         {
             bytesUsed += postings.bytesPerPosting();
         }
@@ -1031,8 +1050,8 @@ public class CassandraOnHeapGraph<T> implements Accountable
 
     /**
      * The graph inserts that a write leaves until it no longer holds the memtable's locks (see
-     * {@link #add(ByteBuffer, Object, PendingInserts)}): those of the vectors it added to the graphs, and the pending
-     * inserts of the vectors it added keys to, which other writes do.
+     * {@link #addAbsent(ByteBuffer, Object, PendingInserts)}): those of the vectors it added to the graphs, and the
+     * pending inserts of the vectors it added keys to, which other writes do.
      */
     public static final class PendingInserts
     {

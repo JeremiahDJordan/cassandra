@@ -15,6 +15,7 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -27,10 +28,14 @@ import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.marshal.FloatType;
 import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
+import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
+import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
@@ -215,6 +220,41 @@ public class IndexFailureAfterApplyTest extends SAITester
             flush();
             assertEquals(memtable, 2, inserts.get());
             assertRowsIgnoringOrder(execute("SELECT ck FROM %s ORDER BY v ANN OF [1, 2] LIMIT 2"), row(1), row(2));
+        }
+    }
+
+    /**
+     * A write of a vector fails once the row is in the postings of its vector, before the index records the vector of
+     * the row; a later write of the row with the same vector leaves the row in those postings once.
+     */
+    @Test
+    public void testVectorWriteFailureAfterThePostings() throws Throwable
+    {
+        Injection failure = Injections.newCustom("vector_bookkeeping_fails")
+                                      .add(InvokePointBuilder.newInvokePoint()
+                                                             .onClass(CassandraOnHeapGraph.class)
+                                                             .onMethod("vectorForKey")
+                                                             .atEntry())
+                                      .add(ActionBuilder.newActionBuilder().actions().doThrow(RuntimeException.class, "\"Injected vector bookkeeping failure\""))
+                                      .build();
+        Injections.inject(failure);
+        failure.disable();
+        for (String memtable : MEMTABLES)
+        {
+            createTable("CREATE TABLE %s (pk int, ck int, v vector<float, 2>, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
+            disableCompaction();
+            String index = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+
+            failingWrite(failure, "INSERT INTO %s (pk, ck, v) VALUES (0, 1, [1, 2]) USING TIMESTAMP 5");
+            execute("INSERT INTO %s (pk, ck, v) VALUES (0, 1, [1, 2]) USING TIMESTAMP 6");
+
+            IndexContext context = getIndexContext(index);
+            VectorMemtableIndex memtableIndex = (VectorMemtableIndex) context.getLiveMemtables().get(getCurrentColumnFamilyStore().getCurrentMemtable());
+            ByteBuffer vector = VectorType.getInstance(FloatType.instance, 2).decompose(List.of(1f, 2f));
+            assertEquals(memtable, 1, memtableIndex.getGraph().keysOf(vector).size());
+
+            flush();
+            assertRows(execute("SELECT ck FROM %s ORDER BY v ANN OF [1, 2] LIMIT 1"), row(1));
         }
     }
 

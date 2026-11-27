@@ -377,7 +377,7 @@ public class IndexContext
 
     /**
      * @param graphInserts where a vector index leaves its graph inserts for the caller, see
-     *                     {@link CassandraOnHeapGraph#add(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}
+     *                     {@link CassandraOnHeapGraph#addAbsent(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}
      */
     public void index(DecoratedKey key, Row row, Memtable mt, OpOrder.Group opGroup, @Nullable CassandraOnHeapGraph.PendingInserts graphInserts)
     {
@@ -815,7 +815,7 @@ public class IndexContext
 
     /**
      * @param graphInserts where a vector index leaves its graph inserts for the caller, see
-     *                     {@link CassandraOnHeapGraph#add(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}
+     *                     {@link CassandraOnHeapGraph#addAbsent(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}
      */
     public void update(DecoratedKey key, Row oldRow, Row newRow, Memtable memtable, OpOrder.Group opGroup, @Nullable CassandraOnHeapGraph.PendingInserts graphInserts)
     {
