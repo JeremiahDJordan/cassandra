@@ -24,7 +24,9 @@ import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
 /// SSTable expiration task.
 ///
 /// This is used when compaction identifies fully-expired SSTables that can be safely deleted. Executing the task
-/// simply commits the associated transaction which has the effect of deleting the source SSTables.
+/// simply commits the associated transaction which has the effect of deleting the source SSTables. Before that, it
+/// tells the secondary indexes that ask for it about the rows in the expired SSTables, as [CompactionTask] does for the
+/// fully expired SSTables it drops (see [FullyExpiredSSTablesIndexNotifier]).
 public class ExpirationTask extends AbstractCompactionTask
 {
     protected ExpirationTask(CompactionRealm realm, ILifecycleTransaction transaction)
@@ -35,6 +37,7 @@ public class ExpirationTask extends AbstractCompactionTask
     @Override
     protected void runMayThrow() throws Exception
     {
+        FullyExpiredSSTablesIndexNotifier.notifyIndexes(realm, transaction.originals(), transaction.opId());
         transaction.obsoleteOriginals();
         transaction.prepareToCommit();
         transaction.commit();
