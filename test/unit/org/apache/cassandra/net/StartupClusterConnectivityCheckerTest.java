@@ -32,6 +32,7 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.gms.EndpointState;
 import org.apache.cassandra.gms.Gossiper;
@@ -42,6 +43,11 @@ import org.apache.cassandra.utils.FBUtilities;
 
 public class StartupClusterConnectivityCheckerTest
 {
+    static
+    {
+        CassandraRelevantProperties.CLUSTER_VERSION_PROVIDER_MIN_STABLE_DURATION.setLong(30000);
+    }
+
     private StartupClusterConnectivityChecker localQuorumConnectivityChecker;
     private StartupClusterConnectivityChecker globalQuorumConnectivityChecker;
     private StartupClusterConnectivityChecker noopChecker;
@@ -238,6 +244,18 @@ public class StartupClusterConnectivityCheckerTest
         Predicate<CassandraVersion> isUpgradingFromVersionLowerThan = new MockIsUpgradingFromVersionLowerThan(new CassandraVersion("3.11.0"));
         Assert.assertTrue(containsCassandra3NodesChecker.execute(peers, this::getDatacenter, isUpgradingFromVersionLowerThan));
         Assert.assertEquals(0, sink.seenConnectionRequests.size());
+    }
+
+    @Test
+    public void execute_RunsWhileVersionsAreNotKnownYet()
+    {
+        Gossiper.instance.clusterVersionProvider.reset();
+        Assert.assertTrue(Gossiper.instance.clusterVersionProvider.isUpgradeInProgress());
+
+        Sink sink = new Sink(true, true, peers);
+        MessagingService.instance().outboundSink.add(sink);
+        Assert.assertTrue(localQuorumConnectivityChecker.execute(peers, this::getDatacenter));
+        Assert.assertFalse(sink.seenConnectionRequests.isEmpty());
     }
 
     private void checkAvailable(StartupClusterConnectivityChecker checker, Set<InetAddressAndPort> available,

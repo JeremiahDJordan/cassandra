@@ -2592,6 +2592,17 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean
     }
 
     /**
+     * Returns {@code true} if a node whose version is known is on a version lower than the provided version. Unlike
+     * {@link #isUpgradingFromVersionLowerThan}, this is {@code false} while the cluster version provider doesn't know
+     * the versions of the other nodes yet, including when it reports {@link CassandraVersion#NULL_VERSION}.
+     */
+    public boolean hasNodeWithKnownVersionLowerThan(CassandraVersion referenceVersion)
+    {
+        CassandraVersion minVersion = clusterVersionProvider.getMinClusterVersion();
+        return !CassandraVersion.NULL_VERSION.equals(minVersion) && minVersion.compareTo(referenceVersion) < 0;
+    }
+
+    /**
      * This is a safe way to get the version we are upgrading from. It will return the current version if the cluster
      * is not in the upgrade state. If the cluster is in upgrade state, it will return NULL_VERSION, if there is no
      * information about the other nodes yet. Otherwise, it will just return the minimum cluster version.

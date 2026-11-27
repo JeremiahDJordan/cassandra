@@ -179,6 +179,23 @@ public class GossiperTest
     }
 
     @Test
+    public void testHasNodeWithKnownVersionLowerThan()
+    {
+        IClusterVersionProvider cvp = Mockito.mock(IClusterVersionProvider.class);
+        Gossiper g = new Gossiper(false, cvp);
+        when(cvp.isUpgradeInProgress()).thenReturn(true);
+
+        when(cvp.getMinClusterVersion()).thenReturn(CassandraVersion.NULL_VERSION);
+        assertThat(g.hasNodeWithKnownVersionLowerThan(CassandraVersion.CASSANDRA_4_0)).isFalse();
+
+        when(cvp.getMinClusterVersion()).thenReturn(new CassandraVersion(CURRENT_VERSION.toString()));
+        assertThat(g.hasNodeWithKnownVersionLowerThan(CassandraVersion.CASSANDRA_4_0)).isFalse();
+
+        when(cvp.getMinClusterVersion()).thenReturn(new CassandraVersion("3.11.0"));
+        assertThat(g.hasNodeWithKnownVersionLowerThan(CassandraVersion.CASSANDRA_4_0)).isTrue();
+    }
+
+    @Test
     public void testDefaultClusterVersionProvider() throws UnknownHostException
     {
         Gossiper g = Gossiper.instance;

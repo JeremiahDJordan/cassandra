@@ -657,8 +657,7 @@ public class CassandraDaemon
     {
         StartupClusterConnectivityChecker connectivityChecker = StartupClusterConnectivityChecker.create(DatabaseDescriptor.getBlockForPeersTimeoutInSeconds(),
                                                                                                          DatabaseDescriptor.getBlockForPeersInRemoteDatacenters());
-        connectivityChecker.execute(Gossiper.instance.getEndpoints(), DatabaseDescriptor.getEndpointSnitch()::getDatacenter,
-                                    Gossiper.instance::isUpgradingFromVersionLowerThan);
+        connectivityChecker.execute(Gossiper.instance.getEndpoints(), DatabaseDescriptor.getEndpointSnitch()::getDatacenter);
 
         // check to see if transports may start else return without starting.  This is needed when in survey mode or
         // when bootstrap has not completed.

@@ -72,13 +72,23 @@ public class StartupClusterConnectivityChecker
     }
 
     /**
+     * As {@link #execute(Set, Function, Predicate)}, skipping the check only if gossip knows of a node on a version
+     * prior to 4.0.
+     */
+    public boolean execute(Set<InetAddressAndPort> peers, Function<InetAddressAndPort, String> getDatacenterSource)
+    {
+        return execute(peers, getDatacenterSource, Gossiper.instance::hasNodeWithKnownVersionLowerThan);
+    }
+
+    /**
      * @param peers The currently known peers in the cluster; argument is not modified.
      * @param getDatacenterSource A function for mapping peers to their datacenter.
      * @return true if the requested percentage of peers are marked ALIVE in gossip and have their connections opened;
      * else false.
      */
-    public boolean execute(Set<InetAddressAndPort> peers, Function<InetAddressAndPort, String> getDatacenterSource,
-                           Predicate<CassandraVersion> isUpgradingFromLowerVersionThan)
+    @VisibleForTesting
+    boolean execute(Set<InetAddressAndPort> peers, Function<InetAddressAndPort, String> getDatacenterSource,
+                    Predicate<CassandraVersion> isUpgradingFromLowerVersionThan)
     {
         if (peers == null || this.timeoutNanos < 0)
             return true;
