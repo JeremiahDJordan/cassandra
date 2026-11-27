@@ -42,7 +42,6 @@ public class CoordinatorSessions
     private static final Logger logger = LoggerFactory.getLogger(CoordinatorSessions.class);
 
     private final Map<UUID, CoordinatorSession> sessions = new HashMap<>();
-    private static final Logger logger = LoggerFactory.getLogger(CoordinatorSessions.class);
 
     protected CoordinatorSession buildSession(CoordinatorSession.Builder builder)
     {
