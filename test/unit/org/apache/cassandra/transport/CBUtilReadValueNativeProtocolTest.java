@@ -19,6 +19,7 @@ package org.apache.cassandra.transport;
 
 import java.io.IOException;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 
 import org.assertj.core.api.Assertions;
 import org.junit.BeforeClass;
@@ -146,9 +147,9 @@ public class CBUtilReadValueNativeProtocolTest extends CQLTester
         }
 
         @Override
-        protected Message.Response execute(QueryState queryState,
-                                           long queryStartNanoTime,
-                                           boolean traceRequest)
+        protected CompletableFuture<Message.Response> maybeExecuteAsync(QueryState queryState,
+                                                                         long queryStartNanoTime,
+                                                                         boolean traceRequest)
         {
             throw new AssertionError("execute not expected for a malformed AUTH_RESPONSE");
         }

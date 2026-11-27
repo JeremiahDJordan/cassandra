@@ -20,6 +20,7 @@ package org.apache.cassandra.transport;
 
 import java.util.Collections;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.util.concurrent.Uninterruptibles;
@@ -29,16 +30,18 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import io.netty.channel.Channel;
+import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.metrics.ClientMetrics;
 import org.apache.cassandra.service.QueryState;
+import org.apache.cassandra.transport.ClientResourceLimits.Overload;
 import org.apache.cassandra.transport.messages.AuthResponse;
 
 public class MessageDispatcherTest
 {
     static final Message.Request AUTH_RESPONSE_REQUEST = new AuthResponse(new byte[0])
     {
-        public Response execute(QueryState queryState, long queryStartNanoTime, boolean traceRequest)
+        public CompletableFuture<Response> maybeExecuteAsync(QueryState queryState, long queryStartNanoTime, boolean traceRequest)
         {
             return null;
         }
@@ -99,7 +102,7 @@ public class MessageDispatcherTest
             long auths = completedAuth();
             long requests = tryAuth(this::completedRequests, new Message.Request(type)
             {
-                public Response execute(QueryState queryState, long queryStartNanoTime, boolean traceRequest)
+                public CompletableFuture<Response> maybeExecuteAsync(QueryState queryState, long queryStartNanoTime, boolean traceRequest)
                 {
                     return null;
                 }
@@ -132,7 +135,7 @@ public class MessageDispatcherTest
 
     private long completedRequests()
     {
-        return Dispatcher.requestExecutor.getCompletedTaskCount();
+        return Stage.NATIVE_TRANSPORT_REQUESTS.getCompletedTaskCount();
     }
 
     private long completedAuth()
@@ -149,7 +152,7 @@ public class MessageDispatcherTest
     public long tryAuth(Callable<Long> check, Message.Request request) throws Exception
     {
         long start = check.call();
-        dispatch.dispatch(null, request, (channel,req,response) -> null);
+        dispatch.dispatch(null, request, (channel, req, response) -> null, Overload.NONE);
 
         // While this is timeout based, we should be *well below* a full second on any of this processing in any sane environment.
         long timeout = System.currentTimeMillis();
@@ -172,7 +175,8 @@ public class MessageDispatcherTest
         @Override
         void processRequest(Channel channel,
                             Message.Request request,
-                            FlushItemConverter forFlusher)
+                            FlushItemConverter forFlusher,
+                            Overload backpressure)
         {
             // noop
         }
