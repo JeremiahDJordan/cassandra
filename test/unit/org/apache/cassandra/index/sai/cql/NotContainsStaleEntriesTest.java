@@ -18,6 +18,7 @@
 package org.apache.cassandra.index.sai.cql;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 
 import org.junit.Test;
@@ -26,7 +27,9 @@ import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.memtable.ShardBoundaries;
+import org.apache.cassandra.db.memtable.TrieMemtable;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SAITester;
@@ -35,6 +38,7 @@ import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.memory.MemtableIndex;
 import org.apache.cassandra.index.sai.plan.Expression;
 
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
@@ -190,6 +194,40 @@ public class NotContainsStaleEntriesTest extends SAITester
         }
     }
 
+    /**
+     * The memtable estimates of NOT CONTAINS, NOT CONTAINS KEY and != count the rows of the memtable once, with the
+     * first memtable shard empty or holding a single row.
+     */
+    @Test
+    public void testMemtableEstimatesWithUnevenShards()
+    {
+        for (int firstShardRows : new int[]{ 0, 1 })
+        {
+            String table = createIndexedTable();
+            ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(table);
+            ShardBoundaries boundaries = cfs.localRangeSplits(TrieMemtable.SHARD_COUNT);
+            int[] shardRows = { firstShardRows, 199 };
+            int[] written = new int[shardRows.length];
+            int rows = 0;
+            int ones = 0;
+            for (int pk = 0; !Arrays.equals(written, shardRows); pk++)
+            {
+                int shard = boundaries.getShardForKey(cfs.decorateKey(Int32Type.instance.decompose(pk)));
+                if (shard >= shardRows.length || written[shard] == shardRows[shard])
+                    continue;
+                written[shard]++;
+                rows++;
+                ones += pk % 2;
+                write(table, "INSERT INTO %s (pk, l, st, mk, mv, n) VALUES (?, ['a'], {'a'}, {'a': 'x'}, {'k': 'a'}, ?)", pk, pk % 2);
+            }
+
+            for (String target : new String[]{ "l", "st", "mv" })
+                assertEquals(target, rows, estimate(table, target, Operator.NOT_CONTAINS, "b", true), rows * 0.1);
+            assertEquals("mk", rows, estimate(table, "mk", Operator.NOT_CONTAINS_KEY, "b", true), rows * 0.1);
+            assertEquals("n", rows - ones, estimate(table, "n", Operator.NEQ, "1", true), rows * 0.1);
+        }
+    }
+
     private static long estimate(String table, String column, Operator operator, String value, boolean memtable)
     {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(table);
@@ -199,7 +237,7 @@ public class NotContainsStaleEntriesTest extends SAITester
             IndexContext context = ((StorageAttachedIndex) index).getIndexContext();
             if (!context.getColumnName().equals(column))
                 continue;
-            Expression expression = new Expression(context).add(operator, UTF8Type.instance.decompose(value));
+            Expression expression = new Expression(context).add(operator, context.getValidator().fromString(value));
             if (memtable)
                 for (MemtableIndex memtableIndex : context.getLiveMemtables().values())
                     estimate += memtableIndex.estimateMatchingRowsCount(expression);

@@ -445,16 +445,6 @@ public class TrieMemoryIndex extends MemoryIndex
             case CONTAINS_KEY:
             case CONTAINS_VALUE:
                 return estimateNumRowsMatchingExact(expression);
-            case NOT_EQ:
-            case NOT_CONTAINS_KEY:
-            case NOT_CONTAINS_VALUE:
-                // The search returns all the rows when it can't subtract the matches of the negated expression
-                if (TypeUtil.supportsRounding(expression.validator) || TypeUtil.isInetAddress(expression.validator)
-                    || !IndexContext.canSubtractMatches(expression))
-                    return Memtable.estimateRowCount(memtable);
-                else
-                    // need to clamp at 0, because row count is imprecise
-                    return Math.max(0, Memtable.estimateRowCount(memtable) - estimateNumRowsMatchingExact(expression));
             case RANGE:
                 return estimateNumRowsMatchingRange(expression);
             default:
@@ -463,7 +453,10 @@ public class TrieMemoryIndex extends MemoryIndex
     }
 
 
-    private int estimateNumRowsMatchingExact(Expression expression)
+    /**
+     * Returns the number of rows holding the term of the given expression, whatever its operator.
+     */
+    int estimateNumRowsMatchingExact(Expression expression)
     {
         final ByteComparable prefix = expression.lower == null ? ByteComparable.EMPTY : asByteComparable(expression.lower.value.encoded);
         final PrimaryKeys primaryKeys = data.get(prefix);
