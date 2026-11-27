@@ -32,13 +32,21 @@ import org.assertj.core.api.Assertions;
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.marshal.Int32Type;
+import org.apache.cassandra.db.marshal.UTF8Type;
+import org.apache.cassandra.db.memtable.ShardBoundaries;
+import org.apache.cassandra.db.memtable.TrieMemtable;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.SAIUtil;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
+import org.apache.cassandra.index.sai.memory.MemtableIndex;
+import org.apache.cassandra.index.sai.plan.Expression;
 import org.apache.cassandra.index.sai.plan.QueryController;
 
 import org.junit.runner.RunWith;
@@ -1253,6 +1261,51 @@ public class BM25Test extends SAITester
                              "SELECT c FROM %s WHERE n = 0 ORDER BY s BM25 OF 'orange' LIMIT 5 WITH excluded_indexes = {" + literalIndex + '}');
         assertInvalidMessage(String.format(StatementRestrictions.BM25_ORDERING_REQUIRES_ANALYZED_INDEX_MESSAGE, 's'),
                              "SELECT c FROM %s WHERE n = 0 ORDER BY s BM25 OF 'orange' LIMIT 5 WITH excluded_indexes = {" + numericIndex + ',' + literalIndex + '}');
+    }
+
+    @Test
+    public void testMemtableDocumentFrequenciesWithUnevenShards()
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, s text)");
+        String index = createIndex("CREATE CUSTOM INDEX ON %s(s) USING 'StorageAttachedIndex' WITH OPTIONS = { 'index_analyzer': 'standard' }");
+
+        // apple is in 100 of the 400 rows of the first shard and in the 1500 rows of the third, banana in 50 rows of
+        // the first shard and in the 100 rows of the second
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        ShardBoundaries boundaries = cfs.localRangeSplits(TrieMemtable.SHARD_COUNT);
+        int[] shardRows = { 400, 100, 1500 };
+        int[] written = new int[shardRows.length];
+        int moreBananas = -1;
+        for (int k = 0; !Arrays.equals(written, shardRows); k++)
+        {
+            int shard = boundaries.getShardForKey(cfs.decorateKey(Int32Type.instance.decompose(k)));
+            if (shard >= shardRows.length || written[shard] == shardRows[shard])
+                continue;
+            int row = written[shard]++;
+            String s;
+            if (shard == 0 && row == 0)
+                s = "apple apple banana";
+            else if (shard == 0 && row == 1)
+            {
+                moreBananas = k;
+                s = "apple banana banana";
+            }
+            else if (shard == 0)
+                s = row < 100 ? "apple filler filler" : row < 148 ? "banana filler filler" : "filler filler filler";
+            else
+                s = shard == 1 ? "banana filler filler" : "apple filler filler";
+            execute("INSERT INTO %s (k, s) VALUES (?, ?)", k, s);
+        }
+
+        IndexContext context = getIndexContext(index);
+        MemtableIndex memtableIndex = context.getLiveMemtables().get(cfs.getCurrentMemtable());
+        assertEquals(1600, memtableIndex.estimateMatchingRowsCount(new Expression(context).add(Operator.ANALYZER_MATCHES, UTF8Type.instance.decompose("apple"))));
+        assertEquals(150, memtableIndex.estimateMatchingRowsCount(new Expression(context).add(Operator.ANALYZER_MATCHES, UTF8Type.instance.decompose("banana"))));
+
+        // banana is the rarer term
+        assertRows(execute("SELECT k FROM %s ORDER BY s BM25 OF 'apple banana' LIMIT 1"), row(moreBananas));
+        flush();
+        assertRows(execute("SELECT k FROM %s ORDER BY s BM25 OF 'apple banana' LIMIT 1"), row(moreBananas));
     }
 
     private void assertCannotBeRestrictedByClustering(String query, String column)
