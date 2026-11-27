@@ -88,6 +88,25 @@ public abstract class RepairCoordinatorFast extends RepairCoordinatorBase
     }
 
     @Test
+    public void streamedSSTablesAreNotLeaked()
+    {
+        Assume.assumeTrue("only incremental repair streams sstables pending repair", repairType == RepairType.INCREMENTAL);
+
+        String table = tableName("streamedsstables");
+        assertTimeoutPreemptively(Duration.ofMinutes(1), () -> {
+            // assertNoSSTableLeak checks only tables whose compaction runs through CompactionStrategyManager
+            CLUSTER.schemaChange(format("CREATE TABLE %s.%s (key text, PRIMARY KEY (key)) WITH compaction = {'class': 'SizeTieredCompactionStrategy'}", KEYSPACE, table));
+            CLUSTER.get(1).executeInternal(format("INSERT INTO %s.%s (key) VALUES (?)", KEYSPACE, table), "some text");
+            CLUSTER.get(1).flush(KEYSPACE);
+
+            repair(2, KEYSPACE, table).asserts().success();
+            assertParentRepairSuccess(CLUSTER, KEYSPACE, table);
+            Assert.assertEquals(1, CLUSTER.get(2).executeInternal(format("SELECT key FROM %s.%s", KEYSPACE, table)).length);
+            assertNoSSTableLeak(CLUSTER, KEYSPACE, table);
+        });
+    }
+
+    @Test
     public void missingKeyspace()
     {
         assertTimeoutPreemptively(Duration.ofMinutes(1), () -> {
