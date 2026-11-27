@@ -54,8 +54,6 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.serializers.AbstractTypeSerializer;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.DURATION_IN_MAPS_COMPATIBILITY_MODE;
-
 public class SerializationHeader
 {
     private static final Logger logger = LoggerFactory.getLogger(SerializationHeader.class);
@@ -426,7 +424,7 @@ public class SerializationHeader
 
             try
             {
-                type.validateForColumn(columnName, isPrimaryKeyColumn, table.isCounter(), dropped, isForOfflineTool, DURATION_IN_MAPS_COMPATIBILITY_MODE.getBoolean());
+                type.validateForColumn(columnName, isPrimaryKeyColumn, table.isCounter(), dropped, isForOfflineTool, true);
                 return type;
             }
             catch (InvalidColumnTypeException e)
@@ -468,7 +466,7 @@ public class SerializationHeader
                 try
                 {
                     // Make doubly sure the fixed type is valid before returning it.
-                    fixed.validateForColumn(name, isPrimaryKeyColumn, isCounterTable, isDroppedColumn, isForOfflineTool, DURATION_IN_MAPS_COMPATIBILITY_MODE.getBoolean());
+                    fixed.validateForColumn(name, isPrimaryKeyColumn, isCounterTable, isDroppedColumn, isForOfflineTool, true);
                     return fixed;
                 }
                 catch (InvalidColumnTypeException e2)

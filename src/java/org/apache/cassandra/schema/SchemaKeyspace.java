@@ -87,11 +87,11 @@ import org.apache.cassandra.service.reads.repair.ReadRepairStrategy;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 import static java.lang.String.format;
 import static java.util.stream.Collectors.toList;
 import static java.util.stream.Collectors.toSet;
-import static org.apache.cassandra.config.CassandraRelevantProperties.DURATION_IN_MAPS_COMPATIBILITY_MODE;
 import static org.apache.cassandra.config.CassandraRelevantProperties.UNSAFE_SYSTEM;
 import static org.apache.cassandra.cql3.QueryProcessor.executeInternal;
 import static org.apache.cassandra.cql3.QueryProcessor.executeOnceInternal;
@@ -1103,7 +1103,7 @@ public final class SchemaKeyspace
                                             boolean isCounterTable,
                                             boolean isDroppedColumn)
     {
-        type.validateForColumn(name, isPrimaryKeyColumn, isCounterTable, isDroppedColumn, false, DURATION_IN_MAPS_COMPATIBILITY_MODE.getBoolean());
+        type.validateForColumn(name, isPrimaryKeyColumn, isCounterTable, isDroppedColumn, false, true);
         return type;
     }
 
@@ -1126,6 +1126,12 @@ public final class SchemaKeyspace
         type = validate(columnNameBytes, type, kind.isPrimaryKeyKind(), isCounterTable, false);
 
         ColumnIdentifier name = new ColumnIdentifier(columnNameBytes, row.getString("column_name"));
+        if (type.hasSortedDuration(kind.isPrimaryKeyKind()))
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, "sorted duration " + keyspace + '.' + table + '.' + name,
+                             1, TimeUnit.HOURS,
+                             "Column {}.{}.{} of type {} has a duration in a sorted position. The type is accepted " +
+                             "for existing data, but cannot be used in new schema.",
+                             keyspace, table, name, type.asCQL3Type());
 
         return new ColumnMetadata(keyspace, table, name, type, position, kind);
     }

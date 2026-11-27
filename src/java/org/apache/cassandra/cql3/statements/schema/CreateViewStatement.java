@@ -237,7 +237,8 @@ public final class CreateViewStatement extends AlterSchemaStatement
             if (type.isCounter())
                 throw ire("counter type is not supported for PRIMARY KEY column '%s'", name);
 
-            if (type.referencesDuration())
+            // A primary key column of the base table can already have a duration, see TableMetadata.validate
+            if (type.referencesDuration() && !column.isPrimaryKeyColumn())
                 throw ire("duration type is not supported for PRIMARY KEY column '%s'", name);
         });
 
@@ -340,7 +341,7 @@ public final class CreateViewStatement extends AlterSchemaStatement
                        .forEach(name -> builder.addRegularColumn(name, getType(table, name)));
 
         ViewMetadata view = new ViewMetadata(table.id, table.name, rawColumns.isEmpty(), whereClause, builder.build());
-        view.metadata.validate();
+        view.metadata.validate(table);
 
         return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.views.with(view)));
     }

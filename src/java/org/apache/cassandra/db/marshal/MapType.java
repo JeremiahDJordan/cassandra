@@ -108,15 +108,6 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
         return (MapType<?, ?>) super.withUpdatedUserType(udt);
     }
 
-    @Override
-    public boolean referencesDuration(boolean legacyMode)
-    {
-        if (legacyMode)
-            return getValuesType().referencesDuration(true);
-        else
-            return super.referencesDuration(false);
-    }
-
     @SuppressWarnings("unchecked")
     public AbstractType<K> getKeysType()
     {

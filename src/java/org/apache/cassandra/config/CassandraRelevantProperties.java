@@ -640,16 +640,6 @@ public enum CassandraRelevantProperties
     REQUIRED_BATCHLOG_REPLICA_COUNT("cassandra.batchlog.required_replica_count", "2"),
 
     /**
-     * This property should be enabled when upgrading from the version of Cassandra that allowed to create maps with
-     * duration type as a key if the schema contains such columns. It was a bug that the validation didn't prevent
-     * from creating such maps but once they are created, we need to be able to read them - hence this property.
-     * When the check is enabled, Cassandra falls back to the old behavior and let the user load the data with such
-     * maps. When the check is disabled, Cassandra will refuse to load the data with such maps and won't start if
-     * the schema contains them.
-     */
-    DURATION_IN_MAPS_COMPATIBILITY_MODE("cassandra.types.map.duration_in_map_compatibility_mode", "false"),
-
-    /**
      * If this is true, compaction will not verify that sstables selected for compaction are in the same repair
      * state. This check is done to ensure that incremental repair is not improperly carried out (potentially causing
      * data loss) if a node has somehow entered an invalid state. The flag should only be used to recover from

@@ -363,6 +363,15 @@ public final class KeyspaceMetadata implements SchemaElement
 
     public void validate()
     {
+        validate(null);
+    }
+
+    /**
+     * @param previous the keyspace before the schema change, or {@code null} for a new keyspace; see
+     *                 {@link TableMetadata#validate(TableMetadata)}.
+     */
+    public void validate(@Nullable KeyspaceMetadata previous)
+    {
         if (!SchemaConstants.isValidName(name))
         {
             throw new ConfigurationException(format("Keyspace name must not be empty, more than %s characters long, "
@@ -373,7 +382,8 @@ public final class KeyspaceMetadata implements SchemaElement
 
         params.validate(name);
 
-        tablesAndViews().forEach(TableMetadata::validate);
+        for (TableMetadata table : tablesAndViews())
+            table.validate(previous == null ? null : previous.getTableOrViewNullable(table.name));
 
         Set<String> indexNames = new HashSet<>();
         for (TableMetadata table : tables)

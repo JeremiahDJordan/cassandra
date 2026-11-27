@@ -650,9 +650,10 @@ public final class ColumnMetadata extends ColumnSpecification implements Selecta
      * Validate whether the column definition is valid (mostly, that the type is valid for the type of column this is).
      *
      * @param isCounterTable whether the table the column is part of is a counter table.
+     * @param allowSortedDuration see {@link AbstractType#validateForColumn}.
      */
-    public void validate(boolean isCounterTable, boolean durationLegacyMode)
+    public void validate(boolean isCounterTable, boolean allowSortedDuration)
     {
-        type.validateForColumn(name.bytes, kind.isPrimaryKeyKind(), isCounterTable, isDropped, false, durationLegacyMode);
+        type.validateForColumn(name.bytes, kind.isPrimaryKeyKind(), isCounterTable, isDropped, false, allowSortedDuration);
     }
 }

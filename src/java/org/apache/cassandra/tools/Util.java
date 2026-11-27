@@ -19,7 +19,6 @@
 package org.apache.cassandra.tools;
 
 import static java.lang.String.format;
-import static org.apache.cassandra.config.CassandraRelevantProperties.DURATION_IN_MAPS_COMPATIBILITY_MODE;
 
 import java.io.IOException;
 import java.io.PrintStream;
@@ -502,7 +501,7 @@ public final class Util
         try
         {
             // isForOfflineTool accepts a multi-cell plain tuple whose subtypes are all frozen
-            type.validateForColumn(name, isPrimaryKeyColumn, isCounter, false, !tuplesAreFrozen, DURATION_IN_MAPS_COMPATIBILITY_MODE.getBoolean());
+            type.validateForColumn(name, isPrimaryKeyColumn, isCounter, false, !tuplesAreFrozen, true);
             return type;
         }
         catch (InvalidColumnTypeException e)

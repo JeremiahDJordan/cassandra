@@ -210,7 +210,7 @@ public final class CreateIndexStatement extends AlterSchemaStatement
             StorageAttachedIndex.validateVectorElementType(table, index);
 
         TableMetadata newTable = table.withSwapped(table.indexes.with(index));
-        newTable.validate();
+        newTable.validate(table);
 
         return schema.withAddedOrUpdated(keyspace.withSwapped(keyspace.tables.withSwapped(newTable)));
     }

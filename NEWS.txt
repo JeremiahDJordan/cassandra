@@ -157,6 +157,14 @@ Upgrading
       LOCAL_SERIAL, and every node in the ring at the other consistency levels. Nodes known to be below DS 10 count,
       and so do live nodes whose version isn't known yet. A read that still reaches such a node fails for that node.
       Queries that only run locally, such as internal queries on non-system keyspaces, are rejected too.
+    - Existing tables with a duration where values are sorted (in a primary key column, or in the keys or elements of
+      a non-frozen map or set) now always load, from `system_schema`, from a peer's schema and from sstable headers,
+      and can be altered. Apache Cassandra creates such tables (e.g. `s set<frozen<tuple<duration, int>>>`), and so did
+      nodes before CNDB-9753 (e.g. `pk frozen<map<duration, text>>`). Loading such a column logs a warning, at most
+      once per hour per column. `cassandra.types.map.duration_in_map_compatibility_mode` (CNDB-9753), which was needed
+      to load durations in map keys, is no longer needed and is ignored. CREATE TABLE, ALTER TABLE ADD and ALTER TYPE
+      still reject such a type for a new column, and slice restrictions and CREATE INDEX on such a column are still
+      rejected.
 
 Deprecation
 ---------
