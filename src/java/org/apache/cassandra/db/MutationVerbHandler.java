@@ -27,7 +27,6 @@ import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.ForwardingInfo;
-import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.NoPayload;
@@ -43,7 +42,7 @@ import org.apache.cassandra.tracing.Tracing;
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
 import static org.apache.cassandra.utils.MonotonicClock.approxTime;
 
-public class MutationVerbHandler implements IVerbHandler<Mutation>
+public class MutationVerbHandler extends AbstractMutationVerbHandler<Mutation>
 {
     public static final MutationVerbHandler instance = new MutationVerbHandler();
 
@@ -70,6 +69,7 @@ public class MutationVerbHandler implements IVerbHandler<Mutation>
             MessagingService.instance().inboundSink.fail(message.header, t);
     }
 
+    @Override
     public void doVerb(Message<Mutation> message)
     {
         if (approxTime.now() > message.expiresAtNanos())
@@ -95,50 +95,56 @@ public class MutationVerbHandler implements IVerbHandler<Mutation>
 
         try
         {
-            // Initialize the sensor and set ExecutorLocals
-            RequestSensors requestSensors = SensorsFactory.instance.createRequestSensors(Set.of(message.payload.getKeyspaceName()));
-            ExecutorLocals locals = ExecutorLocals.create(requestSensors);
-            ExecutorLocals.set(locals);
-
-            Collection<TableMetadata> tables = message.payload.getPartitionUpdates().stream().map(PartitionUpdate::metadata).collect(Collectors.toList());
-            Set<Context> writeContexts = ConcurrentHashMap.newKeySet();
-            for (TableMetadata tm : tables)
-            {
-                Context context = Context.from(tm);
-                if (!tm.isIndex())
-                {
-                    writeContexts.add(context);
-                    requestSensors.registerSensor(context, Type.WRITE_BYTES);
-                    requestSensors.registerSensor(context, Type.INDEX_WRITE_BYTES);
-                    requestSensors.registerSensor(context, Type.WRITE_EXECUTION_TIME);
-                }
-                requestSensors.registerSensor(context, Type.INTERNODE_BYTES);
-                requestSensors.incrementSensor(context, Type.INTERNODE_BYTES, (double) message.payloadSize(MessagingService.current_version) / tables.size());
-            }
-
-            long writeStartNanos = System.nanoTime();
-            // Mutation#applyFuture would also fail for an error in its sensor sync after the write is applied; the
-            // sensors are synced below
-            Keyspace keyspace = Keyspace.open(message.payload.getKeyspaceName());
-            keyspace.applyFuture(message.payload, WriteOptions.DEFAULT, true).whenComplete((o, t) -> {
-                if (t != null)
-                {
-                    failed(message, t);
-                    return;
-                }
-                long writeElapsedNanos = System.nanoTime() - writeStartNanos;
-                for (Context writeContext : writeContexts)
-                {
-                    requestSensors.incrementSensor(writeContext, Type.WRITE_EXECUTION_TIME, (double) writeElapsedNanos / writeContexts.size());
-                }
-                requestSensors.syncAllSensors();
-                respond(requestSensors, message, respondToAddress);
-            });
+            processMessage(message, respondToAddress);
         }
         catch (WriteTimeoutException wto)
         {
             failed();
         }
+    }
+
+    @Override
+    protected void applyMutation(Message<Mutation> message, InetAddressAndPort respondToAddress)
+    {
+        // Initialize the sensor and set ExecutorLocals
+        RequestSensors requestSensors = SensorsFactory.instance.createRequestSensors(Set.of(message.payload.getKeyspaceName()));
+        ExecutorLocals locals = ExecutorLocals.create(requestSensors);
+        ExecutorLocals.set(locals);
+
+        Collection<TableMetadata> tables = message.payload.getPartitionUpdates().stream().map(PartitionUpdate::metadata).collect(Collectors.toList());
+        Set<Context> writeContexts = ConcurrentHashMap.newKeySet();
+        for (TableMetadata tm : tables)
+        {
+            Context context = Context.from(tm);
+            if (!tm.isIndex())
+            {
+                writeContexts.add(context);
+                requestSensors.registerSensor(context, Type.WRITE_BYTES);
+                requestSensors.registerSensor(context, Type.INDEX_WRITE_BYTES);
+                requestSensors.registerSensor(context, Type.WRITE_EXECUTION_TIME);
+            }
+            requestSensors.registerSensor(context, Type.INTERNODE_BYTES);
+            requestSensors.incrementSensor(context, Type.INTERNODE_BYTES, (double) message.payloadSize(MessagingService.current_version) / tables.size());
+        }
+
+        long writeStartNanos = System.nanoTime();
+        // Mutation#applyFuture would also fail for an error in its sensor sync after the write is applied; the
+        // sensors are synced below
+        Keyspace keyspace = Keyspace.open(message.payload.getKeyspaceName());
+        keyspace.applyFuture(message.payload, WriteOptions.DEFAULT, true).whenComplete((o, t) -> {
+            if (t != null)
+            {
+                failed(message, t);
+                return;
+            }
+            long writeElapsedNanos = System.nanoTime() - writeStartNanos;
+            for (Context writeContext : writeContexts)
+            {
+                requestSensors.incrementSensor(writeContext, Type.WRITE_EXECUTION_TIME, (double) writeElapsedNanos / writeContexts.size());
+            }
+            requestSensors.syncAllSensors();
+            respond(requestSensors, message, respondToAddress);
+        });
     }
 
     private static void forwardToLocalNodes(Message<Mutation> originalMessage, ForwardingInfo forwardTo)

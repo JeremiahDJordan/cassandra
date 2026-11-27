@@ -614,7 +614,11 @@ public class CompactionManager implements CompactionManagerMBean
     {
         assert !cfStore.isIndex();
         Keyspace keyspace = cfStore.keyspace;
-
+        if (!StorageService.instance.getTokenMetadata().getPendingRanges(keyspace.getName(), FBUtilities.getBroadcastAddressAndPort()).isEmpty())
+        {
+            logger.info("Cleanup cannot run while node has pending ranges for keyspace {} table {}, wait for node addition/decommission to complete and try again", cfStore.keyspace.getName(), cfStore.getTableName());
+            return AllSSTableOpStatus.ABORTED;
+        }
         // if local ranges is empty, it means no data should remain
         final RangesAtEndpoint replicas = StorageService.instance.getLocalReplicas(keyspace.getName());
         final Set<Range<Token>> allRanges = replicas.ranges();
@@ -973,7 +977,7 @@ public class CompactionManager implements CompactionManagerMBean
 
         CompactionTasks tasks = cfStore.getCompactionStrategy().getMaximalTasks(gcBefore, splitOutput, permittedParallelism);
 
-        if (tasks.isEmpty())
+        if (tasks == null || tasks.isEmpty())
             return Collections.emptyList();
 
         List<Future<?>> futures = new ArrayList<>();
@@ -1039,6 +1043,9 @@ public class CompactionManager implements CompactionManagerMBean
                                                                         false,
                                                                         TableOperation.StopTrigger.COMPACTION))
         {
+            if (tasks == null)
+                throw new RuntimeException("Unable to cancel in-progress compactions for " + cfStore.keyspace.getName() + '.' + cfStore.getTableName() + ". Usually retrying will work.");
+
             if (tasks.isEmpty())
                 return;
 

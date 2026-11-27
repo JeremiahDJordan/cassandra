@@ -155,17 +155,23 @@ public class WriteResponseHandlerTest
         //dc1
         awr.onResponse(createDummyMessage(0));
         awr.onResponse(createDummyMessage(1));
+
+        // there are not enough responses for ideal EACH_QUORUM yet
+        assertEquals(startingCount, ks.metric.idealCLWriteLatency.latency.getCount());
+
         //dc2
         awr.onResponse(createDummyMessage(4));
         awr.onResponse(createDummyMessage(5));
+
+        // there are enough responses for ideal EACH_QUORUM, we should not wait for all responses
+        assertTrue( TimeUnit.DAYS.toMicros(1) < ks.metric.idealCLWriteLatency.totalLatency.getCount());
+        assertEquals(startingCount + 1, ks.metric.idealCLWriteLatency.latency.getCount());
 
         //Don't need the others
         awr.expired();
         awr.expired();
 
         assertEquals(0,  ks.metric.writeFailedIdealCL.getCount());
-        assertTrue( TimeUnit.DAYS.toMicros(1) < ks.metric.idealCLWriteLatency.totalLatency.getCount());
-        assertEquals(startingCount + 1, ks.metric.idealCLWriteLatency.latency.getCount());
     }
 
     /**
@@ -235,6 +241,30 @@ public class WriteResponseHandlerTest
         awr.expired();
         assertEquals(1, ks.metric.writeFailedIdealCL.getCount());
         assertEquals(0, ks.metric.idealCLWriteLatency.totalLatency.getCount());
+    }
+
+    @Test
+    public void failedIdealCLIncrementsStatForExplicitOnFailure()
+    {
+        AbstractWriteResponseHandler awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.EACH_QUORUM);
+
+        long startingCountForWriteFailedIdealCL = ks.metric.writeFailedIdealCL.getCount();
+        long startingCountForIdealCLWriteLatency = ks.metric.idealCLWriteLatency.totalLatency.getCount();
+
+
+        //Succeed in local DC
+        awr.onResponse(createDummyMessage(0));
+        awr.onResponse(createDummyMessage(1));
+        awr.onResponse(createDummyMessage(2));
+
+
+        //Fail in remote DC
+        awr.onFailure(targets.get(3).endpoint(), RequestFailureReason.TIMEOUT);
+        awr.onFailure(targets.get(4).endpoint(), RequestFailureReason.TIMEOUT);
+        awr.onResponse(createDummyMessage(5));
+
+        assertEquals(startingCountForWriteFailedIdealCL + 1, ks.metric.writeFailedIdealCL.getCount());
+        assertEquals(startingCountForIdealCLWriteLatency, ks.metric.idealCLWriteLatency.totalLatency.getCount());
     }
 
     /**
@@ -312,6 +342,30 @@ public class WriteResponseHandlerTest
         assertThat(awr.failureReasonByEndpoint).hasSize(2);
 
         assertThatThrownBy(awr::get).isInstanceOf(WriteFailureException.class);
+    }
+
+    @Test
+    public void failedIdealCLDoesNotIncrementsStatOnExplicitQueryFailure()
+    {
+        AbstractWriteResponseHandler awr = createWriteResponseHandler(ConsistencyLevel.LOCAL_QUORUM, ConsistencyLevel.EACH_QUORUM);
+
+        long startingCountForWriteFailedIdealCL = ks.metric.writeFailedIdealCL.getCount();
+        long startingCountForIdealCLWriteLatency = ks.metric.idealCLWriteLatency.totalLatency.getCount();
+
+
+        //Fail in local DC
+        awr.onFailure(targets.get(0).endpoint(), RequestFailureReason.TIMEOUT);
+        awr.onFailure(targets.get(1).endpoint(), RequestFailureReason.TIMEOUT);
+        awr.onResponse(createDummyMessage(2));
+
+
+        //Fail in remote DC
+        awr.onFailure(targets.get(3).endpoint(), RequestFailureReason.TIMEOUT);
+        awr.onFailure(targets.get(4).endpoint(), RequestFailureReason.TIMEOUT);
+        awr.onResponse(createDummyMessage(5));
+
+        assertEquals(startingCountForWriteFailedIdealCL, ks.metric.writeFailedIdealCL.getCount());
+        assertEquals(startingCountForIdealCLWriteLatency, ks.metric.idealCLWriteLatency.totalLatency.getCount());
     }
 
     private static AbstractWriteResponseHandler createWriteResponseHandler(ConsistencyLevel cl, ConsistencyLevel ideal)

@@ -66,6 +66,7 @@ import org.apache.cassandra.service.pager.PagingState;
 import org.apache.cassandra.transport.messages.ResultMessage;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.UUIDGen;
 
 import static java.lang.String.format;
@@ -149,13 +150,12 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
     @Override
     public ResultMessage executeLocally(QueryState state, QueryOptions options)
     {
-        Keyspaces keyspaces = Schema.instance.distributedAndLocalKeyspaces();
-        UUID schemaVersion = Schema.instance.getVersion();
+        Pair<Keyspaces, UUID> schema = Schema.instance.getSchemaBlocking();
 
-        keyspaces = Keyspaces.builder()
-                             .add(keyspaces)
-                             .add(VirtualKeyspaceRegistry.instance.virtualKeyspacesMetadata())
-                             .build();
+        Keyspaces keyspaces = Keyspaces.builder()
+                                       .add(schema.left)
+                                       .add(VirtualKeyspaceRegistry.instance.virtualKeyspacesMetadata())
+                                       .build();
 
         PagingState pagingState = options.getPagingState();
 
@@ -173,7 +173,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
         //   (vint bytes) serialized schema hash (currently the result of Keyspaces.hashCode())
         //
 
-        long offset = getOffset(pagingState, schemaVersion);
+        long offset = getOffset(pagingState, schema.right);
         PageSize pageSize = options.getPageSize();
 
         if (pageSize.isDefined() && pageSize.getUnit() != PageSize.PageUnit.ROWS)
@@ -194,7 +194,7 @@ public abstract class DescribeStatement<T> extends CQLStatement.Raw implements C
 
         if (pageSize.isDefined() && rows.size() == pageSize.getSize())
         {
-            result.metadata.setHasMorePages(getPagingState(offset + pageSize.getSize(), schemaVersion));
+            result.metadata.setHasMorePages(getPagingState(offset + pageSize.getSize(), schema.right));
         }
 
         return new ResultMessage.Rows(result);

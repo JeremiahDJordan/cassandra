@@ -54,7 +54,7 @@ import org.apache.cassandra.utils.UUIDSerializer;
 import javax.annotation.Nullable;
 
 import static org.apache.cassandra.schema.SchemaConstants.PATTERN_NON_WORD_CHAR;
-import static org.apache.cassandra.schema.SchemaConstants.isValidName;
+import static org.apache.cassandra.schema.SchemaConstants.isValidCharsName;
 
 /**
  * An immutable representation of secondary index metadata.
@@ -158,7 +158,7 @@ public final class IndexMetadata
 
     public void validate(TableMetadata table)
     {
-        if (!isValidName(name, true))
+        if (!isValidCharsName(name))
             throw new ConfigurationException(String.format("Index name must not be empty, or contain non-alphanumeric-underscore characters (got \"%s\")",
                                                            name));
 
@@ -173,7 +173,7 @@ public final class IndexMetadata
             // Find any aliases to the fully qualified index class name:
             String className = expandAliases(options.get(IndexTarget.CUSTOM_INDEX_OPTION_NAME));
 
-            Class<? extends Index> indexerClass = FBUtilities.classForName(className, Index.class, "custom indexer");
+            Class<? extends Index> indexerClass = FBUtilities.classForNameWithoutInitialization(className, "custom indexer", Index.class);
             validateCustomIndexOptions(table, indexerClass, options);
         }
     }

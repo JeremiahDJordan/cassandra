@@ -432,7 +432,7 @@ public class TupleTypeTest extends CQLTester
 
     private static Gen<TypeAndRows> typesAndRowsGen(int numRows)
     {
-        // duration type is invalid for keys
+        // duration type is invalid for keys and decimal type is problematic for equality checks
         Gen<TupleType> typeGen = tupleTypeGen(primitiveTypeGen(DurationType.instance, DecimalType.instance), SourceDSL.integers().between(1, 10));
         Set<ByteBuffer> distinctRows = new HashSet<>(numRows); // reuse the memory
         Gen<TypeAndRows> gen = rnd -> {

@@ -78,6 +78,7 @@ import org.awaitility.Awaitility;
 
 import static java.util.Collections.singleton;
 import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
+import static org.apache.cassandra.schema.MockSchema.readerBounds;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -922,6 +923,24 @@ public class LeveledCompactionStrategyTest
         }
     }
 
+    @Test()
+    public void testInvalidFanoutAndSSTableSize()
+    {
+        try
+        {
+            Map<String, String> options = new HashMap<>();
+            options.put("class", "LeveledCompactionStrategy");
+            options.put("fanout_size", "90");
+            options.put("sstable_size_in_mb", "1089");
+            LeveledCompactionStrategy.validateOptions(options);
+            Assert.fail("fanout_sizeed and sstable_size_in_mb are invalid, but did not throw ConfigurationException");
+        }
+        catch (ConfigurationException e)
+        {
+            assertTrue(e.getMessage().contains("your maxSSTableSize must be absurdly high to compute"));
+        }
+    }
+
     @Test
     public void testReduceScopeL0()
     {
@@ -1024,6 +1043,32 @@ public class LeveledCompactionStrategyTest
         backgroundCompactions.setSubmitted(strategy, taskId, aggregate);
 
         assertEquals(3, strategy.getLevel(txn));
+    }
+
+    @Test
+    public void testLevelScannerIntersection()
+    {
+        Collection<SSTableReader> sstable = Collections.singleton(MockSchema.sstableWithLevel(1, 10, 20, 1, cfs));
+
+        // SSTable range - [10, 20]
+        // range - (1, 9]
+        Range<Token> range = new Range<>(readerBounds(1).getToken(), readerBounds(9).getToken());
+        assertEquals(0, LeveledCompactionStrategy.LeveledScanner.intersecting(sstable, Collections.singleton(range)).size());
+
+        // SSTable range - [10, 20]
+        // range - (1, 10]
+        range = new Range<>(readerBounds(1).getToken(), readerBounds(10).getToken());
+        assertEquals(1, LeveledCompactionStrategy.LeveledScanner.intersecting(sstable, Collections.singleton(range)).size());
+
+        // SSTable range - [10, 20]
+        // range - (1, 15]
+        range = new Range<>(readerBounds(1).getToken(), readerBounds(15).getToken());
+        assertEquals(1, LeveledCompactionStrategy.LeveledScanner.intersecting(sstable, Collections.singleton(range)).size());
+
+        // SSTable range - [10, 20]
+        // range - (20, 25]
+        range = new Range<>(readerBounds(20).getToken(), readerBounds(25).getToken());
+        assertEquals(0, LeveledCompactionStrategy.LeveledScanner.intersecting(sstable, Collections.singleton(range)).size());
     }
 
     private Pair<Set<SSTableReader>, Set<SSTableReader>> groupByLevel(Iterable<SSTableReader> sstables)

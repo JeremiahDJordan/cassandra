@@ -15,7 +15,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
 package org.apache.cassandra.utils.memory;
 
 import java.util.concurrent.CompletableFuture;
@@ -31,10 +30,9 @@ import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
- * CASSANDRA-21019 review: heap_buffers and unslabbed_heap_buffers create their pool with
- * an off-heap limit of 0 (SlabPool(heapLimit, 0, ...) / HeapPool -> super(max, 0, ...)).
- * A zero-limit sub-pool is never allocated from and never signalled, so awaitRoom() must
- * skip it -- without the guard, the first mutation on such a configuration hangs forever.
+ * CASSANDRA-21019: heap_buffers / unslabbed_heap_buffers create their pool with an
+ * off-heap limit of 0; a zero-limit sub-pool is never allocated from and never
+ * signalled, so awaitRoom() must skip it, and configured limits must still gate.
  */
 public class MemtableAllocatorAwaitRoomTest
 {
@@ -47,8 +45,7 @@ public class MemtableAllocatorAwaitRoomTest
     @Test(timeout = 30_000)
     public void zeroLimitPoolDoesNotBlock() throws Exception
     {
-        // heap_buffers shape: off-heap limit == 0
-        SlabPool pool = new SlabPool(1 << 20, 0, 1.0f, () -> CompletableFuture.completedFuture(false));
+        SlabPool pool = new SlabPool(1 << 20, 0, 1.0f, () -> CompletableFuture.completedFuture(true));
         try
         {
             MemtableAllocator allocator = pool.newAllocator();
@@ -67,7 +64,7 @@ public class MemtableAllocatorAwaitRoomTest
     @Test(timeout = 30_000)
     public void configuredLimitStillGates() throws Exception
     {
-        SlabPool pool = new SlabPool(1 << 20, 1 << 20, 1.0f, () -> CompletableFuture.completedFuture(false));
+        SlabPool pool = new SlabPool(1 << 20, 1 << 20, 1.0f, () -> CompletableFuture.completedFuture(true));
         try
         {
             MemtableAllocator allocator = pool.newAllocator();
@@ -76,7 +73,7 @@ public class MemtableAllocatorAwaitRoomTest
             Thread gate = run(() -> allocator.awaitRoomToStart(g));
             gate.join(2_000);
             assertTrue("gate did not wait while the on-heap pool was at its limit", gate.isAlive());
-            pool.onHeap.released(pool.onHeap.limit); // released() signals hasRoom
+            pool.onHeap.released(pool.onHeap.limit);
             gate.join(10_000);
             assertFalse("gate did not wake after room was released", gate.isAlive());
             g.close();

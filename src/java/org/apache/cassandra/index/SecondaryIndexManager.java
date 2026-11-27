@@ -136,6 +136,7 @@ import org.apache.cassandra.tracing.Tracing;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JVMStabilityInspector;
+import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Refs;
 import org.json.simple.JSONValue;
 
@@ -692,8 +693,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                                                          .callAsync(() -> Futures.allAsList(builderFutures), MoreExecutors.directExecutor());
                            Futures.addCallback(builds, new FutureCallback()
                            {
-                               @Override
-                               public void onFailure(Throwable t)
+                               private void doOnFailure(Throwable t)
                                {
                                    try
                                    {
@@ -706,9 +706,30 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                    }
                                }
 
+                               private Throwable closeBuilders(Throwable accumulate)
+                               {
+                                   return Throwables.close(accumulate, builders.stream()
+                                                                               .filter(AutoCloseable.class::isInstance)
+                                                                               .map(AutoCloseable.class::cast)
+                                                                               .collect(Collectors.toList()));
+                               }
+
+                               @Override
+                               public void onFailure(Throwable t)
+                               {
+                                   doOnFailure(closeBuilders(t));
+                               }
+
                                @Override
                                public void onSuccess(Object o)
                                {
+                                   Throwable closeFailure = closeBuilders(null);
+                                   if (closeFailure != null)
+                                   {
+                                       doOnFailure(closeFailure);
+                                       return;
+                                   }
+
                                    try
                                    {
                                        Set<Index> failed = new HashSet<>();
@@ -1037,6 +1058,11 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         return indexes.get(indexName);
     }
 
+    static Class<? extends Index> loadIndexClass(String className)
+    {
+        return FBUtilities.classForNameWithoutInitialization(className, "Index", Index.class);
+    }
+
     private Index createInstance(IndexMetadata indexDef)
     {
         Index newIndex;
@@ -1049,7 +1075,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
 
             try
             {
-                Class<? extends Index> indexClass = FBUtilities.classForName(className, "Index");
+                Class<? extends Index> indexClass = loadIndexClass(className);
                 Constructor<? extends Index> ctor = indexClass.getConstructor(ColumnFamilyStore.class, IndexMetadata.class);
                 newIndex = ctor.newInstance(baseCfs, indexDef);
             }

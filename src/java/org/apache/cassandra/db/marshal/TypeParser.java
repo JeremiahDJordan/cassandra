@@ -371,8 +371,7 @@ public class TypeParser
      */
     private static AbstractType<?> getAbstractType(String typeName) throws ConfigurationException
     {
-        String className = typeName.contains(".") ? typeName : "org.apache.cassandra.db.marshal." + typeName;
-        Class<? extends AbstractType<?>> typeClass = FBUtilities.classForName(className, "abstract-type");
+        Class<? extends AbstractType<?>> typeClass = getAbstractTypeClass(typeName);
         try
         {
             Field field = typeClass.getDeclaredField("instance");
@@ -385,6 +384,19 @@ public class TypeParser
         }
     }
 
+    private static Class<? extends AbstractType<?>> getAbstractTypeClass(String compareWith) throws ConfigurationException
+    {
+        String className = compareWith.contains(".") ? compareWith : "org.apache.cassandra.db.marshal." + compareWith;
+        // Defer class initialization until after confirming this is an AbstractType. The static instance field
+        // access or getInstance(TypeParser) invocation below performs the initialization for valid types.
+        @SuppressWarnings("unchecked")
+        Class<? extends AbstractType<?>> typeClass =
+            (Class<? extends AbstractType<?>>) FBUtilities.classForNameWithoutInitialization(className,
+                                                                                             "abstract-type",
+                                                                                             AbstractType.class);
+        return typeClass;
+    }
+
     /**
      * Parse a type string and return the corresponding {@link AbstractType}. It is used for the type definition
      * which is followed by an opening parenthesis, e.g.
@@ -392,8 +404,7 @@ public class TypeParser
      */
     private static AbstractType<?> getAbstractType(String compareWith, TypeParser parser) throws SyntaxException, ConfigurationException
     {
-        String className = compareWith.contains(".") ? compareWith : "org.apache.cassandra.db.marshal." + compareWith;
-        Class<? extends AbstractType<?>> typeClass = FBUtilities.classForName(className, "abstract-type");
+        Class<? extends AbstractType<?>> typeClass = getAbstractTypeClass(compareWith);
 
         try
         {

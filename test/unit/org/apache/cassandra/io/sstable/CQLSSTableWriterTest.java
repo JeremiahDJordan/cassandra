@@ -49,6 +49,7 @@ import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.dht.*;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.TableMetadataRef;
@@ -61,6 +62,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
+import static org.psjava.util.AssertStatus.assertNotNull;
 
 /**
  * Tests for {@link CQLSSTableWriter}.
@@ -880,6 +882,160 @@ public class CQLSSTableWriterTest
         assertEquals(0, filtered.size());
         filtered = QueryProcessor.executeInternal("SELECT * FROM " + qualifiedTable + " where k='2' and c={" + other + ", " + uuid1 + "};");
         assertEquals(0, filtered.size());
+    }
+
+    @Test
+    public void testWriteWithSorted() throws Exception
+    {
+        String schema = "CREATE TABLE " + qualifiedTable + " ("
+                        + "  k int PRIMARY KEY,"
+                        + "  v blob )";
+        CQLSSTableWriter writer = CQLSSTableWriter.builder()
+                                                  .inDirectory(dataDir)
+                                                  .forTable(schema)
+                                                  .using("INSERT INTO " + qualifiedTable +
+                                                         " (k, v) VALUES (?, textAsBlob(?))" )
+                                                  .sorted()
+                                                  .build();
+        int rowCount = 10_000;
+        for (int i = 0; i < rowCount; i++)
+        {
+            writer.addRow(i, UUID.randomUUID().toString());
+        }
+        writer.close();
+        loadSSTables(dataDir, keyspace);
+
+        UntypedResultSet resultSet = QueryProcessor.executeInternal("SELECT * FROM " + qualifiedTable);
+        assertEquals(rowCount, resultSet.size());
+        Iterator<UntypedResultSet.Row> iter = resultSet.iterator();
+        for (int i = 0; i < rowCount; i++)
+        {
+            UntypedResultSet.Row row = iter.next();
+            assertEquals(i, row.getInt("k"));
+        }
+    }
+
+    @Test
+    public void testWriteWithSortedAndMaxSize() throws Exception
+    {
+        String schema = "CREATE TABLE " + qualifiedTable + " ("
+                        + "  k int PRIMARY KEY,"
+                        + "  v blob )";
+        CQLSSTableWriter writer = CQLSSTableWriter.builder()
+                                                  .inDirectory(dataDir)
+                                                  .forTable(schema)
+                                                  .using("INSERT INTO " + qualifiedTable +
+                                                         " (k, v) VALUES (?, textAsBlob(?))")
+                                                  .sorted()
+                                                  .withMaxSSTableSizeInMiB(1)
+                                                  .build();
+        int rowCount = 30_000;
+        // Max SSTable size is 1 MiB
+        // 30_000 rows should take 30_000 * (4 + 37) = 1.17 MiB > 1 MiB
+        for (int i = 0; i < rowCount; i++)
+        {
+            writer.addRow(i, UUID.randomUUID().toString());
+        }
+        writer.close();
+
+        File[] dataFiles = dataDir.tryList(f -> f.name().endsWith(Component.DATA.type.repr));
+        assertNotNull(dataFiles);
+        assertEquals("The sorted writer should produce 2 sstables when max sstable size is configured",
+                     2, dataFiles.length);
+        long closeTo1MiBFileSize = Math.max(dataFiles[0].length(), dataFiles[1].length());
+        assertTrue("The file size should be close to 1MiB (with at most 50KiB error rate for the test)",
+                   Math.abs(1024 * 1024 - closeTo1MiBFileSize) < 50 * 1024);
+
+        loadSSTables(dataDir, keyspace);
+
+        UntypedResultSet resultSet = QueryProcessor.executeInternal("SELECT * FROM " + qualifiedTable);
+        assertEquals(rowCount, resultSet.size());
+        Iterator<UntypedResultSet.Row> iter = resultSet.iterator();
+        for (int i = 0; i < rowCount; i++)
+        {
+            UntypedResultSet.Row row = iter.next();
+            assertEquals(i, row.getInt("k"));
+        }
+    }
+
+    @Test
+    public void testNotifySSTableFinishedForSorted() throws Exception
+    {
+        testNotifySSTableFinished(true, false);
+    }
+
+    @Test
+    public void testNotifySSTableFinishedForUnsorted() throws Exception
+    {
+        testNotifySSTableFinished(false, false);
+    }
+
+    @Test
+    public void testCloseSortedWriterOnFirstPorducedShouldStillResultInTwoSSTables() throws Exception
+    {
+        // Writing a new partition (and exceeding the size limit) leads to closing the current writer and buffering the last partition update.
+        // Since there is a last partition buffered, closing the sstable writer flushes to a new sstable.
+        // Therefore, even though the test closes the writer immediately, there are still 2 sstables produced.
+        testNotifySSTableFinished(true, true);
+    }
+
+    private void testNotifySSTableFinished(boolean sorted, boolean closeWriterOnFirstProduced) throws Exception
+    {
+        List<SSTableReader> produced = new ArrayList<>();
+        String schema = "CREATE TABLE " + qualifiedTable + " ("
+                + "  k int PRIMARY KEY,"
+                + "  v text )";
+        CQLSSTableWriter.Builder builder = CQLSSTableWriter
+                .builder()
+                .inDirectory(dataDir)
+                .forTable(schema)
+                .using("INSERT INTO " + qualifiedTable +
+                        " (k, v) VALUES (?, ?)")
+                .withMaxSSTableSizeInMiB(1)
+                .openSSTableOnProduced()
+                .withSSTableProducedListener(produced::addAll);
+        if (sorted)
+        {
+            builder.sorted();
+        }
+        CQLSSTableWriter writer = builder.build();
+
+        int rowCount = 30_000;
+        // Max SSTable size is 1 MiB
+        // 30_000 rows should take 30_000 * (4 + 37) = 1.17 MiB > 1 MiB, i.e. producing 2 sstables
+        for (int i = 0; i < rowCount; i++)
+        {
+            writer.addRow(i, UUID.randomUUID().toString());
+            if (closeWriterOnFirstProduced && !produced.isEmpty())
+            {
+                // on closing writer, it flushes the last update to the new sstable
+                writer.close();
+                break;
+            }
+        }
+        // the assertion is only performed for sorted because unsorted writer writes asynchrously; avoid flakiness
+        if (!closeWriterOnFirstProduced && sorted)
+        {
+            // while writing, one sstable should be finished
+            assertEquals(1, produced.size());
+        }
+
+        if (!closeWriterOnFirstProduced)
+            writer.close();
+        // another sstable is finished on closing the writer
+        assertEquals(2, produced.size());
+
+        File[] dataFiles = dataDir.tryList((file, name) -> name.endsWith(Component.DATA.name()));
+        assertNotNull(dataFiles);
+        assertEquals("The sorted writer should produce 2 sstables when max sstable size is configured",
+                2, dataFiles.length);
+        Set<File> notifiedDataFileSet = produced.stream()
+                .map(sstable ->  new File(sstable.descriptor.filenameFor(Component.DATA)))
+                .collect(Collectors.toSet());
+        Set<File> listedDataFileSet = Arrays.stream(dataFiles)
+                .map(File::toCanonical)
+                .collect(Collectors.toSet());
+        assertEquals(notifiedDataFileSet, listedDataFileSet);
     }
 
     private static void loadSSTables(File dataDir, String ks) throws ExecutionException, InterruptedException

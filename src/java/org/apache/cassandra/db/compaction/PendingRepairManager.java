@@ -417,4 +417,12 @@ class PendingRepairManager
         Map<UUID, List<CompactionSSTable>> group = sstables.stream().collect(Collectors.groupingBy(s -> s.getPendingRepair()));
         return group.entrySet().stream().map(g -> strategies.get(g.getKey()).getUserDefinedTasks(g.getValue(), gcBefore)).flatMap(Collection::stream).collect(Collectors.toList());
     }
+
+    synchronized boolean hasPendingRepairSSTable(UUID sessionID, CompactionSSTable sstable)
+    {
+        AbstractCompactionStrategy strat = strategies.get(sessionID);
+        if (strat == null)
+            return false;
+        return strat.getSSTables().contains(sstable);
+    }
 }

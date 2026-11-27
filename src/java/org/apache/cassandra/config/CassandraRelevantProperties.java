@@ -165,6 +165,8 @@ public enum CassandraRelevantProperties
 
     RING_DELAY("cassandra.ring_delay_ms", "30000"),
 
+    FAILED_BOOTSTRAP_TIMEOUT("cassandra.failed_bootstrap_timeout_ms"),
+
     /**
      * When bootstraping we wait for all schema versions found in gossip to be seen, and if not seen in time we fail
      * the bootstrap; this property will avoid failing and allow bootstrap to continue if set to true.
@@ -288,6 +290,11 @@ public enum CassandraRelevantProperties
 
     /** This property indicates whether disable_mbean_registration is true */
     IS_DISABLED_MBEAN_REGISTRATION("org.apache.cassandra.disable_mbean_registration"),
+
+    /**
+     * Validates names of to-be-taken snapshots, defaults to false.
+     */
+    SNAPSHOT_NAME_VALIDATION("cassandra.snapshot.validation", "false"),
 
     /** what class to use for mbean registeration */
     MBEAN_REGISTRATION_CLASS("org.apache.cassandra.mbean_registration_class"),
@@ -890,7 +897,10 @@ public enum CassandraRelevantProperties
      * is blocked, each CFS is served by an assigned thread, chosen pseudo randomly (based on
      * the table id's hash code).
      */
-    MEMTABLE_RECLAIM_THREADS("cassandra.memtable_reclaim_threads", "1");
+    MEMTABLE_RECLAIM_THREADS("cassandra.memtable_reclaim_threads", "1"),
+
+    /** How often a role's password can be changed */
+    ROLE_PASSWORD_UPDATE_MIN_INTERVAL_MS("cassandra.role_password_update_min_interval_in_ms", "5000");
 
 
     CassandraRelevantProperties(String key, String defaultVal)

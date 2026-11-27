@@ -51,19 +51,24 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.compaction.OperationType;
+import org.apache.cassandra.db.streaming.ComponentContext;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
+import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.SequenceBasedSSTableId;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
 import org.apache.cassandra.io.sstable.metadata.MetadataType;
 import org.apache.cassandra.io.sstable.metadata.StatsMetadata;
+import org.apache.cassandra.io.util.DiskOptimizationStrategy;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileHandle;
 import org.apache.cassandra.io.util.FileUtils;
+import org.apache.cassandra.io.util.SpinningDiskOptimizationStrategy;
 import org.apache.cassandra.schema.MockSchema;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.AlwaysPresentFilter;
 import org.apache.cassandra.utils.FBUtilities;
@@ -78,6 +83,7 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
@@ -1314,10 +1320,172 @@ public class LogTransactionTest extends AbstractTransactionalTest
         logs.finish();
     }
 
+    @Test
+    public void testStatsTSMatchOnStart() throws Throwable
+    {
+        ColumnFamilyStore cfs = MockSchema.newCFS(KEYSPACE);
+        File dataFolder = new Directories(cfs.metadata()).getDirectoryForNewSSTables();
+        SSTableReader sstable = sstable(dataFolder, cfs, 0, 128);
+
+        try(LogTransaction log = new LogTransaction(OperationType.COMPACTION, LifecycleTransaction.newId()))
+        {
+            assertNotNull(log);
+            log.trackNew(sstable);
+
+            // Confirm we can remove leftovers when they match
+            LifecycleTransaction.removeUnfinishedLeftovers(cfs.metadata());
+        }
+
+        File sFile = sstable.descriptor.fileFor(Component.STATS);
+        assertFalse("Found STATS file but expected it to be cleaned up.", Files.exists(sFile.toPath()));
+        sstable.selfRef().release();
+    }
+
+    @Test
+    public void testStatsTSMatchDuringList() throws Throwable
+    {
+        ColumnFamilyStore cfs = MockSchema.newCFS(KEYSPACE);
+        File dataFolder = new Directories(cfs.metadata()).getDirectoryForNewSSTables();
+        SSTableReader sstable = sstable(dataFolder, cfs, 0, 128);
+
+        try(LogTransaction log = new LogTransaction(OperationType.COMPACTION, LifecycleTransaction.newId()))
+        {
+            assertNotNull(log);
+            log.trackNew(sstable);
+
+            // Confirm we can successfully classify files when they match - this triggers the LogAwareFileLister verify
+            listFiles(dataFolder, Directories.OnTxnErr.THROW, Directories.FileType.FINAL);
+        }
+        sstable.selfRef().release();
+    }
+
+    @Test
+    public void testStatsTSMismatchDuringStart() throws Throwable
+    {
+        ColumnFamilyStore cfs = MockSchema.newCFS(KEYSPACE);
+        File dataFolder = new Directories(cfs.metadata()).getDirectoryForNewSSTables();
+        SSTableReader sstable = sstable(dataFolder, cfs, 0, 128);
+
+        File sFile = sstable.descriptor.fileFor(Component.STATS);
+        assertTrue("STATS file not created successfully in test setup", Files.exists(sFile.toPath()));
+
+        // Confirm we can remove leftovers even if the STATS file doesn't match
+        try(LogTransaction log = new LogTransaction(OperationType.COMPACTION, LifecycleTransaction.newId()))
+        {
+            assertNotNull(log);
+
+            // Need to flag the transaction as having a REMOVE entry so it'll trigger the path to calculate stats on list
+            log.obsoleted(sstable);
+
+            // Need to sleep for long enough to bypass the millisecond truncation logic due to jdk8 and jdk11 change
+            Thread.sleep(2000);
+            assertTrue("Failed to set mtime for STATS file to currentTimeMillis()", sFile.trySetLastModified(System.currentTimeMillis()));
+
+            // Confirm we have an mtime mismatch
+            File dFile = sstable.descriptor.fileFor(Component.DATA);
+            assertNotEquals(sFile.lastModified(), dFile.lastModified());
+
+            // We need to add another LogRecord as we allow partial or incorrect entries as the last record...
+            log.trackNew(sstable(dataFolder, cfs, 2, 128));
+
+            assertTrue("STATS file gone before removeUnfinished...", Files.exists(sFile.toPath()));
+            // Confirm we can remove leftovers when the STATS file mismatches
+            log.prepareToCommit(); // commit so that obsolete sstable components will be removed.
+            log.commit();
+            ComponentContext.create(sstable.descriptor);
+            assertTrue(LifecycleTransaction.removeUnfinishedLeftovers(cfs.metadata()));
+        }
+
+        sstable.selfRef().release();
+    }
+
+    @Test
+    public void testWrongTimestampInTxnFile() throws IOException, InterruptedException
+    {
+        ColumnFamilyStore cfs = MockSchema.newCFS(KEYSPACE);
+        File dataFolder = new Directories(cfs.metadata()).getDirectoryForNewSSTables();
+        SSTableReader sstable = sstable(dataFolder, cfs, 0, 128);
+
+        File sFile = sstable.descriptor.fileFor(Component.STATS);
+        assertTrue("STATS file not created successfully in test setup", Files.exists(sFile.toPath()));
+
+        LogRecord.INCLUDE_STATS_FOR_TESTS = true;
+
+        Thread.sleep(2000);
+        assertTrue("Failed to set mtime for STATS file to currentTimeMillis()", sFile.trySetLastModified(System.currentTimeMillis()));
+
+        // Confirm we can remove leftovers even if the STATS file doesn't match
+        try(LogTransaction log = new LogTransaction(OperationType.COMPACTION, LifecycleTransaction.newId()))
+        {
+            assertNotNull(log);
+            // Need to flag the transaction as having a REMOVE entry so it'll trigger the path to calculate stats on list
+            log.obsoleted(sstable);
+            // Need to sleep for long enough to bypass the millisecond truncation logic due to jdk8 and jdk11 change
+            // Confirm we have an mtime mismatch
+            File dFile = sstable.descriptor.fileFor(Component.DATA);
+            assertNotEquals(sFile.lastModified(), dFile.lastModified());
+
+            // We need to add another LogRecord as we allow partial or incorrect entries as the last record...
+            log.trackNew(sstable(dataFolder, cfs, 2, 128));
+
+            assertTrue("STATS file gone before removeUnfinished...", Files.exists(sFile.toPath()));
+            // Confirm we can remove leftovers when the STATS file mismatches
+            LogRecord.INCLUDE_STATS_FOR_TESTS = false;
+            assertTrue(LifecycleTransaction.removeUnfinishedLeftovers(cfs.metadata()));
+        }
+
+        sstable.selfRef().release();
+    }
+
+    /**
+     * We do not consider the stats file's ts for any cases at this point
+     */
+    @Test
+    public void testStatsTSMismatchDuringList() throws Throwable
+    {
+        SSTableReader sstable = null;
+        try
+        {
+            ColumnFamilyStore cfs = MockSchema.newCFS(KEYSPACE);
+            File dataFolder = new Directories(cfs.metadata()).getDirectoryForNewSSTables();
+            sstable = sstable(dataFolder, cfs, 0, 128);
+
+            File sFile = sstable.descriptor.fileFor(Component.STATS);
+            assertTrue("STATS file not created successfully in test setup", Files.exists(sFile.toPath()));
+
+            try(LogTransaction log = new LogTransaction(OperationType.COMPACTION, LifecycleTransaction.newId()))
+            {
+                assertNotNull(log);
+
+                // Need to flag the transaction as having a REMOVE entry so it'll trigger the path to calculate stats on list
+                log.obsoleted(sstable);
+
+                // Need to sleep for long enough to bypass the millisecond truncation logic due to jdk8 and jdk11 change
+                Thread.sleep(2000);
+                assertTrue("Failed to set mtime for STATS file to currentTimeMillis()", sFile.trySetLastModified(System.currentTimeMillis()));
+
+                // Confirm we have an mtime mismatch
+                File dFile = sstable.descriptor.fileFor(Component.DATA);
+                assertNotEquals(sFile.lastModified(), dFile.lastModified());
+
+                // We need to add another LogRecord as we allow partial or incorrect entries as the last record...
+                log.trackNew(sstable(dataFolder, cfs, 2, 128));
+
+                // Confirm we don't get a mismatch LogRecord error when the STATS file is different even on listFiles case
+                listFiles(dataFolder, Directories.OnTxnErr.THROW, Directories.FileType.FINAL);
+            }
+        }
+        finally
+        {
+            if (sstable != null)
+                sstable.selfRef().release();
+        }
+    }
+
     private static SSTableReader sstable(File dataFolder, ColumnFamilyStore cfs, int generation, int size) throws IOException
     {
         Descriptor descriptor = new Descriptor(dataFolder, cfs.keyspace.getName(), cfs.getTableName(), new SequenceBasedSSTableId(generation), SSTableFormat.Type.BIG);
-        Set<Component> components = ImmutableSet.of(Component.DATA, Component.PRIMARY_INDEX, Component.FILTER, Component.TOC);
+        Set<Component> components = ImmutableSet.of(Component.DATA, Component.PRIMARY_INDEX, Component.FILTER, Component.TOC, Component.STATS);
         for (Component component : components)
         {
             File file = descriptor.fileFor(component);
@@ -1438,7 +1606,7 @@ public class LogTransactionTest extends AbstractTransactionalTest
 
     static Set<File> getTemporaryFiles(File folder)
     {
-        return listFiles(folder, Directories.FileType.TEMPORARY);
+        return listFiles(folder, Directories.OnTxnErr.IGNORE, Directories.FileType.TEMPORARY);
     }
 
     static Set<File> getTemporaryFiles(File folder, Directories.OnTxnErr onTxnErr)
@@ -1448,7 +1616,7 @@ public class LogTransactionTest extends AbstractTransactionalTest
 
     static Set<File> getFinalFiles(File folder)
     {
-        return listFiles(folder, Directories.FileType.FINAL);
+        return listFiles(folder, Directories.OnTxnErr.IGNORE, Directories.FileType.FINAL);
     }
 
     // Used by listFiles - this test is deliberately racing with files being
@@ -1486,5 +1654,33 @@ public class LogTransactionTest extends AbstractTransactionalTest
                                                .stream()
                                                .flatMap(LogTransactionTest::toCanonicalIgnoringNotFound)
                                                .collect(Collectors.toSet());
+    }
+
+    final String DUMMY_KS = "ks";
+    final String DUMMY_TBL = "tbl";
+    final File dir = new File(".");
+    int nextGeneration = 1;
+    final Set<Component> dummyComponents = Collections.singleton(Component.DATA);
+    final TableMetadataRef dummyMetadata = TableMetadataRef.forOfflineTools(TableMetadata.minimal(DUMMY_KS, DUMMY_TBL));
+    final DiskOptimizationStrategy dummyOptimizationStrategy = new SpinningDiskOptimizationStrategy();
+
+    SSTable dummySSTable()
+    {
+        int id = nextGeneration;
+        nextGeneration++;
+        Descriptor descriptor = new Descriptor(dir, DUMMY_KS, DUMMY_TBL, new SequenceBasedSSTableId(id));
+        return new SSTable(descriptor, dummyComponents, dummyMetadata, dummyOptimizationStrategy)
+        {
+        };
+    }
+
+    @Test(expected = TransactionAlreadyCompletedException.class)
+    public void useAfterCompletedTest()
+    {
+        try (LogTransaction txnFile = new LogTransaction(OperationType.STREAM, LifecycleTransaction.newId()))
+        {
+            txnFile.abort(); // this should complete the txn
+            txnFile.trackNew(dummySSTable()); // expect an IllegalStateException here
+        }
     }
 }

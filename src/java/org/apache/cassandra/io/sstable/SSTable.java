@@ -24,10 +24,14 @@ import java.io.PrintWriter;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -60,6 +64,7 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.SyncUtil;
 import org.apache.cassandra.utils.memory.HeapCloner;
 
 import static org.apache.cassandra.io.util.File.WriteMode.APPEND;
@@ -145,19 +150,21 @@ public abstract class SSTable
     public static boolean delete(Descriptor desc, Set<Component> components)
     {
         logger.debug("Deleting sstable: {}", desc);
-        // remove the DATA component first if it exists
-        if (components.contains(Component.DATA))
-            FileUtils.deleteWithConfirm(desc.fileFor(Component.DATA));
-        for (Component component : components)
+
+        // delete older files first so the overall SSTable timestamp stays the same on partial deletes
+        List<Component> sorted = new ArrayList<>(components);
+        Map<Component, Long> lastModified = new HashMap<>();
+        for (Component component : sorted)
+            lastModified.put(component, desc.fileFor(component).lastModified());
+        sorted.sort(Comparator.comparingLong(lastModified::get));
+
+        for (Component component : sorted)
         {
-            if (component.equals(Component.DATA) || component.equals(Component.SUMMARY))
-                continue;
-
-            FileUtils.deleteWithConfirm(desc.fileFor(component));
+            if (component.equals(Component.SUMMARY))
+                FileUtils.delete(desc.fileFor(component));
+            else
+                FileUtils.deleteWithConfirm(desc.fileFor(component));
         }
-
-        if (components.contains(Component.SUMMARY))
-            FileUtils.delete(desc.fileFor(Component.SUMMARY));
 
         return true;
     }
@@ -410,7 +417,7 @@ public abstract class SSTable
             for (Component component : components)
                 w.println(component.name);
             w.flush();
-            fos.sync();
+            SyncUtil.force(fos.getChannel(), true);
         }
         catch (IOException e)
         {

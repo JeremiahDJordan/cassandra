@@ -414,6 +414,20 @@ public class CompactionStrategyManager implements CompactionStrategyContainer
         return transientRepairs;
     }
 
+    @VisibleForTesting
+    public boolean hasPendingRepairSSTable(UUID sessionID, CompactionSSTable sstable)
+    {
+        readLock.lock();
+        try
+        {
+            return pendingRepairs.hasPendingRepairSSTable(sessionID, sstable) || transientRepairs.hasPendingRepairSSTable(sessionID, sstable);
+        }
+        finally
+        {
+            readLock.unlock();
+        }
+    }
+
     @Override
     public void shutdown()
     {
@@ -602,7 +616,7 @@ public class CompactionStrategyManager implements CompactionStrategyContainer
     private void handleFlushNotification(Iterable<? extends CompactionSSTable> added)
     {
         for (CompactionSSTable sstable : added)
-            compactionStrategyFor(sstable).addSSTable(sstable);
+            getHolder(sstable).addSSTable(sstable);
     }
 
     private int getHolderIndex(CompactionSSTable sstable)

@@ -19,16 +19,21 @@
 package org.apache.cassandra.schema;
 
 import com.datastax.driver.core.exceptions.InvalidQueryException;
+import org.apache.commons.lang3.StringUtils;
+
 import org.apache.cassandra.cql3.CQLTester;
-import org.apache.cassandra.cql3.UntypedResultSet;
-import org.apache.cassandra.cql3.functions.types.ParseUtils;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.exceptions.RequestValidationException;
 
 import org.junit.Test;
 
+import static org.apache.cassandra.schema.SchemaConstants.FILENAME_LENGTH;
+import static org.apache.cassandra.schema.SchemaConstants.NAME_LENGTH;
+import static org.apache.cassandra.schema.SchemaConstants.TABLE_NAME_LENGTH;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.fail;
 
 public class CreateTableValidationTest extends CQLTester
@@ -118,35 +123,60 @@ public class CreateTableValidationTest extends CQLTester
     }
 
     @Test
-    public void testCreatingInternalTableWithLongName() throws Throwable
+    public void testCreatingTableWithLongName() throws Throwable
     {
-        String keyspace = "\"38373639353166362d356631322d343864652d393063362d653862616534343165333764_tpch\"";
-        String table = "test_create_k8yq1r75bpzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
+        int tableIdSuffix = "-1b255f4def2540a60000000000000000".length();
+        String keyspaceName = StringUtils.repeat("k", NAME_LENGTH);
+        String tableName = StringUtils.repeat("t", FILENAME_LENGTH - tableIdSuffix);
+        String tooLongTableName = StringUtils.repeat("l", FILENAME_LENGTH - tableIdSuffix + 1);
+
+        // Assert that the documented value of 222 corresponds to the actual constant.
+        assertEquals(222, TABLE_NAME_LENGTH);
 
         execute(String.format("CREATE KEYSPACE %s with replication = " +
                               "{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }",
-                              keyspace));
-        createTableMayThrow(String.format("CREATE TABLE %s.%s (" +
-                                           "key int PRIMARY KEY," +
-                                           "val int)", keyspace, table));
+                              keyspaceName));
 
-        execute(String.format("INSERT INTO %s.%s (key,val) VALUES (1,1)", keyspace, table));
-        flush(ParseUtils.unDoubleQuote(keyspace), table);
-        UntypedResultSet result = execute(String.format("SELECT * from %s.%s", keyspace, table));
-        assertThat(result.size()).isEqualTo(1);
+        assertInvalidMessage(String.format("%s.%s: Table name must not be more than %d characters long (got %d characters for \"%2$s\")",
+                                           keyspaceName, tooLongTableName, TABLE_NAME_LENGTH, tooLongTableName.length()),
+                             String.format("CREATE TABLE %s.%s (" +
+                                           "key int PRIMARY KEY," +
+                                           "val int)", keyspaceName, tooLongTableName));
+
+        createTable(String.format("CREATE TABLE %s.%s (" +
+                                  "key int PRIMARY KEY," +
+                                  "val int)", keyspaceName, tableName));
+        execute(String.format("INSERT INTO %s.%s (key,val) VALUES (1,1)", keyspaceName, tableName));
+        assertThat(execute(String.format("SELECT * from %s.%s", keyspaceName, tableName))).hasSize(1);
+        flush(keyspaceName, tableName);
+        assertThat(execute(String.format("SELECT * from %s.%s", keyspaceName, tableName))).hasSize(1);
     }
 
     @Test
-    public void testNonAlphanummericTableName()
+    public void testNonAlphanummericTableName() throws Throwable
     {
-        assertThatExceptionOfType(ConfigurationException.class)
-            .isThrownBy(() -> createTableMayThrow(String.format("CREATE TABLE %s.\"d-3\" (key int PRIMARY KEY, val int)", KEYSPACE)))
-            .withMessageContaining("Table name must not be empty or contain non-alphanumeric-underscore characters (got \"d-3\")");
+        assertInvalidMessage(String.format("%s.d-3: Table name must not be empty or contain non-alphanumeric-underscore characters (got \"d-3\")", KEYSPACE),
+                             String.format("CREATE TABLE %s.\"d-3\" (key int PRIMARY KEY, val int)", KEYSPACE));
+        assertInvalidMessage(String.format("%s.    : Table name must not be empty or contain non-alphanumeric-underscore characters (got \"    \")", KEYSPACE),
+                             String.format("CREATE TABLE %s.\"    \" (key int PRIMARY KEY, val int)", KEYSPACE));
+    }
+
+    @Test
+    public void testInvalidCompactionOptions()
+    {
+        expectedFailure(ConfigurationException.class, "CREATE TABLE %s (k int PRIMARY KEY, v int) WITH compaction = {'class': 'LeveledCompactionStrategy', 'fanout_size': '90', 'sstable_size_in_mb': '1089'}",
+                        "your maxSSTableSize must be absurdly high to compute");
+    }
+
+    private void expectedFailure(final Class<? extends RequestValidationException> exceptionType, String statement, String errorMsg)
+    {
+
+        assertThatExceptionOfType(exceptionType)
+        .isThrownBy(() -> createTableMayThrow(statement)) .withMessageContaining(errorMsg);
     }
 
     private void expectedFailure(String statement, String errorMsg)
     {
-
         assertThatExceptionOfType(InvalidRequestException.class)
         .isThrownBy(() -> createTableMayThrow(statement)) .withMessageContaining(errorMsg);
     }

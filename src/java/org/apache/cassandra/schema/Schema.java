@@ -538,7 +538,17 @@ public class Schema implements SchemaProvider
     }
 
     /**
+     * Returns the current keyspaces metadata and version synchronouly. If the schema is in the middle of a multistep
+     * transformation, the method blocks until the update is completed.
+     */
+    public synchronized Pair<Keyspaces, UUID> getSchemaBlocking()
+    {
+        return Pair.create(keyspaces, version);
+    }
+
+    /**
      * Checks whether the given schema version is the same as the current local schema.
+     * Note that this method is non-blocking and may use a stale schema version for comparison - see {@link #getVersion()}.
      */
     public boolean isSameVersion(UUID schemaVersion)
     {
@@ -547,6 +557,7 @@ public class Schema implements SchemaProvider
 
     /**
      * Checks whether the current schema is empty.
+     * Note that this method is non-blocking and may use a stale schema version for comparison - see {@link #getVersion()}.
      */
     public boolean isEmpty()
     {

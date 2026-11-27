@@ -91,6 +91,12 @@ public abstract class BufferPoolAllocator extends AbstractByteBufAllocator
         return bufferPool.usedSizeInBytes();
     }
 
+    @VisibleForTesting
+    long overflowMemoryInBytes()
+    {
+        return bufferPool.overflowMemoryInBytes();
+    }
+
     void release()
     {
     }

@@ -27,6 +27,7 @@ import org.slf4j.LoggerFactory;
 import net.openhft.chronicle.core.util.ThrowingConsumer;
 import org.apache.cassandra.db.filter.TombstoneOverwhelmingException;
 import org.apache.cassandra.exceptions.RequestFailureReason;
+import org.apache.cassandra.exceptions.TruncateException;
 import org.apache.cassandra.index.IndexBuildInProgressException;
 import org.apache.cassandra.index.IndexNotAvailableException;
 import org.apache.cassandra.index.sai.utils.AbortedOperationException;
@@ -109,7 +110,8 @@ public class InboundSink implements InboundMessageHandlers.MessageConsumer
 
             if (t instanceof TombstoneOverwhelmingException || 
                 t instanceof IndexNotAvailableException || 
-                t instanceof IndexBuildInProgressException)
+                t instanceof IndexBuildInProgressException ||
+                t instanceof TruncateException)
             {
                 noSpamLogger.error(t.getMessage());
             }

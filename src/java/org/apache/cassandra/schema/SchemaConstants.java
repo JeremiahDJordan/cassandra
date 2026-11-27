@@ -28,6 +28,8 @@ import com.google.common.collect.ImmutableSet;
 
 import org.apache.cassandra.db.Digest;
 
+import static org.apache.cassandra.db.Directories.TABLE_DIRECTORY_NAME_SEPARATOR;
+
 public final class SchemaConstants
 {
     public static final Pattern PATTERN_WORD_CHARS = Pattern.compile("\\w+");
@@ -84,52 +86,32 @@ public final class SchemaConstants
      */
     public static final int INDEX_NAME_LENGTH = 182;
 
+    /**
+     * Length of a table uuid as a hex string.
+     */
+    public static final int TABLE_UUID_AS_HEX_LENGTH = 32;
+
+    /**
+     * Longest acceptable table name, so it can be used in a directory
+     * name constructed with a suffix of a table id and a separator.
+     */
+    public static final int TABLE_NAME_LENGTH = FILENAME_LENGTH - TABLE_UUID_AS_HEX_LENGTH - TABLE_DIRECTORY_NAME_SEPARATOR.length();
+
     // 59adb24e-f3cd-3e02-97f0-5b395827453f
     public static final UUID emptyVersion;
 
     public static final List<String> LEGACY_AUTH_TABLES = Arrays.asList("credentials", "users", "permissions");
 
     /**
-     * Checks if the length of the given name will be suitable to be used
-     * in constructed file names.
+     * Validates that a name is not empty and contains only alphanumeric characters or
+     * underscore, so it can be used in file or directory names.
      *
      * @param name the name to check
-     * @return true if the name is short enough to be safe to use, otherwise false
+     * @return whether the non-empty name contains only valid characters
      */
-    public static boolean isSafeLengthForFilename(String name)
+    public static boolean isValidCharsName(String name)
     {
-        return name.length() <= NAME_LENGTH;
-    }
-
-    /**
-     * Names such as keyspace, table, index names are used in file paths and file names,
-     * so, they need to be safe for the use there, i.e., short enough and
-     * containing only alphanumeric characters and underscores.
-     *
-     * @param name the name to check
-     * @return whether the name is safe for use in file paths and file names
-     */
-    public static boolean isValidName(String name)
-    {
-        return isValidName(name, false);
-    }
-
-    /**
-     * Names such as keyspace, table, index names are used in file paths and file names,
-     * so, they need to be safe for the use there, i.e., short enough and
-     * containing only alphanumeric characters and underscores.
-     * However, historically not all names were checked for their length.
-     * Such legacy behaviour is supported through passing true for doNotCheckLength.
-     *
-     * @param name             the name to check
-     * @param doNotCheckLength specifies if no check on the name length should be done
-     *                         to support legacy behaviour
-     * @return true if the name is valid, false otherwise
-     */
-    public static boolean isValidName(String name, boolean doNotCheckLength)
-    {
-        return name != null && !name.isEmpty() && PATTERN_WORD_CHARS.matcher(name).matches() &&
-               (doNotCheckLength || isSafeLengthForFilename(name));
+        return name != null && !name.isEmpty() && PATTERN_WORD_CHARS.matcher(name).matches();
     }
 
     static
@@ -179,6 +161,16 @@ public final class SchemaConstants
     public static boolean isVirtualKeyspace(String keyspaceName)
     {
         return VIRTUAL_KEYSPACE_NAMES.contains(keyspaceName.toLowerCase());
+    }
+
+    /**
+     * @return whether or not the keyspace is a non-virtual, system keyspace
+     */
+    public static boolean isNonVirtualSystemKeyspace(String keyspaceName)
+    {
+        final String lowercaseKeyspaceName = keyspaceName.toLowerCase();
+        return LOCAL_SYSTEM_KEYSPACE_NAMES.contains(lowercaseKeyspaceName)
+               || REPLICATED_SYSTEM_KEYSPACE_NAMES.contains(lowercaseKeyspaceName);
     }
 
     public static boolean isInternalKeyspace(String keyspaceName)

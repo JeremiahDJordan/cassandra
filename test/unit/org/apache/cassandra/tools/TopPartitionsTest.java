@@ -32,10 +32,13 @@ import com.google.common.collect.Lists;
 import org.junit.Before;
 import org.junit.Test;
 
+import org.apache.cassandra.Util;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.metrics.Sampler;
 import org.apache.cassandra.service.StorageService;
 
+import static org.hamcrest.Matchers.greaterThan;
 import static org.junit.Assert.assertEquals;
 
 public class TopPartitionsTest extends CQLTester
@@ -72,9 +75,31 @@ public class TopPartitionsTest extends CQLTester
     @Test
     public void testServiceTopPartitionsSingleTable() throws Throwable
     {
-        getCurrentColumnFamilyStore().beginLocalSampling("READS", 5, 100000);
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        long executedBefore = Sampler.samplerExecutor.getCompletedTaskCount();
+        cfs.beginLocalSampling("READS", 5, 100000);
         execute("SELECT * FROM %s WHERE pk=1");
-        List<CompositeData> result = getCurrentColumnFamilyStore().finishLocalSampling("READS", 5);
+        ensureThatSamplerExecutorProcessedAllSamples(executedBefore);
+        List<CompositeData> result = cfs.finishLocalSampling("READS", 5);
         assertEquals("If this failed you probably have to raise the beginLocalSampling duration", 1, result.size());
+    }
+
+    private static void ensureThatSamplerExecutorProcessedAllSamples(long executedBefore)
+    {
+        Util.spinAssertEquals("samplerExecutor should not have pending tasks",
+                              0,
+                              () -> Sampler.samplerExecutor.getQueue().size(),
+                              60,
+                              TimeUnit.SECONDS);
+        Util.spinAssertEquals("samplerExecutor should not have active tasks",
+                              0,
+                              Sampler.samplerExecutor::getActiveCount,
+                              60,
+                              TimeUnit.SECONDS);
+        Util.spinAssert("samplerExecutor has not completed any new tasks after beginLocalSampling",
+                        greaterThan(executedBefore),
+                        Sampler.samplerExecutor::getCompletedTaskCount,
+                        60,
+                        TimeUnit.SECONDS);
     }
 }

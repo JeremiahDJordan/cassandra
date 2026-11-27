@@ -86,6 +86,11 @@ hints_flush_period_in_ms: 10000
 # Maximum size for a single hints file, in megabytes.
 max_hints_file_size_in_mb: 128
 
+# Enable/disable transferring hints to a peer during decommission. Even when enabled, this does not guarantee
+# consistency for logged batches, and it may delay decommission when coupled with a strict hinted_handoff_throttle.
+# Default: true
+#transfer_hints_on_decommission: true
+
 # Compression to apply to the hint files. If omitted, hints files
 # will be written uncompressed. LZ4, Snappy, and Deflate compressors
 # are supported.
@@ -321,7 +326,7 @@ commit_failure_policy: stop
 #
 # Valid values are either "auto" (omitting the value) or a value greater 0.
 #
-# Note that specifying a too large value will result in long running GCs and possbily
+# Note that specifying a too large value will result in long running GCs and possibly
 # out-of-memory errors. Keep the value at a small fraction of the heap.
 #
 # If you constantly see "prepared statements discarded in the last minute because
@@ -330,7 +335,7 @@ commit_failure_policy: stop
 # i.e. use bind markers for variable parts.
 #
 # Do only change the default value, if you really have more prepared statements than
-# fit in the cache. In most cases it is not neccessary to change this value.
+# fit in the cache. In most cases it is not necessary to change this value.
 # Constantly re-preparing statements is a performance penalty.
 #
 # Default value ("auto") is 1/256th of the heap or 10MB, whichever is greater
@@ -603,7 +608,7 @@ concurrent_materialized_view_writes: 32
 memtable_allocation_type: offheap_objects
 
 # Limit memory usage for Merkle tree calculations during repairs of a certain
-# table and common token range. Repair commands targetting multiple tables or
+# table and common token range. Repair commands targeting multiple tables or
 # virtual nodes can exceed this limit depending on concurrent_merkle_tree_requests.
 #
 # The default is 1/16th of the available heap. The main tradeoff is that
@@ -692,7 +697,7 @@ memtable_allocation_type: offheap_objects
 # new space for cdc-tracked tables has been made available. Default to 250ms
 # cdc_free_space_check_interval_ms: 250
 
-# A fixed memory pool size in MB for for SSTable index summaries. If left
+# A fixed memory pool size in MB for SSTable index summaries. If left
 # empty, this will default to 5% of the heap size. If the memory usage of
 # all index summaries exceeds this limit, SSTables with low read rates will
 # shrink their index summaries in order to meet this limit.  However, this
@@ -782,6 +787,9 @@ native_transport_port: 9042
 # The maximum threads for handling requests (note that idle threads are stopped
 # after 30 seconds so there is not corresponding minimum setting).
 # native_transport_max_threads: 128
+# The maximum threads for handling auth requests in a separate executor from main request executor.
+# When set to 0, main executor for requests is used.
+# native_transport_max_auth_threads: 0
 #
 # The maximum size of allowed frame. Frame (requests) larger than this will
 # be rejected as invalid. The default is 256MB. If you're changing this parameter,
@@ -922,7 +930,7 @@ column_index_cache_size_in_kb: 2
 
 # Number of simultaneous repair validations to allow. If not set or set to
 # a value less than 1, it defaults to the value of concurrent_compactors.
-# To set a value greeater than concurrent_compactors at startup, the system
+# To set a value greater than concurrent_compactors at startup, the system
 # property cassandra.allow_unlimited_concurrent_validations must be set to
 # true. To dynamically resize to a value > concurrent_compactors on a running
 # node, first call the bypassConcurrentValidatorsLimit method on the
@@ -964,6 +972,14 @@ enable_uuid_sstable_identifiers: true
 # disks balanced, it cannot guarantee it. This feature will be automatically
 # disabled if internode encryption is enabled.
 # stream_entire_sstables: true
+
+# When an entire SSTable is received via zero-copy streaming, validate the Digest.crc32 that was streamed with it
+# against the received Data.db before the SSTable is added to the table. This detects corruption introduced in
+# transit as well as pre-existing corruption on the sending node's disk, neither of which is otherwise noticed by
+# this path, since it writes component bytes to disk without parsing them.
+# If there's no Digest.crc32, this check passes.
+# When unset, the default is not validating Digest.crc32.
+# entire_sstable_stream_digest_validation_enabled: false
 
 # Throttles all outbound streaming file transfers on this node to the
 # given total throughput in Mbps. This is necessary because Cassandra does
@@ -1226,7 +1242,7 @@ server_encryption_options:
     keystore_password: cassandra
     # Verify peer server certificates
     require_client_auth: false
-    # Set to a valid trustore if require_client_auth is true
+    # Set to a valid truststore if require_client_auth is true
     truststore: conf/.truststore
     truststore_password: cassandra
     # Verify that the host name in the certificate matches the connected host
@@ -1265,7 +1281,7 @@ client_encryption_options:
     keystore_password: cassandra
     # Verify client certificates
     require_client_auth: false
-    # Set trustore and truststore_password if require_client_auth is true
+    # Set truststore and truststore_password if require_client_auth is true
     # truststore: conf/.truststore
     # truststore_password: cassandra
     # More advanced defaults:
@@ -1317,7 +1333,7 @@ windows_timer_interval: 1
 
 # Enables encrypting data at-rest (on disk). Different key providers can be plugged in, but the default reads from
 # a JCE-style keystore. A single keystore can hold multiple keys, but the one referenced by
-# the "key_alias" is the only key that will be used for encrypt opertaions; previously used keys
+# the "key_alias" is the only key that will be used for encrypt operations; previously used keys
 # can still (and should!) be in the keystore and will be used on decrypt operations
 # (to handle the case of key rotation).
 #

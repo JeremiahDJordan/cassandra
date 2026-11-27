@@ -48,6 +48,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryHandler.Prepared;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.io.util.FileUtils;
@@ -918,6 +919,25 @@ public final class SystemKeyspace
         availableRanges.truncateBlockingWithoutSnapshot();
     }
 
+    /**
+     * Wipes the whole table rather than deleting per (operation, keyspace): keyspace_name is part of the
+     * partition key, so an operation-scoped delete would have to iterate keyspaces. Safe because the
+     * decommission path is the only reader - see getTransferredRanges. Revisit if another topology
+     * change starts consulting this table.
+     */
+    public static synchronized void resetTransferredRanges()
+    {
+        Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(TRANSFERRED_RANGES_V2).truncateBlockingWithoutSnapshot();
+        try
+        {
+            Keyspace.open(SchemaConstants.SYSTEM_KEYSPACE_NAME).getColumnFamilyStore(LEGACY_TRANSFERRED_RANGES).truncateBlockingWithoutSnapshot();
+        }
+        catch (Throwable t)
+        {
+            logger.warn("failed to truncate system table {} but it should no longer be being consulted", LEGACY_TRANSFERRED_RANGES, t);
+        }
+    }
+
     public static synchronized void updateTransferredRanges(StreamOperation streamOperation,
                                                          InetAddressAndPort peer,
                                                          String keyspace,
@@ -934,11 +954,19 @@ public final class SystemKeyspace
         executeInternal(String.format(cql, TRANSFERRED_RANGES_V2), rangesToUpdate, streamOperation.getDescription(), peer.address, peer.port, keyspace);
     }
 
-    public static synchronized Map<InetAddressAndPort, Set<Range<Token>>> getTransferredRanges(String description, String keyspace, IPartitioner partitioner)
+    // Only consulted on the decommission path, where the leaving node is the only streamer and its
+    // local transferred_ranges_v2 is therefore a complete record of what has already moved.
+    //
+    // Being node-local rules out the other topology changes. Under removenode the surviving replicas
+    // stream, and the node running it need not be one of them, so its local table may record nothing;
+    // even when it is a replica it can only account for its own streams. Move could use it for the
+    // ranges the moving node gives up, but the move path registers no listener so nothing is recorded,
+    // and it would still miss the ranges moving the other way.
+    public static synchronized Map<InetAddressAndPort, Set<Range<Token>>> getTransferredRanges(StreamOperation streamOperation, String keyspace, IPartitioner partitioner)
     {
         Map<InetAddressAndPort, Set<Range<Token>>> result = new HashMap<>();
         String query = "SELECT * FROM system.%s WHERE operation = ? AND keyspace_name = ?";
-        UntypedResultSet rs = executeInternal(String.format(query, TRANSFERRED_RANGES_V2), description, keyspace);
+        UntypedResultSet rs = executeInternal(String.format(query, TRANSFERRED_RANGES_V2), streamOperation.getDescription(), keyspace);
         for (UntypedResultSet.Row row : rs)
         {
             InetAddress peerAddress = row.getInetAddress("peer");
@@ -1021,12 +1049,12 @@ public final class SystemKeyspace
         preparedStatements.truncateBlockingWithoutSnapshot();
     }
 
-    public static int loadPreparedStatements(TriFunction<MD5Digest, String, String, Integer> onLoaded)
+    public static int loadPreparedStatements(TriFunction<MD5Digest, String, String, Prepared> onLoaded)
     {
         return loadPreparedStatements(onLoaded, QueryProcessor.PRELOAD_PREPARED_STATEMENTS_FETCH_SIZE);
     }
 
-    public static int loadPreparedStatements(TriFunction<MD5Digest, String, String, Integer> onLoaded, int pageSize)
+    public static int loadPreparedStatements(TriFunction<MD5Digest, String, String, Prepared> onLoaded, int pageSize)
     {
         String query = String.format("SELECT prepared_id, logged_keyspace, query_string FROM %s.%s", SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS);
         UntypedResultSet resultSet = executeOnceInternalWithPaging(query, pageSize);
@@ -1038,16 +1066,21 @@ public final class SystemKeyspace
         long preparedBytesLoaded = 0L;
         for (UntypedResultSet.Row row : resultSet)
         {
-            Integer cacheEntrySize = onLoaded.accept(MD5Digest.wrap(row.getByteArray("prepared_id")),
-                                                     row.getString("query_string"),
-                                                     row.has("logged_keyspace") ? row.getString("logged_keyspace") : null);
-            if (cacheEntrySize != null)
+            Prepared prepared = onLoaded.accept(MD5Digest.wrap(row.getByteArray("prepared_id")),
+                                                row.getString("query_string"),
+                                                row.has("logged_keyspace") ? row.getString("logged_keyspace") : null);
+            if (prepared != null)
             {
                 counter++;
-                preparedBytesLoaded += Math.max(0, cacheEntrySize);
+                preparedBytesLoaded += Math.max(0, prepared.pstmntSize);
 
                 if (preparedBytesLoaded > preparedBytesLoadThreshold)
                 {
+                    // In the event that we detect that we have loaded more bytes than the cache size return early to
+                    // prevent an indefinite startup time. This is almost certainly caused by the prepared statement cache
+                    // leaking (CASSANDRA-19703) which should not recur after being on a version running this code.
+                    // In such a case it's better to warn and continue startup than to continually page over millions of
+                    // prepared statements that would be immediately evicted.
                     logger.warn("Detected prepared statement cache filling up during preload after preparing {} " +
                                 "statements (loaded {} with prepared_statements_cache_size being {}). " +
                                 "This could be an indication that prepared statements leaked prior to CASSANDRA-19703 " +
@@ -1064,7 +1097,7 @@ public final class SystemKeyspace
         return counter;
     }
 
-    public static int loadPreparedStatement(MD5Digest digest, TriFunction<MD5Digest, String, String, Integer> onLoaded)
+    public static int loadPreparedStatement(MD5Digest digest, TriFunction<MD5Digest, String, String, Prepared> onLoaded)
     {
         String query = String.format("SELECT prepared_id, logged_keyspace, query_string FROM %s.%s WHERE prepared_id = ?", SchemaConstants.SYSTEM_KEYSPACE_NAME, PREPARED_STATEMENTS);
         UntypedResultSet resultSet = executeOnceInternal(query, digest.byteBuffer());

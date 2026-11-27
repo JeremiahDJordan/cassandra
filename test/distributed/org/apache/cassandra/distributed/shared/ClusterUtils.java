@@ -142,6 +142,22 @@ public class ClusterUtils
      * Create a new instance and add it to the cluster, without starting it.
      *
      * @param cluster to add to
+     * @param other config to copy from
+     * @param fn function to add to the config before starting
+     * @param <I> instance type
+     * @return the instance added
+     */
+    public static <I extends IInstance> I addInstance(AbstractCluster<I> cluster,
+                                                      IInstanceConfig other,
+                                                      Consumer<IInstanceConfig> fn)
+    {
+        return addInstance(cluster, other.localDatacenter(), other.localRack(), fn);
+    }
+
+    /**
+     * Create a new instance and add it to the cluster, without starting it.
+     *
+     * @param cluster to add to
      * @param dc the instance should be in
      * @param rack the instance should be in
      * @param <I> instance type
@@ -393,6 +409,20 @@ public class ClusterUtils
     }
 
     /**
+     * Wait for the ring to have the target instance with the provided status.
+     *
+     * @param instance instance to check on
+     * @param expectedInRing to look for
+     * @param status expected
+     * @return the ring
+     */
+    public static List<RingInstanceDetails> awaitRingStatus(IInstance instance, IInstance expectedInRing, String status)
+    {
+        return awaitInstanceMatching(instance, expectedInRing, d -> d.status.equals(status),
+                                     "Timeout waiting for " + expectedInRing + " to have status " + status);
+    }
+
+    /**
      * Wait for the ring to have the target instance with the provided state.
      *
      * @param instance instance to check on
@@ -402,12 +432,20 @@ public class ClusterUtils
      */
     public static List<RingInstanceDetails> awaitRingState(IInstance instance, IInstance expectedInRing, String state)
     {
-        return awaitRing(instance, "Timeout waiting for " + expectedInRing + " to have state " + state,
-                         ring ->
-                         ring.stream()
-                             .filter(d -> d.address.equals(getBroadcastAddressHostString(expectedInRing)))
-                             .filter(d -> d.state.equals(state))
-                             .findAny().isPresent());
+        return awaitInstanceMatching(instance, expectedInRing, d -> d.state.equals(state),
+                                     "Timeout waiting for " + expectedInRing + " to have state " + state);
+    }
+
+    private static List<RingInstanceDetails> awaitInstanceMatching(IInstance instance,
+                                                                   IInstance expectedInRing,
+                                                                   Predicate<RingInstanceDetails> predicate,
+                                                                   String errorMessage)
+    {
+        return awaitRing(instance,
+                         errorMessage,
+                         ring -> ring.stream()
+                                     .filter(d -> d.address.equals(getBroadcastAddressHostString(expectedInRing)))
+                                     .anyMatch(predicate));
     }
 
     /**

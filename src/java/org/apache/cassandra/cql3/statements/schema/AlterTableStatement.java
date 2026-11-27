@@ -43,6 +43,7 @@ import org.apache.cassandra.cql3.QualifiedName;
 import org.apache.cassandra.cql3.statements.RawKeyspaceAwareStatement;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.gms.ApplicationState;
 import org.apache.cassandra.gms.Gossiper;
@@ -228,6 +229,16 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
             if (isStatic && table.clusteringColumns().isEmpty())
                 throw ire("Static columns are only useful (and thus allowed) if the table has at least one clustering column");
 
+            // check for nested non-frozen UDTs or collections in a non-frozen UDT
+            if (type.isUDT() && type.isMultiCell())
+            {
+                for (AbstractType<?> fieldType : ((UserType) type).fieldTypes())
+                {
+                    if (fieldType.isMultiCell())
+                        throw ire("Non-frozen UDTs with nested non-frozen collections are not supported for column " + column.name);
+                }
+            }
+
             ColumnMetadata droppedColumn = table.getDroppedColumn(name.bytes);
             if (null != droppedColumn)
             {
@@ -235,9 +246,10 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
                 // columns is pushed deeper down the line. The latter would still be problematic in cases of schema races.
                 if (!type.isSerializationCompatibleWith(droppedColumn.type))
                 {
-                    throw ire("Cannot re-add previously dropped column '%s' of type %s, incompatible with previous type %s",
+                    throw ire("Cannot add a column '%s' of type %s, incompatible with previously dropped column '%s' of type %s",
                               name,
                               type.asCQL3Type().toSchemaString(),
+                              name,
                               droppedColumn.type.asCQL3Type().toSchemaString());
                 }
 

@@ -60,7 +60,7 @@ except ImportError:
 CQL_LIB_PREFIX = 'cassandra-driver-internal-only-'
 
 CASSANDRA_PATH = os.path.join(os.path.dirname(os.path.realpath(__file__)), '..')
-CASSANDRA_CQL_HTML_FALLBACK = 'https://cassandra.apache.org/doc/latest/cql/index.html'
+CASSANDRA_CQL_HTML_FALLBACK = 'https://cassandra.apache.org/doc/latest/cassandra/cql/cql_singlefile.html'
 
 # default location of local CQL.html
 if os.path.exists(CASSANDRA_PATH + '/doc/cql3/CQL.html'):
@@ -160,6 +160,10 @@ from cqlshlib.formatting import (DEFAULT_DATE_FORMAT, DEFAULT_NANOTIME_FORMAT,
                                  format_by_type, formatter_for)
 from cqlshlib.tracing import print_trace, print_trace_session
 from cqlshlib.util import get_file_encoding_bomsize, is_file_secure, trim_if_present
+try:
+    from cqlshlib.serverversion import version as build_version
+except ImportError:
+    build_version = "UNKNOWN"
 
 from cqlshlib.geotypes import patch_geotypes_import_conversion  # nopep8
 from cqlshlib.daterangetype import patch_daterange_import_conversion  # nopep
@@ -245,28 +249,52 @@ parser.add_argument("--insecure-password-without-warning", action='store_true', 
                     help=argparse.SUPPRESS)
 parser.add_argument("--no-file-io", action='store_true', dest='no_file_io',
                     help='Disable cqlsh commands that perform file I/O.')
-parser.add_argument('--disable-history', action='store_true', help='Disable saving of history', default=False)
+parser.add_argument('--disable-history', default=False, action='store_true',
+                    help='Disable saving of history (existing history will still be loaded)')
 
 cfarguments, args = parser.parse_known_args()
 
 
 # BEGIN history/config definition
-HISTORY_DIR = os.path.expanduser(os.path.join('~', '.cassandra'))
+
+
+def mkdirp(path):
+    """Creates all parent directories up to path parameter or fails when path exists, but it is not a directory."""
+
+    try:
+        os.makedirs(path)
+    except OSError:
+        if not os.path.isdir(path):
+            raise
+
+
+def resolve_cql_history_file():
+    default_cql_history = os.path.expanduser(os.path.join('~', '.cassandra', 'cqlsh_history'))
+    if 'CQL_HISTORY' in os.environ:
+        return os.environ['CQL_HISTORY']
+    else:
+        return default_cql_history
+
+
+HISTORY = resolve_cql_history_file()
+HISTORY_DIR = os.path.dirname(HISTORY)
+
+try:
+    mkdirp(HISTORY_DIR)
+except OSError:
+    print('\nWarning: Cannot create directory at `%s`. Command history will not be saved. Please check what was the environment property CQL_HISTORY set to.\n' % HISTORY_DIR)
+
+DEFAULT_CQLSHRC = os.path.expanduser(os.path.join('~', '.cassandra', 'cqlshrc'))
 
 if cfarguments.cqlshrc is not None:
-    CONFIG_FILE = cfarguments.cqlshrc
+    CONFIG_FILE = os.path.expanduser(cfarguments.cqlshrc)
     if not os.path.exists(CONFIG_FILE):
-        print('\nWarning: Specified cqlshrc location `%s` does not exist.  Using `%s` instead.\n' % (CONFIG_FILE, HISTORY_DIR))
-        CONFIG_FILE = os.path.join(HISTORY_DIR, 'cqlshrc')
+        print('\nWarning: Specified cqlshrc location `%s` does not exist.  Using `%s` instead.\n' % (CONFIG_FILE, DEFAULT_CQLSHRC))
+        CONFIG_FILE = DEFAULT_CQLSHRC
 else:
-    CONFIG_FILE = os.path.join(HISTORY_DIR, 'cqlshrc')
+    CONFIG_FILE = DEFAULT_CQLSHRC
 
-HISTORY = os.path.join(HISTORY_DIR, 'cqlsh_history')
-if not os.path.exists(HISTORY_DIR):
-    try:
-        os.mkdir(HISTORY_DIR)
-    except OSError:
-        print('\nWarning: Cannot create directory at `%s`. Command history will not be saved.\n' % HISTORY_DIR)
+CQL_DIR = os.path.dirname(CONFIG_FILE)
 
 OLD_CONFIG_FILE = os.path.expanduser(os.path.join('~', '.cqlshrc'))
 if os.path.exists(OLD_CONFIG_FILE):
@@ -281,9 +309,9 @@ if os.path.exists(OLD_CONFIG_FILE):
 OLD_HISTORY = os.path.expanduser(os.path.join('~', '.cqlsh_history'))
 if os.path.exists(OLD_HISTORY):
     os.rename(OLD_HISTORY, HISTORY)
-# END history/config definition
 
-CQL_DIR = os.path.dirname(CONFIG_FILE)
+
+# END history/config definition
 
 CQL_TRACED_ERRORS = (
     cassandra.CoordinationFailure,  # superclass of ReadFailure
@@ -474,7 +502,8 @@ class Shell(cmd.Cmd):
                  no_file_io=DEFAULT_NO_FILE_IO,
                  is_subshell=False,
                  debug=False,
-                 auth_provider=None):
+                 auth_provider=None,
+                 disable_history=False):
         cmd.Cmd.__init__(self, completekey=completekey)
         self.debug = debug
         self.hostname = hostname
@@ -565,17 +594,27 @@ class Shell(cmd.Cmd):
 
         self.statement = StringIO()
         self.lineno = 1
-        self.in_comment = False
 
         self.prompt = ''
         if stdin is None:
             stdin = sys.stdin
 
+        self.check_build_versions()
+
         if tty:
+            # Inform users about history logging if not disabled
+            if not disable_history and readline is not None:
+                print()
+                print("ATTENTION: All commands will be saved to history file: %s" % HISTORY)
+                print("This may include sensitive information such as passwords.")
+                print("To disable history, use --disable-history or set 'disabled = true' in the [history] section of cqlshrc.")
+                print("See https://cassandra.apache.org/doc/latest/tools/cqlsh.html for more information.")
+                print()
             self.reset_prompt()
             self.maybe_warn_py2()
             self.report_connection()
             print('Use HELP for help.')
+
         else:
             self.show_line_nums = True
         self.stdin = stdin
@@ -589,6 +628,14 @@ class Shell(cmd.Cmd):
     @property
     def batch_mode(self):
         return not self.tty
+
+    def check_build_versions(self):
+        baseversion = self.connection_versions['build']
+        extra = baseversion.rfind('-')
+        if extra != -1:
+            baseversion = baseversion[0:extra]
+        if baseversion != build_version:
+            print("WARNING: cqlsh was built against {}, but this server is {}.  All features may not work!".format(build_version, baseversion))
 
     @property
     def is_using_utf8(self):
@@ -888,9 +935,9 @@ class Shell(cmd.Cmd):
         # start coverage collection if requested, unless in subshell
         if self.coverage and not self.is_subshell:
             # check for coveragerc file, write it if missing
-            if os.path.exists(HISTORY_DIR):
-                self.coveragerc_path = os.path.join(HISTORY_DIR, '.coveragerc')
-                covdata_path = os.path.join(HISTORY_DIR, '.coverage')
+            if os.path.exists(CQL_DIR):
+                self.coveragerc_path = os.path.join(CQL_DIR, '.coveragerc')
+                covdata_path = os.path.join(CQL_DIR, '.coverage')
                 if not os.path.isfile(self.coveragerc_path):
                     with open(self.coveragerc_path, 'w') as f:
                         f.writelines(["[run]\n",
@@ -958,29 +1005,11 @@ class Shell(cmd.Cmd):
                     self.reset_statement()
                     print('')
 
-    def strip_comment_blocks(self, statementtext):
-        comment_block_in_literal_string = re.search('["].*[/][*].*[*][/].*["]', statementtext)
-        if not comment_block_in_literal_string:
-            result = re.sub('[/][*].*[*][/]', "", statementtext)
-            if '*/' in result and '/*' not in result and not self.in_comment:
-                raise SyntaxError("Encountered comment block terminator without being in comment block")
-            if '/*' in result:
-                result = re.sub('[/][*].*', "", result)
-                self.in_comment = True
-            if '*/' in result:
-                result = re.sub('.*[*][/]', "", result)
-                self.in_comment = False
-            if self.in_comment and not re.findall('[/][*]|[*][/]', statementtext):
-                result = ''
-            return result
-        return statementtext
-
     def onecmd(self, statementtext):
         """
         Returns true if the statement is complete and was handled (meaning it
         can be reset).
         """
-        statementtext = self.strip_comment_blocks(statementtext)
         try:
             statements, endtoken_escaped = cqlruleset.cql_split_statements(statementtext)
         except pylexotron.LexingError as e:
@@ -2525,7 +2554,8 @@ def main(options, hostname, port):
                           config_file=CONFIG_FILE,
                           cred_file=options.credentials,
                           username=options.username,
-                          password=options.password))
+                          password=options.password),
+                      disable_history=options.disable_history)
     except KeyboardInterrupt:
         sys.exit('Connection aborted.')
     except CQL_ERRORS as e:

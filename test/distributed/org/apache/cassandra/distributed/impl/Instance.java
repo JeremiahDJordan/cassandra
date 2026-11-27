@@ -140,7 +140,6 @@ import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.JMXServerUtils;
 import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.MBeanWrapper;
-import org.apache.cassandra.utils.RMIClientSocketFactoryImpl;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.UUIDSerializer;
 import org.apache.cassandra.utils.concurrent.Ref;
@@ -169,8 +168,6 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
     private JMXServerUtils.JmxRegistry registry;
     private RMIJRMPServerImpl jmxRmiServer;
     private MBeanWrapper.InstanceMBeanWrapper wrapper;
-    private RMIClientSocketFactoryImpl clientSocketFactory;
-    private CollectingRMIServerSocketFactoryImpl serverSocketFactory;
     private IsolatedJmx isolatedJmx;
 
     // should never be invoked directly, so that it is instantiated on other class loader;
@@ -660,17 +657,18 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
         initialized = true;
     }
 
-    private void startJmx()
+    private synchronized void startJmx()
     {
         isolatedJmx = new IsolatedJmx(this, inInstancelogger);
         isolatedJmx.startJmx();
     }
 
-    private void stopJmx() throws NoSuchFieldException, InterruptedException, IllegalAccessException
+    private synchronized void stopJmx()
     {
         if (config.has(JMX))
         {
             isolatedJmx.stopJmx();
+            isolatedJmx = null;
         }
     }
 
@@ -815,6 +813,7 @@ public class Instance extends IsolatedExecutor implements IInvokableInstance
 
             error = parallelRun(error, executor,
                     () -> StorageService.instance.setRpcReady(false),
+                    () -> StorageService.instance.setIsShutdownUnsafeForTests(true),
                     CassandraDaemon.getInstanceForTesting()::destroyClientTransports);
 
             if (config.has(GOSSIP) || config.has(NETWORK))

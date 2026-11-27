@@ -230,7 +230,7 @@ public abstract class CQLTester
 
     private static Randomization random;
 
-    protected static final int nativePort;
+    protected static int nativePort;
     protected static final InetAddress nativeAddr;
     protected static final Set<InetAddressAndPort> remoteAddrs = new HashSet<>();
     private static final Map<Pair<User, ProtocolVersion>, Cluster> clusters = new HashMap<>();
@@ -278,7 +278,6 @@ public abstract class CQLTester
         checkProtocolVersion();
 
         nativeAddr = InetAddress.getLoopbackAddress();
-        nativePort = getAutomaticallyAllocatedPort(nativeAddr);
 
         ServerTestUtils.daemonInitialization();
     }
@@ -398,14 +397,21 @@ public abstract class CQLTester
     @BeforeClass
     public static void setUpClass()
     {
+        prePrepareServer();
+
+        // Once per-JVM is enough
+        prepareServer();
+    }
+
+    protected static void prePrepareServer()
+    {
+        System.setProperty("cassandra.superuser_setup_delay_ms", "0");
+
         DatabaseDescriptor.setAutoSnapshot(false);
 
         if (ROW_CACHE_SIZE_IN_MB > 0)
             DatabaseDescriptor.setRowCacheSizeInMB(ROW_CACHE_SIZE_IN_MB);
         StorageService.instance.setPartitionerUnsafe(Murmur3Partitioner.instance);
-
-        // Once per-JVM is enough
-        prepareServer();
     }
 
     @AfterClass
@@ -597,6 +603,7 @@ public abstract class CQLTester
 
     private static void startServer(Consumer<Server.Builder> decorator)
     {
+        nativePort = getAutomaticallyAllocatedPort(nativeAddr);
         Server.Builder serverBuilder = new Server.Builder().withHost(nativeAddr).withPort(nativePort);
         decorator.accept(serverBuilder);
         server = serverBuilder.build();
@@ -2256,7 +2263,7 @@ public abstract class CQLTester
      * @param text the text that the exception message must contains
      * @param e the exception to check
      */
-    private static void assertMessageContains(String text, Exception e)
+    protected static void assertMessageContains(String text, Exception e)
     {
         Assert.assertTrue("Expected error message to contain '" + text + "', but got '" + e.getMessage() + "'",
                 e.getMessage().contains(text));

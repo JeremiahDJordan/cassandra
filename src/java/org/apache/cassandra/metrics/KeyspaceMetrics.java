@@ -161,6 +161,12 @@ public class KeyspaceMetrics
     public final Histogram coordinatorSingleReadSizeWithIndex;
     public final Histogram coordinatorSingleReadSizeWithoutIndex;
     public final Counter deleteRequests;
+    /** Lifetime count of reads for keys outside the node's owned token ranges for this keyspace **/
+    public final Counter outOfRangeTokenReads;
+    /** Lifetime count of writes for keys outside the node's owned token ranges for this keyspace **/
+    public final Counter outOfRangeTokenWrites;
+    /** Lifetime count of paxos requests for keys outside the node's owned token ranges for this keyspace **/
+    public final Counter outOfRangeTokenPaxosRequests;
 
     /*
      * Metrics for inconsistencies detected between repaired data sets across replicas. These
@@ -300,6 +306,10 @@ public class KeyspaceMetrics
         repairedDataTrackingOverreadTime = createKeyspaceTimer("RepairedDataTrackingOverreadTime");
 
         viewSSTableIntervalTree = createLatencyMetrics("ViewSSTableIntervalTree");
+
+        outOfRangeTokenReads = createKeyspaceCounter("ReadOutOfRangeToken");
+        outOfRangeTokenWrites = createKeyspaceCounter("WriteOutOfRangeToken");
+        outOfRangeTokenPaxosRequests = createKeyspaceCounter("PaxosOutOfRangeToken");
     }
 
     /**

@@ -152,6 +152,7 @@ import org.apache.cassandra.utils.Throwables;
 import org.assertj.core.api.Assertions;
 import org.awaitility.Awaitility;
 import org.awaitility.core.ThrowingRunnable;
+import org.hamcrest.Matcher;
 
 import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -742,11 +743,16 @@ public class Util
 
     public static <T> void spinAssertEquals(String message, T expected, Supplier<? extends T> actualSupplier, long timeout, TimeUnit timeUnit)
     {
+        spinAssert(message, equalTo(expected), actualSupplier, timeout, timeUnit);
+    }
+
+    public static <T> void spinAssert(String message, Matcher<T> matcher, Supplier<? extends T> actualSupplier, long timeout, TimeUnit timeUnit)
+    {
         Awaitility.await()
                   .pollInterval(Duration.ofMillis(100))
                   .pollDelay(0, TimeUnit.MILLISECONDS)
                   .atMost(timeout, timeUnit)
-                  .untilAsserted(() -> assertThat(message, actualSupplier.get(), equalTo(expected)));
+                  .untilAsserted(() -> assertThat(message, actualSupplier.get(), matcher));
     }
 
     public static void joinThread(Thread thread) throws InterruptedException
@@ -1175,7 +1181,7 @@ public class Util
 
     /**
      * Setups Gossiper to mimic the upgrade behaviour when {@link Gossiper#isUpgradingFromVersionLowerThan(CassandraVersion)}
-     * or {@link Gossiper#hasMajorVersion3Nodes()} is called.
+     * or {@link Gossiper#hasMajorVersion3OrUnknownNodes()} is called.
      */
     public static void setUpgradeFromVersion(String version)
     {

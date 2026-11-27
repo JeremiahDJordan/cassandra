@@ -34,6 +34,7 @@ import com.datastax.driver.core.exceptions.OperationTimedOutException;
 import org.apache.cassandra.concurrent.Stage;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.utils.FBUtilities;
 
 import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
 
@@ -129,6 +130,6 @@ public abstract class ViewComplexTester extends CQLTester
             Thread.sleep(1);
         }
         if (flush)
-            Keyspace.open(keyspace()).flush(UNIT_TESTS);
+            FBUtilities.waitOnFutures(Keyspace.open(keyspace()).flush(UNIT_TESTS));
     }
 }

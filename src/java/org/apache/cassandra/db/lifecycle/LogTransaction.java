@@ -395,18 +395,14 @@ final class LogTransaction extends AbstractLogTransaction
             {
                 try
                 {
-                    // If we can't successfully delete the DATA component, set the task to be retried later: see TransactionTidier
-                    File datafile = desc.fileFor(Component.DATA);
-
+                    // If we can't successfully delete all components, set the task to be retried later: see TransactionTidier
                     if (logger.isTraceEnabled())
                         logger.trace("Tidier running for old sstable {}", desc.baseFileUri());
 
-                    if (datafile.exists())
-                        delete(datafile);
-                    else if (!wasNew)
+                    if (!desc.fileFor(Component.DATA).exists() && !wasNew)
                         logger.error("SSTableTidier ran with no existing data file for an sstable that was not new");
 
-                    // let the remainder be cleaned up by delete
+                    // delete all components, DATA included, oldest first so the REMOVE record stays valid on partial deletes
                     SSTable.delete(desc, SSTable.discoverComponentsFor(desc));
                 }
                 catch (Throwable t)

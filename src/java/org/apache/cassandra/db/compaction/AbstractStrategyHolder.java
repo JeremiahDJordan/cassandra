@@ -182,6 +182,7 @@ public abstract class AbstractStrategyHolder
         return new GroupedSSTableContainer<>(this);
     }
 
+    public abstract void addSSTable(CompactionSSTable sstable);
     public abstract void addSSTables(GroupedSSTableContainer<CompactionSSTable> sstables);
 
     public abstract void removeSSTables(GroupedSSTableContainer<CompactionSSTable> sstables);

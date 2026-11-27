@@ -43,6 +43,7 @@ import java.util.stream.Stream;
 
 import javax.annotation.concurrent.GuardedBy;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
 import org.slf4j.Logger;
@@ -158,6 +159,7 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
     private final Map<Integer, NetworkTopology.DcAndRack> nodeIdTopology;
     private final Consumer<IInstanceConfig> configUpdater;
     private final int broadcastPort;
+    private final Map<String, Integer> portMap;
 
     // mutated by starting/stopping a node
     private final List<I> instances;
@@ -181,6 +183,7 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         extends org.apache.cassandra.distributed.shared.AbstractBuilder<I, C, B>
     {
         private INodeProvisionStrategy.Strategy nodeProvisionStrategy = INodeProvisionStrategy.Strategy.MultipleNetworkInterfaces;
+        private boolean dynamicPortAllocation = false;
 
         {
             // Indicate that we are running in the in-jvm dtest environment
@@ -198,7 +201,23 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         public B withNodeProvisionStrategy(INodeProvisionStrategy.Strategy nodeProvisionStrategy)
         {
             this.nodeProvisionStrategy = nodeProvisionStrategy;
-            return (B) this;
+            return self();
+        }
+
+        /**
+         * When {@code dynamicPortAllocation} is {@code true}, it will ask {@link INodeProvisionStrategy} to provision
+         * available storage, native and JMX ports in the given interface. When {@code dynamicPortAllocation} is
+         * {@code false} (the default behavior), it will use statically allocated ports based on the number of
+         * interfaces available and the node number.
+         *
+         * @param dynamicPortAllocation {@code true} for dynamic port allocation, {@code false} for static port
+         *                              allocation
+         * @return a reference to this Builder
+         */
+        public B withDynamicPortAllocation(boolean dynamicPortAllocation)
+        {
+            this.dynamicPortAllocation = dynamicPortAllocation;
+            return self();
         }
     }
 
@@ -433,6 +452,7 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         this.filters = new MessageFilters();
         this.instanceInitializer = builder.getInstanceInitializer();
         this.datadirCount = builder.getDatadirCount();
+        this.portMap = builder.dynamicPortAllocation ? new ConcurrentHashMap<>() : null;
 
         int generation = GENERATION.incrementAndGet();
         for (int i = 0; i < builder.getNodeCount(); ++i)
@@ -454,9 +474,10 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
         return createInstanceConfig(size() + 1);
     }
 
-    private InstanceConfig createInstanceConfig(int nodeNum)
+    @VisibleForTesting
+    public InstanceConfig createInstanceConfig(int nodeNum)
     {
-        INodeProvisionStrategy provisionStrategy = nodeProvisionStrategy.create(subnet);
+        INodeProvisionStrategy provisionStrategy = nodeProvisionStrategy.create(subnet, portMap);
         long token = tokenSupplier.token(nodeNum);
         NetworkTopology topology = buildNetworkTopology(provisionStrategy, nodeIdTopology);
         InstanceConfig config = InstanceConfig.generate(nodeNum, provisionStrategy, topology, root, Long.toString(token), datadirCount);
@@ -676,8 +697,13 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
 
     public void schemaChange(String query, boolean ignoreStoppedInstances, I instance)
     {
+        schemaChange(query, ignoreStoppedInstances, instance, SchemaChangeMonitor.DEFAULT_WAIT_SECONDS, TimeUnit.SECONDS);
+    }
+
+    public void schemaChange(String query, boolean ignoreStoppedInstances, I instance, int waitSchemaAgreementAmount, TimeUnit unit)
+    {
         instance.sync(() -> {
-            try (SchemaChangeMonitor monitor = new SchemaChangeMonitor())
+            try (SchemaChangeMonitor monitor = new SchemaChangeMonitor(waitSchemaAgreementAmount, unit))
             {
                 if (ignoreStoppedInstances)
                     monitor.ignoreStoppedInstances();
@@ -789,9 +815,17 @@ public abstract class AbstractCluster<I extends IInstance> implements ICluster<I
      */
     public class SchemaChangeMonitor extends ChangeMonitor
     {
+        // See CASSANDRA-18707
+        static final public int DEFAULT_WAIT_SECONDS = 120;
+
         public SchemaChangeMonitor()
         {
-            super(70, TimeUnit.SECONDS);
+            super(DEFAULT_WAIT_SECONDS, TimeUnit.SECONDS);
+        }
+
+        public SchemaChangeMonitor(int waitAmount, TimeUnit unit)
+        {
+            super(waitAmount, unit);
         }
 
         protected IListen.Cancel startPolling(IInstance instance)

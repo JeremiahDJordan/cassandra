@@ -43,11 +43,11 @@ import org.apache.cassandra.io.util.DataInputBuffer;
 import org.apache.cassandra.io.util.DataInputPlus;
 import org.apache.cassandra.io.util.DataOutputBuffer;
 import org.apache.cassandra.io.util.DataOutputPlus;
-import org.apache.cassandra.io.util.DataOutputStreamPlus;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileInputStreamPlus;
 import org.apache.cassandra.io.util.FileOutputStreamPlus;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.SyncUtil;
 
 import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
 
@@ -305,10 +305,11 @@ public class MetadataSerializer implements IMetadataSerializer
     public void rewriteSSTableMetadata(Descriptor descriptor, Map<MetadataType, MetadataComponent> currentComponents) throws IOException
     {
         File filePath = descriptor.tmpFileFor(Component.STATS);
-        try (DataOutputStreamPlus out = new FileOutputStreamPlus(filePath))
+        try (FileOutputStreamPlus out = new FileOutputStreamPlus(filePath))
         {
             serialize(currentComponents, out, descriptor);
             out.flush();
+            SyncUtil.force(out.getChannel(), true);
         }
         catch (IOException e)
         {
@@ -319,6 +320,7 @@ public class MetadataSerializer implements IMetadataSerializer
         if (FBUtilities.isWindows)
             descriptor.fileFor(Component.STATS).tryDelete();
         filePath.move(descriptor.fileFor(Component.STATS));
+        SyncUtil.trySyncDir(descriptor.directory);
     }
 
     public void updateSSTableMetadata(Descriptor descriptor, Map<MetadataType, MetadataComponent> updatedComponents) throws IOException

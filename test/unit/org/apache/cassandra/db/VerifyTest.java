@@ -29,6 +29,7 @@ import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ThreadLocalRandom;
@@ -351,7 +352,7 @@ public class VerifyTest
 
         try (RandomAccessFile file = new RandomAccessFile(sstable.descriptor.fileFor(Component.DIGEST).toJavaIOFile(), "rw"))
         {
-            Long correctChecksum = Long.valueOf(file.readLine());
+            long correctChecksum = Long.parseLong(Objects.requireNonNull(file.readLine()));
 
             writeChecksum(++correctChecksum, sstable.descriptor.fileFor(Component.DIGEST));
         }
@@ -611,7 +612,7 @@ public class VerifyTest
         Long correctChecksum;
         try (RandomAccessFile file = new RandomAccessFile(sstable.descriptor.fileFor(Component.DIGEST).toJavaIOFile(), "rw"))
         {
-            correctChecksum = Long.parseLong(file.readLine());
+            correctChecksum = Long.parseLong(Objects.requireNonNull(file.readLine()));
         }
         writeChecksum(++correctChecksum, sstable.descriptor.fileFor(Component.DIGEST));
         try (Verifier verifier = new Verifier(cfs, sstable, false, Verifier.options().mutateRepairStatus(false).invokeDiskFailurePolicy(true).build()))
@@ -680,7 +681,7 @@ public class VerifyTest
         Long correctChecksum;
         try (RandomAccessFile file = new RandomAccessFile(sstable.descriptor.fileFor(Component.DIGEST).toJavaIOFile(), "rw"))
         {
-            correctChecksum = Long.parseLong(file.readLine());
+            correctChecksum = Long.parseLong(Objects.requireNonNull(file.readLine()));
         }
         writeChecksum(++correctChecksum, sstable.descriptor.fileFor(Component.DIGEST));
         try (Verifier verifier = new Verifier(cfs, sstable, false, Verifier.options().invokeDiskFailurePolicy(true).mutateRepairStatus(true).build()))
@@ -773,7 +774,7 @@ public class VerifyTest
 
         try (RandomAccessFile file = new RandomAccessFile(sstable.descriptor.fileFor(Component.DIGEST).toJavaIOFile(), "rw"))
         {
-            Long correctChecksum = Long.valueOf(file.readLine());
+            long correctChecksum = Long.parseLong(Objects.requireNonNull(file.readLine()));
 
             writeChecksum(++correctChecksum, sstable.descriptor.fileFor(Component.DIGEST));
         }

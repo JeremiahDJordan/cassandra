@@ -1,5 +1,22 @@
 #!/usr/bin/make -f
-
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+#
 # Uncomment to enable verbose mode.
 #export DH_VERBOSE=1
 
@@ -65,7 +82,7 @@ binary-indep: build install
 	dh_testroot
 	dh_installchangelogs
 	dh_installinit -u'start 50 2 3 4 5 . stop 50 0 1 6 .'
-	dh_installdocs README.asc CHANGES.txt NEWS.txt doc/cql3/CQL.css doc/cql3/CQL.html CASSANDRA-14092.txt
+	dh_installdocs README.asc CHANGES.txt NEWS.txt doc/cql3/CQL.css doc/cql3/CQL.html CASSANDRA-14092.txt .snyk
 	dh_installexamples tools/*.yaml
 	dh_bash-completion
 	dh_compress

@@ -154,14 +154,14 @@ public class GossiperTest
         assertThat(g.getMinVersion()).isEqualTo(new CassandraVersion("3.0.0"));
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.11.0"))).isTrue();
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.0.0"))).isFalse();
-        assertThat(g.hasMajorVersion3Nodes()).isTrue();
+        assertThat(g.hasMajorVersion3OrUnknownNodes()).isTrue();
 
         when(cvp.isUpgradeInProgress()).thenReturn(true);
         when(cvp.getMinClusterVersion()).thenReturn(new CassandraVersion("3.0.0"));
         assertThat(g.getMinVersion()).isEqualTo(new CassandraVersion("3.0.0"));
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.11.0"))).isTrue();
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.0.0"))).isFalse();
-        assertThat(g.hasMajorVersion3Nodes()).isTrue();
+        assertThat(g.hasMajorVersion3OrUnknownNodes()).isTrue();
 
         when(cvp.isUpgradeInProgress()).thenReturn(true);
         when(cvp.getMinClusterVersion()).thenReturn(new CassandraVersion("3.11.0"));
@@ -169,13 +169,13 @@ public class GossiperTest
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.11.0"))).isFalse();
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.0.0"))).isFalse();
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("4.0.0"))).isTrue();
-        assertThat(g.hasMajorVersion3Nodes()).isTrue();
+        assertThat(g.hasMajorVersion3OrUnknownNodes()).isTrue();
 
         when(cvp.isUpgradeInProgress()).thenReturn(true);
         when(cvp.getMinClusterVersion()).thenReturn(new CassandraVersion(CURRENT_VERSION.toString()));
         assertThat(g.getMinVersion()).isEqualTo(CassandraVersion.NULL_VERSION);
         assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.0.0"))).isTrue();
-        assertThat(g.hasMajorVersion3Nodes()).isTrue();
+        assertThat(g.hasMajorVersion3OrUnknownNodes()).isTrue();
     }
 
     @Test
@@ -214,6 +214,62 @@ public class GossiperTest
         setLiveEndpoint("127.0.0.2", "3.0.0");
         assertThat(cvp.getMinClusterVersion()).isEqualTo(new CassandraVersion("3.0.0"));
         assertThat(cvp.isUpgradeInProgress()).isTrue();
+    }
+
+    @Test
+    public void testHasVersion3NodesShouldReturnFalseWhenNoVersion3NodesDetectedAndCassandra4UpgradeInProgress() throws Exception
+    {
+        IClusterVersionProvider cvp = Mockito.mock(IClusterVersionProvider.class);
+        Gossiper g = new Gossiper(false, cvp);
+
+        when(cvp.isUpgradeInProgress()).thenReturn(true);
+        when(cvp.getMinClusterVersion()).thenReturn(new CassandraVersion("4.0.0"));
+        assertThat(g.getMinVersion()).isEqualTo(new CassandraVersion("4.0.0"));
+        assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.0.0"))).isFalse();
+        assertThat(g.hasMajorVersion3OrUnknownNodes()).isFalse();
+    }
+
+    @Test
+    public void testHasVersion3NodesShouldReturnTrueWhenNoVersion3NodesDetectedButNotAllVersionsKnown() throws Exception
+    {
+        Gossiper.instance.start(0);
+        Gossiper.instance.clusterVersionProvider.reset();
+
+        VersionedValue.VersionedValueFactory factory = new VersionedValue.VersionedValueFactory(null);
+        EndpointState es = new EndpointState((HeartBeatState) null);
+        es.addApplicationState(ApplicationState.RELEASE_VERSION, null);
+        Gossiper.instance.endpointStateMap.put(InetAddressAndPort.getByName("127.0.0.3"), es);
+        Gossiper.instance.liveEndpoints.add(InetAddressAndPort.getByName("127.0.0.3"));
+
+        es = new EndpointState((HeartBeatState) null);
+        String previousPatchVersion = String.valueOf(CURRENT_VERSION.major) + '.' + (CURRENT_VERSION.minor) + '.' + Math.max(CURRENT_VERSION.patch - 1, 0);
+        es.addApplicationState(ApplicationState.RELEASE_VERSION, factory.releaseVersion(previousPatchVersion));
+        Gossiper.instance.endpointStateMap.put(InetAddressAndPort.getByName("127.0.0.2"), es);
+        Gossiper.instance.liveEndpoints.add(InetAddressAndPort.getByName("127.0.0.2"));
+        assertTrue(Gossiper.instance.hasMajorVersion3OrUnknownNodes());
+
+        Gossiper.instance.endpointStateMap.remove(InetAddressAndPort.getByName("127.0.0.2"));
+        Gossiper.instance.liveEndpoints.remove(InetAddressAndPort.getByName("127.0.0.2"));
+    }
+
+    @Test
+    public void testAssassinatedNodeWillNotContributeToVersionCalculation() throws Exception
+    {
+        int initialNodeCount = 3;
+        Util.createInitialRing(ss, partitioner, endpointTokens, keyTokens, hosts, hostIds, initialNodeCount);
+        for (int i = 0; i < initialNodeCount; i++)
+        {
+            Gossiper.instance.injectApplicationState(hosts.get(i), ApplicationState.RELEASE_VERSION, new VersionedValue.VersionedValueFactory(null).releaseVersion("4.0.0"));
+        }
+        Gossiper.instance.start(1);
+        Gossiper.instance.clusterVersionProvider.reset();
+
+        // assassinate a non-existing node
+        Gossiper.instance.assassinateEndpoint("127.0.0.4");
+
+        assertTrue(Gossiper.instance.endpointStateMap.containsKey(InetAddressAndPort.getByName("127.0.0.4")));
+        assertFalse(Gossiper.instance.hasMajorVersion3OrUnknownNodes());
+        assertFalse(Gossiper.instance.isUpgradingFromVersionLowerThan(CassandraVersion.CASSANDRA_3_4));
     }
 
     @Test
@@ -303,7 +359,7 @@ public class GossiperTest
             proposedRemoteState = new EndpointState(proposedRemoteHeartBeat);
 
             // Bump the heartbeat version and use the same TOKENS state
-            proposedRemoteHeartBeat.updateHeartBeat();
+            proposedRemoteState.updateHeartBeat();
             proposedRemoteState.addApplicationState(ApplicationState.TOKENS, tokensValue);
 
             // The following state change should only update heartbeat without updating the TOKENS state

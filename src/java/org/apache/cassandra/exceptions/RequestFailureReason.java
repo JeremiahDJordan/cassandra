@@ -43,6 +43,7 @@ public enum RequestFailureReason
     TIMEOUT                  (2),
     INCOMPATIBLE_SCHEMA      (3),
     INDEX_NOT_AVAILABLE      (6), // We match it to Apache Cassandra's INDEX_NOT_AVAILABLE code introduced in 5.0
+    TRUNCATE_FAILED          (12),
     // The following codes are not present in Apache Cassandra's RequestFailureReason
     // We should add new codes in HCD (which do not exist in Apache Cassandra) only with big numbers, to avoid conflicts
     UNKNOWN_COLUMN           (500),
@@ -93,6 +94,7 @@ public enum RequestFailureReason
         exceptionToReasonMap.put(UnknownTableException.class, UNKNOWN_TABLE);
         exceptionToReasonMap.put(IndexBuildInProgressException.class, INDEX_BUILD_IN_PROGRESS);
         exceptionToReasonMap.put(FeatureNeedsIndexRebuildException.class, FEATURE_NEEDS_INDEX_REBUILD);
+        exceptionToReasonMap.put(TruncateException.class, TRUNCATE_FAILED);
 
         if (exceptionToReasonMap.size() != reasons.length-2)
             throw new RuntimeException("A new RequestFailureReasons was probably added and you may need to update the exceptionToReasonMap");

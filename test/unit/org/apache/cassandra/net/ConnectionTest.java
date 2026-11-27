@@ -956,7 +956,7 @@ public class ConnectionTest
 
                 // Simulate disconnect
                 inbound.close().get(10, SECONDS);
-                Awaitility.await().timeout(10, SECONDS).until(() -> !outbound.isConnected());
+                Awaitility.await().atMost(10, SECONDS).until(() -> !outbound.isConnected());
                 MessagingService.instance().removeInbound(endpoint);
                 inbound = new InboundSockets(settings.inbound.apply(new InboundConnectionSettings()));
                 inbound.open().sync();

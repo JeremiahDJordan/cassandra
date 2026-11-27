@@ -34,6 +34,7 @@ import org.apache.cassandra.cql3.functions.UDAggregate;
 import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.exceptions.ConfigurationException;
+import org.apache.cassandra.exceptions.RequestValidationException;
 import org.apache.cassandra.locator.AbstractReplicationStrategy;
 import org.apache.cassandra.schema.UserFunctions.FunctionsDiff;
 import org.apache.cassandra.schema.Tables.TablesDiff;
@@ -51,6 +52,23 @@ import static java.lang.String.format;
  */
 public final class KeyspaceMetadata implements SchemaElement
 {
+    /**
+     * Validates the keyspace name for valid characters and correct length.
+     * Throws an exception if it's invalid.
+     *
+     * @param keyspaceName     The name of the keyspace to validate
+     * @param exceptionBuilder The exception constructor to throw if validation fails
+     */
+    public static <T extends RequestValidationException> void validateKeyspaceName(String keyspaceName, java.util.function.Function<String, T> exceptionBuilder)
+    {
+        if (!SchemaConstants.isValidCharsName(keyspaceName))
+            throw exceptionBuilder.apply(format("Keyspace name must not be empty and must contain alphanumeric or underscore characters only (got \"%s\")",
+                                                keyspaceName));
+        if (keyspaceName.length() > SchemaConstants.NAME_LENGTH)
+            throw exceptionBuilder.apply(format("Keyspace name must not be more than %d characters long (got %d characters for \"%s\")",
+                                                SchemaConstants.NAME_LENGTH, keyspaceName.length(), keyspaceName));
+    }
+
     public enum Kind
     {
         REGULAR, VIRTUAL
@@ -372,16 +390,8 @@ public final class KeyspaceMetadata implements SchemaElement
      */
     public void validate(@Nullable KeyspaceMetadata previous)
     {
-        if (!SchemaConstants.isValidName(name))
-        {
-            throw new ConfigurationException(format("Keyspace name must not be empty, more than %s characters long, "
-                                                    + "or contain non-alphanumeric-underscore characters (got \"%s\")",
-                                                    SchemaConstants.NAME_LENGTH,
-                                                    name));
-        }
-
+        validateKeyspaceName(name, ConfigurationException::new);
         params.validate(name);
-
         for (TableMetadata table : tablesAndViews())
             table.validate(previous == null ? null : previous.getTableOrViewNullable(table.name));
 

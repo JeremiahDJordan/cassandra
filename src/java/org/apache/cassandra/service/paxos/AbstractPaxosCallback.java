@@ -22,10 +22,15 @@ package org.apache.cassandra.service.paxos;
 
 import java.util.concurrent.CountDownLatch;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.WriteType;
+import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.RequestCallback;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.sensors.Context;
@@ -38,6 +43,7 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 
 public abstract class AbstractPaxosCallback<T> implements RequestCallback<T>
 {
+    private static final Logger logger = LoggerFactory.getLogger(AbstractPaxosCallback.class);
     protected final CountDownLatch latch;
     protected final int targets;
     private final TableMetadata metadata;
@@ -91,5 +97,17 @@ public abstract class AbstractPaxosCallback<T> implements RequestCallback<T>
         {
             throw new AssertionError("This latch shouldn't have been interrupted.");
         }
+    }
+
+    @Override
+    public void onFailure(InetAddressAndPort from, RequestFailureReason failureReason)
+    {
+        logger.debug("Received paxos propose/prepare failure response from {} reason {}", from, failureReason);
+    }
+
+    @Override
+    public boolean invokeOnFailure()
+    {
+        return true;
     }
 }

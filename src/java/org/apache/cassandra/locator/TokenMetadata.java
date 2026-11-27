@@ -112,7 +112,7 @@ public class TokenMetadata
 
     // signals replication strategies that nodes have joined or left the ring and they need to recompute ownership
     @GuardedBy("lock")
-    private long ringVersion = 0;
+    private volatile long ringVersion = 0;
 
     public TokenMetadata()
     {
@@ -961,6 +961,14 @@ public class TokenMetadata
         return builder.build();
     }
 
+    @VisibleForTesting
+    public void setPendingRangesUnsafe(String keyspaceName, Multimap<Range<Token>, Replica> rangeMap)
+    {
+        PendingRangeMaps prm = new PendingRangeMaps();
+        rangeMap.entries().forEach(entry -> prm.addPendingRange(entry.getKey(), entry.getValue()));
+        pendingRanges.put(keyspaceName, prm);
+    }
+
      /**
      * Calculate pending ranges according to bootsrapping and leaving nodes. Reasoning is:
      *
@@ -1534,16 +1542,7 @@ public class TokenMetadata
 
     public long getRingVersion()
     {
-        lock.readLock().lock();
-
-        try
-        {
-            return ringVersion;
-        }
-        finally
-        {
-            lock.readLock().unlock();
-        }
+        return ringVersion;
     }
 
     public void invalidateCachedRings()
@@ -1570,6 +1569,12 @@ public class TokenMetadata
     public DecoratedKey decorateKey(ByteBuffer key)
     {
         return partitioner.decorateKey(key);
+    }
+
+    public boolean isTokenInLocalPendingRange(String keyspaceName, Token token)
+    {
+        PendingRangeMaps pending = pendingRanges.get(keyspaceName);
+        return pending == null ? false : pending.isTokenInLocalPendingRange(token);
     }
 
     /**

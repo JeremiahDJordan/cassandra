@@ -30,10 +30,11 @@
     <property environment="env"/>
     <property file="build.properties" />
     <property file="build.properties.default" />
+    <property file="${user.home}/.ant/build.properties"/>
     <property name="debuglevel" value="source,lines,vars"/>
 
     <!-- default version and SCM information -->
-    <property name="base.version" value="4.0.11.0"/>
+    <property name="base.version" value="4.0.22.0"/>
     <property name="scm.connection" value="scm:git:ssh://git@github.com:datastax/cassandra.git"/>
     <property name="scm.developerConnection" value="scm:git:ssh://git@github.com:datastax/cassandra.git"/>
     <property name="scm.url" value="scm:git:ssh://git@github.com:datastax/cassandra.git"/>
@@ -72,6 +73,7 @@
     <property name="test.classlistfile" value="testlist.txt"/>
     <property name="test.classlistprefix" value="unit"/>
     <property name="benchmark.name" value=""/>
+    <property name="jmh.args" value=""/>
     <property name="test.anttasks.src" value="${test.dir}/anttasks"/>
     <property name="test.methods" value=""/>
     <property name="test.anttasks.src" value="${test.dir}/anttasks"/>
@@ -159,6 +161,18 @@
     <property name="jacoco.agent.includes" value="org.apache.cassandra.*:com.datastax.driver.core.PreparedStatementHelper" />
     <property name="jacoco.version" value="0.8.12"/>
 
+    <condition property="isMac" value="true">
+        <os family="mac"/>
+    </condition>
+    <condition property="isLinux" value="true">
+        <and>
+            <os family="unix"/>
+            <not>
+                <os family="mac"/>
+            </not>
+        </and>
+    </condition>
+
     <property name="byteman.version" value="4.0.23"/>
     <property name="jamm.version" value="0.3.2"/>
     <property name="ecj.version" value="3.33.0"/>
@@ -194,6 +208,25 @@
 
     <condition property="cassandra.use_nix_recursive_delete" value="false" else="true">
         <os family="windows" />
+    </condition>
+
+    <condition property="withoutMethods">
+        <and>
+            <equals arg1="${test.methods}" arg2=""/>
+            <not>
+                <contains string="${test.name}" substring="*"/>
+            </not>
+        </and>
+    </condition>
+    <condition property="withMethods">
+        <and>
+            <not>
+                <equals arg1="${test.methods}" arg2=""/>
+            </not>
+            <not>
+                <contains string="${test.name}" substring="*"/>
+            </not>
+        </and>
     </condition>
 
     <!-- Check if all tests are being run or just one (check testclasslist target). If it's all tests don't spam the
@@ -238,6 +271,7 @@
         <string>--add-exports java.management.rmi/com.sun.jmx.remote.internal.rmi=ALL-UNNAMED</string>
         <string>--add-exports java.rmi/sun.rmi.registry=ALL-UNNAMED</string>
         <string>--add-exports java.rmi/sun.rmi.server=ALL-UNNAMED</string>
+        <string>--add-exports java.rmi/sun.rmi.transport=ALL-UNNAMED</string>
         <string>--add-exports java.rmi/sun.rmi.transport.tcp=ALL-UNNAMED</string>
         <string>--add-exports java.sql/java.sql=ALL-UNNAMED</string>
         <string>--add-exports jdk.compiler/com.sun.tools.javac.file=ALL-UNNAMED</string>
@@ -577,7 +611,6 @@
         <dependencyManagement>
           <dependency groupId="org.xerial.snappy" artifactId="snappy-java" version="1.1.10.12"/>
           <dependency groupId="at.yawk.lz4" artifactId="lz4-java" version="1.11.4"/>
-          <dependency groupId="com.ning" artifactId="compress-lzf" version="0.8.4" scope="provided"/>
           <dependency groupId="com.github.luben" artifactId="zstd-jni" version="1.5.7-28"/>
           <dependency groupId="com.google.guava" artifactId="guava" version="33.7.2-jre">
             <exclusion groupId="com.google.code.findbugs" artifactId="jsr305" />
@@ -586,7 +619,7 @@
             <exclusion groupId="org.checkerframework" artifactId="checker-qual" />
             <exclusion groupId="com.google.errorprone" artifactId="error_prone_annotations" />
           </dependency>
-          <dependency groupId="org.hdrhistogram" artifactId="HdrHistogram" version="2.1.9"/>
+          <dependency groupId="org.hdrhistogram" artifactId="HdrHistogram" version="2.1.12"/>
           <dependency groupId="com.dynatrace.hash4j" artifactId="hash4j" version="0.30.0"/>
           <dependency groupId="commons-cli" artifactId="commons-cli" version="1.1"/>
           <dependency groupId="commons-codec" artifactId="commons-codec" version="1.23.0"/>
@@ -622,7 +655,7 @@
           <dependency groupId="com.google.code.java-allocation-instrumenter" artifactId="java-allocation-instrumenter" version="${allocation-instrumenter.version}" scope="test">
             <exclusion groupId="com.google.guava" artifactId="guava"/>
           </dependency>
-          <dependency groupId="org.apache.cassandra" artifactId="dtest-api" version="0.0.15" scope="test"/>
+          <dependency groupId="org.apache.cassandra" artifactId="dtest-api" version="0.0.18" scope="test"/>
           <dependency groupId="org.reflections" artifactId="reflections" version="0.10.2" scope="test"/>
           <dependency groupId="org.apache.hadoop" artifactId="hadoop-core" version="1.0.3" scope="provided">
             <exclusion groupId="org.mortbay.jetty" artifactId="servlet-api"/>
@@ -643,6 +676,8 @@
           <dependency groupId="org.jacoco" artifactId="org.jacoco.agent" version="${jacoco.version}" scope="test"/>
           <dependency groupId="org.jacoco" artifactId="org.jacoco.ant" version="${jacoco.version}" scope="test"/>
 
+          <!-- these dependencies have to be of provided scope as they are used by cassandra-dtests and ccm is looking
+               for these libraries in build/lib/jars -->
           <dependency groupId="org.jboss.byteman" artifactId="byteman-install" version="${byteman.version}" scope="provided"/>
           <dependency groupId="org.jboss.byteman" artifactId="byteman" version="${byteman.version}" scope="provided"/>
           <dependency groupId="org.jboss.byteman" artifactId="byteman-submit" version="${byteman.version}" scope="provided"/>
@@ -699,7 +734,7 @@
             <exclusion groupId="it.unimi.dsi" artifactId="fastutil" />
           </dependency>
           <dependency groupId="com.esri.geometry" artifactId="esri-geometry-api" version="2.2.4"/>
-          <dependency groupId="com.datastax.cassandra" artifactId="cassandra-driver-core" version="3.11.0" classifier="shaded">
+          <dependency groupId="com.datastax.cassandra" artifactId="cassandra-driver-core" version="3.11.5" classifier="shaded">
             <exclusion groupId="io.netty" artifactId="netty-buffer"/>
             <exclusion groupId="io.netty" artifactId="netty-codec"/>
             <exclusion groupId="io.netty" artifactId="netty-handler"/>
@@ -864,7 +899,6 @@
         <dependency groupId="org.xerial.snappy" artifactId="snappy-java"/>
         <dependency groupId="at.yawk.lz4" artifactId="lz4-java"/>
         <dependency groupId="com.dynatrace.hash4j" artifactId="hash4j"/>
-        <dependency groupId="com.ning" artifactId="compress-lzf"/>
         <dependency groupId="com.google.guava" artifactId="guava"/>
         <dependency groupId="commons-cli" artifactId="commons-cli"/>
         <dependency groupId="commons-codec" artifactId="commons-codec"/>
@@ -972,7 +1006,7 @@
     </target>
 
     <!-- create properties file with C version -->
-    <target name="createVersionPropFile">
+    <target name="createVersionPropFile" depends="set-cqlsh-version">
       <taskdef name="propertyfile" classname="org.apache.tools.ant.taskdefs.optional.PropertyFile"/>
       <mkdir dir="${version.properties.dir}"/>
       <propertyfile file="${version.properties.dir}/version.properties">
@@ -1265,6 +1299,7 @@
       <copy todir="${dist.dir}/">
         <fileset dir="${basedir}">
           <include name="*.txt" />
+          <include name=".snyk" />
         </fileset>
       </copy>
       <copy todir="${dist.dir}/tools/bin">
@@ -1479,29 +1514,6 @@
       </checksum>
 
     </target>
-
-  <target name="build-jmh" depends="build-test, jar" description="Create JMH uber jar">
-      <jar jarfile="${build.test.dir}/deps.jar">
-          <zipgroupfileset dir="${test.lib}/jars">
-              <include name="*jmh*.jar"/>
-              <include name="junit*.jar"/>
-              <include name="jopt*.jar"/>
-              <include name="commons*.jar"/>
-              <include name="junit*.jar"/>
-              <include name="hamcrest*.jar"/>
-          </zipgroupfileset>
-          <zipgroupfileset dir="${build.lib}" includes="*.jar"/>
-      </jar>
-      <jar jarfile="${build.test.dir}/benchmarks.jar">
-          <manifest>
-              <attribute name="Main-Class" value="org.openjdk.jmh.Main"/>
-          </manifest>
-          <zipfileset src="${build.test.dir}/deps.jar" excludes="META-INF/*.SF" />
-          <fileset dir="${build.classes.main}"/>
-          <fileset dir="${test.classes}"/>
-          <fileset dir="${test.conf}" />
-      </jar>
-  </target>
 
   <!-- Wrapper of build-test without dependencies, so both that target and its dependencies are skipped if the property
     no-build-test is true. This is meant to be used to run tests without actually building them, provided that they have
@@ -1907,8 +1919,8 @@
   -->
   <target name="long-testsome" depends="maybe-build-test" description="Execute specific long unit tests" >
     <testmacro inputdir="${test.long.src}" timeout="${test.long.timeout}">
-      <test unless:blank="${test.methods}" name="${test.name}" methods="${test.methods}"/>
-      <test if:blank="${test.methods}" name="${test.name}"/>
+      <test if="withMethods" name="${test.name}" methods="${test.methods}" todir="${build.test.dir}/output/" outfile="TEST-${test.name}-${test.methods}"/>
+      <test if="withoutMethods" name="${test.name}" todir="${build.test.dir}/output/" outfile="TEST-${test.name}"/>
       <jvmarg value="-Dcassandra.ring_delay_ms=1000"/>
       <jvmarg value="-Dcassandra.tolerate_sstable_size=true"/>
     </testmacro>
@@ -1920,8 +1932,8 @@
   -->
   <target name="burn-testsome" depends="maybe-build-test" description="Execute specific burn unit tests" >
     <testmacro inputdir="${test.burn.src}" timeout="${test.burn.timeout}">
-      <test unless:blank="${test.methods}" name="${test.name}" methods="${test.methods}"/>
-      <test if:blank="${test.methods}" name="${test.name}"/>
+      <test if="withMethods" name="${test.name}" methods="${test.methods}" todir="${build.test.dir}/output/" outfile="TEST-${test.name}-${test.methods}"/>
+      <test if="withoutMethods" name="${test.name}" todir="${build.test.dir}/output/" outfile="TEST-${test.name}"/>
       <jvmarg value="-Dlogback.configurationFile=test/conf/logback-burntest.xml"/>
     </testmacro>
   </target>
@@ -2327,34 +2339,12 @@
     </testmacro>
   </target>
 
-  <!-- run microbenchmarks suite -->
-  <target name="microbench" depends="build-jmh">
-      <java classname="org.openjdk.jmh.Main"
-            fork="true"
-            failonerror="true">
-          <classpath>
-              <path refid="cassandra.classpath.test" />
-              <pathelement location="${test.classes}"/>
-              <pathelement location="${test.conf}"/>
-              <fileset dir="${test.lib}">
-                  <include name="**/*.jar" />
-              </fileset>
-          </classpath>
-          <arg value="-foe"/>
-          <arg value="true"/>
-          <arg value="-rf"/>
-          <arg value="json"/>
-          <arg value="-rff"/>
-          <arg value="${build.test.dir}/jmh-result.json"/>
-          <arg value="-v"/>
-          <arg value="EXTRA"/>
-          <jvmarg line="${java-jvmargs}"/>
+  <target name="microbench" depends="maybe-build-test">
+    <antcall target="-microbench" inheritrefs="true"/>
+  </target>
 
-          <!-- Broken: ZeroCopyStreamingBench,MutationBench,FastThreadLocalBench  (FIXME) -->
-          <arg value="-e"/><arg value="ZeroCopyStreamingBench|MutationBench|FastThreadLocalBench"/>
-
-          <arg value=".*microbench.*${benchmark.name}"/>
-      </java>
+  <target name="microbench-with-profiler" depends="maybe-build-test">
+    <antcall target="-microbench-with-profiler" inheritrefs="true"/>
   </target>
 
   <!-- run arbitrary mains in tests, for example to run the long running memory tests with lots of memory pressure
@@ -2397,7 +2387,8 @@
     <option name="ADDITIONAL_OPTIONS_STRING" value="--add-exports java.rmi/sun.rmi.registry=ALL-UNNAMED
                                                     --add-exports java.rmi/sun.rmi.transport.tcp=ALL-UNNAMED
                                                     --add-exports java.base/jdk.internal.ref=ALL-UNNAMED
-                                                    --add-exports java.base/sun.nio.ch=ALL-UNNAMED" />
+                                                    --add-exports java.base/sun.nio.ch=ALL-UNNAMED
+                                                    --add-exports java.rmi/sun.rmi.transport=ALL-UNNAMED" />
   </component>
 </project>]]></echo>
   </target>
@@ -2483,6 +2474,7 @@
   <classpathentry kind="src" output="build/test/fqltool-classes" path="tools/fqltool/test/unit" />
   <classpathentry kind="con" path="org.eclipse.jdt.launching.JRE_CONTAINER"/>
   <classpathentry kind="output" path="build/classes/eclipse"/>
+  <classpathentry kind="lib" path="${build.classes.main}"/>
   <classpathentry kind="lib" path="test/conf"/>
   <classpathentry kind="lib" path="${java.home}/../lib/tools.jar"/>
   ${eclipse-libs-list}
@@ -2649,4 +2641,6 @@
   <import file="${basedir}/.build/build-resolver.xml"/>
   <import file="${basedir}/.build/build-rat.xml"/>
   <import file="${basedir}/.build/build-owasp.xml"/>
+  <import file="${basedir}/.build/build-cqlsh.xml"/>
+  <import file="${basedir}/.build/build-bench.xml"/>
 </project>

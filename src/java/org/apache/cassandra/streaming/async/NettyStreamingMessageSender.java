@@ -89,7 +89,7 @@ public class NettyStreamingMessageSender implements StreamingMessageSender
     private static final long DEFAULT_CLOSE_WAIT_IN_MILLIS = TimeUnit.MINUTES.toMillis(5);
 
     // a simple mechansim for allowing a degree of fairnes across multiple sessions
-    private static final Semaphore fileTransferSemaphore = new Semaphore(DEFAULT_MAX_PARALLEL_TRANSFERS, true);
+    private static final Semaphore fileTransferSemaphore = new Semaphore(MAX_PARALLEL_TRANSFERS, true);
 
     private final StreamSession session;
     private final boolean isPreview;
@@ -293,7 +293,7 @@ public class NettyStreamingMessageSender implements StreamingMessageSender
      * @return null if the message was processed sucessfully; else, a {@link java.util.concurrent.Future} to indicate
      * the status of aborting any remaining tasks in the session.
      */
-    java.util.concurrent.Future onControlMessageComplete(Future<?> future, StreamMessage msg)
+    java.util.concurrent.Future<?> onControlMessageComplete(Future<?> future, StreamMessage msg)
     {
         ChannelFuture channelFuture = (ChannelFuture)future;
         Throwable cause = future.cause();

@@ -115,11 +115,19 @@ public abstract class AbstractReplicationStrategy
         return endpoints;
     }
 
-    public Replica getLocalReplicaFor(RingPosition<?> searchPosition)
+    /**
+     * Check if the token is in a naturally replicated range or pending range
+     * @param token the position to check
+     * @return true if the token is in a natural or pending locally replicationed range, false otherwise
+     */
+    public boolean isTokenInLocalNaturalOrPendingRange(Token token)
     {
-        return getNaturalReplicas(searchPosition)
-               .byEndpoint()
-               .get(FBUtilities.getBroadcastAddressAndPort());
+        return getLocalReplicaFor(token) != null || tokenMetadata.isTokenInLocalPendingRange(keyspaceName, token);
+    }
+
+    public Replica getLocalReplicaFor(Token searchPosition)
+    {
+        return getNaturalReplicas(searchPosition).byEndpoint().get(FBUtilities.getBroadcastAddressAndPort());
     }
 
     /**
@@ -442,11 +450,11 @@ public abstract class AbstractReplicationStrategy
         if ("org.apache.cassandra.locator.OldNetworkTopologyStrategy".equals(className)) // see CASSANDRA-16301 
             throw new ConfigurationException("The support for the OldNetworkTopologyStrategy has been removed in C* version 4.0. The keyspace strategy should be switch to NetworkTopologyStrategy");
 
-        Class<AbstractReplicationStrategy> strategyClass = FBUtilities.classForName(className, "replication strategy");
-        if (!AbstractReplicationStrategy.class.isAssignableFrom(strategyClass))
-        {
-            throw new ConfigurationException(String.format("Specified replication strategy class (%s) is not derived from AbstractReplicationStrategy", className));
-        }
+        @SuppressWarnings("unchecked")
+        Class<AbstractReplicationStrategy> strategyClass =
+            (Class<AbstractReplicationStrategy>) FBUtilities.classForNameWithoutInitialization(className,
+                                                                                             "replication strategy",
+                                                                                             AbstractReplicationStrategy.class);
         return strategyClass;
     }
 

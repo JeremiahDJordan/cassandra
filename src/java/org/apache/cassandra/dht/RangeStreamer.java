@@ -330,8 +330,8 @@ public class RangeStreamer
             logger.info("{}: range {} exists on {} for keyspace {}", description, entry.getKey(), entry.getValue(), keyspaceName);
 
         Multimap<InetAddressAndPort, FetchReplica> workMap;
-        //Only use the optimized strategy if we don't care about strict sources, have a replication factor > 1, no
-        //transient replicas or HCD-84
+        //Only use the optimized strategy if we don't care about strict sources, have a replication factor > 1, and no
+        //transient replicas or it is intentionally skipped.
         if (CassandraRelevantProperties.SKIP_OPTIMAL_STREAMING_CANDIDATES_CALCULATION.getBoolean() ||
             useStrictSource ||
             strat == null ||

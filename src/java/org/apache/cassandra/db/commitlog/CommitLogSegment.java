@@ -45,6 +45,7 @@ import org.apache.cassandra.schema.TableId;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.INativeLibrary;
 import org.apache.cassandra.utils.IntegerInterval;
+import org.apache.cassandra.utils.SyncUtil;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.concurrent.WaitQueue;
 
@@ -57,7 +58,7 @@ import static org.apache.cassandra.utils.FBUtilities.updateChecksumInt;
  */
 public abstract class CommitLogSegment
 {
-    private CDCState cdcState = CDCState.PERMITTED;
+    private volatile CDCState cdcState = CDCState.PERMITTED;
     public enum CDCState
     {
         PERMITTED,
@@ -171,6 +172,7 @@ public abstract class CommitLogSegment
             throw new FSWriteError(e, logFile);
         }
 
+        SyncUtil.trySyncDir(logFile.parent());
         buffer = createBuffer(commitLog);
     }
 

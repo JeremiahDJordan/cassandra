@@ -22,7 +22,6 @@ package org.apache.cassandra.service.paxos;
 import java.util.Set;
 
 import org.apache.cassandra.concurrent.ExecutorLocals;
-import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.sensors.SensorsCustomParams;
@@ -31,7 +30,7 @@ import org.apache.cassandra.sensors.RequestSensors;
 import org.apache.cassandra.sensors.SensorsFactory;
 import org.apache.cassandra.sensors.Type;
 
-public class PrepareVerbHandler implements IVerbHandler<Commit>
+public class PrepareVerbHandler extends AbstractPaxosVerbHandler
 {
     public static PrepareVerbHandler instance = new PrepareVerbHandler();
 
@@ -40,7 +39,8 @@ public class PrepareVerbHandler implements IVerbHandler<Commit>
         return PaxosState.prepare(toPrepare);
     }
 
-    public void doVerb(Message<Commit> message)
+    @Override
+    public void processMessage(Message<Commit> message)
     {
         // Initialize the sensor and set ExecutorLocals
         RequestSensors sensors = SensorsFactory.instance.createRequestSensors(Set.of(message.payload.update.metadata().keyspace));

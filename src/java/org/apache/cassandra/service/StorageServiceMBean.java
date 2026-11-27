@@ -788,6 +788,19 @@ public interface StorageServiceMBean extends NotificationEmitter
     /** Sets the hinted handoff throttle in kb per second, per delivery thread. */
     public void setHintedHandoffThrottleInKB(int throttleInKB);
 
+    public boolean getTransferHintsOnDecommission();
+    public void setTransferHintsOnDecommission(boolean enabled);
+
+    /** Returns whether we are using the creation time of the mutation for determining hint ttl **/
+    public boolean isHintTtlUseMutationCreationTime();
+    /** Sets whether we are using the creation time of the mutation for determining hint ttl **/
+    public void setUseCreationTimeForHintTtl(boolean enabled);
+
+    /** Returns upper bound on the hint ttl **/
+    public int getMaxHintTTL();
+    /** Sets the upper bound on the hint ttl **/
+    public void setMaxHintTTL(int maxHintTTL);
+
     /**
      * Resume bootstrap streaming when there is failed data streaming.
      *
@@ -881,4 +894,22 @@ public interface StorageServiceMBean extends NotificationEmitter
 
     public Long getRepairRpcTimeout();
     public void setRepairRpcTimeout(Long timeoutInMillis);
+
+    /**
+     * Toggles to turn on the logging or rejection of operations for token ranges that the node does not own,
+     * or is not about to acquire.
+     */
+    boolean isOutOfTokenRangeRequestLoggingEnabled();
+    void setOutOfTokenRangeRequestLoggingEnabled(boolean enabled);
+
+    boolean isOutOfTokenRangeRequestRejectionEnabled();
+    void setOutOfTokenRangeRequestRejectionEnabled(boolean enabled);
+
+    /**
+     * Get the per-keyspace counts of operations that the node has received for tokens outside
+     * its owned ranges. Represented as a {@code Map<String, long[]>}, keys are keyspace names and the
+     * values are the counts for read, write and paxos ops respectivly.
+     * e.g. keyspace_name -> [reads, writes, paxos].
+     */
+    Map<String, long[]> getOutOfRangeOperationCounts();
 }

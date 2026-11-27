@@ -19,8 +19,11 @@
 package org.apache.cassandra.transport;
 
 import java.io.IOException;
+import java.net.SocketAddress;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+
+import javax.net.ssl.SSLException;
 
 import com.google.common.base.Predicate;
 import com.google.common.collect.ImmutableSet;
@@ -90,7 +93,7 @@ public class ExceptionHandlers
                 }
             }
 
-            logClientNetworkingExceptions(cause);
+            logClientNetworkingExceptions(cause, ctx.channel().remoteAddress());
         }
 
         private static boolean isFatal(Throwable cause)
@@ -100,7 +103,7 @@ public class ExceptionHandlers
         }
     }
 
-    static void logClientNetworkingExceptions(Throwable cause)
+    static void logClientNetworkingExceptions(Throwable cause, SocketAddress clientAddress)
     {
         if (Throwables.anyCauseMatches(cause, t -> t instanceof ProtocolException))
         {
@@ -119,14 +122,18 @@ public class ExceptionHandlers
             NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, cause.getMessage());
         }
         else if (Throwables.anyCauseMatches(cause, t -> t instanceof Errors.NativeIoException))
-            {
-                ClientMetrics.instance.markUnknownException();
-                logger.trace("Native exception in client networking", cause);
-            }
-            else
         {
             ClientMetrics.instance.markUnknownException();
-            logger.warn("Unknown exception in client networking", cause);
+            logger.trace("Native exception in client networking", cause);
+        }
+        else if (Throwables.anyCauseMatches(cause, t -> t instanceof SSLException))
+        {
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, 1, TimeUnit.MINUTES, "SSLException in client networking with peer {} {}", clientAddress, cause.getMessage());
+        }
+        else
+        {
+            ClientMetrics.instance.markUnknownException();
+            logger.warn("Unknown exception in client networking with peer {} {}", clientAddress, cause.getMessage());
         }
     }
 

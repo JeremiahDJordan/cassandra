@@ -78,6 +78,7 @@ public class AuditLoggerAuthTest
         });
 
         System.setProperty("cassandra.superuser_setup_delay_ms", "0");
+        CassandraRoleManager.updatePasswordUpdateMinInterval(0);
         embedded = ServerTestUtils.startEmbeddedCassandraService();
 
         executeWithCredentials(

@@ -35,6 +35,7 @@ import org.apache.cassandra.cql3.statements.RawKeyspaceAwareStatement;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget.Type;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.marshal.MapType;
+import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.guardrails.Guardrails;
 import org.apache.cassandra.guardrails.Threshold;
@@ -97,7 +98,7 @@ public final class CreateIndexStatement extends AlterSchemaStatement
         // Check the length of a valid index name.
         // Non-valid indexes are validated in IndexMetadata#validate.
         if (!state.getClientState().isInternal
-            && SchemaConstants.isValidName(indexName, true)
+            && SchemaConstants.isValidCharsName(indexName)
             && indexName.length() > SchemaConstants.INDEX_NAME_LENGTH)
 
             throw ire("Index name shouldn't be more than %s characters long (got %s chars for %s)",
@@ -239,6 +240,8 @@ public final class CreateIndexStatement extends AlterSchemaStatement
         if (null == column)
             throw ire("Column '%s' doesn't exist", target.column);
 
+        AbstractType<?> baseType = column.type.unwrap();
+
         if (column.type.referencesDuration())
         {
             if (column.type.isCollection())
@@ -265,17 +268,17 @@ public final class CreateIndexStatement extends AlterSchemaStatement
         if (column.isPartitionKey() && table.partitionKeyColumns().size() == 1)
             throw ire("Cannot create secondary index on the only partition key column %s", column);
 
-        if (column.type.isCollection() && !column.type.isMultiCell() && target.type != Type.FULL)
+        if (baseType.isCollection() && !baseType.isMultiCell() && target.type != Type.FULL)
             throw ire("Cannot create %s() index on frozen column %s. Frozen collections are immutable and must be fully " +
                       "indexed by using the 'full(%s)' modifier", target.type, column, column);
 
-        if ((!column.type.isCollection() || column.type.isMultiCell()) && target.type == Type.FULL)
+        if ((!baseType.isCollection() || baseType.isMultiCell()) && target.type == Type.FULL)
             throw ire("full() indexes can only be created on frozen collections");
 
-        if (!column.type.isCollection() && target.type != Type.SIMPLE)
+        if (!baseType.isCollection() && target.type != Type.SIMPLE)
             throw ire("Cannot create %s() index on %s. Non-collection columns only support simple indexes", target.type, column);
 
-        if (!(column.type instanceof MapType && column.type.isMultiCell()) && (target.type == Type.KEYS || target.type == Type.KEYS_AND_VALUES))
+        if (!(baseType instanceof MapType && column.type.isMultiCell()) && (target.type == Type.KEYS || target.type == Type.KEYS_AND_VALUES))
             throw ire("Cannot create index on %s of column %s with non-map type", target.type, column);
 
         if (column.type.isUDT() && column.type.isMultiCell())

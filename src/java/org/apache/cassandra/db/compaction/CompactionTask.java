@@ -19,6 +19,7 @@ package org.apache.cassandra.db.compaction;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
@@ -43,15 +44,22 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.Directories;
+import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.compaction.unified.UnifiedCompactionTask;
 import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
 import org.apache.cassandra.db.compaction.writers.DefaultCompactionWriter;
 import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
+import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.ScannerList;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
@@ -59,6 +67,7 @@ import org.apache.cassandra.schema.CompactionParams;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.ActiveRepairService;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.cassandra.utils.concurrent.Refs;
 
@@ -287,6 +296,13 @@ public class CompactionTask extends AbstractCompactionTask
     private CompactionOperation createCompactionOperation(CompactionController controller, CompactionStrategy strategy)
     {
         Set<CompactionSSTable> fullyExpiredSSTables = controller.getFullyExpiredSSTables();
+        maybeNotifyIndexersAboutRowsInFullyExpiredSSTables(fullyExpiredSSTables);
+
+        if (!fullyExpiredSSTables.isEmpty())
+        {
+            logger.debug("Compaction {} dropping expired sstables: {}", transaction.opId().toString(), fullyExpiredSSTables);
+            fullyExpiredSSTables.forEach(reader -> { if (reader instanceof SSTableReader) transaction.obsolete((SSTableReader) reader); });
+        }
         Set<SSTableReader> actuallyCompact = new HashSet<>(inputSSTables());
         actuallyCompact.removeAll(fullyExpiredSSTables);
         // select SSTables to compact based on available disk space.
@@ -1200,5 +1216,93 @@ public class CompactionTask extends AbstractCompactionTask
                      totalKeysWritten,
                      estimatedKeys,
                      ((double) (totalKeysWritten - estimatedKeys) / totalKeysWritten));
+    }
+
+    private void maybeNotifyIndexersAboutRowsInFullyExpiredSSTables(Set<CompactionSSTable> fullyExpiredSSTables)
+    {
+        if (fullyExpiredSSTables.isEmpty())
+            return;
+
+        List<Index> indexes = new ArrayList<>();
+        for (Index index : realm.getIndexManager().listIndexes())
+        {
+            if (index.notifyIndexerAboutRowsInFullyExpiredSSTables())
+                indexes.add(index);
+        }
+
+        if (indexes.isEmpty())
+            return;
+
+        for (CompactionSSTable expiredSSTable : fullyExpiredSSTables)
+        {
+            if (!(expiredSSTable instanceof SSTableReader))
+                continue;
+
+            // Notifying indexers is best-effort: the SSTable is fully expired and is going to be obsoleted regardless.
+            // A read error (e.g. a corrupt SSTable that is fully expired) or a failure in a custom indexer must not
+            // silently leave the SSTable undropped, or every subsequent compaction would hit the same failure, leaving
+            // the expired SSTables permanently stuck.
+            try (ISSTableScanner scanner = ((SSTableReader) expiredSSTable).getScanner())
+            {
+                while (scanner.hasNext())
+                {
+                    try (UnfilteredRowIterator partition = scanner.next();
+                         WriteContext ctx = Keyspace.open(realm.getKeyspaceName()).getWriteHandler().createContextForIndexing())
+                    {
+                        List<Index.Indexer> indexers = new ArrayList<>();
+                        for (int i = 0; i < indexes.size(); i++)
+                        {
+                            Index.Indexer indexer = indexes.get(i).indexerFor(partition.partitionKey(),
+                                                                              partition.columns(),
+                                                                              FBUtilities.nowInSeconds(),
+                                                                              ctx,
+                                                                              IndexTransaction.Type.COMPACTION,
+                                                                              null);
+
+                            if (indexer != null)
+                                indexers.add(indexer);
+                        }
+
+                        if (!indexers.isEmpty())
+                        {
+                            for (Index.Indexer indexer : indexers)
+                                indexer.begin();
+
+                            try
+                            {
+                                Row staticRow = partition.staticRow();
+                                if (!staticRow.isEmpty())
+                                {
+                                    for (Index.Indexer indexer : indexers)
+                                        indexer.removeRow(staticRow);
+                                }
+
+                                while (partition.hasNext())
+                                {
+                                    Unfiltered unfiltered = partition.next();
+                                    if (unfiltered instanceof Row)
+                                    {
+                                        for (Index.Indexer indexer : indexers)
+                                            indexer.removeRow((Row) unfiltered);
+                                    }
+                                }
+                            }
+                            finally
+                            {
+                                for (Index.Indexer indexer : indexers)
+                                    indexer.finish();
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Throwable t)
+            {
+                JVMStabilityInspector.inspectThrowable(t);
+                logger.warn("Failed to notify secondary indexes about rows in fully expired SSTable {} during compaction {}; " +
+                            "the SSTable will still be dropped, but index cleanup for it may be incomplete.",
+                            expiredSSTable, transaction.opId(), t);
+            }
+        }
     }
 }

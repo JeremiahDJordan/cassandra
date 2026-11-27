@@ -370,7 +370,7 @@ public class DatabaseDescriptor
         String loaderClass = System.getProperty(Config.PROPERTY_PREFIX + "config.loader");
         ConfigurationLoader loader = loaderClass == null
                                      ? new YamlConfigurationLoader()
-                                     : FBUtilities.construct(loaderClass, "configuration loading");
+                                     : FBUtilities.construct(loaderClass, "configuration loading", ConfigurationLoader.class);
             config = loader.loadConfig();
         }
 
@@ -1169,8 +1169,9 @@ public class DatabaseDescriptor
         }
         try
         {
-            Class<?> seedProviderClass = Class.forName(conf.seed_provider.class_name);
-            seedProvider = (SeedProvider)seedProviderClass.getConstructor(Map.class).newInstance(conf.seed_provider.parameters);
+            Class<? extends SeedProvider> seedProviderClass =
+                FBUtilities.classForNameWithoutInitialization(conf.seed_provider.class_name, "seed provider", SeedProvider.class);
+            seedProvider = seedProviderClass.getConstructor(Map.class).newInstance(conf.seed_provider.parameters);
         }
         // there are about 5 checked exceptions that could be thrown here.
         catch (Exception e)
@@ -1346,7 +1347,7 @@ public class DatabaseDescriptor
     {
         if (!snitchClassName.contains("."))
             snitchClassName = "org.apache.cassandra.locator." + snitchClassName;
-        IEndpointSnitch snitch = FBUtilities.construct(snitchClassName, "snitch");
+        IEndpointSnitch snitch = FBUtilities.construct(snitchClassName, "snitch", IEndpointSnitch.class);
         return dynamic ? new DynamicEndpointSnitch(snitch) : snitch;
     }
 
@@ -2418,6 +2419,22 @@ public class DatabaseDescriptor
         conf.native_transport_max_threads = max_threads;
     }
 
+    public static Integer getNativeTransportMaxAuthThreads()
+    {
+        return conf.native_transport_max_auth_threads;
+    }
+
+    /**
+     * If this value is set to <= 0 it will move auth requests to the standard request pool regardless of the current
+     * size of the authExecutor in {@link org.apache.cassandra.transport.Dispatcher}'s active size.
+     *
+     * see {@link org.apache.cassandra.transport.Dispatcher#dispatch} for executor selection
+     */
+    public static void setNativeTransportMaxAuthThreads(int threads)
+    {
+        conf.native_transport_max_auth_threads = threads;
+    }
+
     public static int getNativeTransportMaxFrameSize()
     {
         return (int) ByteUnit.MEBI_BYTES.toBytes(conf.native_transport_max_frame_size_in_mb);
@@ -2803,6 +2820,26 @@ public class DatabaseDescriptor
         conf.hints_compression = parameterizedClass;
     }
 
+    public static boolean getTransferHintsOnDecommission()
+    {
+        return conf.transfer_hints_on_decommission;
+    }
+
+    public static void setTransferHintsOnDecommission(boolean enabled)
+    {
+        conf.transfer_hints_on_decommission = enabled;
+    }
+
+    public static boolean isUseCreationTimeForHintTtl()
+    {
+        return conf.use_creation_time_for_hint_ttl;
+    }
+
+    public static void setUseCreationTimeForHintTtl(boolean enabled)
+    {
+        conf.use_creation_time_for_hint_ttl = enabled;
+    }
+
     public static boolean isIncrementalBackupsEnabled()
     {
         return conf.incremental_backups;
@@ -3051,6 +3088,17 @@ public class DatabaseDescriptor
     {
         return conf.stream_entire_sstables;
     }
+
+    public static boolean getEntireSSTableStreamDigestValidationEnabled()
+    {
+        return conf.entire_sstable_stream_digest_validation_enabled;
+    }
+
+    public static void setEntireSSTableStreamDigestValidationEnabled(boolean value)
+    {
+        conf.entire_sstable_stream_digest_validation_enabled = value;
+    }
+
 
     public static String getLocalDataCenter()
     {
@@ -3676,6 +3724,26 @@ public class DatabaseDescriptor
     public static void setConsecutiveMessageErrorsThreshold(int value)
     {
         conf.consecutive_message_errors_threshold = value;
+    }
+
+    public static boolean getLogOutOfTokenRangeRequests()
+    {
+        return conf.log_out_of_token_range_requests;
+    }
+
+    public static void setLogOutOfTokenRangeRequests(boolean enabled)
+    {
+        conf.log_out_of_token_range_requests = enabled;
+    }
+
+    public static boolean getRejectOutOfTokenRangeRequests()
+    {
+        return conf.reject_out_of_token_range_requests;
+    }
+
+    public static void setRejectOutOfTokenRangeRequests(boolean enabled)
+    {
+        conf.reject_out_of_token_range_requests = enabled;
     }
 
     public static boolean getForceNewPreparedStatementBehaviour()

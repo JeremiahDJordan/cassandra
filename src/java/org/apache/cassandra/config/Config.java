@@ -208,6 +208,8 @@ public class Config
     public Integer native_transport_port_ssl = null;
     public int native_transport_max_threads = 128;
     public int native_transport_max_frame_size_in_mb = 256;
+    /** do bcrypt hashing in a limited pool to prevent cpu load spikes; 0 means that all requests will go to default request executor**/
+    public int native_transport_max_auth_threads = 0;
     public volatile long native_transport_max_concurrent_connections = -1L;
     public volatile long native_transport_max_concurrent_connections_per_ip = -1L;
     public boolean native_transport_flush_in_batches_legacy = false;
@@ -335,6 +337,8 @@ public class Config
     public int max_hints_file_size_in_mb = 128;
     public int max_total_hints_size_in_mb = -1; // negative value means unlimited
     public ParameterizedClass hints_compression;
+    public volatile boolean transfer_hints_on_decommission = true;
+    public volatile boolean use_creation_time_for_hint_ttl = true;
 
     public volatile boolean incremental_backups = false;
     public boolean trickle_fsync = true;
@@ -535,6 +539,12 @@ public class Config
     public boolean stream_entire_sstables = true;
     public boolean netty_zerocopy_enabled = true;
 
+    /**
+     * When receiving a zero-copy stream, validate Digest.crc32 before the sstable is made visible.
+     */
+    public volatile boolean entire_sstable_stream_digest_validation_enabled = false;
+
+
     public volatile AuditLogOptions audit_logging_options = new AuditLogOptions();
     public volatile FullQueryLoggerOptions full_query_logging_options = new FullQueryLoggerOptions();
 
@@ -579,6 +589,13 @@ public class Config
     public boolean hcd_guardrail_defaults = false;
 
     public GuardrailsConfig guardrails = new GuardrailsConfig();
+
+    /*
+     * Toggles to turn on the logging or rejection of operations for token ranges that the node does not own,
+     * or is not about to acquire.
+     */
+    public volatile boolean log_out_of_token_range_requests = true;
+    public volatile boolean reject_out_of_token_range_requests = true;
 
     /**
      * The intial capacity for creating RangeTombstoneList.

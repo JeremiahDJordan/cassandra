@@ -32,6 +32,7 @@ import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.INativeLibrary;
+import org.apache.cassandra.utils.SyncUtil;
 
 /**
  * Because a column family may have sstables on different disks and disks can
@@ -122,7 +123,7 @@ final class LogReplica implements AutoCloseable
         try
         {
             if (directoryDescriptor >= 0)
-                INativeLibrary.instance.trySync(directoryDescriptor);
+                SyncUtil.trySync(directoryDescriptor);
         }
         catch (FSError e)
         {

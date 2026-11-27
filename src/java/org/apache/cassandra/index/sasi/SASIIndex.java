@@ -187,6 +187,12 @@ public class SASIIndex implements Index, INotificationConsumer
     }
 
     @Override
+    public boolean notifyIndexerAboutRowsInFullyExpiredSSTables()
+    {
+        return false;
+    }
+
+    @Override
     public Searcher searcherFor(ReadCommand command) throws InvalidRequestException
     {
         throw new UnsupportedOperationException(getUnsupportedMessage());

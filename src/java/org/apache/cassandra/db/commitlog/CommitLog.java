@@ -89,7 +89,7 @@ public class CommitLog implements CommitLogMBean
 
     private final BiPredicate<File, String> unmanagedFilesFilter = (dir, name) -> CommitLogDescriptor.isValid(name) && segmentManager.shouldReplay(name);
 
-    public final CommitLogArchiver archiver;
+    public volatile CommitLogArchiver archiver;
     public final CommitLogMetrics metrics;
     final AbstractCommitLogService executor;
     private Set<String> segmentsWithInvalidMutations;
@@ -485,13 +485,19 @@ public class CommitLog implements CommitLogMBean
     @Override
     public long getRestorePointInTime()
     {
-        return archiver.restorePointInTime;
+        return archiver.restorePointInTimeInMicroseconds;
     }
 
     @Override
     public String getRestorePrecision()
     {
         return archiver.precision.toString();
+    }
+
+    @VisibleForTesting
+    public void setCommitlogArchiver(CommitLogArchiver archiver)
+    {
+        this.archiver = archiver;
     }
 
     public List<String> getActiveSegmentNames()

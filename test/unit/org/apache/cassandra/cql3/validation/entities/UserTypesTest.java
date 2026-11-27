@@ -204,6 +204,11 @@ public class UserTypesTest extends CQLTester
         String myType2 = KEYSPACE + '.' + typename2;
         assertInvalidMessage("for column v: non-frozen collections are only supported at top-level",
                 "CREATE TABLE " + KEYSPACE + ".wrong (k int PRIMARY KEY, v " + myType2 + ")");
+
+        String userType = createType("CREATE TYPE %s (userids SET<UUID>)");
+        createTable("CREATE TABLE %s (id int PRIMARY KEY)");
+        assertInvalidMessage("Non-frozen UDTs with nested non-frozen collections are not supported for column my_type",
+                             "alter TABLE %s add my_type " + userType);
     }
 
     @Test
@@ -586,6 +591,20 @@ public class UserTypesTest extends CQLTester
 
         // TODO: deserialize the value here and check it 's right.
         execute("SELECT addresses FROM %s WHERE id = ? ", userID_1);
+    }
+
+    @Test
+    public void testCreateTypeWithUndesiredFieldType() throws Throwable
+    {
+        String typeName = createTypeName();
+        assertInvalidMessage("A user type cannot contain counters", "CREATE TYPE " + typeWithKs(typeName) + " (f counter)");
+    }
+
+    @Test
+    public void testAlterTypeWithUndesiredFieldType() throws Throwable
+    {
+        String typeName = createType("CREATE TYPE %s (a int)");
+        assertInvalidMessage("A user type cannot contain counters", "ALTER TYPE " + typeWithKs(typeName) + " ADD f counter");
     }
 
     /**

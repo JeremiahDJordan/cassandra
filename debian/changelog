@@ -1,3 +1,69 @@
+cassandra (4.0.22) UNRELEASED; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Tue, 28 Jul 2026 11:37:54 +0200
+
+cassandra (4.0.21) unstable; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Tue, 28 Jul 2026 11:37:54 +0200
+
+cassandra (4.0.20) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Tue, 17 Mar 2026 23:39:26 +0100
+
+cassandra (4.0.19) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Tue, 14 Oct 2025 21:13:44 +0200
+
+cassandra (4.0.18) unstable; urgency=medium
+
+  * New release
+
+ -- Brandon Williams <brandonwilliams@apache.org>  Thu, 22 May 2025 06:35:42 -0500
+
+cassandra (4.0.17) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Thu, 06 Feb 2025 10:44:49 +0100
+
+cassandra (4.0.16) unstable; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Mon, 27 Jan 2025 12:37:18 +0100
+
+cassandra (4.0.15) unstable; urgency=medium
+
+  * New release
+
+ -- Brandon Williams <brandonwilliams@apache.org>  Wed, 13 Nov 2024 12:49:46 -0600
+
+cassandra (4.0.14) unstable; urgency=medium
+
+  * New release
+
+ -- Mick Semb Wever <mck@apache.org>  Wed, 18 Sep 2024 11:12:58 +0200
+
+cassandra (4.0.13) unstable; urgency=medium
+
+  * New release
+
+ -- Brandon Williams <brandonwilliams@apache.org>  Thu, 02 May 2024 09:51:49 -0500
+
+cassandra (4.0.12) unstable; urgency=medium
+
+  * New release
+
+ -- Stefan Miklosovic <smiklosovic@apache.org>  Wed, 17 Jan 2024 12:02:18 +0100
+
 cassandra (4.0.11) unstable; urgency=medium
 
   * New release

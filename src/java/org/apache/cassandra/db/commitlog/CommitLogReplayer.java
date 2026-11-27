@@ -108,7 +108,7 @@ public class CommitLogReplayer implements CommitLogReadHandler
     private long pendingMutationBytes = 0;
 
     private final ReplayFilter replayFilter;
-    private final CommitLogArchiver archiver;
+    private CommitLogArchiver archiver;
 
     @VisibleForTesting
     protected boolean sawCDCMutation;
@@ -152,7 +152,8 @@ public class CommitLogReplayer implements CommitLogReadHandler
                 // Point in time restore is taken to mean that the tables need to be replayed even if they were
                 // deleted at a later point in time. Any truncation record after that point must thus be cleared prior
                 // to replay (CASSANDRA-9195).
-                long restoreTime = commitLog.archiver.restorePointInTime;
+                // truncatedTime is millseconds level but restoreTime is microlevel
+                long restoreTime = commitLog.archiver.restorePointInTimeInMicroseconds == Long.MAX_VALUE ? Long.MAX_VALUE : commitLog.archiver.restorePointInTimeInMicroseconds / 1000;
                 long truncatedTime = truncationRecord.truncatedAt;
                 if (truncatedTime > restoreTime)
                 {
@@ -602,11 +603,9 @@ public class CommitLogReplayer implements CommitLogReadHandler
 
     protected boolean pointInTimeExceeded(Mutation fm)
     {
-        long restoreTarget = archiver.restorePointInTime;
-
         for (PartitionUpdate upd : fm.getPartitionUpdates())
         {
-            if (archiver.precision.toMillis(upd.maxTimestamp()) > restoreTarget)
+            if (archiver.precision.toMicros(upd.maxTimestamp()) > archiver.restorePointInTimeInMicroseconds)
                 return true;
         }
         return false;

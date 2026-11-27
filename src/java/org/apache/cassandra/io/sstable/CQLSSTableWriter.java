@@ -23,10 +23,12 @@ import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.SortedSet;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import com.google.common.base.Preconditions;
@@ -51,6 +53,7 @@ import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.SyntaxException;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.KeyspaceMetadata;
 import org.apache.cassandra.schema.KeyspaceParams;
@@ -66,6 +69,8 @@ import org.apache.cassandra.schema.Views;
 import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * Utility to write SSTables.
@@ -356,17 +361,21 @@ public class CQLSSTableWriter implements Closeable
      */
     public static class Builder
     {
-        private File directory;
+        private static final Logger logger = LoggerFactory.getLogger(Builder.class);
+        private static final long DEFAULT_BUFFER_SIZE_IN_MIB_FOR_UNSORTED = 128L;
+
 
         protected SSTableFormat.Type formatType = null;
 
-        private CreateTableStatement.Raw schemaStatement;
         private final List<CreateTypeStatement.Raw> typeStatements;
+        private File directory;
+        private CreateTableStatement.Raw schemaStatement;
         private ModificationStatement.Parsed insertStatement;
         private IPartitioner partitioner;
-
         private boolean sorted = false;
-        private long bufferSizeInMB = 128;
+        private long maxSSTableSizeInMiB = -1L;
+        private Consumer<Collection<SSTableReader>> sstableProducedListener;
+        private boolean openSSTableOnProduced = false;
 
         protected Builder() {
             this.typeStatements = new ArrayList<>();
@@ -473,22 +482,42 @@ public class CQLSSTableWriter implements Closeable
         }
 
         /**
+         * Defines the maximum SSTable size in mebibytes when using the sorted writer.
+         * By default, i.e. not specified, there is no maximum size limit for the produced SSTable
+         *
+         * @param size the maximum sizein mebibytes of each individual SSTable allowed
+         * @return this builder
+         */
+        public Builder withMaxSSTableSizeInMiB(int size)
+        {
+            if (size <= 0)
+            {
+                logger.warn("A non-positive value for maximum SSTable size is specified, " +
+                            "which disables the size limiting effectively. Please supply a positive value in order " +
+                            "to enforce size limiting for the produced SSTables.");
+            }
+            this.maxSSTableSizeInMiB = size;
+            return this;
+        }
+
+        /**
          * The size of the buffer to use.
          * <p>
          * This defines how much data will be buffered before being written as
-         * a new SSTable. This correspond roughly to the data size that will have the created
+         * a new SSTable. This corresponds roughly to the data size that will have the created
          * sstable.
          * <p>
          * The default is 128MB, which should be reasonable for a 1GB heap. If you experience
          * OOM while using the writer, you should lower this value.
          *
+         * @deprecated This method is deprecated in favor of the new withMaxSSTableSizeInMiB(int size)
          * @param size the size to use in MB.
          * @return this builder.
          */
+        @Deprecated
         public Builder withBufferSizeInMB(int size)
         {
-            this.bufferSizeInMB = size;
-            return this;
+            return withMaxSSTableSizeInMiB(size);
         }
 
         /**
@@ -514,6 +543,33 @@ public class CQLSSTableWriter implements Closeable
             return this;
         }
 
+        /**
+         * Set the listener to receive notifications on sstable produced
+         * <p>
+         * Note that if listener is registered, the sstables are opened into {@link SSTableReader}.
+         * The consumer is responsible for releasing the {@link SSTableReader}
+         *
+         * @param sstableProducedListener receives the produced sstables
+         * @return this builder
+         */
+        public Builder withSSTableProducedListener(Consumer<Collection<SSTableReader>> sstableProducedListener)
+        {
+            this.sstableProducedListener = sstableProducedListener;
+            return this;
+        }
+
+        /**
+         * Whether the produced sstable should be open or not.
+         * By default, the writer does not open the produced sstables
+         *
+         * @return this builder
+         */
+        public Builder openSSTableOnProduced()
+        {
+            this.openSSTableOnProduced = true;
+            return this;
+        }
+
         @SuppressWarnings("resource")
         public CQLSSTableWriter build()
         {
@@ -526,7 +582,14 @@ public class CQLSSTableWriter implements Closeable
 
             Preconditions.checkState(Sets.difference(SchemaConstants.LOCAL_SYSTEM_KEYSPACE_NAMES, Schema.instance.getKeyspaces()).isEmpty(),
                                      "Local keyspaces were not loaded. If this is running as a client, please make sure to add %s=true system property.", Schema.FORCE_LOAD_LOCAL_KEYSPACES_PROP);
-            synchronized (CQLSSTableWriter.class)
+
+            // Assign the default max SSTable size if not defined in builder
+            if (isMaxSSTableSizeUnset())
+            {
+                maxSSTableSizeInMiB = sorted ? -1L : DEFAULT_BUFFER_SIZE_IN_MIB_FOR_UNSORTED;
+            }
+
+            synchronized (Schema.instance)
             {
 
                 String keyspaceName = schemaStatement.keyspace();
@@ -553,14 +616,24 @@ public class CQLSSTableWriter implements Closeable
 
                 TableMetadataRef ref = TableMetadataRef.forOfflineTools(tableMetadata);
                 AbstractSSTableSimpleWriter writer = sorted
-                                                   ? new SSTableSimpleWriter(directory, ref, preparedInsert.updatedColumns())
-                                                   : new SSTableSimpleUnsortedWriter(directory, ref, preparedInsert.updatedColumns(), bufferSizeInMB);
+                                                   ? new SSTableSimpleWriter(directory, ref, preparedInsert.updatedColumns(), maxSSTableSizeInMiB)
+                                                   : new SSTableSimpleUnsortedWriter(directory, ref, preparedInsert.updatedColumns(), maxSSTableSizeInMiB);
 
                 if (formatType != null)
                     writer.setSSTableFormatType(formatType);
 
+                if (sstableProducedListener != null)
+                    writer.setSSTableProducedListener(sstableProducedListener);
+
+                writer.setShouldOpenProducedSSTable(openSSTableOnProduced);
+
                 return new CQLSSTableWriter(writer, preparedInsert, preparedInsert.getBindVariables());
             }
+        }
+
+        private boolean isMaxSSTableSizeUnset()
+        {
+            return maxSSTableSizeInMiB <= 0;
         }
 
         private Types createTypes(String keyspace)

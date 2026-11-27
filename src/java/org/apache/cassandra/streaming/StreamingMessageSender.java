@@ -29,7 +29,7 @@ public interface StreamingMessageSender
 {
     void initialize() throws IOException;
 
-    void sendMessage(StreamMessage message) throws IOException;
+    void sendMessage(StreamMessage message);
 
     boolean connected();
 

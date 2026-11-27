@@ -42,6 +42,7 @@ public class CoordinatorSessions
     private static final Logger logger = LoggerFactory.getLogger(CoordinatorSessions.class);
 
     private final Map<UUID, CoordinatorSession> sessions = new HashMap<>();
+    private static final Logger logger = LoggerFactory.getLogger(CoordinatorSessions.class);
 
     protected CoordinatorSession buildSession(CoordinatorSession.Builder builder)
     {
@@ -66,6 +67,7 @@ public class CoordinatorSessions
         builder.withRepairedAt(prs.repairedAt);
         builder.withRanges(prs.getRanges());
         builder.withParticipants(participants);
+        builder.withListener(this::onSessionStateUpdate);
         CoordinatorSession session = buildSession(builder);
         sessions.put(session.sessionID, session);
         logger.info("Registered coordinator session {} with {} participant(s): {} for tables {}",
@@ -76,6 +78,15 @@ public class CoordinatorSessions
     public synchronized CoordinatorSession getSession(UUID sessionId)
     {
         return sessions.get(sessionId);
+    }
+
+    public synchronized void onSessionStateUpdate(CoordinatorSession session)
+    {
+        if (session.isCompleted())
+        {
+            logger.info("Removing completed session {} with state {}", session.sessionID, session.getState());
+            sessions.remove(session.sessionID);
+        }
     }
 
     public void handlePrepareResponse(PrepareConsistentResponse msg)

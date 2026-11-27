@@ -533,7 +533,7 @@ public class CassandraDaemon
             {
                 List<File> tableDirectories = new ArrayList<>();
                 keyspaceDirectory.forEach(f -> {
-                    if (f.isDirectory() && !SystemKeyspace.TABLES_SPLIT_ACROSS_MULTIPLE_DISKS.contains(f.name()))
+                    if (f.isDirectory() && SystemKeyspace.TABLES_SPLIT_ACROSS_MULTIPLE_DISKS.stream().noneMatch(t -> f.name().startsWith(t + '-')))
                         tableDirectories.add(f);
                 });
 
@@ -657,7 +657,8 @@ public class CassandraDaemon
     {
         StartupClusterConnectivityChecker connectivityChecker = StartupClusterConnectivityChecker.create(DatabaseDescriptor.getBlockForPeersTimeoutInSeconds(),
                                                                                                          DatabaseDescriptor.getBlockForPeersInRemoteDatacenters());
-        connectivityChecker.execute(Gossiper.instance.getEndpoints(), DatabaseDescriptor.getEndpointSnitch()::getDatacenter);
+        connectivityChecker.execute(Gossiper.instance.getEndpoints(), DatabaseDescriptor.getEndpointSnitch()::getDatacenter,
+                                    Gossiper.instance::isUpgradingFromVersionLowerThan);
 
         // check to see if transports may start else return without starting.  This is needed when in survey mode or
         // when bootstrap has not completed.
@@ -679,10 +680,7 @@ public class CassandraDaemon
     {
         String nativeFlag = System.getProperty("cassandra.start_native_transport");
         if ((nativeFlag != null && Boolean.parseBoolean(nativeFlag)) || (nativeFlag == null && DatabaseDescriptor.startNativeTransport()))
-        {
             startNativeTransport();
-            StorageService.instance.setRpcReady(true);
-        }
         else
             logger.info("Not starting native transport as requested. Use JMX (StorageService->startNativeTransport()) or nodetool (enablebinary) to start it");
     }
@@ -843,13 +841,23 @@ public class CassandraDaemon
         if (nativeTransportService == null)
             throw new IllegalStateException("setup() must be called first for CassandraDaemon");
 
+        // this iterates over a collection of servers and returns true if one of them is started
+        boolean alreadyRunning = nativeTransportService.isRunning();
+
+        // this might in practice start all servers which are not started yet
         nativeTransportService.start();
+
+        // interact with gossip only in case if no server was started before to signal they are started now
+        if (!alreadyRunning)
+            StorageService.instance.setRpcReady(true);
     }
 
     public void stopNativeTransport()
     {
         if (nativeTransportService != null)
+        {
             nativeTransportService.stop();
+        }
     }
 
     public boolean isNativeTransportRunning()

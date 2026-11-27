@@ -31,6 +31,7 @@ import javax.annotation.Nonnull;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.compress.CompressedSequentialWriter;
 import org.apache.cassandra.utils.ChecksumType;
+import org.apache.cassandra.utils.SyncUtil;
 
 public class ChecksumWriter
 {
@@ -127,7 +128,7 @@ public class ChecksumWriter
         {
             out.write(String.valueOf(checksum).getBytes(StandardCharsets.UTF_8));
             out.flush();
-            fos.sync();
+            SyncUtil.force(fos.getChannel(), true);
         }
         catch (IOException e)
         {

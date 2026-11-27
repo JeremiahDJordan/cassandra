@@ -76,7 +76,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         TableMetadata cfm = currentTableMetadata();
 
         // Confirm that logic to check for whether or not we can allocate new CDC segments works
-        Integer originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
+        int originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
         try
         {
             DatabaseDescriptor.setCDCSpaceInMB(32);
@@ -108,11 +108,10 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
                     .forceBlockingFlush(UNIT_TESTS);
             CommitLog.instance.forceRecycleAllSegments();
             cdcMgr.awaitManagementTasksCompletion();
-            Assert.assertTrue("Expected files to be moved to overflow.", getCDCRawCount() > 0);
+            Assert.assertTrue("Expected files to be moved to overflow.", getCDCRawFiles().length > 0);
 
             // Simulate a CDC consumer reading files then deleting them
-            for (File f : DatabaseDescriptor.getCDCLogLocation().tryList())
-                FileUtils.deleteWithConfirm(f);
+            deleteCDCRawFiles();
 
             // Update size tracker to reflect deleted files. Should flip flag on current allocatingFrom to allow.
             cdcMgr.updateCDCTotalSize();
@@ -125,7 +124,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
     }
 
     @Test
-    public void testSegmentFlaggingOnCreation() throws Throwable
+    public void testSegmentFlaggingOnCreation()
     {
         CommitLogSegmentManagerCDC cdcMgr = (CommitLogSegmentManagerCDC)CommitLog.instance.getSegmentManager();
         String ct = createTable("CREATE TABLE %s (idx int, data text, primary key(idx)) WITH cdc=true;");
@@ -153,16 +152,13 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
 
             cdcMgr.awaitManagementTasksCompletion();
             // Delete all files in cdc_raw
-            for (File f : DatabaseDescriptor.getCDCLogLocation().tryList())
-                f.tryDelete();
+            deleteCDCRawFiles();
             cdcMgr.updateCDCTotalSize();
             // Confirm cdc update process changes flag on active segment
             expectCurrentCDCState(CDCState.PERMITTED);
 
             // Clear out archived CDC files
-            for (File f : DatabaseDescriptor.getCDCLogLocation().tryList()) {
-                FileUtils.deleteWithConfirm(f);
-            }
+            deleteCDCRawFiles();
         }
         finally
         {
@@ -189,8 +185,8 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         // Read index value and confirm it's == end from last sync
         BufferedReader in = new BufferedReader(new FileReader(cdcIndexFile));
         String input = in.readLine();
-        Integer offset = Integer.parseInt(input);
-        Assert.assertEquals(syncOffset, (long)offset);
+        int offset = Integer.parseInt(input);
+        Assert.assertEquals(syncOffset, offset);
         in.close();
     }
 
@@ -199,7 +195,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
     {
         createTable("CREATE TABLE %s (idx int, data text, primary key(idx)) WITH cdc=true;");
         CommitLogSegment initialSegment = CommitLog.instance.getSegmentManager().allocatingFrom();
-        Integer originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
+        int originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
 
         DatabaseDescriptor.setCDCSpaceInMB(8);
         try
@@ -230,7 +226,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         BufferedReader in = new BufferedReader(new FileReader(cdcIndexFile));
         String input = in.readLine();
         input = in.readLine();
-        Assert.assertTrue("Expected COMPLETED in index file, got: " + input, input.equals("COMPLETED"));
+        Assert.assertEquals("Expected COMPLETED in index file, got: " + input, "COMPLETED", input);
         in.close();
     }
 
@@ -311,7 +307,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
     public void testReplayLogic() throws IOException
     {
         String table_name = createTable("CREATE TABLE %s (idx int, data text, primary key(idx)) WITH cdc=true;");
-        Integer originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
+        int originalCDCSize = DatabaseDescriptor.getCDCSpaceInMB();
 
         DatabaseDescriptor.setCDCSpaceInMB(8);
         TableMetadata ccfm = Keyspace.open(keyspace()).getColumnFamilyStore(table_name).metadata();
@@ -339,13 +335,12 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
 
         // Build up a list of expected index files after replay and then clear out cdc_raw
         List<CDCIndexData> oldData = parseCDCIndexData();
-        for (File f : DatabaseDescriptor.getCDCLogLocation().tryList())
-            FileUtils.deleteWithConfirm(f.absolutePath());
+        deleteCDCRawFiles();
 
         try
         {
             Assert.assertEquals("Expected 0 files in CDC folder after deletion. ",
-                                0, DatabaseDescriptor.getCDCLogLocation().tryList().length);
+                                0, getCDCRawFiles().length);
         }
         finally
         {
@@ -360,7 +355,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
 
         // Rough sanity check -> should be files there now.
         Assert.assertTrue("Expected non-zero number of files in CDC folder after restart.",
-                          DatabaseDescriptor.getCDCLogLocation().tryList().length > 0);
+                          getCDCRawFiles().length > 0);
 
         // Confirm all the old indexes in old are present and >= the original offset, as we flag the entire segment
         // as cdc written on a replay.
@@ -374,6 +369,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
                 {
                     Assert.assertTrue("New CDC index file expected to have >= offset in old.", ncid.offset >= cid.offset);
                     found = true;
+                    break;
                 }
             }
             if (!found)
@@ -394,7 +390,10 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
             for (CDCIndexData cid : oldData)
             {
                 if (cid.fileName.equals(ncid.fileName))
+                {
                     found = true;
+                    break;
+                }
             }
             if (!found)
                 Assert.fail(String.format("Unexpected new CDCIndexData found after replay: %s\n", ncid));
@@ -406,7 +405,7 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         List<CDCIndexData> results = new ArrayList<>();
         try
         {
-            for (File f : DatabaseDescriptor.getCDCLogLocation().tryList())
+            for (File f : getCDCRawFiles())
             {
                 if (f.name().contains("_cdc.idx"))
                     results.add(new CDCIndexData(f));
@@ -426,15 +425,12 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
 
         CDCIndexData(File f) throws IOException
         {
-            String line = "";
+            String line;
             try (BufferedReader br = new BufferedReader(new FileReader(f)))
             {
                 line = br.readLine();
             }
-            catch (Exception e)
-            {
-                throw e;
-            }
+
             fileName = f.name();
             offset = Integer.parseInt(line);
         }
@@ -448,6 +444,8 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         @Override
         public boolean equals(Object other)
         {
+            if (!(other instanceof CDCIndexData))
+                return false;
             CDCIndexData cid = (CDCIndexData)other;
             return fileName.equals(cid.fileName) && offset == cid.offset;
         }
@@ -460,11 +458,6 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
         return ByteBuffer.wrap(toWrap);
     }
 
-    private int getCDCRawCount()
-    {
-        return DatabaseDescriptor.getCDCLogLocation().tryList().length;
-    }
-
     private void expectCurrentCDCState(CDCState expectedState)
     {
         CDCState currentState = CommitLog.instance.getSegmentManager().allocatingFrom().getCDCState();
@@ -475,5 +468,16 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
             Assert.fail(String.format("Received unexpected CDCState on current allocatingFrom segment. Expected: %s. Received: %s",
                         expectedState, currentState));
         }
+    }
+
+    private static File[] getCDCRawFiles()
+    {
+        return DatabaseDescriptor.getCDCLogLocation().tryList();
+    }
+
+    private static void deleteCDCRawFiles()
+    {
+        for (File f : getCDCRawFiles())
+            f.tryDelete();
     }
 }

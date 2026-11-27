@@ -63,6 +63,42 @@ public class AlterTest extends CQLTester
     }
 
     @Test
+    public void testNonFrozenCollectionsAreIncompatibleWithBlob() throws Throwable
+    {
+        String[] collectionTypes = new String[] {"map<int, int>", "set<int>", "list<int>"};
+
+        for (String type : collectionTypes)
+        {
+            createTable("CREATE TABLE %s (a int, b " + type + ", PRIMARY KEY (a));");
+            alterTable("ALTER TABLE %s DROP b;");
+            assertInvalidMessage("Cannot add a column 'b' of type blob, incompatible with previously dropped column 'b' of type " + type,
+                                 "ALTER TABLE %s ADD b blob;");
+        }
+
+        for (String type : collectionTypes)
+        {
+            createTable("CREATE TABLE %s (a int, b blob, PRIMARY KEY (a));");
+            alterTable("ALTER TABLE %s DROP b;");
+            assertInvalidMessage("Cannot add a column 'b' of type " + type + ", incompatible with previously dropped column 'b' of type blob",
+                                 "ALTER TABLE %s ADD b " + type + ';');
+        }
+    }
+
+    @Test
+    public void testFrozenCollectionsAreNotCompatibleWithBlob() throws Throwable
+    {
+        String[] collectionTypes = new String[] {"frozen<map<int, int>>", "frozen<set<int>>", "frozen<list<int>>"};
+
+        for (String type : collectionTypes)
+        {
+            createTable("CREATE TABLE %s (a int, b " + type + ", PRIMARY KEY (a));");
+            alterTable("ALTER TABLE %s DROP b;");
+            assertInvalidMessage("Cannot add a column 'b' of type blob, incompatible with previously dropped column 'b' of type " + type,
+                                 "ALTER TABLE %s ADD b blob;");
+        }
+    }
+
+    @Test
     public void testAddList() throws Throwable
     {
         createTable("CREATE TABLE %s (id text PRIMARY KEY, content text);");
@@ -563,6 +599,43 @@ public class AlterTest extends CQLTester
         cfs.loadNewSSTables();
         assertEquals(1, cfs.getLiveSSTables().size());
         assertRows(execute("SELECT * FROM %s"), row(1, 1, 1));
+    }
+
+    @Test
+    public void testInvalidDroppingAndAddingOfCollections() throws Throwable
+    {
+        for (String[] typePair : new String[][]
+                                 {
+                                 new String[] {"list<int>", "list<varint>"},
+                                 new String[] {"set<int>", "set<varint>"},
+                                 new String[] {"map<int, int>", "map<varint, varint>"},
+                                 new String[] {"list<int>", "frozen<list<varint>>"},
+                                 new String[] {"set<int>", "frozen<set<varint>>"},
+                                 new String[] {"map<int, int>", "frozen<map<varint, varint>>"},
+                                 })
+        {
+            createTable("create table %s (k int, c int, v " + typePair[0] + ", PRIMARY KEY (k, c))");
+            execute("alter table %s drop v");
+            assertInvalidMessage("Cannot add a column 'v' of type "
+                                 + typePair[1] + ", incompatible with previously dropped column 'v' of type " + typePair[0],
+                                 "alter table %s add v " + typePair[1]);
+        }
+    }
+
+    @Test(expected = InvalidRequestException.class)
+    public void testDropFixedAddVariable() throws Throwable
+    {
+        createTable("create table %s (k int, c int, v int, PRIMARY KEY (k, c))");
+        execute("alter table %s drop v");
+        execute("alter table %s add v varint");
+    }
+
+    @Test(expected = InvalidRequestException.class)
+    public void testDropSimpleAddComplex() throws Throwable
+    {
+        createTable("create table %s (k int, c int, v set<text>, PRIMARY KEY (k, c))");
+        execute("alter table %s drop v");
+        execute("alter table %s add v blob");
     }
 
     @Test

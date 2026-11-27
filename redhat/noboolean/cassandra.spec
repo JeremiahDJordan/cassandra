@@ -49,7 +49,7 @@ BuildRoot:     %{_tmppath}/%{relname}root-%(%{__id_u} -n)
 BuildRequires: ant >= 1.9
 BuildRequires: ant-junit >= 1.9
 
-Requires:      jre >= 1.8.0
+Requires:      java-1.8.0-headless
 Requires:      python(abi) >= 3.6
 Requires:      procps-ng >= 3.3
 Requires(pre): user(cassandra)
@@ -100,6 +100,7 @@ patch -p1 < debian/patches/cassandra_logdir_fix.diff
 sed -i 's/^# hints_directory:/hints_directory:/' conf/cassandra.yaml
 
 # remove other files not being installed
+rm -f bin/stop-server
 rm -f bin/*.orig
 rm -f bin/cassandra.in.sh
 rm -f lib/sigar-bin/*winnt*  # strip segfaults on dll..
@@ -142,7 +143,7 @@ exit 0
 
 %files
 %defattr(0644,root,root,0755)
-%doc CHANGES.txt LICENSE.txt README.asc NEWS.txt NOTICE.txt CASSANDRA-14092.txt
+%doc CHANGES.txt LICENSE.txt README.asc NEWS.txt NOTICE.txt CASSANDRA-14092.txt .snyk
 %attr(755,root,root) %{_bindir}/auditlogviewer
 %attr(755,root,root) %{_bindir}/jmxtool
 %attr(755,root,root) %{_bindir}/cassandra-stress
@@ -157,7 +158,6 @@ exit 0
 %attr(755,root,root) %{_bindir}/sstableupgrade
 %attr(755,root,root) %{_bindir}/sstableutil
 %attr(755,root,root) %{_bindir}/sstableverify
-%attr(755,root,root) %{_bindir}/stop-server
 %attr(755,root,root) %{_sbindir}/cassandra
 %attr(755,root,root) /%{_sysconfdir}/rc.d/init.d/%{username}
 %{_sysconfdir}/default/%{username}

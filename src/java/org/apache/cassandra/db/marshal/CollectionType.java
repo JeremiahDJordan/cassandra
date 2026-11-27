@@ -21,6 +21,7 @@ import java.nio.ByteBuffer;
 import java.io.IOException;
 import java.util.List;
 import java.util.Iterator;
+import java.util.Locale;
 
 import com.google.common.collect.ImmutableList;
 
@@ -72,6 +73,12 @@ public abstract class CollectionType<T> extends MultiCellCapableType<T>
         };
 
         public abstract ColumnSpecification makeCollectionReceiver(ColumnSpecification collection, boolean isKey);
+
+        @Override
+        public String toString()
+        {
+            return super.toString().toLowerCase(Locale.US);
+        }
     }
 
     public final Kind kind;
@@ -165,10 +172,10 @@ public abstract class CollectionType<T> extends MultiCellCapableType<T>
     {
         // When multi-cell, the name comparator is the one used to compare cell-path so must be sorted-compatible
         // (same remarks than in isCompatibleWhenFrozenWith for lists and sets), but the value comparator is never used
-        // for sorting so value-compatibility is enough.
+        // for sorting so serialization-compatibility is enough.
         CollectionType<?> prev = (CollectionType<?>)previous;
         return nameComparator().isCompatibleWith(prev.nameComparator())
-               && valueComparator().isValueCompatibleWith(prev.valueComparator());
+               && valueComparator().isSerializationCompatibleWith(prev.valueComparator());
     }
 
     @Override

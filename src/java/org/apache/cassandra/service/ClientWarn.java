@@ -17,10 +17,10 @@
  */
 package org.apache.cassandra.service;
 
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import io.netty.util.concurrent.FastThreadLocal;
 import org.apache.cassandra.concurrent.ExecutorLocal;
@@ -81,7 +81,9 @@ public class ClientWarn implements ExecutorLocal<ClientWarn.State>
 
     public static class State
     {
-        private final List<String> warnings = new ArrayList<>();
+        // This must be a thread-safe list. Even though it's wrapped in a ThreadLocal, it's propagated to each thread
+        // from shared state, so multiple threads can reference the same State.
+        private final List<String> warnings = new CopyOnWriteArrayList<>();
         private final Set<Object> keysAdded = new HashSet<>();
 
         private void add(String warning, Object key)

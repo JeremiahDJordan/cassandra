@@ -84,6 +84,7 @@ import org.apache.cassandra.exceptions.CasWriteUnknownResultException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.IsBootstrappingException;
 import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.exceptions.QueryCancelledException;
 import org.apache.cassandra.exceptions.ReadFailureException;
 import org.apache.cassandra.exceptions.ReadTimeoutException;
 import org.apache.cassandra.exceptions.RequestFailureException;
@@ -156,6 +157,7 @@ import static org.apache.cassandra.net.Verb.TRUNCATE_REQ;
 import static org.apache.cassandra.service.BatchlogResponseHandler.BatchlogCleanup;
 import static org.apache.cassandra.service.paxos.PrepareVerbHandler.doPrepare;
 import static org.apache.cassandra.service.paxos.ProposeVerbHandler.doPropose;
+import static org.apache.cassandra.utils.MonotonicClock.approxTime;
 
 public class StorageProxy implements StorageProxyMBean
 {
@@ -1683,8 +1685,6 @@ public class StorageProxy implements StorageProxyMBean
         Replica localReplica = null;
         Collection<Replica> endpointsToHint = null;
 
-        List<InetAddressAndPort> backPressureHosts = null;
-
         // For performance, Mutation caches serialized buffers that are computed lazily in serializedBuffer(). That
         // computation is not synchronized however and we will potentially call that method concurrently for each
         // dispatched message (not that concurrent calls to serializedBuffer() are "unsafe" per se, just that they
@@ -1733,11 +1733,6 @@ public class StorageProxy implements StorageProxyMBean
 
                         messages.add(destination);
                     }
-
-                    if (backPressureHosts == null)
-                        backPressureHosts = new ArrayList<>(plan.contacts().size());
-
-                    backPressureHosts.add(destination.endpoint());
                 }
             }
             else
@@ -2481,6 +2476,12 @@ public class StorageProxy implements StorageProxyMBean
                 {
                     response = command.createResponse(iterator, controller.getRepairedDataInfo());
                 }
+                catch (QueryCancelledException e)
+                {
+                    logger.debug("Query cancelled (timeout)", e);
+                    response = null;
+                    Preconditions.checkState(!command.isCompleted(), "Local read marked as completed despite being aborted by timeout to table %s", command.metadata());
+                }
                 long readElapsedNanos = System.nanoTime() - readStartNanos;
 
                 Context context = Context.from(command);
@@ -2993,8 +2994,15 @@ public class StorageProxy implements StorageProxyMBean
                     else
                         logger.debug("Discarding hint for endpoint not part of ring: {}", target);
                 }
-                logger.trace("Adding hints for {}", validTargets);
-                HintsService.instance.write(hostIds, Hint.create(mutation, System.currentTimeMillis()));
+
+                long creationTime = System.currentTimeMillis();
+                if (DatabaseDescriptor.isUseCreationTimeForHintTtl())
+                {
+                    long mutationCreationTimeNanos = responseHandler != null ? responseHandler.getQueryStartNanoTime() : mutation.getApproxCreatedAtNanos();
+                    creationTime -= TimeUnit.MILLISECONDS.convert(Math.max(0, approxTime.now() - mutationCreationTimeNanos), NANOSECONDS);
+                }
+                logger.trace("Adding hints for {} with creation time {} ms", validTargets, creationTime);
+                HintsService.instance.write(hostIds, Hint.create(mutation,  creationTime));
                 validTargets.forEach(HintsService.instance.metrics::incrCreatedHints);
                 // Notify the handler only for CL == ANY
                 if (responseHandler != null && responseHandler.replicaPlan.consistencyLevel() == ConsistencyLevel.ANY)

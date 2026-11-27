@@ -187,7 +187,7 @@ final class HintsDispatchExecutor
         private boolean transfer(UUID hostId)
         {
             catalog.stores()
-                   .map(store -> new DispatchHintsTask(store, hostId))
+                   .map(store -> new DispatchHintsTask(store, hostId, true))
                    .forEach(Runnable::run);
 
             return !catalog.hasFiles();
@@ -200,11 +200,16 @@ final class HintsDispatchExecutor
         private final UUID hostId;
         private final RateLimiter rateLimiter;
 
-        DispatchHintsTask(HintsStore store, UUID hostId)
+        DispatchHintsTask(HintsStore store, UUID hostId, boolean isTransfer)
         {
             this.store = store;
             this.hostId = hostId;
             this.rateLimiter = HintsRateLimiterFactory.instance.create(hostId);
+        }
+
+        DispatchHintsTask(HintsStore store, UUID hostId)
+        {
+            this(store, hostId, false);
         }
 
         public void run()

@@ -23,7 +23,6 @@ package org.apache.cassandra.service.paxos;
 import java.util.Set;
 
 import org.apache.cassandra.concurrent.ExecutorLocals;
-import org.apache.cassandra.net.IVerbHandler;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.net.NoPayload;
@@ -35,11 +34,12 @@ import org.apache.cassandra.sensors.Type;
 import org.apache.cassandra.service.MutatorProvider;
 import org.apache.cassandra.tracing.Tracing;
 
-public class CommitVerbHandler implements IVerbHandler<Commit>
+public class CommitVerbHandler extends AbstractPaxosVerbHandler
 {
     public static final CommitVerbHandler instance = new CommitVerbHandler();
 
-    public void doVerb(Message<Commit> message)
+    @Override
+    void processMessage(Message<Commit> message)
     {
         // Initialize the sensor and set ExecutorLocals
         RequestSensors sensors = SensorsFactory.instance.createRequestSensors(Set.of(message.payload.update.metadata().keyspace));

@@ -855,3 +855,7 @@ class TestCqlshCompletion(CqlshCompletionCase):
         self.trycompletions('SELECT * FROM system.peers ORDER BY vectorcol ANN OF [ 1.0, 2.0] LIMIT 100 WITH a', immediate='nn_options = { ',)
         self.trycompletions('SELECT * FROM system.peers ORDER BY vectorcol ANN OF [ 1.0, 2.0] LIMIT 100 WITH i', immediate='ncluded_indexes = { ',)
         self.trycompletions('SELECT * FROM system.peers ORDER BY vectorcol ANN OF [ 1.0, 2.0] LIMIT 100 WITH e', immediate='xcluded_indexes = { ',)
+
+    def test_complete_in_create_role(self):
+        self.trycompletions('CREATE ROLE ', choices=['<rolename>'])
+        self.trycompletions('CREATE USER ', choices=['<username>', 'IF'])

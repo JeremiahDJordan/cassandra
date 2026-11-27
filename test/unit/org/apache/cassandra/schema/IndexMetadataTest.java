@@ -60,7 +60,7 @@ public class IndexMetadataTest
 
         assertThatThrownBy(() -> index.validate(table))
         .isInstanceOf(ConfigurationException.class)
-        .hasMessageContaining("is not a " + Index.class.getName());
+        .hasMessageContaining("must extend or implement " + Index.class.getName());
 
         assertThat(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class)).isFalse();
     }

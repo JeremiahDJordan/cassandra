@@ -125,6 +125,7 @@ import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
 import org.apache.cassandra.db.virtual.VirtualKeyspaceRegistry;
 import org.apache.cassandra.dht.BootStrapper;
 import org.apache.cassandra.dht.IPartitioner;
+import org.apache.cassandra.dht.OwnedRanges;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.RangeStreamer;
 import org.apache.cassandra.dht.RangeStreamer.FetchReplica;
@@ -144,6 +145,7 @@ import org.apache.cassandra.gms.IEndpointStateChangeSubscriber;
 import org.apache.cassandra.gms.IFailureDetector;
 import org.apache.cassandra.gms.TokenSerializer;
 import org.apache.cassandra.gms.VersionedValue;
+import org.apache.cassandra.hints.Hint;
 import org.apache.cassandra.hints.HintsService;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.io.sstable.SSTableLoader;
@@ -320,6 +322,35 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     @VisibleForTesting // this is used for dtests only, see CASSANDRA-18152
     public volatile boolean skipNotificationListeners = false;
 
+    private final java.util.function.Predicate<Keyspace> anyOutOfRangeOpsRecorded
+            = keyspace -> keyspace.metric.outOfRangeTokenReads.getCount() > 0
+                          || keyspace.metric.outOfRangeTokenWrites.getCount() > 0
+                          || keyspace.metric.outOfRangeTokenPaxosRequests.getCount() > 0;
+
+    private long[] getOutOfRangeOperationCounts(Keyspace keyspace)
+    {
+        return new long[]
+        {
+               keyspace.metric.outOfRangeTokenReads.getCount(),
+               keyspace.metric.outOfRangeTokenWrites.getCount(),
+               keyspace.metric.outOfRangeTokenPaxosRequests.getCount()
+        };
+    }
+
+    public Map<String, long[]> getOutOfRangeOperationCounts()
+    {
+        return Schema.instance.getKeyspaces()
+                              .stream()
+                              .map(Keyspace::open)
+                              .filter(anyOutOfRangeOpsRecorded)
+                              .collect(Collectors.toMap(Keyspace::getName, this::getOutOfRangeOperationCounts));
+    }
+
+    public void incOutOfRangeOperationCount()
+    {
+        (isStarting() ? StorageMetrics.startupOpsForInvalidToken : StorageMetrics.totalOpsForInvalidToken).inc();
+    }
+
     @Deprecated
     public boolean isInShutdownHook()
     {
@@ -358,6 +389,11 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         return ranges;
     }
 
+    public OwnedRanges getNormalizedLocalRanges(String keyspaceName)
+    {
+        return new OwnedRanges(getLocalReplicas(keyspaceName).ranges());
+    }
+
     public Collection<Range<Token>> getPrimaryRanges(String keyspace)
     {
         return getPrimaryRangesForEndpoint(keyspace, FBUtilities.getBroadcastAddressAndPort());
@@ -392,7 +428,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     /* the probability for tracing any particular request, 0 disables tracing and 1 enables for all */
     private double traceProbability = 0.0;
 
-    private enum Mode { STARTING, NORMAL, JOINING, LEAVING, DECOMMISSIONED, MOVING, DRAINING, DRAINED }
+    public enum Mode { STARTING, NORMAL, JOINING, LEAVING, DECOMMISSIONED, MOVING, DRAINING, DRAINED }
     private volatile Mode operationMode = Mode.STARTING;
 
     /* Used for tracking drain progress */
@@ -1415,43 +1451,34 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public void rebuild(String sourceDc, String keyspace, String tokens, String specificSources)
     {
-        try
+        if (sourceDc != null)
         {
-            // check ongoing rebuild
-            if (!isRebuilding.compareAndSet(false, true))
+            TokenMetadata.Topology topology = getTokenMetadata().cloneOnlyTokenMap().getTopology();
+            Set<String> availableDCs = topology.getDatacenterEndpoints().keySet();
+            if (!availableDCs.contains(sourceDc))
             {
-                throw new IllegalStateException("Node is still rebuilding. Check nodetool netstats.");
-            }
-
-            if (sourceDc != null)
-            {
-                TokenMetadata.Topology topology = getTokenMetadata().cloneOnlyTokenMap().getTopology();
-                Set<String> availableDCs = topology.getDatacenterEndpoints().keySet();
-                if (!availableDCs.contains(sourceDc))
-                {
-                    throw new IllegalArgumentException(String.format("Provided datacenter '%s' is not a valid datacenter, available datacenters are: %s",
-                                                                     sourceDc, String.join(",", availableDCs)));
-                }
-            }
-
-            // check the arguments
-            if (keyspace == null && tokens != null)
-            {
-                throw new IllegalArgumentException("Cannot specify tokens without keyspace.");
+                throw new IllegalArgumentException(String.format("Provided datacenter '%s' is not a valid datacenter, available datacenters are: %s",
+                                                                 sourceDc, String.join(",", availableDCs)));
             }
         }
-        catch (Throwable ex)
+
+        if (keyspace == null && tokens != null)
         {
-            isRebuilding.set(false);
-            throw ex;
+            throw new IllegalArgumentException("Cannot specify tokens without keyspace.");
         }
 
-        logger.info("rebuild from dc: {}, {}, {}", sourceDc == null ? "(any dc)" : sourceDc,
-                    keyspace == null ? "(All keyspaces)" : keyspace,
-                    tokens == null ? "(All tokens)" : tokens);
+        // check ongoing rebuild
+        if (!isRebuilding.compareAndSet(false, true))
+        {
+            throw new IllegalStateException("Node is still rebuilding. Check nodetool netstats.");
+        }
 
         try
         {
+            logger.info("rebuild from dc: {}, {}, {}", sourceDc == null ? "(any dc)" : sourceDc,
+                        keyspace == null ? "(All keyspaces)" : keyspace,
+                        tokens == null ? "(All tokens)" : tokens);
+
             RangeStreamer streamer = new RangeStreamer(getTokenMetadata(),
                                                        null,
                                                        FBUtilities.getBroadcastAddressAndPort(),
@@ -3947,7 +3974,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         if (SchemaConstants.isLocalSystemKeyspace(keyspaceName))
             throw new RuntimeException("Cleanup of the system keyspace is neither necessary nor wise");
 
-        if (getTokenMetadata().getPendingRanges(keyspaceName, getBroadcastAddressAndPort()).size() > 0)
+        if (!getTokenMetadata().getPendingRanges(keyspaceName, getBroadcastAddressAndPort()).isEmpty())
             throw new RuntimeException("Node is involved in cluster membership changes. Not safe to run cleanup.");
 
         CompactionManager.AllSSTableOpStatus status = CompactionManager.AllSSTableOpStatus.SUCCESSFUL;
@@ -4736,6 +4763,12 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         return Keyspace.open(keyspaceName).getReplicationStrategy().getNaturalReplicasForToken(token);
     }
 
+    public boolean isEndpointValidForWrite(String keyspace, Token token)
+    {
+        AbstractReplicationStrategy replicationStrategy = Keyspace.open(keyspace).getReplicationStrategy();
+        return replicationStrategy.isTokenInLocalNaturalOrPendingRange(token);
+    }
+
     public void setLoggingLevel(String classQualifier, String rawLevel) throws Exception
     {
         LoggingSupportFactory.getLoggingSupport().setLoggingLevel(classQualifier, rawLevel);
@@ -4839,6 +4872,32 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         try
         {
             PendingRangeCalculatorService.instance.blockUntilFinished();
+
+            // In 5.0 we need to handle DECOMMISSION_FAILED which can be legitimately resumed
+            // hence operationMode != NORMAL clause chosen, and kept same on 4.0/4.1/5.0 for simplicity
+            // Checking OperationMode alone is insufficient since consider the following sequence:
+            //
+            // 1. Run a decommission, get far enough to persist transferred ranges, then fail, setting operationMode to DECOMMISSION_FAILED
+            // 2. Restart instance go NORMAL again, lose pending endpoints
+            // 3. Write comes in and is now not written to pending endpoint for one of the transferred ranges
+            // 4. Attempt decommission which fails before resetTransferredRanges, leaving operationMode as DECOMMISSION_FAILED
+            // 5. Re-attempt decommission which now sees operationMode == DECOMMISSION_FAILED
+            // (!= NORMAL) so skips resetting transferred ranges
+            // 6. decommission completes and write from step 3 has not been transferred via streaming or write path to the new owner.
+            //
+            // So checking tokenMetadata.isLeaving in addition means that on step 5 we now fail the isLeaving check
+            // (cleared by the restart in step 2, and step 4 never reached startLeaving) and truncate transferred ranges
+            boolean resumingInFlightDecommission = tokenMetadata.isLeaving(FBUtilities.getBroadcastAddressAndPort())
+                                                   && operationMode != Mode.NORMAL;
+
+            // We reset transferred ranges upon starting a new decommission so that we fully stream
+            // anything written since a previous attempt, which may not have been persisted to a pending endpoint.
+            // See CASSANDRA-16290.
+            if (!resumingInFlightDecommission)
+            {
+                logger.info("resetting transferred ranges to force re-streaming");
+                SystemKeyspace.resetTransferredRanges();
+            }
 
             String dc = DatabaseDescriptor.getEndpointSnitch().getLocalDatacenter();
 
@@ -4953,9 +5012,21 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         logger.debug("waiting for batch log processing.");
         batchlogReplay.get();
 
-        setMode(Mode.LEAVING, "streaming hints to other nodes", true);
+        Future<?> hintsSuccess = Futures.immediateFuture(null);
 
-        Future hintsSuccess = streamHints();
+        if (DatabaseDescriptor.getTransferHintsOnDecommission())
+        {
+            setMode(Mode.LEAVING, "streaming hints to other nodes", true);
+            hintsSuccess = streamHints();
+        }
+        else
+        {
+            setMode(Mode.LEAVING, "pausing dispatch and deleting hints", true);
+            DatabaseDescriptor.setHintedHandoffEnabled(false);
+            HintsService.instance.pauseDispatch();
+            HintsService.instance.deleteAllHints();
+        }
+
 
         // wait for the transfer runnables to signal the latch.
         logger.debug("waiting for stream acks.");
@@ -5845,8 +5916,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             if (rangesWithEndpoints.isEmpty())
                 continue;
 
-            //Description is always Unbootstrap? Is that right?
-            Map<InetAddressAndPort, Set<Range<Token>>> transferredRangePerKeyspace = SystemKeyspace.getTransferredRanges("Unbootstrap",
+            Map<InetAddressAndPort, Set<Range<Token>>> transferredRangePerKeyspace = SystemKeyspace.getTransferredRanges(StreamOperation.DECOMMISSION,
                                                                                                                          keyspace,
                                                                                                                          StorageService.instance.getTokenMetadata().partitioner);
             RangesByEndpoint.Builder replicasPerEndpoint = new RangesByEndpoint.Builder();
@@ -5857,7 +5927,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                 Set<Range<Token>> transferredRanges = transferredRangePerKeyspace.get(remote.endpoint());
                 if (transferredRanges != null && transferredRanges.contains(local.range()))
                 {
-                    logger.debug("Skipping transferred range {} of keyspace {}, endpoint {}", local, keyspace, remote);
+                    logger.info("Skipping transferred range {} of keyspace {}, endpoint {}", local, keyspace, remote);
                     continue;
                 }
 
@@ -6226,10 +6296,46 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         }
     }
 
-    public void setHintedHandoffThrottleInKB(int throttleInKB)
+    public boolean getTransferHintsOnDecommission()
     {
+        return DatabaseDescriptor.getTransferHintsOnDecommission();
+    }
+
+    public void setTransferHintsOnDecommission(boolean enabled)
+    {
+        DatabaseDescriptor.setTransferHintsOnDecommission(enabled);
+        logger.info("updated transfer_hints_on_decommission to {}", enabled);
+    }
+
+    @Override
+    public boolean isHintTtlUseMutationCreationTime()
+    {
+        return DatabaseDescriptor.isUseCreationTimeForHintTtl();
+    }
+
+    @Override
+    public void setUseCreationTimeForHintTtl(boolean enabled)
+    {
+        DatabaseDescriptor.setUseCreationTimeForHintTtl(enabled);
+        logger.info("updated use_creation_time_for_hint_ttl to {}", enabled);
+    }
+
+    public void setHintedHandoffThrottleInKB(int throttleInKB) {
         DatabaseDescriptor.setHintedHandoffThrottleInKB(throttleInKB);
         logger.info("updated hinted_handoff_throttle_in_kb to {}", throttleInKB);
+    }
+
+    @Override
+    public int getMaxHintTTL()
+    {
+        return Hint.maxHintTTL;
+    }
+
+    @Override
+    public void setMaxHintTTL(int maxHintTTL)
+    {
+        Hint.maxHintTTL = maxHintTTL;
+        logger.info("updated Hint.maxHintTTL to {}", maxHintTTL);
     }
 
     @Override
@@ -6316,6 +6422,36 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     public void setNativeTransportMaxConcurrentRequestsInBytesPerIp(long newLimit)
     {
         ClientResourceLimits.setEndpointLimit(newLimit);
+    }
+
+    public boolean isOutOfTokenRangeRequestLoggingEnabled()
+    {
+        return DatabaseDescriptor.getLogOutOfTokenRangeRequests();
+    }
+
+    public void setOutOfTokenRangeRequestLoggingEnabled(boolean enabled)
+    {
+        if (enabled)
+            logger.info("Enabling logging of requests on tokens outside owned ranges");
+        else
+            logger.info("Disabling logging of requests on tokens outside owned ranges");
+
+        DatabaseDescriptor.setLogOutOfTokenRangeRequests(enabled);
+    }
+
+    public boolean isOutOfTokenRangeRequestRejectionEnabled()
+    {
+        return DatabaseDescriptor.getRejectOutOfTokenRangeRequests();
+    }
+
+    public void setOutOfTokenRangeRequestRejectionEnabled(boolean enabled)
+    {
+        if (enabled)
+            logger.info("Enabling rejection of requests on tokens outside owned ranges");
+        else
+            logger.info("Disabling rejection of requests on tokens outside owned ranges");
+
+        DatabaseDescriptor.setRejectOutOfTokenRangeRequests(enabled);
     }
 
     @Override

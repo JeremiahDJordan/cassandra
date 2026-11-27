@@ -39,6 +39,8 @@ import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.transport.Event.SchemaChange;
 import org.apache.cassandra.transport.messages.ResultMessage;
 
+import static org.apache.cassandra.schema.KeyspaceMetadata.validateKeyspaceName;
+
 public abstract class AlterSchemaStatement implements CQLStatement.SingleKeyspaceCqlStatement, SchemaTransformation
 {
     private final String rawCQLStatement;
@@ -121,7 +123,7 @@ public abstract class AlterSchemaStatement implements CQLStatement.SingleKeyspac
         if (null != keyspace && keyspace.isVirtual())
             throw ire("Virtual keyspace '%s' is not user-modifiable", keyspaceName);
 
-        validateKeyspaceName();
+        validateKeyspaceName(keyspaceName, AlterSchemaStatement::ire);
 
         SchemaTransformationResult result = Schema.instance.transform(this, locally);
 
@@ -142,16 +144,6 @@ public abstract class AlterSchemaStatement implements CQLStatement.SingleKeyspac
             createdResources(result.diff).forEach(r -> grantPermissionsOnResource(r, user));
 
         return new ResultMessage.SchemaChange(schemaChangeEvent(result.diff));
-    }
-
-    private void validateKeyspaceName()
-    {
-        if (!SchemaConstants.isValidName(keyspaceName))
-        {
-            throw ire("Keyspace name must not be empty, more than %d characters long, " +
-                      "or contain non-alphanumeric-underscore characters (got '%s')",
-                      SchemaConstants.NAME_LENGTH, keyspaceName);
-        }
     }
 
     private void grantPermissionsOnResource(IResource resource, AuthenticatedUser user)

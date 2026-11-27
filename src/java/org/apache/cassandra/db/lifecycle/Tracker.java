@@ -605,6 +605,8 @@ public class Tracker
 
     public void notifySSTableRepairedStatusChanged(Collection<SSTableReader> repairStatusesChanged)
     {
+        if (repairStatusesChanged.isEmpty())
+            return;
         notify(new SSTableRepairStatusChanged(repairStatusesChanged));
     }
 

@@ -25,8 +25,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * Goes through all hint stores and schedules for dispatch all the hints for hosts that are:
  * 1. Not currently scheduled for dispatch, and
  * 2. Either have some hint files, or an active hint writer, and
- * 3. Are live, and
- * 4. Have matching schema versions
+ * 3. Are live
  *
  * What does triggering a hints store for dispatch mean?
  * - If there are existing hint files, it means submitting them for dispatch;
@@ -59,7 +58,6 @@ final class HintsDispatchTrigger implements Runnable
                .filter(store -> !isScheduled(store))
                .filter(HintsStore::isLive)
                .filter(store -> store.isWriting() || store.hasFiles())
-               .filter(store -> HintsEndpointProvider.instance.isSameSchemaVersion(store.hostId))
                .forEach(this::schedule);
     }
 

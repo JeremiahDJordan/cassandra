@@ -31,7 +31,7 @@ import org.apache.cassandra.sensors.RequestSensors;
 import org.apache.cassandra.sensors.SensorsFactory;
 import org.apache.cassandra.sensors.Type;
 
-public class ProposeVerbHandler implements IVerbHandler<Commit>
+public class ProposeVerbHandler extends AbstractPaxosVerbHandler implements IVerbHandler<Commit>
 {
     public static final ProposeVerbHandler instance = new ProposeVerbHandler();
 
@@ -40,7 +40,7 @@ public class ProposeVerbHandler implements IVerbHandler<Commit>
         return PaxosState.propose(proposal);
     }
 
-    public void doVerb(Message<Commit> message)
+    void processMessage(Message<Commit> message)
     {
         // Initialize the sensor and set ExecutorLocals
         RequestSensors sensors = SensorsFactory.instance.createRequestSensors(Set.of(message.payload.update.metadata().keyspace));

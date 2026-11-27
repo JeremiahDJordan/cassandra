@@ -27,7 +27,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.concurrent.ExecutorLocals;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
-import org.apache.cassandra.net.IVerbHandler;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.net.Message;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.sensors.Context;
@@ -36,13 +36,14 @@ import org.apache.cassandra.sensors.SensorsFactory;
 import org.apache.cassandra.sensors.Type;
 import org.apache.cassandra.service.StorageProxy;
 
-public class CounterMutationVerbHandler implements IVerbHandler<CounterMutation>
+public class CounterMutationVerbHandler extends AbstractMutationVerbHandler<CounterMutation>
 {
     public static final CounterMutationVerbHandler instance = new CounterMutationVerbHandler();
 
     private static final Logger logger = LoggerFactory.getLogger(CounterMutationVerbHandler.class);
 
-    public void doVerb(final Message<CounterMutation> message)
+    @Override
+    protected void applyMutation(final Message<CounterMutation> message, InetAddressAndPort respondToAddress)
     {
         long queryStartNanoTime = System.nanoTime();
         final CounterMutation cm = message.payload;
@@ -83,7 +84,7 @@ public class CounterMutationVerbHandler implements IVerbHandler<CounterMutation>
         // it's own in that case.
         StorageProxy.applyCounterMutationOnLeader(cm,
                                                   localDataCenter,
-                                                  new CounterMutationCallback(message, message.from(), requestSensors),
+                                                  new CounterMutationCallback(message, respondToAddress, requestSensors),
                                                   queryStartNanoTime);
     }
 }

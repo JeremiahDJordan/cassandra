@@ -28,7 +28,6 @@ import java.util.function.Predicate;
 import java.util.stream.Collectors;
 
 import com.codahale.metrics.ExponentiallyDecayingReservoir;
-
 import com.codahale.metrics.Snapshot;
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.cassandra.concurrent.ScheduledExecutors;
@@ -38,6 +37,7 @@ import org.apache.cassandra.net.LatencySubscribers;
 import org.apache.cassandra.net.MessagingService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.MBeanWrapper;
+
 
 /**
  * A dynamic snitch that sorts endpoints by latency with an adapted phi failure detector
