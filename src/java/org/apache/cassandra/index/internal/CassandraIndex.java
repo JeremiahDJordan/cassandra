@@ -24,10 +24,12 @@ import java.nio.ByteBuffer;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.StreamSupport;
 
 import com.google.common.collect.ImmutableSet;
+import com.google.common.util.concurrent.Uninterruptibles;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,6 +59,7 @@ import org.apache.cassandra.index.internal.keys.KeysSearcher;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.ReducingKeyIterator;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.utils.FBUtilities;
@@ -64,6 +67,7 @@ import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Refs;
 
 import static org.apache.cassandra.cql3.statements.RequestValidations.checkFalse;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 /**
  * Index implementation which indexes the values for a single column in the base
@@ -671,8 +675,36 @@ public abstract class CassandraIndex implements Index
         // compaction can start: stop the remaining ones and wait for the files to be removed, so that an index created
         // next with the same name, whose sstables are in the same directory, does not load them.
         CompactionManager.instance.interruptCompactionForCFs(cfss, (sstable) -> true, true);
-        CompactionManager.instance.waitForCessation(cfss, (sstable) -> true);
-        LifecycleTransaction.waitForDeletions();
+        waitForSSTablesDeleted();
+    }
+
+    /**
+     * Waits, at most for the cessation wait, for the transactions of the stopped compactions of the invalidated index
+     * table to drop and release its sstables, including the ones they wrote, which deletes their files, and then for the
+     * deletions queued so far. The transactions do that after they stop marking the sstables as compacting, and after
+     * the compactions stop counting as running.
+     */
+    private void waitForSSTablesDeleted()
+    {
+        long start = nanoTime();
+        long delay = TimeUnit.MINUTES.toNanos(1);
+        // canonical, as in the sstable descriptors
+        Set<File> directories = new HashSet<>();
+        for (File directory : indexCfs.getDirectories().getCFDirectories())
+            directories.add(directory.toCanonical());
+        while (SSTableReader.hasGlobalReference(directories))
+        {
+            if (nanoTime() - start >= delay)
+            {
+                logger.warn("Timed out waiting for the sstables of {} to be released; an index created again with " +
+                            "the same name may load them", indexCfs.metadata);
+                return;
+            }
+            Uninterruptibles.sleepUninterruptibly(10, TimeUnit.MILLISECONDS);
+        }
+
+        if (!LifecycleTransaction.waitForDeletions(delay - (nanoTime() - start), TimeUnit.NANOSECONDS))
+            logger.warn("Timed out waiting for the deletions of the sstables of {}", indexCfs.metadata);
     }
 
     private boolean isBuilt()

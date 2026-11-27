@@ -20,6 +20,7 @@ package org.apache.cassandra.index.internal;
 
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
@@ -39,6 +40,7 @@ import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.utils.FBUtilities;
 import org.jboss.byteman.contrib.bmunit.BMRule;
+import org.jboss.byteman.contrib.bmunit.BMRules;
 import org.jboss.byteman.contrib.bmunit.BMUnitRunner;
 
 import static org.apache.cassandra.utils.TimeUUID.Generator.nextTimeUUID;
@@ -65,6 +67,31 @@ public class CassandraIndexDropTest extends CQLTester
         }
     }
 
+    /**
+     * Called by {@link org.apache.cassandra.db.lifecycle.Tracker#dropSSTables} once it has removed sstables from the live
+     * set, before it releases them: holds the stopped compaction, whose transaction drops the sstables of the invalid
+     * table, there.
+     */
+    public static void pauseBeforeReleasingDroppedSSTables()
+    {
+        if (compaction != null && Thread.currentThread() == compaction.thread)
+        {
+            compaction.held.countDown();
+            Uninterruptibles.sleepUninterruptibly(2, TimeUnit.SECONDS);
+        }
+    }
+
+    /**
+     * Called by {@link CassandraIndex#invalidate} once the index table is invalid: ends the compaction, which drops the
+     * sstables it holds from the invalid table, and waits until it is held there.
+     */
+    public static void endCompactionAndAwaitHold()
+    {
+        compaction.abort = true;
+        if (!Uninterruptibles.awaitUninterruptibly(compaction.held, 20, TimeUnit.SECONDS))
+            throw new AssertionError("The compaction didn't reach the drop of its sstables");
+    }
+
     @Test
     @BMRule(name = "Start a compaction of the index table right before it is invalidated",
             targetClass = "CassandraIndex",
@@ -73,6 +100,49 @@ public class CassandraIndexDropTest extends CQLTester
             action = "org.apache.cassandra.index.internal.CassandraIndexDropTest.startCompaction($0.getIndexCfs())")
     public void testRecreateIndexWhileCompactionOfDroppedIndexInFlight() throws Throwable
     {
+        checkRecreateIndexWhileCompactionOfDroppedIndexInFlight();
+    }
+
+    @Test
+    @BMRules(rules = { @BMRule(name = "Start a compaction of the index table right before it is invalidated",
+                               targetClass = "CassandraIndex",
+                               targetMethod = "invalidate",
+                               targetLocation = "AT INVOKE org.apache.cassandra.db.ColumnFamilyStore.invalidate()",
+                               action = "org.apache.cassandra.index.internal.CassandraIndexDropTest.startCompaction($0.getIndexCfs())"),
+                       @BMRule(name = "Hold the stopped compaction after it removes the sstables of the invalid table from the live set",
+                               targetClass = "Tracker",
+                               targetMethod = "dropSSTables",
+                               targetLocation = "AT INVOKE finish",
+                               action = "org.apache.cassandra.index.internal.CassandraIndexDropTest.pauseBeforeReleasingDroppedSSTables()") })
+    public void testRecreateIndexWhileCompactionOfDroppedIndexReleasesItsSSTables() throws Throwable
+    {
+        checkRecreateIndexWhileCompactionOfDroppedIndexInFlight();
+    }
+
+    @Test
+    @BMRules(rules = { @BMRule(name = "Start a compaction of the index table right before it is invalidated",
+                               targetClass = "CassandraIndex",
+                               targetMethod = "invalidate",
+                               targetLocation = "AT INVOKE org.apache.cassandra.db.ColumnFamilyStore.invalidate()",
+                               action = "org.apache.cassandra.index.internal.CassandraIndexDropTest.startCompaction($0.getIndexCfs())"),
+                       @BMRule(name = "End the compaction once the index table is invalid",
+                               targetClass = "CassandraIndex",
+                               targetMethod = "invalidate",
+                               targetLocation = "AFTER INVOKE org.apache.cassandra.db.ColumnFamilyStore.invalidate()",
+                               action = "org.apache.cassandra.index.internal.CassandraIndexDropTest.endCompactionAndAwaitHold()"),
+                       @BMRule(name = "Hold the compaction after it removes the sstables of the invalid table from the live set",
+                               targetClass = "Tracker",
+                               targetMethod = "dropSSTables",
+                               targetLocation = "AT INVOKE finish",
+                               action = "org.apache.cassandra.index.internal.CassandraIndexDropTest.pauseBeforeReleasingDroppedSSTables()") })
+    public void testRecreateIndexWhileCompactionEndedAfterInvalidationReleasesItsSSTables() throws Throwable
+    {
+        checkRecreateIndexWhileCompactionOfDroppedIndexInFlight();
+    }
+
+    private void checkRecreateIndexWhileCompactionOfDroppedIndexInFlight() throws Throwable
+    {
+        compaction = null;
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v int)");
         createIndex("CREATE INDEX idx ON %s(v) USING 'legacy_local_table'");
         ColumnFamilyStore indexCfs = indexCfs();
@@ -117,7 +187,9 @@ public class CassandraIndexDropTest extends CQLTester
     private static class CompactionInFlight
     {
         private final Thread thread;
+        private final CountDownLatch held = new CountDownLatch(1);
         private volatile boolean complete;
+        private volatile boolean abort;
 
         CompactionInFlight(ColumnFamilyStore cfs)
         {
@@ -132,12 +204,12 @@ public class CassandraIndexDropTest extends CQLTester
             thread = new Thread(() -> {
                 try
                 {
-                    while (!complete && !ci.isStopRequested())
+                    while (!complete && !abort && !ci.isStopRequested())
                         Uninterruptibles.sleepUninterruptibly(10, TimeUnit.MILLISECONDS);
 
                     ci.close();
                     controller.close();
-                    if (ci.isStopRequested())
+                    if (abort || ci.isStopRequested())
                     {
                         txn.abort();
                     }

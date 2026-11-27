@@ -1735,6 +1735,20 @@ public abstract class SSTableReader extends SSTable implements UnfilteredSource,
         GlobalTidy.lookup.clear();
     }
 
+    /**
+     * @return true if a global reference exists for a physical sstable in one of the given directories, that is until
+     * the last of its readers is released
+     */
+    public static boolean hasGlobalReference(Collection<File> directories)
+    {
+        for (Descriptor descriptor : GlobalTidy.lookup.keySet())
+        {
+            if (directories.contains(descriptor.directory))
+                return true;
+        }
+        return false;
+    }
+
     public static class PartitionPositionBounds
     {
         public final long lowerPosition;

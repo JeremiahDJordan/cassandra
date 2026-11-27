@@ -29,11 +29,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Queue;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.Predicate;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.util.concurrent.Runnables;
+import com.google.common.util.concurrent.Uninterruptibles;
 
 import com.codahale.metrics.Counter;
 import org.slf4j.Logger;
@@ -441,6 +445,24 @@ class LogTransaction extends Transactional.AbstractTransactional implements Tran
     static void waitForDeletions()
     {
         FBUtilities.waitOnFuture(ScheduledExecutors.nonPeriodicTasks.schedule(Runnables.doNothing(), 0, TimeUnit.MILLISECONDS));
+    }
+
+    static boolean waitForDeletions(long timeout, TimeUnit unit)
+    {
+        Future<?> deletions = ScheduledExecutors.nonPeriodicTasks.schedule(Runnables.doNothing(), 0, TimeUnit.MILLISECONDS);
+        try
+        {
+            Uninterruptibles.getUninterruptibly(deletions, timeout, unit);
+            return true;
+        }
+        catch (TimeoutException e)
+        {
+            return false;
+        }
+        catch (ExecutionException e)
+        {
+            throw Throwables.cleaned(e);
+        }
     }
 
     @VisibleForTesting

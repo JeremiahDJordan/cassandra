@@ -25,6 +25,7 @@ import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.BiPredicate;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -662,6 +663,16 @@ public class LifecycleTransaction extends Transactional.AbstractTransactional im
     public static void waitForDeletions()
     {
         LogTransaction.waitForDeletions();
+    }
+
+    /**
+     * Waits, at most for {@code timeout}, for the deletions queued so far.
+     *
+     * @return false if the deletions didn't finish in time
+     */
+    public static boolean waitForDeletions(long timeout, TimeUnit unit)
+    {
+        return LogTransaction.waitForDeletions(timeout, unit);
     }
 
     // a class representing the current state of the reader within this transaction, encoding the actions both logged
