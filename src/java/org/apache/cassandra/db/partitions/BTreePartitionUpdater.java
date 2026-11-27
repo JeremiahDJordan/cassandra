@@ -66,6 +66,9 @@ public class BTreePartitionUpdater extends BasePartitionUpdater implements Updat
     {
         Row reconciled = ((BTreeRow) existing).mergeWith((BTreeRow) update, this);
         indexer.onUpdated(existing, reconciled);
+        // mergeWith reports the size changes of the cells, but not those of the row's liveness and deletion
+        this.dataSize += (reconciled.primaryKeyLivenessInfo().dataSize() + reconciled.deletion().dataSize())
+                         - (existing.primaryKeyLivenessInfo().dataSize() + existing.deletion().dataSize());
 
         return reconciled;
     }
