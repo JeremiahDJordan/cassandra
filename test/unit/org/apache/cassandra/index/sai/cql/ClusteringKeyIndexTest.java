@@ -17,6 +17,8 @@
  */
 package org.apache.cassandra.index.sai.cql;
 
+import java.math.BigDecimal;
+
 import org.junit.Before;
 import org.junit.Test;
 
@@ -95,6 +97,27 @@ public class ClusteringKeyIndexTest extends SAITester
         flush();
         compact();
         runQueries();
+    }
+
+    @Test
+    public void decimalClusteringAtScaleLimit() throws Throwable
+    {
+        createTable("CREATE TABLE %s (pk int, ck decimal, val int, PRIMARY KEY (pk, ck))");
+        createIndex("CREATE CUSTOM INDEX ON %s(val) USING 'StorageAttachedIndex'");
+
+        BigDecimal[] cks = { new BigDecimal("-5E-2147483647"), new BigDecimal("1E-2147483647"), new BigDecimal("1.25") };
+        for (int i = 0; i < cks.length; i++)
+            execute("INSERT INTO %s (pk, ck, val) VALUES (0, ?, ?)", cks[i], i);
+        runDecimalClusteringQueries(cks);
+        flush();
+        runDecimalClusteringQueries(cks);
+    }
+
+    private void runDecimalClusteringQueries(BigDecimal[] cks) throws Throwable
+    {
+        for (int i = 0; i < cks.length; i++)
+            assertRows(execute("SELECT * FROM %s WHERE val = ?", i), row(0, cks[i], i));
+        assertRows(execute("SELECT * FROM %s WHERE val >= 0"), row(0, cks[0], 0), row(0, cks[1], 1), row(0, cks[2], 2));
     }
 
     private Object[] expectedRow(int index)
