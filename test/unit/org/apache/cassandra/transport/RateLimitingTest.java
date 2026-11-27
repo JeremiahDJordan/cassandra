@@ -29,6 +29,8 @@ import java.util.stream.Collectors;
 import com.codahale.metrics.Meter;
 import com.google.common.base.Ticker;
 
+import io.netty.buffer.PooledByteBufAllocator;
+
 import org.awaitility.Awaitility;
 
 import org.junit.Before;
@@ -42,6 +44,7 @@ import org.apache.cassandra.exceptions.OverloadedException;
 import org.apache.cassandra.metrics.CassandraMetricsRegistry;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.memory.BufferPools;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
@@ -145,6 +148,56 @@ public class RateLimitingTest extends NativeProtocolLimitsTestBase
     public void shouldReleaseLargeMessageOnBytesInFlightOverload() throws Exception
     {
         testBytesInFlightOverload(LARGE_PAYLOAD_THRESHOLD_BYTES * 2);
+    }
+
+    @Test
+    public void shouldReleaseBuffersOfOverloadedMessages()
+    {
+        int payloadSize = 64 * 1024;
+        try (SimpleClient client = client(true, LARGE_PAYLOAD_THRESHOLD_BYTES))
+        {
+            StorageService.instance.setNativeTransportRateLimitingEnabled(false);
+            createTable(client);
+
+            StorageService.instance.setNativeTransportRateLimitingEnabled(true);
+            ClientResourceLimits.GLOBAL_REQUEST_LIMITER.setRate(OVERLOAD_PERMITS_PER_SECOND, ticker);
+
+            // The first query takes the one available permit, so the following ones are rejected.
+            client.execute(queryMessage(payloadSize));
+            long bytesInUseBefore = networkBytesInUse();
+
+            for (int i = 0; i < 10; i++)
+            {
+                try
+                {
+                    client.execute(queryMessage(payloadSize));
+                    fail("Expected an OverloadedException");
+                }
+                catch (RuntimeException e)
+                {
+                    assertTrue(Throwables.anyCauseMatches(e, cause -> cause instanceof OverloadedException));
+                }
+            }
+
+            Awaitility.await().untilAsserted(() ->
+            {
+                long bytesInUse = networkBytesInUse();
+                assertTrue(String.format("Network buffers in use grew from %d to %d bytes", bytesInUseBefore, bytesInUse),
+                           bytesInUse - bytesInUseBefore < payloadSize);
+            });
+        }
+        finally
+        {
+            StorageService.instance.setNativeTransportRateLimitingEnabled(false);
+        }
+    }
+
+    /**
+     * Bytes in use by the allocator of pre-V5 connections and by the buffer pool of V5 connections.
+     */
+    private static long networkBytesInUse()
+    {
+        return ((PooledByteBufAllocator) CBUtil.allocator).pinnedDirectMemory() + BufferPools.forNetworking().usedSizeInBytes();
     }
 
     private void testBytesInFlightOverload(int payloadSize) throws Exception
