@@ -577,6 +577,29 @@ public class RowFilterPeerGateTest extends CQLTester
     }
 
     /**
+     * A query whose restrictions match no row, such as a contradictory range, reads nothing, so it isn't rejected while
+     * a node it can contact is below DS 10.
+     */
+    @Test
+    public void testUnsatisfiableFilterBelowDS10() throws Throwable
+    {
+        InetAddressAndPort peer = InetAddressAndPort.getByName("127.0.0.8");
+        addToRing(peer);
+        MessagingService.instance().versions.set(peer, MessagingService.VERSION_50);
+        try
+        {
+            assertRejected();
+            assertEmpty(execute("SELECT k FROM %s WHERE a > 2 AND a < 1 ALLOW FILTERING"));
+            assertEmpty(execute("SELECT k FROM %s WHERE (a > 2 AND a < 1) OR (b > 3 AND b < 2) ALLOW FILTERING"));
+        }
+        finally
+        {
+            StorageService.instance.getTokenMetadata().removeEndpoint(peer);
+            MessagingService.instance().versions.reset(peer);
+        }
+    }
+
+    /**
      * Asserts that the given change makes the next queries check the nodes again, once for every node and once for the
      * local datacenter.
      */

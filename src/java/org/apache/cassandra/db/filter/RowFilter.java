@@ -254,14 +254,14 @@ public class RowFilter
      * #dataStaxOnlyFeature()}) while a node that the read can contact is, or may be, on a messaging version below
      * {@link MessagingService#VERSION_DS_10}: known to be below it, or alive with an unknown version. LIKE has its own
      * gate. This doesn't know whether the query is sent to other nodes, so queries that only run locally are rejected
-     * too.
+     * too. A filter that matches no row is accepted, as its query reads nothing.
      *
      * @param filteredBySAI whether the replicas filter the read with SAI (see {@link #dataStaxOnlyFeature(boolean)})
      * @throws InvalidRequestException if this filter uses a DataStax-only feature and such a node may be contacted
      */
     public void validateForPeers(String keyspace, ConsistencyLevel consistency, boolean filteredBySAI)
     {
-        if (root.isAlwaysSatisfied())
+        if (root.isAlwaysSatisfied() || root.isUnsatisfiable())
             return;
 
         // checking the peers is usually cheaper than going through the filter
