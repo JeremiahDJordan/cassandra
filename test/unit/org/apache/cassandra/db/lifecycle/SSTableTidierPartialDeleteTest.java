@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
 import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -37,13 +36,14 @@ import org.apache.cassandra.db.commitlog.CommitLog;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.MockSchema;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
 /**
- * Verifies that when the {@link LogTransaction.SSTableTidier} fails partway through deleting an sstable,
+ * Verifies that when the {@link AbstractLogTransaction.ReaderTidier} fails partway through deleting an sstable,
  * the transaction log is kept and still matches the files left on disk, so both the tidier's retry
  * and the startup cleanup finish the deletion.
  */
@@ -56,7 +56,7 @@ import static org.junit.Assert.assertTrue;
             action = "createCountDown(\"deletes\", $1);"),
     @BMRule(name = "Fail the delete once the countdown runs out",
             targetClass = "org.apache.cassandra.io.util.FileUtils",
-            targetMethod = "deleteWithConfirm(java.lang.String)",
+            targetMethod = "deleteWithConfirm(org.apache.cassandra.io.util.File)",
             targetLocation = "AT ENTRY",
             condition = "countDown(\"deletes\")",
             action = "throw new org.apache.cassandra.io.FSWriteError(new java.io.IOException(\"simulated delete failure\"), $1);")
@@ -87,16 +87,16 @@ public class SSTableTidierPartialDeleteTest
         ColumnFamilyStore cfs = MockSchema.newCFS();
         SSTableReader sstableOld = MockSchema.sstable(0, true, cfs);
         SSTableReader sstableNew = MockSchema.sstable(1, true, cfs);
-        List<File> files = sstableOld.getAllFilePaths().stream().map(File::new).collect(Collectors.toList());
+        List<File> files = sstableOld.components().stream().map(sstableOld.descriptor::fileFor).collect(Collectors.toList());
 
         // make DATA the newest file, so deleting it early would cause the REMOVE record to have a different timestamp
-        File data = new File(sstableOld.descriptor.filenameFor(Component.DATA));
+        File data = sstableOld.descriptor.fileFor(Component.DATA);
         long newest = files.stream().mapToLong(File::lastModified).max().getAsLong();
-        assertTrue(data.setLastModified(newest + 1000));
+        assertTrue(data.trySetLastModified(newest + 1000));
 
-        LogTransaction log = new LogTransaction(OperationType.COMPACTION);
+        LogTransaction log = new LogTransaction(OperationType.COMPACTION, LifecycleTransaction.newId());
         log.trackNew(sstableNew);
-        LogTransaction.SSTableTidier tidier = log.obsoleted(sstableOld);
+        AbstractLogTransaction.ReaderTidier tidier = log.obsoleted(sstableOld);
         List<File> logFiles = log.txnFile().getFiles();
         log.finish();
 
@@ -111,23 +111,23 @@ public class SSTableTidierPartialDeleteTest
         if (restart)
         {
             // the startup txn log replay finishes the deletion, and the old sstable isn't picked up as live
-            assertTrue(LogTransaction.removeUnfinishedLeftovers(cfs.metadata()));
+            assertTrue(LifecycleTransaction.removeUnfinishedLeftovers(cfs.metadata()));
             assertEquals(Collections.singleton(sstableNew.descriptor),
                          new Directories(cfs.metadata()).sstableLister(Directories.OnTxnErr.THROW).list().keySet());
         }
 
         // the tidier's retry finishes the deletion (or finds nothing left after a restart) and releases the txn log
         sstableNew.selfRef().release();
-        LogTransaction.rescheduleFailedDeletions();
-        LogTransaction.waitForDeletions();
+        LifecycleTransaction.rescheduleFailedDeletions();
+        LifecycleTransaction.waitForDeletions();
         assertTrue(Stream.concat(files.stream(), logFiles.stream()).noneMatch(File::exists));
     }
 
     // the BMRules above use deletesBeforeFailure to fail the next delete
-    private static void runTidier(int deletesBeforeFailure, LogTransaction.SSTableTidier tidier, SSTableReader sstable)
+    private static void runTidier(int deletesBeforeFailure, AbstractLogTransaction.ReaderTidier tidier, SSTableReader sstable)
     {
         sstable.markObsolete(tidier);
         sstable.selfRef().release();
-        LogTransaction.waitForDeletions();
+        LifecycleTransaction.waitForDeletions();
     }
 }

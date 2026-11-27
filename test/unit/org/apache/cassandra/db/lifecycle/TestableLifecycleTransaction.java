@@ -38,7 +38,7 @@ public class TestableLifecycleTransaction extends LifecycleTransaction
 {
     public TestableLifecycleTransaction(Tracker tracker, OperationType operationType, Iterable<SSTableReader> readers)
     {
-        super(markCompactingAndReturn(tracker, readers), operationType, readers);
+        super(markCompactingAndReturn(tracker, readers), operationType, readers, newId());
     }
 
     private static Tracker markCompactingAndReturn(Tracker tracker, Iterable<SSTableReader> readers)
