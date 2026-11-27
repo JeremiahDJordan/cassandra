@@ -595,7 +595,7 @@ public class Config
      * or is not about to acquire.
      */
     public volatile boolean log_out_of_token_range_requests = true;
-    public volatile boolean reject_out_of_token_range_requests = true;
+    public volatile boolean reject_out_of_token_range_requests = false;
 
     /**
      * The intial capacity for creating RangeTombstoneList.
