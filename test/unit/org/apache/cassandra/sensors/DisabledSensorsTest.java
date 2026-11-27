@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.sensors;
 
+import java.io.IOException;
 import java.util.HashMap;
 
 import org.junit.After;
@@ -152,7 +153,7 @@ public class DisabledSensorsTest
     }
 
     @Test
-    public void testSensorsForCounterMutationVerbHandler() throws WriteTimeoutException
+    public void testSensorsForCounterMutationVerbHandler() throws WriteTimeoutException, IOException
     {
         store = SensorsTestUtil.discardSSTables(KEYSPACE1, CF_COUTNER);
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_COUTNER);
@@ -193,7 +194,7 @@ public class DisabledSensorsTest
         MutationVerbHandler.instance.doVerb(Message.builder(Verb.MUTATION_REQ, mutation).build());
     }
 
-    private static void handleCounterMutation(CounterMutation mutation)
+    private static void handleCounterMutation(CounterMutation mutation) throws IOException
     {
         CounterMutationVerbHandler.instance.doVerb(Message.builder(Verb.COUNTER_MUTATION_REQ, mutation).build());
     }

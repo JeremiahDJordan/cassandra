@@ -16,6 +16,7 @@
 
 package org.apache.cassandra.sensors;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -368,7 +369,7 @@ public class ReplicaWriteSensorsTest
     // -------------------------------------------------------------------------
 
     @Test
-    public void testSingleCounterMutation() throws WriteTimeoutException
+    public void testSingleCounterMutation() throws WriteTimeoutException, IOException
     {
         store = SensorsTestUtil.discardSSTables(KEYSPACE1, CF_COUTNER);
         Context context = new Context(KEYSPACE1, CF_COUTNER, store.metadata.id.toString());
@@ -675,7 +676,7 @@ public class ReplicaWriteSensorsTest
         MutationVerbHandler.instance.doVerb(Message.builder(Verb.MUTATION_REQ, mutation).build());
     }
 
-    private static void handleCounterMutation(CounterMutation mutation)
+    private static void handleCounterMutation(CounterMutation mutation) throws IOException
     {
         CounterMutationVerbHandler.instance.doVerb(Message.builder(Verb.COUNTER_MUTATION_REQ, mutation).build());
     }

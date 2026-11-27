@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.sensors;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
@@ -62,6 +63,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.UUIDGen;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.fail;
 
 public class SensorsInternodeTest
 {
@@ -195,7 +197,16 @@ public class SensorsInternodeTest
         CounterMutation counterMutation = new CounterMutation(mutation, ConsistencyLevel.ANY);
 
         Message request = Message.builder(Verb.COUNTER_MUTATION_REQ, counterMutation).build();
-        Runnable handler = () -> CounterMutationVerbHandler.instance.doVerb(request);
+        Runnable handler = () -> {
+            try
+            {
+                CounterMutationVerbHandler.instance.doVerb(request);
+            }
+            catch (IOException e)
+            {
+                fail("Failed to handle counter mutation", e);
+            }
+        };
         testInternodeSensors(request, handler, ImmutableSet.of(context));
     }
 
