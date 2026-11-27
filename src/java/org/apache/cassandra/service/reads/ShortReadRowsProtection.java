@@ -51,7 +51,6 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     private final Replica source;
     private final DataLimits.Counter singleResultCounter; // unmerged per-source counter
     private final DataLimits.Counter mergedResultCounter; // merged end-result counter
-    private final DataLimits.Counter resultRowsCounter; // see ShortReadPartitionsProtection#resultRowsCounter
     private final Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor;
     private final TableMetadata metadata;
     private final DecoratedKey partitionKey;
@@ -70,14 +69,13 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     ShortReadRowsProtection(DecoratedKey partitionKey, ReadCommand command, Replica source,
                             Function<ReadCommand, UnfilteredPartitionIterator> commandExecutor,
                             DataLimits.Counter singleResultCounter, DataLimits.Counter mergedResultCounter,
-                            DataLimits.Counter resultRowsCounter, BooleanSupplier hasNextPartition, boolean inFirstResponse)
+                            BooleanSupplier hasNextPartition, boolean inFirstResponse)
     {
         this.command = command;
         this.source = source;
         this.commandExecutor = commandExecutor;
         this.singleResultCounter = singleResultCounter;
         this.mergedResultCounter = mergedResultCounter;
-        this.resultRowsCounter = resultRowsCounter;
         this.metadata = command.metadata();
         this.partitionKey = partitionKey;
         this.hasNextPartition = hasNextPartition;
@@ -108,7 +106,10 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
     public UnfilteredRowIterator moreContents()
     {
         // never try to request additional rows from replicas if our reconciled partition is already filled to the limit
-        assert !mergedResultCounter.isDoneForPartition();
+        // (the merged result counter stops the iteration once it's done, except in the first phase of replica filtering
+        // protection, where it only counts the rows that are known to be returned, see DataResolver)
+        if (mergedResultCounter.isDoneForPartition())
+            return null;
 
         // we do not apply short read protection when we have no limits at all
         assert !command.limits().isUnlimited();
@@ -325,7 +326,7 @@ class ShortReadRowsProtection extends Transformation implements MoreRows<Unfilte
      */
     boolean isCompleteWithLastRow()
     {
-        return command.limits().isCompleteWithLastRowOf(resultRowsCounter,
+        return command.limits().isCompleteWithLastRowOf(mergedResultCounter,
                                                         inFirstResponse && lastQueried == 0 ? singleResultCounter : null,
                                                         lastClustering == null ? null : partitionKey,
                                                         lastClustering,

@@ -238,13 +238,13 @@ public abstract class DataLimits
      * row so far is the row at {@code lastClustering} of {@code partitionKey}.
      * <p>
      * Only GROUP BY limits can tell, as their counters only count a group once the next one starts, and don't stop at
-     * the row or byte limit when they only count. The merged result needs no more rows from the replica when it has as
-     * many rows or bytes as the row or byte limit, or as many groups as the limit with its open group and the open
-     * group has all the rows of the replica: when the replica's last row is in a later group, or is the last row of the
-     * open group and the replica stopped at the end of a group or of its data, which the counter of the replica's
-     * response to the command tells, if the replica returned nothing else. When the open group is the last group of the
-     * previous page, of which the merged result has no row, it has all the rows of a replica whose response to the
-     * command has no row: the next row of that replica starts a new group.
+     * the row or byte limit when they only count, or count outside of an iteration. The merged result needs no more
+     * rows from the replica when it has as many rows or bytes as the row or byte limit, or as many groups as the limit
+     * with its open group and the open group has all the rows of the replica: when the replica's last row is in a later
+     * group, or is the last row of the open group and the replica stopped at the end of a group or of its data, which
+     * the counter of the replica's response to the command tells, if the replica returned nothing else. When the open
+     * group is the last group of the previous page, of which the merged result has no row, it has all the rows of a
+     * replica whose response to the command has no row: the next row of that replica starts a new group.
      *
      * @param firstResponseCounter the counter of the replica's response to the command, if the replica returned nothing
      * else, or {@code null}
@@ -465,6 +465,15 @@ public abstract class DataLimits
                 onPartitionClose();
             countedPartitionKey = partitionKey;
             applyToPartition(partitionKey, Rows.EMPTY_STATIC_ROW);
+        }
+
+        /**
+         * Counts the static row of the partition started by {@link #countPartitionStart(DecoratedKey)}, which has no rows
+         * counted: a partition without rows counts for its static row when it is closed.
+         */
+        public void countStaticRow(Row staticRow)
+        {
+            applyToPartition(countedPartitionKey, staticRow);
         }
 
         /**
