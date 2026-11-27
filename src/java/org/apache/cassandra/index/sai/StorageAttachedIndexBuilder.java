@@ -786,25 +786,32 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 // The index is only affected if the SSTable is live: for one that isn't yet, the failure fails the
                 // operation that was going to add it (a stream or import), and the index is fine without it. The
                 // writer then neither makes the index non-queryable nor rethrows, and the failure is handled below.
-                indexWriter.abort(t, updateViews);
+                // Once our components are registered, every index we built uses them, maybe instead of Apache Cassandra
+                // ones (see completeSSTable), and the abort deletes them: all those indexes are affected.
+                Collection<StorageAttachedIndex> nonQueryable = registered && updateViews ? makeNonQueryable(indexes, t)
+                                                                                          : nonQueryableOnAbort;
+                try
+                {
+                    indexWriter.abort(t, updateViews);
+                }
+                finally
+                {
+                    // once the abort has deleted what the writer wrote
+                    if (updateViews)
+                        removeFromViews(sstable, nonQueryable, t);
+                }
             }
             else if (replacingApache == null && updateViews)
             {
                 // Before the widening, nonQueryableOnAbort holds the requested indexes, and after it those the build
                 // rebuilds and owns the files of (ownFilesOfOtherIndexes runs before any file is deleted)
+                Set<StorageAttachedIndex> lostFiles = new HashSet<>();
                 for (StorageAttachedIndex index : nonQueryableOnAbort)
                 {
-                    if (!lostPerSSTable && !lostPerIndex.contains(index))
-                        continue;
-                    try
-                    {
-                        index.makeIndexNonQueryable();
-                    }
-                    catch (Throwable e)
-                    {
-                        t.addSuppressed(e);
-                    }
+                    if (lostPerSSTable || lostPerIndex.contains(index))
+                        lostFiles.add(index);
                 }
+                removeFromViews(sstable, makeNonQueryable(lostFiles, t), t);
             }
 
             if (t instanceof InterruptedException)
@@ -870,6 +877,50 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             if (buildLock != null)
                 unlockForBuild(sstable, buildLock);
             owners.values().forEach(PerIndexFilesOwner::close);
+        }
+    }
+
+    /** @return the provided indexes that this has made non-queryable */
+    private static Set<StorageAttachedIndex> makeNonQueryable(Collection<StorageAttachedIndex> indexes, Throwable failure)
+    {
+        Set<StorageAttachedIndex> nonQueryable = new HashSet<>();
+        for (StorageAttachedIndex index : indexes)
+        {
+            try
+            {
+                index.makeIndexNonQueryable();
+                nonQueryable.add(index);
+            }
+            catch (Throwable e)
+            {
+                failure.addSuppressed(e);
+            }
+        }
+        return nonQueryable;
+    }
+
+    /**
+     * Removes the SSTable from the views of the provided indexes, which its failed build has made non-queryable, as it
+     * may have deleted their files on it: a build of one of them in progress, which may have built the SSTable already
+     * (e.g. its initial build), then finds the SSTable missing from its view and builds it again before the index is
+     * made queryable (see StorageAttachedIndex#buildSSTablesMissedByInitialBuild). An initial build that has looked at
+     * its view just before still makes the index queryable without the SSTable, until a restart builds it. Not for an
+     * index dropped meanwhile, whose drop cleans up the files of the SSTables in its view.
+     */
+    private void removeFromViews(SSTableReader sstable, Collection<StorageAttachedIndex> indexes, Throwable failure)
+    {
+        for (StorageAttachedIndex index : indexes)
+        {
+            if (!group.containsIndex(index))
+                continue;
+            try
+            {
+                index.getIndexContext().prepareSSTablesForRebuild(Collections.singleton(sstable));
+            }
+            catch (Throwable e)
+            {
+                failure.addSuppressed(e);
+            }
         }
     }
 
@@ -1042,6 +1093,8 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             // The size of an SSTable that isn't live yet isn't tracked (see completeSSTable).
             components.invalidate(sstable, updateViews ? tracker : null);
             index.makeIndexNonQueryable();
+            if (updateViews)
+                index.getIndexContext().prepareSSTablesForRebuild(Collections.singleton(sstable));
         }
     }
 

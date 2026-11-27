@@ -19,6 +19,7 @@ package org.apache.cassandra.index.sai.cql;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -32,11 +33,13 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.index.sai.SAITester;
 import org.apache.cassandra.index.sai.SAIUtil;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.StorageAttachedIndexBuilder;
 import org.apache.cassandra.index.sai.StorageAttachedIndexGroup;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.Version;
+import org.apache.cassandra.index.sai.disk.v1.SSTableIndexWriter;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injections;
@@ -70,6 +73,7 @@ public class PerSSTableComponentsRebuildTest extends SAITester
     }
 
     private boolean defaultImmutableSetting;
+    private Injections.Barrier holdInitialBuild;
 
     @Before
     public void saveImmutableSetting()
@@ -259,6 +263,112 @@ public class PerSSTableComponentsRebuildTest extends SAITester
     public void testFailedRebuildOfUnreadableImmutableComponentsMakesTheOtherIndexesNonQueryable() throws Throwable
     {
         testFailedRebuildOfReplacedComponents(true, true);
+    }
+
+    /**
+     * A full rebuild of v that also rebuilds w, as a column was dropped since the SSTable was written, fails before its
+     * writer exists, while the initial build of w has built the SSTable and hasn't ended: the initial build builds the
+     * SSTable again, as the rebuild has deleted the files of w on it, before w is queryable.
+     */
+    @Test
+    public void testFailedRebuildBeforeWriterDuringInitialBuildOfOtherIndex() throws Throwable
+    {
+        testFailedRebuildDuringInitialBuildOfOtherIndex(InvokePointBuilder.newInvokePoint()
+                                                                          .onClass(StorageAttachedIndexWriter.class)
+                                                                          .onMethod("<init>")
+                                                                          .atEntry());
+    }
+
+    /**
+     * The same with a rebuild that fails as it writes a row.
+     */
+    @Test
+    public void testFailedRebuildInWriterDuringInitialBuildOfOtherIndex() throws Throwable
+    {
+        testFailedRebuildDuringInitialBuildOfOtherIndex(InvokePointBuilder.newInvokePoint()
+                                                                          .onClass(SSTableIndexWriter.class)
+                                                                          .onMethod("addRow")
+                                                                          .atEntry());
+    }
+
+    /**
+     * The same with a partial build of v that writes lost per-SSTable components, and so invalidates the components of
+     * w on the SSTable.
+     */
+    @Test
+    public void testBuildOfLostComponentsDuringInitialBuildOfOtherIndex() throws Throwable
+    {
+        String v = createTableWithIndexOnV();
+        String w = startInitialBuildOfWHeldAtItsEnd();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+        SSTableReader sstable = cfs.getLiveSSTables().iterator().next();
+        group.descriptorFor(sstable).perSSTableComponents().invalidate(sstable, cfs.getTracker());
+        assertThat(partialBuild(group, sstable, v)).isNull();
+        checkInitialBuildOfWBuildsTheSSTableAgain(w);
+    }
+
+    private void testFailedRebuildDuringInitialBuildOfOtherIndex(InvokePointBuilder failurePoint) throws Throwable
+    {
+        String v = createTableWithIndexOnV();
+        String w = startInitialBuildOfWHeldAtItsEnd();
+        injectFailureOnce(failurePoint);
+        assertThatThrownBy(() -> rebuildIndexes(v)).hasStackTraceContaining("Injected writer failure");
+        assertTrue(writerFailures.get() <= 0);
+        checkInitialBuildOfWBuildsTheSSTableAgain(w);
+    }
+
+    /** Creates a table with one SSTable whose rows have cells of a column dropped since, and an index on v. */
+    private String createTableWithIndexOnV()
+    {
+        IMMUTABLE_SAI_COMPONENTS.setBoolean(false);
+        createTable("CREATE TABLE %s (pk int, ck int, v int, w int, d int, PRIMARY KEY (pk, ck))");
+        disableCompaction();
+        String v = createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        for (int pk = 0; pk < 10; pk++)
+            for (int ck = 0; ck < 3; ck++)
+                execute("INSERT INTO %s (pk, ck, v, w, d) VALUES (?, ?, ?, ?, 1)", pk, ck, pk * 10 + ck, pk);
+        flush();
+        schemaChange(String.format("ALTER TABLE %s.%s DROP d", KEYSPACE, currentTable()));
+        return v;
+    }
+
+    /** Creates an index on w, and holds its initial build once it has built the SSTable, before it looks for missed ones. */
+    private String startInitialBuildOfWHeldAtItsEnd() throws Throwable
+    {
+        holdInitialBuild = Injections.newBarrier("hold_initial_build_" + UUID.randomUUID(), 2, false)
+                                     .add(InvokePointBuilder.newInvokePoint()
+                                                            .onClass(StorageAttachedIndex.class)
+                                                            .onMethod("buildSSTablesMissedByInitialBuild")
+                                                            .atEntry())
+                                     .build();
+        Injections.inject(holdInitialBuild);
+        String w = createIndexAsync("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
+        waitForAssert(() -> assertEquals(1, holdInitialBuild.getCount()));
+        return w;
+    }
+
+    /**
+     * Checks that w, which has lost its files on the SSTable while its initial build is held, isn't queryable, and is
+     * once its initial build is over, with the rows of the SSTable after it is loaded again.
+     */
+    private void checkInitialBuildOfWBuildsTheSSTableAgain(String w) throws Throwable
+    {
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        assertFalse(isIndexQueryable(KEYSPACE, w));
+        assertTrue("the initial build of w is held", cfs.indexManager.isIndexBuilding(w));
+        holdInitialBuild.countDown();
+        holdInitialBuild.disable();
+        waitForIndexBuilds(KEYSPACE, w);
+        assertTrue(isIndexQueryable(KEYSPACE, w));
+
+        // the SSTable is loaded again, as when a compaction that opened its result early aborts
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+        Set<SSTableReader> sstables = cfs.getLiveSSTables();
+        group.onSSTableChanged(sstables, Collections.emptyList(), group.getIndexes(), false);
+        group.onSSTableChanged(Collections.emptyList(), sstables, group.getIndexes(), false);
+        for (int pk = 0; pk < 10; pk++)
+            assertRowsIgnoringOrder(execute("SELECT pk, ck FROM %s WHERE w = ?", pk), row(pk, 0), row(pk, 1), row(pk, 2));
     }
 
     /**
