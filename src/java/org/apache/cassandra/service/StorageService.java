@@ -418,7 +418,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public RangesAtEndpoint getReplicas(AbstractReplicationStrategy replicationStrategy, InetAddressAndPort endpoint)
     {
-        return replicationStrategy.getAddressReplicas(getTokenMetadata().cloneOnlyTokenMap(), endpoint);
+        return replicationStrategy.getAddressReplicas(endpoint);
     }
 
     public List<Range<Token>> getLocalRanges(String ks)

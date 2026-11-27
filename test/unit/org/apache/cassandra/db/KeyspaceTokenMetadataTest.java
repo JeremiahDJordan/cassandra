@@ -18,10 +18,12 @@ package org.apache.cassandra.db;
 import java.util.Collections;
 
 import com.google.common.collect.ImmutableMultimap;
+import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.Util;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
 import org.apache.cassandra.dht.Range;
@@ -55,6 +57,12 @@ public class KeyspaceTokenMetadataTest
         SchemaLoader.createKeyspace(KEYSPACE, KeyspaceParams.simple(1), SchemaLoader.standardCFMD(KEYSPACE, TABLE));
     }
 
+    @Before
+    public void clearKeyspaceTokenMetadata()
+    {
+        StorageService.instance.getTokenMetadataForKeyspace(KEYSPACE).clearUnsafe();
+    }
+
     @Test
     public void testCleanupIsAbortedWhenKeyspaceTokenMetadataHasPendingRanges() throws Exception
     {
@@ -66,6 +74,20 @@ public class KeyspaceTokenMetadataTest
 
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(TABLE);
         assertEquals(CompactionManager.AllSSTableOpStatus.ABORTED, CompactionManager.instance.performCleanup(cfs, 1));
+    }
+
+    @Test
+    public void testCleanupKeepsRangesOwnedInKeyspaceTokenMetadata() throws Exception
+    {
+        StorageService.instance.getTokenMetadata().clearUnsafe();
+        StorageService.instance.getTokenMetadataForKeyspace(KEYSPACE).updateNormalToken(new BytesToken(new byte[]{ 50 }), FBUtilities.getBroadcastAddressAndPort());
+
+        ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(TABLE);
+        new RowUpdateBuilder(cfs.metadata(), 0, "key").clustering("name").add("val", "value").build().applyUnsafe();
+        Util.flush(cfs);
+
+        assertEquals(CompactionManager.AllSSTableOpStatus.SUCCESSFUL, CompactionManager.instance.performCleanup(cfs, 1));
+        assertEquals(1, Util.getAll(Util.cmd(cfs).build()).size());
     }
 
     @Test
