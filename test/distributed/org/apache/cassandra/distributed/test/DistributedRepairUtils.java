@@ -29,6 +29,8 @@ import org.junit.Assert;
 
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
+import org.apache.cassandra.db.compaction.CompactionStrategyContainer;
+import org.apache.cassandra.db.compaction.CompactionStrategyManager;
 import org.apache.cassandra.distributed.api.ConsistencyLevel;
 import org.apache.cassandra.distributed.api.ICluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
@@ -190,7 +192,9 @@ public final class DistributedRepairUtils
                     if (session != null && !session.isCompleted())
                         continue;
                     // The session is complete, yet the sstable is not updated... is this still pending in compaction?
-                    if (cfs.getCompactionStrategyManager().hasPendingRepairSSTable(pendingRepair, sstable))
+                    CompactionStrategyContainer container = cfs.getCompactionStrategyContainer();
+                    if (!(container instanceof CompactionStrategyManager)
+                        || ((CompactionStrategyManager) container).hasPendingRepairSSTable(pendingRepair, sstable))
                         continue;
                     // compaction does not know about the pending repair... race condition since this check started?
                     if (sstable.getSSTableMetadata().pendingRepair == null)
