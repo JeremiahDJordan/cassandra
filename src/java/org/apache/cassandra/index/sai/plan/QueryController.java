@@ -595,7 +595,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
             Expression expression = new Expression(orderer.context).add(Operator.ANALYZER_MATCHES, term);
             if (existing.contains(expression))
                 continue;
-            long expectedMatchingRowCount = Math.min(estimateMatchingRowCount(expression), planFactory.tableMetrics.rows);
+            long expectedMatchingRowCount = Math.min(estimateMatchingRowCount(expression, Plan.DataScope.ALL), planFactory.tableMetrics.rows);
             termScans.add(planFactory.indexScan(expression, expectedMatchingRowCount));
         }
 

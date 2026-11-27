@@ -285,7 +285,10 @@ public abstract class SegmentBuilder
         @Override
         protected long addInternal(List<ByteBuffer> terms, int segmentRowId)
         {
-            return ramIndexer.addAll(terms.stream().map(term -> new BytesRef(termType.toComparableBytes(term))).collect(Collectors.toList()), segmentRowId);
+            List<BytesRef> bytesRefs = new ArrayList<>(terms.size());
+            for (ByteBuffer term : terms)
+                bytesRefs.add(new BytesRef(termType.toComparableBytes(term)));
+            return ramIndexer.addAll(bytesRefs, segmentRowId);
         }
 
         @Override

@@ -261,7 +261,7 @@ public class RowFilter
      */
     public void validateForPeers(String keyspace, ConsistencyLevel consistency, boolean filteredBySAI)
     {
-        if (root.isAlwaysTrue())
+        if (root.isAlwaysSatisfied())
             return;
 
         // checking the peers is usually cheaper than going through the filter

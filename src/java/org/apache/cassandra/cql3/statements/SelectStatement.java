@@ -561,8 +561,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         if (rowFilter == null)
             return null;
 
-        ReadQuery retry = getReadQuery(options, state, query.columnFilter(), rowFilter, query.limits(),
-                                       query.nowInSec(), IndexRegistry.obtain(table));
+        ReadQuery retry = getReadQuery(options, state, query.columnFilter(), rowFilter, query.limits(), query.nowInSec());
         rowFilter.validateForPeers(table.keyspace, options.getConsistency(), isFilteredBySAI(retry));
         return retry;
     }
@@ -650,7 +649,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         RowFilter rowFilter = restrictions.getRowFilter(indexRegistry, options, state, selectOptions);
         DataLimits dataLimits = getDataLimits(state, userLimit, perPartitionLimit, userOffset, aggregationSpec);
 
-        ReadQuery query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
+        ReadQuery query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec);
 
         // Whether the read uses an index is decided from its index query plan rather than from the restrictions, which
         // don't say whether an index serves the restrictions nested in disjunctions: it doesn't serve those with a
@@ -685,7 +684,7 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
                 if (rowFilter.needsReconciliation())
                 {
                     rowFilter = rowFilter.withoutReconciliation();
-                    query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec, indexRegistry);
+                    query = getReadQuery(options, state, columnFilter, rowFilter, dataLimits, nowInSec);
                 }
             }
 
@@ -1082,14 +1081,13 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     }
 
     private ReadQuery getReadQuery(QueryOptions options, ClientState state, ColumnFilter columnFilter,
-                                   RowFilter rowFilter, DataLimits limit, long nowInSec,
-                                   IndexRegistry indexRegistry)
+                                   RowFilter rowFilter, DataLimits limit, long nowInSec)
     {
         if (rowFilter.isUnsatisfiable())
             return ReadQuery.empty(table, limit);
 
         if (restrictions.isKeyRange())
-            return getRangeCommand(options, state, columnFilter, rowFilter, limit, nowInSec, indexRegistry);
+            return getRangeCommand(options, state, columnFilter, rowFilter, limit, nowInSec);
 
         // A partition-restricted index query whose replicas relax a non-strict row filter (see RowFilter#isStrict and
         // RowFilter#withReplicaFilteringStrictness) reads its partition with a range read, which reconciles and filters
@@ -1098,9 +1096,9 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         // index plan covers nested expressions. Reads of several partitions stay single-partition reads, which don't
         // compare digests when their replicas may return candidate rows (see ReadCommand#returnsCandidateRows).
         if (rowFilter.isStrict())
-            return getSliceCommands(options, state, columnFilter, rowFilter, limit, nowInSec, indexRegistry);
+            return getSliceCommands(options, state, columnFilter, rowFilter, limit, nowInSec);
 
-        ReadQuery sliceQuery = getSliceCommands(options, state, columnFilter, rowFilter, limit, nowInSec, indexRegistry);
+        ReadQuery sliceQuery = getSliceCommands(options, state, columnFilter, rowFilter, limit, nowInSec);
         if (isSinglePartitionRead(sliceQuery) && (restrictions.usesSecondaryIndexing() || hasIndexQueryPlan(sliceQuery)))
         {
             // The range has a single partition, so its per-partition limit is a row limit. It reads the clusterings
