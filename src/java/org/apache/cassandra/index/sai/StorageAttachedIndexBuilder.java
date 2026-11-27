@@ -235,7 +235,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
         {
             if (indexWriter != null)
             {
-                indexWriter.abort(t, true);
+                // A stop by a truncate, which removes the SSTables, isn't a failure of the index
+                boolean truncated = t instanceof CompactionInterruptedException && trigger() == TRUNCATE;
+                indexWriter.abort(t, !truncated);
             }
 
             if (t instanceof InterruptedException)
