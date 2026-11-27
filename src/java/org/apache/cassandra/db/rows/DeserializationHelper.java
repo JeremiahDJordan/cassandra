@@ -85,20 +85,35 @@ public class DeserializationHelper
         // we always need to distinguish between having a row (with potentially only null values) and not
         // having a row at all (see #CASSANDRA-7085 for background). In the case where the column is not
         // actually requested by the user however (canSkipValue), we can skip the full cell if the cell
-        // timestamp is lower than the row one, because in that case, the row timestamp is enough proof
-        // of the liveness of the row. Otherwise, we'll only be able to skip the values of those cells.
+        // timestamp is lower than the row one and the row's liveness can't expire, because in that case, the row
+        // timestamp is enough proof of the liveness of the row (see ReadCommand#mayNeedRowsReadAgain for a newer
+        // liveness of another source). Otherwise, we'll only be able to skip the values of those cells.
         ColumnMetadata column = cell.column();
         if (column.isComplex())
         {
             if (!includes(cell.path()))
                 return false;
 
-            return !canSkipValue(cell.path()) || cell.timestamp() >= rowLiveness.timestamp();
+            return !canSkipValue(cell.path()) || !isOlderThanDroppingLiveness(cell, rowLiveness);
         }
         else
         {
-            return columnsToFetch.fetchedColumnIsQueried(column) || cell.timestamp() >= rowLiveness.timestamp();
+            return columnsToFetch.fetchedColumnIsQueried(column) || !isOlderThanDroppingLiveness(cell, rowLiveness);
         }
+    }
+
+    /**
+     * Whether a row liveness info proves that its row exists for good, so that the cells of fetched but not queried
+     * columns that are older than it can be dropped: a live liveness info that can't expire.
+     */
+    public static boolean dropsOlderNotQueriedCells(LivenessInfo rowLiveness)
+    {
+        return !rowLiveness.isEmpty() && !rowLiveness.isExpiring();
+    }
+
+    private static boolean isOlderThanDroppingLiveness(Cell<?> cell, LivenessInfo rowLiveness)
+    {
+        return dropsOlderNotQueriedCells(rowLiveness) && cell.timestamp() < rowLiveness.timestamp();
     }
 
     public boolean includes(CellPath path)
