@@ -106,6 +106,17 @@ public class ReadExecutionController implements AutoCloseable
         oldestUnrepairedTombstone = Math.min(oldestUnrepairedTombstone, candidate);
     }
 
+    /**
+     * A controller for another read of the same table as part of this one, in this controller's op order group, that
+     * doesn't track the repaired data. It isn't closed: closing this controller ends the group.
+     */
+    ReadExecutionController withoutRepairedDataTracking()
+    {
+        return isTrackingRepairedStatus()
+               ? new ReadExecutionController(command, baseOp, baseMetadata, null, null, NO_SAMPLING, false)
+               : this;
+    }
+
     boolean validForReadOn(ColumnFamilyStore cfs)
     {
         return baseOp != null && cfs.metadata.id.equals(baseMetadata.id);
