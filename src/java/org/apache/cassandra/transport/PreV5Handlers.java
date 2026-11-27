@@ -244,6 +244,7 @@ public class PreV5Handlers
             OverloadedException exception = CQLMessageHandler.buildOverloadedException(endpointPayloadTracker::toString,
                                                                                        GLOBAL_REQUEST_LIMITER,
                                                                                        overload);
+            request.getSource().release();
             throw ErrorMessage.wrap(exception, request.getSource().header.streamId);
         }
 
