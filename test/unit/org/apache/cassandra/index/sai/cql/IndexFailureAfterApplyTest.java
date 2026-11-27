@@ -25,10 +25,12 @@ import org.junit.Test;
 
 import org.apache.cassandra.Util;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.index.sai.SAITester;
+import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
@@ -79,6 +81,11 @@ public class IndexFailureAfterApplyTest extends SAITester
 
     private void failingWrite(String query)
     {
+        failingWrite(failure, query);
+    }
+
+    private void failingWrite(Injection failure, String query)
+    {
         failure.enable();
         try
         {
@@ -119,6 +126,95 @@ public class IndexFailureAfterApplyTest extends SAITester
             for (SSTableReader sstable : cfs.getLiveSSTables())
                 assertEquals(memtable, 5, sstable.getMinTimestamp());
             assertRows(execute("SELECT ck, v, x FROM %s WHERE pk = 0"), row(1, 1, "abc"));
+        }
+    }
+
+    /** The graph insert of the new vector of a write fails, after the memtable released the partition. */
+    @Test
+    public void testVectorGraphInsertFailure() throws Throwable
+    {
+        Injection graphInsertFailure = Injections.newCustom("graph_insert_fails")
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass("io.github.jbellis.jvector.graph.GraphIndexBuilder")
+                                                                        .onMethod("addGraphNode")
+                                                                        .atExit())
+                                                 .add(ActionBuilder.newActionBuilder().actions().doThrow(RuntimeException.class, "\"Injected graph insert failure\""))
+                                                 .build();
+        Injections.inject(graphInsertFailure);
+        graphInsertFailure.disable();
+        for (String memtable : MEMTABLES)
+        {
+            createTable("CREATE TABLE %s (pk int, ck int, v vector<float, 2>, x text, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
+            disableCompaction();
+            createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+            ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+
+            failingWrite(graphInsertFailure, "INSERT INTO %s (pk, ck, v, x) VALUES (0, 1, [1, 2], 'abc') USING TIMESTAMP 5");
+
+            Memtable mt = cfs.getCurrentMemtable();
+            assertRows(execute("SELECT ck, v, x FROM %s WHERE pk = 0"), row(1, vector(1f, 2f), "abc"));
+            assertEquals(memtable, 5, mt.getMinTimestamp());
+            assertEquals(memtable, 1, mt.operationCount());
+            assertTrue(memtable, mt.getLiveDataSize() > 0);
+
+            flush();
+            for (SSTableReader sstable : cfs.getLiveSSTables())
+                assertEquals(memtable, 5, sstable.getMinTimestamp());
+            assertRows(execute("SELECT ck FROM %s ORDER BY v ANN OF [1, 2] LIMIT 1"), row(1));
+        }
+    }
+
+    /**
+     * The graph insert of the first new vector of a write ends with an OutOfMemoryError: the write fails with it at
+     * once, and the flush does the insert of its other new vector.
+     */
+    @Test
+    public void testVectorGraphInsertOutOfMemoryError() throws Throwable
+    {
+        Injection outOfMemory = Injections.newCustom("graph_insert_oom")
+                                          .add(InvokePointBuilder.newInvokePoint()
+                                                                 .onClass(CassandraOnHeapGraph.class)
+                                                                 .onMethod("insertIntoGraph")
+                                                                 .atExit())
+                                          .add(ActionBuilder.newActionBuilder().actions().doThrow(OutOfMemoryError.class, "\"Injected graph insert OOM\""))
+                                          .build();
+        Injections.Counter inserts = Injections.newCounter("graph_inserts")
+                                               .add(InvokePointBuilder.newInvokePoint()
+                                                                      .onClass(CassandraOnHeapGraph.class)
+                                                                      .onMethod("insertIntoGraph"))
+                                               .build();
+        Injections.inject(outOfMemory, inserts);
+        outOfMemory.disable();
+        for (String memtable : MEMTABLES)
+        {
+            createTable("CREATE TABLE %s (pk int, ck int, v vector<float, 2>, PRIMARY KEY (pk, ck)) WITH memtable = '" + memtable + "'");
+            disableCompaction();
+            createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+
+            inserts.reset();
+            outOfMemory.enable();
+            try
+            {
+                // locally, as through a coordinator the error stays on the replica and the write times out
+                QueryProcessor.executeInternal(formatQuery("BEGIN UNLOGGED BATCH " +
+                                                           "INSERT INTO %1$s (pk, ck, v) VALUES (0, 1, [1, 2]); " +
+                                                           "INSERT INTO %1$s (pk, ck, v) VALUES (0, 2, [3, 4]); " +
+                                                           "APPLY BATCH"));
+                fail("expected the injected failure");
+            }
+            catch (OutOfMemoryError e)
+            {
+                // expected
+            }
+            finally
+            {
+                outOfMemory.disable();
+            }
+            assertEquals(memtable, 1, inserts.get());
+
+            flush();
+            assertEquals(memtable, 2, inserts.get());
+            assertRowsIgnoringOrder(execute("SELECT ck FROM %s ORDER BY v ANN OF [1, 2] LIMIT 2"), row(1), row(2));
         }
     }
 

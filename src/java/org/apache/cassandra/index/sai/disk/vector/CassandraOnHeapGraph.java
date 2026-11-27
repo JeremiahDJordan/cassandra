@@ -32,6 +32,7 @@ import java.util.EnumMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.TimeUnit;
@@ -39,7 +40,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.IntFunction;
 import java.util.function.IntUnaryOperator;
+import java.util.function.LongConsumer;
 import java.util.function.ToIntFunction;
+import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 import org.cliffc.high_scale_lib.NonBlockingHashMap;
@@ -82,6 +85,7 @@ import org.apache.cassandra.db.compaction.CompactionSSTable;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.exceptions.InvalidRequestException;
+import org.apache.cassandra.index.IndexerFailures;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.QueryContext;
 import org.apache.cassandra.index.sai.SSTableIndex;
@@ -103,16 +107,20 @@ import org.apache.cassandra.index.sai.metrics.IndexMetrics;
 import org.apache.cassandra.index.sai.utils.PrimaryKeyWithSortKey;
 import org.apache.cassandra.index.sai.utils.SAICodecUtils;
 import org.apache.cassandra.io.util.File;
+import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.SequentialWriter;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.tracing.Tracing;
+import org.apache.cassandra.utils.AbstractIterator;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.SyncUtil;
+import org.apache.cassandra.utils.concurrent.CountDownLatch;
 import org.apache.lucene.util.StringHelper;
 
 import static org.apache.cassandra.utils.Clock.Global.nanoTime;
+import static org.apache.cassandra.utils.concurrent.CountDownLatch.newCountDownLatch;
 import static org.apache.cassandra.index.sai.disk.vector.JVectorVersionUtil.NUM_SUB_VECTORS;
 
 public class CassandraOnHeapGraph<T> implements Accountable
@@ -128,6 +136,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
 
     private static final Logger logger = LoggerFactory.getLogger(CassandraOnHeapGraph.class);
     private static final VectorTypeSupport vts = VectorizationProvider.getInstance().getVectorTypeSupport();
+    private static final SearchResult.NodeScore[] NO_NODE_SCORES = new SearchResult.NodeScore[0];
 
     // We use the metable reference for easier tracing.
     private final String source;
@@ -141,6 +150,11 @@ public class CassandraOnHeapGraph<T> implements Accountable
     private final ConcurrentMap<VectorFloat<?>, VectorPostings<T>> postingsMap;
     private final DenseIntMap<VectorPostings<T>> postingsByOrdinal;
     private final NonBlockingHashMap<T, VectorFloat<?>> vectorsByKey;
+    // the graph inserts of the vectors added by add(ByteBuffer, Object, PendingInserts) that aren't done yet
+    private final ConcurrentMap<VectorPostings<T>, GraphInsert> pendingInserts = new ConcurrentHashMap<>();
+    // the pending inserts that searches score, counted from before they're ready until after they leave pendingInserts:
+    // a count of 0 means none, which ConcurrentHashMap#isEmpty can't tell while entries come and go
+    private final AtomicInteger readyPendingInserts = new AtomicInteger();
     private final AtomicInteger nextOrdinal = new AtomicInteger();
     private final VectorSourceModel sourceModel;
     private final InvalidVectorBehavior invalidVectorBehavior;
@@ -221,6 +235,15 @@ public class CassandraOnHeapGraph<T> implements Accountable
         return vectorValues.size();
     }
 
+    /**
+     * @return the number of vectors in the graph, the same as {@link #size} once no graph insert is pending
+     */
+    @VisibleForTesting
+    public int graphSize()
+    {
+        return builder.getGraph().size();
+    }
+
     public boolean isEmpty()
     {
         return postingsMap.values().stream().allMatch(VectorPostings::isEmpty);
@@ -241,6 +264,21 @@ public class CassandraOnHeapGraph<T> implements Accountable
      * @return the incremental bytes used by adding the given vector to the index
      */
     public long add(ByteBuffer term, T key)
+    {
+        return add(term, key, null);
+    }
+
+    /**
+     * Adds the given vector for the key, as {@link #add(ByteBuffer, Object)} does, but leaves the graph insert of a
+     * vector new to the graph to the caller, which does it with {@link PendingInserts#complete} once it no longer holds
+     * the memtable's locks. Until then, {@link #search} scores the vector itself, and a caller that adds a key to it
+     * waits in its own {@link PendingInserts#complete} until the vector has its ordinal.
+     *
+     * @param inserts where the graph inserts are left for the caller, or null to do them here
+     * @return the incremental bytes used by adding the given vector to the index, without those of a graph insert left
+     * to the caller
+     */
+    public long add(ByteBuffer term, T key, @Nullable PendingInserts inserts)
     {
         assert term != null && term.remaining() != 0;
 
@@ -299,36 +337,73 @@ public class CassandraOnHeapGraph<T> implements Accountable
         if (postings == null)
         {
             postings = new VectorPostings<>(key);
-            // since we are using ConcurrentSkipListMap, it is NOT correct to use computeIfAbsent here
-            if (postingsMap.putIfAbsent(vector, postings) == null)
+            // registered before the postings are visible, so that a caller adding a key to them finds the insert
+            GraphInsert insert = null;
+            if (inserts != null)
             {
-                // we won the race to add the new entry; assign it an ordinal and add to the other structures
-                int ordinal = nextOrdinal.getAndIncrement();
-                postings.setOrdinal(ordinal);
-                bytesUsed += RamEstimation.concurrentHashMapRamUsed(1); // the new posting Map entry
-                bytesUsed += vectorValues.add(ordinal, vector);
-                bytesUsed += postings.ramBytesUsed();
-                var success = postingsByOrdinal.compareAndPut(ordinal, null, postings);
-                assert success : "postingsByOrdinal already contains an entry for ordinal " + ordinal;
-                bytesUsed += builder.addGraphNode(ordinal, vector);
+                insert = new GraphInsert(this, postings, vector);
+                pendingInserts.put(postings, insert);
+            }
+            boolean won;
+            try
+            {
+                // since we are using ConcurrentSkipListMap, it is NOT correct to use computeIfAbsent here
+                won = postingsMap.putIfAbsent(vector, postings) == null;
+                if (won)
+                {
+                    // we won the race to add the new entry; assign it an ordinal and add to the other structures
+                    int ordinal = nextOrdinal.getAndIncrement();
+                    postings.setOrdinal(ordinal);
+                    bytesUsed += RamEstimation.concurrentHashMapRamUsed(1); // the new posting Map entry
+                    bytesUsed += vectorValues.add(ordinal, vector);
+                    bytesUsed += postings.ramBytesUsed();
+                    var success = postingsByOrdinal.compareAndPut(ordinal, null, postings);
+                    assert success : "postingsByOrdinal already contains an entry for ordinal " + ordinal;
+                }
+            }
+            catch (Throwable t)
+            {
+                if (insert != null)
+                    insert.abandon();
+                throw t;
+            }
 
-                // If necessary, check if the vector is unit length.
-                if (!sourceModel.hasKnownUnitLengthVectors() && allVectorsAreUnitLength)
-                    if (!(Math.abs(VectorUtil.dotProduct(vector, vector) - 1.0f) < 0.01))
-                        allVectorsAreUnitLength = false;
-
+            if (won)
+            {
+                if (insert == null)
+                    return bytesUsed + insertIntoGraph(postings.getOrdinal(), vector);
+                readyPendingInserts.incrementAndGet();
+                insert.markReady();
+                inserts.added(insert);
                 return bytesUsed;
             }
-            else
-            {
-                postings = postingsMap.get(vector);
-            }
+            if (insert != null)
+                insert.abandon();
+            postings = postingsMap.get(vector);
+        }
+        if (inserts != null)
+        {
+            GraphInsert pending = pendingInserts.get(postings);
+            if (pending != null && !pending.isReady())
+                inserts.awaited(pending);
         }
         // postings list already exists, just add the new key (if it's not already in the list)
         if (postings.add(key))
         {
             bytesUsed += postings.bytesPerPosting();
         }
+
+        return bytesUsed;
+    }
+
+    private long insertIntoGraph(int ordinal, VectorFloat<?> vector)
+    {
+        long bytesUsed = builder.addGraphNode(ordinal, vector);
+
+        // If necessary, check if the vector is unit length.
+        if (!sourceModel.hasKnownUnitLengthVectors() && allVectorsAreUnitLength)
+            if (!(Math.abs(VectorUtil.dotProduct(vector, vector) - 1.0f) < 0.01))
+                allVectorsAreUnitLength = false;
 
         return bytesUsed;
     }
@@ -408,6 +483,11 @@ public class CassandraOnHeapGraph<T> implements Accountable
             rerankK = limit;
 
         Bits bits = hasDeletions ? BitsUtil.bitsIgnoringDeleted(toAccept, postingsByOrdinal) : toAccept;
+        // Taken before the view of the graph: a pending insert is removed only once its node is in the graph, so a
+        // vector not taken here is in the view, and one taken here is left out of the graph search.
+        IntHashSet pendingOrdinals = readyPendingInserts.get() == 0 ? null : new IntHashSet();
+        SearchResult.NodeScore[] pending = pendingOrdinals == null ? NO_NODE_SCORES : scorePendingInserts(queryVector, threshold, bits, pendingOrdinals);
+        Bits graphBits = pendingOrdinals == null || pendingOrdinals.isEmpty() ? bits : ordinal -> bits.get(ordinal) && !pendingOrdinals.contains(ordinal);
         var graphAccessManager = searchers.get();
         var searcher = graphAccessManager.get();
         searcher.usePruning(usePruning);
@@ -416,7 +496,7 @@ public class CassandraOnHeapGraph<T> implements Accountable
         {
             var ssf = DefaultSearchScoreProvider.exact(queryVector, similarityFunction, vectorValues);
             long start = nanoTime();
-            var result = searcher.search(ssf, limit, rerankK, threshold, 0.0f, bits);
+            var result = searcher.search(ssf, limit, rerankK, threshold, 0.0f, graphBits);
             long elapsed = nanoTime() - start;
             Tracing.trace("ANN search for {}/{} (usePruning: {}) visited {} nodes, reranked {} to return {} results from {}",
                           limit, rerankK, usePruning, result.getVisitedCount(), result.getRerankedCount(), result.getNodes().length, source);
@@ -426,9 +506,9 @@ public class CassandraOnHeapGraph<T> implements Accountable
             {
                 // Threshold based searches do not support resuming the search.
                 graphAccessManager.release();
-                return CloseableIterator.wrap(Arrays.stream(result.getNodes()).iterator());
+                return withPending(CloseableIterator.wrap(Arrays.stream(result.getNodes()).iterator()), pending);
             }
-            return new AutoResumingNodeScoreIterator(searcher, graphAccessManager, result, context, columnQueryMetrics, visited -> {}, limit, rerankK, true, source);
+            return withPending(new AutoResumingNodeScoreIterator(searcher, graphAccessManager, result, context, columnQueryMetrics, visited -> {}, limit, rerankK, true, source), pending);
         }
         catch (Throwable t)
         {
@@ -436,6 +516,69 @@ public class CassandraOnHeapGraph<T> implements Accountable
             graphAccessManager.forceRelease();
             throw t;
         }
+    }
+
+    /**
+     * Scores the vectors whose graph insert is pending, which a search of the graph doesn't find yet, with the same
+     * acceptance and threshold as the graph search.
+     *
+     * @param ordinals told the ordinals of all the pending vectors scored, accepted or not
+     * @return the accepted vectors, highest score first
+     */
+    private SearchResult.NodeScore[] scorePendingInserts(VectorFloat<?> queryVector, float threshold, Bits bits, IntHashSet ordinals)
+    {
+        List<SearchResult.NodeScore> scores = new ArrayList<>();
+        for (GraphInsert insert : pendingInserts.values())
+        {
+            // without its ordinal, the vector's postings are still being added, by a write that hasn't returned
+            if (!insert.isReady())
+                continue;
+            int ordinal = insert.postings.getOrdinal();
+            ordinals.add(ordinal);
+            if (!bits.get(ordinal))
+                continue;
+            float score = similarityFunction.compare(queryVector, insert.vector);
+            if (threshold > 0 && score < threshold)
+                continue;
+            scores.add(new SearchResult.NodeScore(ordinal, score));
+        }
+        SearchResult.NodeScore[] sorted = scores.toArray(NO_NODE_SCORES);
+        Arrays.sort(sorted);
+        return sorted;
+    }
+
+    /** The node scores of the graph search merged with those of the pending vectors, highest score first. */
+    private static CloseableIterator<SearchResult.NodeScore> withPending(CloseableIterator<SearchResult.NodeScore> graphScores,
+                                                                       SearchResult.NodeScore[] pending)
+    {
+        if (pending.length == 0)
+            return graphScores;
+
+        return new AbstractIterator<>()
+        {
+            private SearchResult.NodeScore graphHead;
+            private int next = 0;
+
+            @Override
+            protected SearchResult.NodeScore computeNext()
+            {
+                if (graphHead == null && graphScores.hasNext())
+                    graphHead = graphScores.next();
+                if (graphHead != null && (next == pending.length || graphHead.compareTo(pending[next]) <= 0))
+                {
+                    SearchResult.NodeScore score = graphHead;
+                    graphHead = null;
+                    return score;
+                }
+                return next < pending.length ? pending[next++] : endOfData();
+            }
+
+            @Override
+            public void close()
+            {
+                FileUtils.closeQuietly(graphScores);
+            }
+        };
     }
 
     /**
@@ -464,6 +607,11 @@ public class CassandraOnHeapGraph<T> implements Accountable
      */
     public boolean preFlush(ToIntFunction<T> postingTransformer, Function<T, ByteBuffer> currentValue)
     {
+        // a write does the graph inserts it left before it returns, unless its memtable never told it to or an
+        // OutOfMemoryError stopped it
+        for (GraphInsert insert : pendingInserts.values())
+            insert.runAtFlush();
+
         for (VectorPostings<T> vp : postingsMap.values())
             vp.computeRowIds(postingTransformer);
 
@@ -879,6 +1027,148 @@ public class CassandraOnHeapGraph<T> implements Accountable
     public void cleanup()
     {
         builder.cleanup();
+    }
+
+    /**
+     * The graph inserts that a write leaves until it no longer holds the memtable's locks (see
+     * {@link #add(ByteBuffer, Object, PendingInserts)}): those of the vectors it added to the graphs, and the pending
+     * inserts of the vectors it added keys to, which other writes do.
+     */
+    public static final class PendingInserts
+    {
+        private List<GraphInsert> added;
+        private List<GraphInsert> awaited;
+
+        private void added(GraphInsert insert)
+        {
+            if (added == null)
+                added = new ArrayList<>(1);
+            added.add(insert);
+        }
+
+        private void awaited(GraphInsert insert)
+        {
+            if (awaited == null)
+                awaited = new ArrayList<>(1);
+            awaited.add(insert);
+        }
+
+        /**
+         * Does the graph inserts of the vectors the write added, then waits until the vectors it added keys to have
+         * their ordinals, which the writes adding them are still assigning if they write another partition: searches
+         * find a vector with an ordinal before its insert is done. Each of the write's own inserts is done even if
+         * another fails, unless with an {@link OutOfMemoryError}, and the first failure is thrown, as
+         * {@link IndexerFailures} does for index events.
+         *
+         * @param bytesUsed told the bytes each successful insert added to its graph
+         */
+        public void complete(LongConsumer bytesUsed)
+        {
+            IndexerFailures failures = null;
+            if (added != null)
+            {
+                for (GraphInsert insert : added)
+                {
+                    try
+                    {
+                        bytesUsed.accept(insert.run());
+                    }
+                    catch (Throwable t)
+                    {
+                        if (failures == null)
+                            failures = new IndexerFailures(null);
+                        failures.add(t);
+                    }
+                }
+                added = null;
+            }
+            if (awaited != null)
+            {
+                for (GraphInsert insert : awaited)
+                    insert.awaitReady();
+                awaited = null;
+            }
+            if (failures != null)
+                failures.maybeFail();
+        }
+    }
+
+    /**
+     * The graph insert of a vector that a write added, done by that write once it no longer holds the memtable's locks,
+     * or at the flush if the write never did it.
+     */
+    private static final class GraphInsert
+    {
+        private final CassandraOnHeapGraph<?> graph;
+        private final VectorPostings<?> postings;
+        private final VectorFloat<?> vector;
+        // counted down once the vector has its ordinal and is in the vector values, or the add failed before that
+        private final CountDownLatch ready = newCountDownLatch(1);
+        private volatile boolean abandoned;
+
+        private GraphInsert(CassandraOnHeapGraph<?> graph, VectorPostings<?> postings, VectorFloat<?> vector)
+        {
+            this.graph = graph;
+            this.postings = postings;
+            this.vector = vector;
+        }
+
+        private void markReady()
+        {
+            ready.decrement();
+        }
+
+        private boolean isReady()
+        {
+            return ready.count() == 0 && !abandoned;
+        }
+
+        private void awaitReady()
+        {
+            ready.awaitUninterruptibly();
+        }
+
+        /** The add of the vector failed, or another write added it first. */
+        private void abandon()
+        {
+            abandoned = true;
+            graph.pendingInserts.remove(postings);
+            ready.decrement();
+        }
+
+        /**
+         * Does the insert for the write that added the vector, once the vector has its ordinal. The flush does the
+         * inserts that writes left with {@link #runAtFlush}, after them, so an insert never runs in two threads.
+         *
+         * @return the bytes the insert added to the graph
+         */
+        private long run()
+        {
+            try
+            {
+                return graph.insertIntoGraph(postings.getOrdinal(), vector);
+            }
+            finally
+            {
+                done();
+            }
+        }
+
+        /**
+         * Does the insert at the flush. If it fails, the vector stays pending, so that searches of the memtable, which
+         * the failed flush keeps, still find it.
+         */
+        private void runAtFlush()
+        {
+            graph.insertIntoGraph(postings.getOrdinal(), vector);
+            done();
+        }
+
+        private void done()
+        {
+            graph.pendingInserts.remove(postings);
+            graph.readyPendingInserts.decrementAndGet();
+        }
     }
 
     /**

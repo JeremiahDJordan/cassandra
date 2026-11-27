@@ -377,6 +377,22 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
         }
     }
 
+    /// An OutOfMemoryError from an indexer once the memtable is done with an update that failed after it was applied
+    /// is thrown, rather than added to the update's failure.
+    @Test
+    public void testAfterPutOutOfMemoryErrorIsRethrown()
+    {
+        for (String memtable : ATOMIC_MEMTABLES)
+        {
+            OutOfMemoryError oom = new OutOfMemoryError("Java heap space");
+            Throwable failure = writeWithScriptedIndexes(memtable, (index, event) ->
+                                                                   index.equals("pa") && event.equals("row#2") ? new RuntimeException("pa row")
+                                                                   : index.equals("pb") && event.equals("afterPut#1") ? oom
+                                                                   : null);
+            assertSame(memtable + ": " + failure, oom, failure);
+        }
+    }
+
     /// When the memtable fails to apply an update, here because an indexer's begin() throws, and the abort then fails
     /// too, the write must fail with the original failure, with the abort's failure suppressed under it.
     @Test
@@ -526,6 +542,12 @@ public class TrieMemtableFailedWriteIndexTest extends CQLTester
                 {
                     indexer.finish();
                     maybeFail(name, "finish");
+                }
+
+                public void afterPut()
+                {
+                    indexer.afterPut();
+                    maybeFail(name, "afterPut");
                 }
             };
         }

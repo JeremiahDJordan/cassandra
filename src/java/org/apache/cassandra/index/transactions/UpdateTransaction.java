@@ -61,6 +61,7 @@ import org.apache.cassandra.schema.ColumnMetadata;
 ///                                  *not* the incoming row, but the result of merging the incoming and existing
 ///                                  rows.
 /// - `commit()`                      -- finally, finish is called when the new Partition is swapped into the Memtable
+/// - `afterPut()`                    -- after the Memtable's put returned or failed, see [#afterPut]
 ///
 /// A Memtable that applies updates atomically (see `Memtable#appliesUpdatesAtomically()`) calls `abort()` instead of
 /// `commit()` when it fails to apply the update. It then holds none of the update's rows and deletions, so
@@ -127,6 +128,13 @@ public interface UpdateTransaction extends IndexTransaction
     /// partition that [require it][#requiresAtomicApply]. Only called if [#requiresAtomicApply] is true, at most once,
     /// and before [#commit].
     default void onApplied()
+    {
+    }
+
+    /// Called by the table once [Memtable#put][org.apache.cassandra.db.memtable.Memtable#put] has returned or failed,
+    /// after [#commit] or [#abort], outside every lock the memtable applied the update under and before the write
+    /// returns (see `Index.Indexer#afterPut`). A failure fails the write, after the update was applied if it was.
+    default void afterPut()
     {
     }
 

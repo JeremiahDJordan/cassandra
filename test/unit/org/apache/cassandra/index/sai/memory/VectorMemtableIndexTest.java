@@ -35,8 +35,11 @@ import org.junit.Before;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import io.github.jbellis.jvector.graph.SearchResult;
+import io.github.jbellis.jvector.util.Bits;
 import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.VectorizationProvider;
+import io.github.jbellis.jvector.vector.types.VectorFloat;
 import io.github.jbellis.jvector.vector.types.VectorTypeSupport;
 import org.apache.cassandra.cql3.Operator;
 import org.apache.cassandra.db.Clustering;
@@ -64,6 +67,8 @@ import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.index.sai.plan.Orderer;
 import org.apache.cassandra.index.sai.utils.PrimaryKeyWithScore;
+import org.apache.cassandra.inject.ActionBuilder;
+import org.apache.cassandra.inject.Injection;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
 import org.apache.cassandra.locator.TokenMetadata;
@@ -72,10 +77,12 @@ import org.apache.cassandra.schema.MockSchema;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.CloseableIterator;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.concurrent.OpOrder;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.MEMTABLE_SHARD_COUNT;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -325,6 +332,40 @@ public class VectorMemtableIndexTest extends SAITester
         assertEquals(List.of(1), graph.rowIdsOf(stale));
         assertEquals(List.of(0), graph.rowIdsOf(current));
         assertEquals(List.of(2), graph.rowIdsOf(other));
+    }
+
+    /**
+     * The flush does a graph insert that its write left undone, and fails if that insert fails, leaving the vector to
+     * the searches that score pending vectors.
+     */
+    @Test
+    public void preFlushDoesGraphInsertsLeftToItTest() throws Throwable
+    {
+        CassandraOnHeapGraph<Integer> graph = new CassandraOnHeapGraph<>(indexContext, false, null);
+        graph.add(randomVectorSerialized(), 0, new CassandraOnHeapGraph.PendingInserts());
+        assertEquals(0, graph.graphSize());
+        assertTrue(graph.preFlush(key -> key));
+        assertEquals(1, graph.graphSize());
+
+        Injection failure = Injections.newCustom("graph_insert_fails_at_flush")
+                                      .add(InvokePointBuilder.newInvokePoint()
+                                                             .onClass(CassandraOnHeapGraph.class)
+                                                             .onMethod("insertIntoGraph"))
+                                      .add(ActionBuilder.newActionBuilder().actions().doThrow(RuntimeException.class, "\"Injected graph insert failure\""))
+                                      .build();
+        Injections.inject(failure);
+        CassandraOnHeapGraph<Integer> failing = new CassandraOnHeapGraph<>(indexContext, false, null);
+        ByteBuffer vector = randomVectorSerialized();
+        failing.add(vector, 0, new CassandraOnHeapGraph.PendingInserts());
+        assertThatThrownBy(() -> failing.preFlush(key -> key)).hasMessageContaining("Injected graph insert failure");
+
+        VectorFloat<?> query = vts.createFloatVector(((VectorType.VectorSerializer) indexContext.getValidator().getSerializer()).deserializeFloatArray(vector));
+        List<Integer> nodes = new ArrayList<>();
+        try (CloseableIterator<SearchResult.NodeScore> scores = failing.search(new QueryContext(), query, 1, 0, 0, false, Bits.ALL))
+        {
+            scores.forEachRemaining(score -> nodes.add(score.node));
+        }
+        assertEquals(List.of(0), nodes);
     }
 
     /**

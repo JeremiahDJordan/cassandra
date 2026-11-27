@@ -113,6 +113,7 @@ import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
 import org.apache.cassandra.index.sai.disk.v1.SSTableIndexWriter;
+import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.index.sai.view.View;
 import org.apache.cassandra.index.transactions.IndexTransaction;
@@ -139,6 +140,7 @@ import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.FutureCombiner;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
+import org.apache.cassandra.utils.concurrent.OpOrder;
 import org.apache.cassandra.utils.concurrent.Ref;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.RANGE_READ_ENDPOINT_GROUPING_ENABLED;
@@ -1942,24 +1944,38 @@ public class StorageAttachedIndex implements Index
         private final DecoratedKey key;
         private final Memtable mt;
         private final WriteContext writeContext;
+        // the vector graph inserts of the update, done once the memtable no longer holds the partition's locks
+        @Nullable
+        private final CassandraOnHeapGraph.PendingInserts graphInserts;
 
         UpdateIndexer(DecoratedKey key, Memtable mt, WriteContext writeContext)
         {
             this.key = key;
             this.mt = mt;
             this.writeContext = writeContext;
+            this.graphInserts = indexContext.isVector() ? new CassandraOnHeapGraph.PendingInserts() : null;
         }
 
         @Override
         public void insertRow(Row row)
         {
-            indexContext.index(key, row, mt, CassandraWriteContext.fromContext(writeContext).getGroup());
+            indexContext.index(key, row, mt, CassandraWriteContext.fromContext(writeContext).getGroup(), graphInserts);
         }
 
         @Override
         public void updateRow(Row oldRow, Row newRow)
         {
-            indexContext.update(key, oldRow, newRow, mt, CassandraWriteContext.fromContext(writeContext).getGroup());
+            indexContext.update(key, oldRow, newRow, mt, CassandraWriteContext.fromContext(writeContext).getGroup(), graphInserts);
+        }
+
+        @Override
+        public void afterPut()
+        {
+            if (graphInserts != null)
+            {
+                OpOrder.Group opGroup = CassandraWriteContext.fromContext(writeContext).getGroup();
+                graphInserts.complete(bytes -> mt.markExtraOnHeapUsed(bytes, opGroup));
+            }
         }
 
         @Override

@@ -897,9 +897,19 @@ public interface Index
 
         /**
          * Notification of the end of the partition update.
-         * This event always occurs after all others for the particular update.
+         * This event always occurs after all others for the particular update, except {@link #afterPut}.
          */
         default void finish() {}
+
+        /**
+         * Notification that the Memtable is done with the update, after {@link #finish}: its put returned or failed,
+         * and it holds none of the locks it applied the update under. The write has not returned yet and still holds
+         * its {@link org.apache.cassandra.utils.concurrent.OpOrder.Group}, so an Indexer can do here the work of the
+         * update that must not hold up the other writes of the partition but must be done before the write returns.
+         * A failure fails the write, after the update was applied if it was. An Indexer that delegates must forward
+         * this call.
+         */
+        default void afterPut() {}
     }
 
     /*

@@ -393,6 +393,13 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 forEach(indexer -> indexer.rangeTombstone(tombstone));
             }
 
+            // every SAI index completes the work its events left, whatever happened to the update
+            @Override
+            public void afterPut()
+            {
+                forAll(Index.Indexer::afterPut);
+            }
+
             // On a memtable that applies updates atomically, delivers the event to every SAI index, then throws the
             // first failure; otherwise stops at the first failure, which fails the update before it is applied.
             private void forEach(Consumer<Index.Indexer> action)
@@ -402,7 +409,12 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                     indexers.forEach(action::accept);
                     return;
                 }
+                forAll(action);
+            }
 
+            // delivers the event to every SAI index, then throws the first failure
+            private void forAll(Consumer<Index.Indexer> action)
+            {
                 IndexerFailures failures = null;
                 for (Index.Indexer indexer : indexers)
                 {

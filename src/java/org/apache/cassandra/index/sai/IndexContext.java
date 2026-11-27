@@ -84,6 +84,7 @@ import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.IndexFeatureSet;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig;
+import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.disk.vector.VectorMemtableIndex;
 import org.apache.cassandra.index.sai.disk.vector.VectorValidation;
 import org.apache.cassandra.index.sai.iterators.KeyRangeAntiJoinIterator;
@@ -374,7 +375,11 @@ public class IndexContext
         return liveMemtables.computeIfAbsent(memtable, mt -> MemtableIndex.createIndex(this, mt));
     }
 
-    public void index(DecoratedKey key, Row row, Memtable mt, OpOrder.Group opGroup)
+    /**
+     * @param graphInserts where a vector index leaves its graph inserts for the caller, see
+     *                     {@link CassandraOnHeapGraph#add(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}
+     */
+    public void index(DecoratedKey key, Row row, Memtable mt, OpOrder.Group opGroup, @Nullable CassandraOnHeapGraph.PendingInserts graphInserts)
     {
         MemtableIndex target = initializeMemtableIndex(mt);
 
@@ -391,7 +396,7 @@ public class IndexContext
         {
             Cell<?> cell = vectorCell(row);
             if (cell != null)
-                ((VectorMemtableIndex) target).update(key, row.clustering(), withoutOversizedVector(key, cell), mt, opGroup);
+                ((VectorMemtableIndex) target).update(key, row.clustering(), withoutOversizedVector(key, cell), mt, opGroup, graphInserts);
         }
         else if (isNonFrozenCollection())
         {
@@ -664,8 +669,8 @@ public class IndexContext
 
     /**
      * Whether the given value of the row, which the memtable index gets whether it's live or not (see
-     * {@link #index(DecoratedKey, Row, Memtable, OpOrder.Group)}), is live now: the value of a primary key column
-     * is in every row of the key, so it's live if the row has live data.
+     * {@link #index(DecoratedKey, Row, Memtable, OpOrder.Group, CassandraOnHeapGraph.PendingInserts)}), is live now:
+     * the value of a primary key column is in every row of the key, so it's live if the row has live data.
      */
     public boolean isLiveValue(Row row, ByteBuffer value)
     {
@@ -808,12 +813,16 @@ public class IndexContext
         return true;
     }
 
-    public void update(DecoratedKey key, Row oldRow, Row newRow, Memtable memtable, OpOrder.Group opGroup)
+    /**
+     * @param graphInserts where a vector index leaves its graph inserts for the caller, see
+     *                     {@link CassandraOnHeapGraph#add(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}
+     */
+    public void update(DecoratedKey key, Row oldRow, Row newRow, Memtable memtable, OpOrder.Group opGroup, @Nullable CassandraOnHeapGraph.PendingInserts graphInserts)
     {
         if (version.equals(Version.AA))
         {
             // AA cannot handle updates because it indexes partition keys instead of fully qualified primary keys.
-            index(key, newRow, memtable, opGroup);
+            index(key, newRow, memtable, opGroup, graphInserts);
             return;
         }
 
@@ -827,7 +836,7 @@ public class IndexContext
             // write and reconciles it itself, see VectorMemtableIndex#update(..., Cell, ...).
             Cell<?> cell = vectorCell(newRow);
             if (cell != null)
-                ((VectorMemtableIndex) target).update(key, newRow.clustering(), withoutOversizedVector(key, cell), memtable, opGroup);
+                ((VectorMemtableIndex) target).update(key, newRow.clustering(), withoutOversizedVector(key, cell), memtable, opGroup, graphInserts);
             return;
         }
 

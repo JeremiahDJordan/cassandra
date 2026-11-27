@@ -181,6 +181,18 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
      */
     public void update(DecoratedKey key, Clustering clustering, Cell<?> cell, Memtable memtable, OpOrder.Group opGroup)
     {
+        update(key, clustering, cell, memtable, opGroup, null);
+    }
+
+    /**
+     * Same as {@link #update(DecoratedKey, Clustering, Cell, Memtable, OpOrder.Group)}, leaving the graph inserts to
+     * the caller, see {@link CassandraOnHeapGraph#add(ByteBuffer, Object, CassandraOnHeapGraph.PendingInserts)}.
+     *
+     * @param graphInserts where the graph inserts are left for the caller, or null to do them here
+     */
+    public void update(DecoratedKey key, Clustering clustering, Cell<?> cell, Memtable memtable, OpOrder.Group opGroup,
+                       @Nullable CassandraOnHeapGraph.PendingInserts graphInserts)
+    {
         PrimaryKey primaryKey = indexContext.keyFactory().create(key, clustering);
 
         long bytesUsed = 0;
@@ -220,7 +232,7 @@ public class VectorMemtableIndex extends AbstractMemtableIndex
                         // not in the index at all
                         updateKeyBounds(primaryKey);
                         primaryKeys.add(primaryKey);
-                        bytesUsed += graph.add(value, primaryKey);
+                        bytesUsed += graph.add(value, primaryKey, graphInserts);
                         if (oldVector == null)
                             writeCount.increment();
                         else

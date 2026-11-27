@@ -2552,6 +2552,27 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                 failures.maybeFail();
         }
 
+        @Override
+        public void afterPut()
+        {
+            IndexerFailures failures = null;
+            for (Index.Indexer indexer : indexers)
+            {
+                try
+                {
+                    indexer.afterPut();
+                }
+                catch (Throwable t)
+                {
+                    if (failures == null)
+                        failures = new IndexerFailures(table);
+                    failures.add(t);
+                }
+            }
+            if (failures != null)
+                failures.maybeFail();
+        }
+
         /// Calls finish() on every indexer, even if some fail, and records their failures.
         @Nullable
         private IndexerFailures finish(@Nullable IndexerFailures failures)

@@ -1825,21 +1825,34 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             DecoratedKey key = update.partitionKey();
             try
             {
-                // Nesting is tracked on the context; updateIndexes cannot identify it, as index build and compaction cleanup also pass false. See Memtable#checkSpaceAndPut.
-                if (context.enterMemtableWrite())
+                Throwable putFailure = null;
+                try
                 {
-                    try
+                    // Nesting is tracked on the context; updateIndexes cannot identify it, as index build and compaction cleanup also pass false. See Memtable#checkSpaceAndPut.
+                    if (context.enterMemtableWrite())
                     {
-                        timeDelta = mt.checkSpaceAndPut(update, indexer, opGroup);
+                        try
+                        {
+                            timeDelta = mt.checkSpaceAndPut(update, indexer, opGroup);
+                        }
+                        finally
+                        {
+                            context.exitMemtableWrite();
+                        }
                     }
-                    finally
+                    else
                     {
-                        context.exitMemtableWrite();
+                        timeDelta = mt.put(update, indexer, opGroup);
                     }
                 }
-                else
+                catch (Throwable t)
                 {
-                    timeDelta = mt.put(update, indexer, opGroup);
+                    putFailure = t;
+                    throw t;
+                }
+                finally
+                {
+                    afterPut(indexer, putFailure);
                 }
             }
             finally
@@ -1881,6 +1894,33 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
             throw new RuntimeException(e.getMessage()
                                        + " for ks: "
                                        + getKeyspaceName() + ", table: " + name, e);
+        }
+    }
+
+    /**
+     * Tells the index transaction that the memtable is done with the update (see {@link UpdateTransaction#afterPut}).
+     * If the put failed with {@code putFailure}, which the caller is rethrowing, a failure here is added to it as
+     * suppressed, unless it is an {@link OutOfMemoryError}, which is thrown instead so that the JVM handles it.
+     */
+    private static void afterPut(UpdateTransaction indexer, @Nullable Throwable putFailure)
+    {
+        if (putFailure == null)
+        {
+            indexer.afterPut();
+            return;
+        }
+        try
+        {
+            indexer.afterPut();
+        }
+        catch (OutOfMemoryError e)
+        {
+            throw e;
+        }
+        catch (Throwable t)
+        {
+            if (t != putFailure)
+                putFailure.addSuppressed(t);
         }
     }
 
