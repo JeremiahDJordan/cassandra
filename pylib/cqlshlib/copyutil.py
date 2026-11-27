@@ -292,7 +292,7 @@ class CopyTask(object):
             return opts
 
         configs = configparser.RawConfigParser()
-        configs.readfp(open(config_file))
+        configs.read_file(open(config_file))
 
         ret = dict()
         config_sections = list(['copy', 'copy-%s' % (direction,),
