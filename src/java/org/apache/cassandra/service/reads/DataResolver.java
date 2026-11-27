@@ -129,7 +129,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
 
         if (!needsReplicaFilteringProtection())
         {
-            ResolveContext context = new ResolveContext(replicas, true);
+            ResolveContext context = new ResolveContext(replicas);
             return resolveWithReadRepair(context,
                                          i -> shortReadProtectedResponse(i, context, runOnShortRead),
                                          UnaryOperator.identity(),
@@ -165,9 +165,8 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
 
         /**
          * @param replicas the collection of {@link Endpoints} involved in the query
-         * @param enforceLimits whether or not to enforce counter limits in this context
          */
-        private ResolveContext(E replicas, boolean enforceLimits)
+        private ResolveContext(E replicas)
         {
             this.replicas = replicas;
             this.mergedResultCounter = command.limits().newCounter(command.nowInSec(),
@@ -176,7 +175,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                                                    enforceStrictLiveness);
 
             // In case of top-k query, do not trim reconciled rows here because QueryPlan#postProcessor() needs to compare all rows
-            if (command.isTopK() || !enforceLimits)
+            if (command.isTopK())
                 this.mergedResultCounter.onlyCount();
         }
 
@@ -277,9 +276,10 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         //      before it counts against the limit. If this "pre-count" filter causes a short read, additional rows
         //      will be fetched from the first-phase iterator.
         // The first phase doesn't apply its merged result counter; replica filtering protection counts in it the rows
-        // that the second phase returns as they are (see ReplicaFilteringProtection.CompleteRows).
+        // that the second phase returns as they are, as the second phase's counter counts them (see
+        // ReplicaFilteringProtection.CompleteRows).
 
-        ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
+        ResolveContext firstPhaseContext = new ResolveContext(replicas);
         UnaryOperator<PartitionIterator> filter = preCountFilterForReplicaFilteringProtection();
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(replicaPlan().keyspace(),
                                                                              command,
@@ -297,7 +297,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                                                  null,
                                                                  QueryInfoTracker.ReadTracker.NOOP);
 
-        ResolveContext secondPhaseContext = new ResolveContext(replicas, true);
+        ResolveContext secondPhaseContext = new ResolveContext(replicas);
         PartitionIterator completedPartitions = resolveWithReadRepair(secondPhaseContext,
                                                                       i -> rfp.queryProtectedPartitions(firstPhasePartitions, i),
                                                                       filter,
