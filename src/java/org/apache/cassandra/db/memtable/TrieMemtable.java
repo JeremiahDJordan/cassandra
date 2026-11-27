@@ -323,13 +323,6 @@ public class TrieMemtable extends AbstractShardedMemtable
     }
 
     @Override
-    public boolean limitsConcurrentWritesTo(int maxWriters)
-    {
-        // each shard applies one update at a time under its write lock
-        return boundaries.shardCount() <= maxWriters;
-    }
-
-    @Override
     public boolean appliesUpdatesAtomically()
     {
         // A failed merge leaves the trie without any of the update's rows and deletions, and put() completes the index
