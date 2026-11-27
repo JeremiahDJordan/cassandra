@@ -67,7 +67,8 @@ public class TrieColumnFilter
     /// Create a filter trie that applies the given [ColumnFilter]:
     /// - the trie is restricted to only the fetched columns
     /// - columns that are fetched but not queried have their cell values dropped, and their cells older than the
-    ///   row's primary key liveness skipped (as done by `BTreeRow.filter` and by sstable reads, see `#10657`)
+    ///   row's primary key liveness skipped when it can't expire (as done by `BTreeRow.filter` and by sstable reads,
+    ///   see `#10657` and `DeserializationHelper#dropsOlderNotQueriedCells`)
     /// - complex columns are restricted to their subselections, if any are specified, preserving the complex deletion
     /// - the row deletion is preserved
     ///
@@ -75,8 +76,8 @@ public class TrieColumnFilter
     ///                 false if the regular part
     /// @param mayFilterColumns must be set to `!filter.fetchesAllColumns(isStatic()) || !filter.allFetchedColumnsAreQueried()`
     /// @param rowLivenessTimestamp the timestamp of the row's primary key liveness, after applying any active deletion
-    ///                             (i.e. [LivenessInfo#NO_TIMESTAMP] if the active deletion shadows it); cells of
-    ///                             fetched but not queried columns older than it are skipped
+    ///                             (i.e. [LivenessInfo#NO_TIMESTAMP] if the active deletion shadows it or it can
+    ///                             expire); cells of fetched but not queried columns older than it are skipped
     public TrieColumnFilter(Columns columns,
                             Object2IntHashMap<ColumnIdentifier> columnIds,
                             ColumnFilter filter,

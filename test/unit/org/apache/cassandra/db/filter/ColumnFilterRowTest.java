@@ -1038,6 +1038,33 @@ public class ColumnFilterRowTest
     }
 
     @Test
+    public void testFilterKeepsFetchedNotQueriedCellsOlderThanExpiringRowLiveness()
+    {
+        // A primary key liveness with a TTL proves nothing once it expires: cells of fetched but not queried columns
+        // older than it are kept, with a skipped value.
+        Row.Builder builder = newBuilder(clustering);
+        builder.newRow(clustering);
+        builder.addPrimaryKeyLivenessInfo(LivenessInfo.expiring(TIMESTAMP, 100, FBUtilities.nowInSeconds()));
+        builder.addCell(cell(v1, 100, TIMESTAMP - 1));
+        builder.addCell(cell(v2, cellPath(0), 200, TIMESTAMP - 1));
+        Row row = builder.build();
+
+        ColumnFilter queriesV1 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v1).build();
+        Row filtered = row.filter(queriesV1, metadata);
+        assertNotNull(filtered);
+        assertEquals(100, ByteBufferUtil.toInt(filtered.getCell(v1).buffer()));
+        assertNotNull(filtered.getCell(v2, cellPath(0)));
+        assertEquals(0, filtered.getCell(v2, cellPath(0)).buffer().remaining());
+
+        ColumnFilter queriesV2 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v2).build();
+        filtered = row.filter(queriesV2, metadata);
+        assertNotNull(filtered);
+        assertNotNull(filtered.getCell(v1));
+        assertEquals(0, filtered.getCell(v1).buffer().remaining());
+        assertEquals(200, ByteBufferUtil.toInt(filtered.getCell(v2, cellPath(0)).buffer()));
+    }
+
+    @Test
     public void testFilterKeepsFetchedNotQueriedCellsWithoutRowLiveness()
     {
         // Without primary key liveness there is no reference point: all cells of not queried columns are kept,
