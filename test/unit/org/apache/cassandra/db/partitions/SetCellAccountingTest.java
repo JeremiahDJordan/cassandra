@@ -19,11 +19,15 @@
 package org.apache.cassandra.db.partitions;
 
 import java.lang.reflect.Field;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
 
+import com.google.common.collect.ImmutableList;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -45,9 +49,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  * Runs a grow/reset op mix on one partition's {@code set<text>} column with strictly
  * increasing timestamps, then asserts the memtable's on/off-heap ownership never goes negative.
  */
+@RunWith(Parameterized.class)
 public class SetCellAccountingTest extends CQLTester
 {
     private static final Logger logger = LoggerFactory.getLogger(SetCellAccountingTest.class);
+
+    @Parameterized.Parameter()
+    public String memtableClass;
+
+    @Parameterized.Parameters(name = "{0}")
+    public static List<Object> parameters()
+    {
+        return ImmutableList.of("SkipListMemtable",
+                                "TrieMemtableStage1",
+                                "TrieMemtable");
+    }
 
     @BeforeClass
     public static void setUpClass()
@@ -76,7 +92,8 @@ public class SetCellAccountingTest extends CQLTester
                     "    partitioner text," +
                     "    properties text," +
                     "    state text," +
-                    "    seed_hosts set<text>)");
+                    "    seed_hosts set<text>)" +
+                    " WITH memtable = {'class': '" + memtableClass + "'}");
         return getCurrentColumnFamilyStore();
     }
 

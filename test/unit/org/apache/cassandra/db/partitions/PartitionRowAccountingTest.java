@@ -19,11 +19,15 @@
 package org.apache.cassandra.db.partitions;
 
 import java.lang.reflect.Field;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
+import com.google.common.collect.ImmutableList;
 import org.junit.BeforeClass;
 import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -52,9 +56,21 @@ import static org.assertj.core.api.Assertions.assertThat;
  * It runs a grow/reset op mix on one partition with strictly increasing timestamps and asserts the memtable's
  * on/off-heap ownership never goes negative -- i.e. the update accounting never releases more than it allocated.
  */
+@RunWith(Parameterized.class)
 public class PartitionRowAccountingTest extends CQLTester
 {
     private static final Logger logger = LoggerFactory.getLogger(PartitionRowAccountingTest.class);
+
+    @Parameterized.Parameter()
+    public String memtableClass;
+
+    @Parameterized.Parameters(name = "{0}")
+    public static List<Object> parameters()
+    {
+        return ImmutableList.of("SkipListMemtable",
+                                "TrieMemtableStage1",
+                                "TrieMemtable");
+    }
 
     @BeforeClass
     public static void setUpClass()
@@ -156,7 +172,8 @@ public class PartitionRowAccountingTest extends CQLTester
                     "    properties text," +
                     "    state text," +
                     "    v text," +
-                    "    PRIMARY KEY (pk, ck))");
+                    "    PRIMARY KEY (pk, ck))" +
+                    " WITH memtable = {'class': '" + memtableClass + "'}");
         return getCurrentColumnFamilyStore();
     }
 
@@ -437,7 +454,7 @@ public class PartitionRowAccountingTest extends CQLTester
         StringBuilder sb = new StringBuilder("CREATE TABLE %s (pk text, ck int");
         for (int i = 0; i < WIDE_COLS; i++)
             sb.append(", ").append(colName(i)).append(" int");
-        sb.append(", PRIMARY KEY (pk, ck))");
+        sb.append(", PRIMARY KEY (pk, ck)) WITH memtable = {'class': '").append(memtableClass).append("'}");
         createTable(sb.toString());
         return getCurrentColumnFamilyStore();
     }
@@ -465,7 +482,7 @@ public class PartitionRowAccountingTest extends CQLTester
 
     private ColumnFamilyStore createCollectionTable()
     {
-        createTable("CREATE TABLE %s (pk text, ck int, s set<text>, PRIMARY KEY (pk, ck))");
+        createTable("CREATE TABLE %s (pk text, ck int, s set<text>, PRIMARY KEY (pk, ck)) WITH memtable = {'class': '" + memtableClass + "'}");
         return getCurrentColumnFamilyStore();
     }
 
