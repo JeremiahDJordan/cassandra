@@ -255,6 +255,9 @@ public class EmptyRangeQueryTest extends SAITester.Versioned
     @Test
     public void testOrderBy() throws Throwable
     {
+        // Ordering on a table with clustering columns needs row-aware indexes (see FeaturesVersionSupportTest).
+        Assume.assumeTrue(version.onOrAfter(Version.ROW_AWARE_EARLIEST));
+
         createTable("CREATE TABLE %s (pk int, ck int, v bigint, PRIMARY KEY (pk, ck))");
         createIndex("CREATE INDEX ON %s(v) USING 'sai'");
         disableCompaction();
