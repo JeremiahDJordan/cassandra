@@ -236,14 +236,24 @@ public class GossiperTest
     @Test
     public void testHasVersion3NodesShouldReturnFalseWhenNoVersion3NodesDetectedAndCassandra4UpgradeInProgress() throws Exception
     {
-        IClusterVersionProvider cvp = Mockito.mock(IClusterVersionProvider.class);
-        Gossiper g = new Gossiper(false, cvp);
+        Gossiper.instance.start(0);
+        Gossiper.instance.clusterVersionProvider.reset();
 
-        when(cvp.isUpgradeInProgress()).thenReturn(true);
-        when(cvp.getMinClusterVersion()).thenReturn(new CassandraVersion("4.0.0"));
-        assertThat(g.getMinVersion()).isEqualTo(new CassandraVersion("4.0.0"));
-        assertThat(g.isUpgradingFromVersionLowerThan(new CassandraVersion("3.0.0"))).isFalse();
-        assertThat(g.hasMajorVersion3OrUnknownNodes()).isFalse();
+        VersionedValue.VersionedValueFactory factory = new VersionedValue.VersionedValueFactory(null);
+        EndpointState es = new EndpointState((HeartBeatState) null);
+        es.addApplicationState(ApplicationState.RELEASE_VERSION, factory.releaseVersion(CURRENT_VERSION.toString()));
+        Gossiper.instance.endpointStateMap.put(InetAddressAndPort.getByName("127.0.0.1"), es);
+        Gossiper.instance.liveEndpoints.add(InetAddressAndPort.getByName("127.0.0.1"));
+
+        es = new EndpointState((HeartBeatState) null);
+        String previousPatchVersion = String.valueOf(CURRENT_VERSION.major) + '.' + (CURRENT_VERSION.minor) + '.' + Math.max(CURRENT_VERSION.patch - 1, 0);
+        es.addApplicationState(ApplicationState.RELEASE_VERSION, factory.releaseVersion(previousPatchVersion));
+        Gossiper.instance.endpointStateMap.put(InetAddressAndPort.getByName("127.0.0.2"), es);
+        Gossiper.instance.liveEndpoints.add(InetAddressAndPort.getByName("127.0.0.2"));
+        assertFalse(Gossiper.instance.hasMajorVersion3OrUnknownNodes());
+
+        Gossiper.instance.endpointStateMap.remove(InetAddressAndPort.getByName("127.0.0.2"));
+        Gossiper.instance.liveEndpoints.remove(InetAddressAndPort.getByName("127.0.0.2"));
     }
 
     @Test
