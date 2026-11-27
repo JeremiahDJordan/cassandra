@@ -26,6 +26,7 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.Queue;
+import java.util.Set;
 import java.util.UUID;
 
 import org.apache.cassandra.io.sstable.Component;
@@ -36,6 +37,7 @@ import org.junit.Test;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
 
+import com.google.common.collect.ImmutableSet;
 import com.google.common.io.ByteStreams;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -228,11 +230,12 @@ public class CassandraEntireSSTableStreamWriterTest
             full = context.manifest();
         }
 
-        // remove digest component from sstable
+        // remove the digest components from sstable
+        Set<Component> digests = ImmutableSet.of(Component.DIGEST, Component.DIGEST_CRC32C, Component.DIGEST_CRC64NVME);
         LinkedHashMap<Component, Long> withoutDigest = new LinkedHashMap<>();
         for (Component component : full.components())
         {
-            if (!component.equals(Component.DIGEST))
+            if (!digests.contains(component))
                 withoutDigest.put(component, full.sizeOf(component));
         }
         ComponentManifest manifest = new ComponentManifest(withoutDigest);
