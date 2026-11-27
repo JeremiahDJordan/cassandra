@@ -4887,7 +4887,7 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
             //
             // So checking tokenMetadata.isLeaving in addition means that on step 5 we now fail the isLeaving check
             // (cleared by the restart in step 2, and step 4 never reached startLeaving) and truncate transferred ranges
-            boolean resumingInFlightDecommission = tokenMetadata.isLeaving(FBUtilities.getBroadcastAddressAndPort())
+            boolean resumingInFlightDecommission = getTokenMetadata().isLeaving(FBUtilities.getBroadcastAddressAndPort())
                                                    && operationMode != Mode.NORMAL;
 
             // We reset transferred ranges upon starting a new decommission so that we fully stream
