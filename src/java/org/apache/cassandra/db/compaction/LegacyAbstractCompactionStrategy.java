@@ -37,6 +37,7 @@ import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 /**
  * Pluggable compaction strategy determines how SSTables get merged.
@@ -318,29 +319,58 @@ abstract class LegacyAbstractCompactionStrategy extends AbstractCompactionStrate
         }
         else
         {
+            // a strictly newer sstable holds no data that the tombstones of this one shadow
+            List<CompactionSSTable> olderOverlaps = new ArrayList<>(overlaps.size());
+            for (CompactionSSTable overlap : overlaps)
+            {
+                if (overlap.getMinTimestamp() <= sstable.getMaxTimestamp())
+                    olderOverlaps.add(overlap);
+            }
+            if (olderOverlaps.isEmpty())
+                return true;
+
             if (!(sstable instanceof SSTableReader))
                 return false; // Correctly estimating percentage requires data that CompactionSSTable does not provide.
 
             SSTableReader reader = (SSTableReader) sstable;
-            // what percentage of columns do we expect to compact outside of overlap?
-            if (reader.getIndexSummarySize() < 2)
+            // an overlapping sstable spanning the whole range of this one leaves no key outside the overlaps, which the
+            // estimate, from the positions of the range bounds, can miss for few keys
+            for (CompactionSSTable overlap : olderOverlaps)
             {
-                // we have too few samples to estimate correct percentage
-                return false;
+                if (overlap.getFirst().compareTo(reader.getFirst()) <= 0 && overlap.getLast().compareTo(reader.getLast()) >= 0)
+                    return false;
             }
-            // first, calculate estimated keys that do not overlap
-            long keys = reader.estimatedKeys();
-            Set<Range<Token>> ranges = new HashSet<Range<Token>>(overlaps.size());
-            for (CompactionSSTable overlap : overlaps)
-                ranges.add(new Range<>(overlap.getFirst().getToken(), overlap.getLast().getToken()));
-            long remainingKeys = keys - reader.estimatedKeysForRanges(ranges);
-            // next, calculate what percentage of columns we have within those keys
-            long columns = reader.getEstimatedCellPerPartitionCount().mean() * remainingKeys;
-            double remainingColumnsRatio = ((double) columns) / (reader.getEstimatedCellPerPartitionCount().count() *
-                                                                 reader.getEstimatedCellPerPartitionCount().mean());
 
-            // return if we still expect to have droppable tombstones in rest of columns
-            return remainingColumnsRatio * droppableRatio > options.getTombstoneThreshold();
+            // the strategy can still list an sstable that was compacted away and released, which can't be read
+            Ref<SSTableReader> ref = reader.tryRef();
+            if (ref == null)
+                return false;
+            try
+            {
+                // what percentage of columns do we expect to compact outside of overlap?
+                if (!reader.isEstimationInformative())
+                {
+                    // we have too few samples to estimate correct percentage
+                    return false;
+                }
+                // first, calculate estimated keys that do not overlap
+                long keys = reader.estimatedKeys();
+                Set<Range<Token>> ranges = new HashSet<Range<Token>>(olderOverlaps.size());
+                for (CompactionSSTable overlap : olderOverlaps)
+                    ranges.add(new Range<>(overlap.getFirst().getToken(), overlap.getLast().getToken()));
+                long remainingKeys = keys - reader.estimatedKeysForRanges(ranges);
+                // next, calculate what percentage of columns we have within those keys
+                long columns = reader.getEstimatedCellPerPartitionCount().mean() * remainingKeys;
+                double remainingColumnsRatio = ((double) columns) / (reader.getEstimatedCellPerPartitionCount().count() *
+                                                                     reader.getEstimatedCellPerPartitionCount().mean());
+
+                // return if we still expect to have droppable tombstones in rest of columns
+                return remainingColumnsRatio * droppableRatio > options.getTombstoneThreshold();
+            }
+            finally
+            {
+                ref.release();
+            }
         }
     }
 }
