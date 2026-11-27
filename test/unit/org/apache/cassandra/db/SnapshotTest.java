@@ -35,6 +35,7 @@ import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.service.StorageService;
 
 import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
+import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.Assert.assertFalse;
@@ -187,6 +188,17 @@ public class SnapshotTest extends CQLTester
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessage("Snapshot name '..' is reserved");
         }
+    }
+
+    @Test
+    public void testInvalidSnapshotNameDoesNotFlush()
+    {
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        assertThatThrownBy(() -> cfs.snapshot(".."))
+        .isInstanceOf(IllegalArgumentException.class)
+        .hasMessage("Snapshot name '..' is reserved");
+        assertThat(cfs.getLiveSSTables()).isEmpty();
+        assertThat(cfs.getTracker().getView().getCurrentMemtable().isClean()).isFalse();
     }
 
     private static String repeat(char c, int times)

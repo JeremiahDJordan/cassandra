@@ -2541,6 +2541,7 @@ public class ColumnFamilyStore implements ColumnFamilyStoreMBean, Memtable.Owner
      */
     public Set<SSTableReader> snapshot(String snapshotName, Predicate<SSTableReader> predicate, boolean ephemeral, boolean skipMemtable, RateLimiter rateLimiter)
     {
+        validateSnapshotName(snapshotName);
         if (!skipMemtable)
         {
             Memtable current = getTracker().getView().getCurrentMemtable();
