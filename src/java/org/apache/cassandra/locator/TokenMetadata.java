@@ -42,6 +42,7 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.gms.IFailureDetector;
+import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.locator.ReplicaCollection.Builder.Conflict;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.BiMultiValMap;
@@ -375,6 +376,8 @@ public class TokenMetadata
                 logger.warn("Changing {}'s host ID from {} to {}", endpoint, storedId, hostId);
 
             endpointToHostIdMap.forcePut(endpoint, hostId);
+            if (!hostId.equals(storedId) || !endpoint.equals(storedEp))
+                PeerCheckCache.peersChanged();
         }
         finally
         {
@@ -415,6 +418,7 @@ public class TokenMetadata
 
             endpointToHostIdMap.remove(existing);
             endpointToHostIdMap.forcePut(current, hostId);
+            PeerCheckCache.peersChanged();
         }
         finally
         {
@@ -633,7 +637,8 @@ public class TokenMetadata
             {
                 logger.debug("Node {} failed during replace.", endpoint);
             }
-            endpointToHostIdMap.remove(endpoint);
+            if (endpointToHostIdMap.remove(endpoint) != null)
+                PeerCheckCache.peersChanged();
             sortedTokens = sortTokens();
             invalidateCachedRingsUnsafe();
         }
@@ -1559,6 +1564,7 @@ public class TokenMetadata
     {
         ringVersion++;
         cachedTokenMap.set(null);
+        PeerCheckCache.peersChanged();
     }
 
     public DecoratedKey decorateKey(ByteBuffer key)

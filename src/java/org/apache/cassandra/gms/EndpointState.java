@@ -183,14 +183,22 @@ public class EndpointState
         return isAlive;
     }
 
-    void markAlive()
+    @VisibleForTesting
+    public void markAlive()
     {
+        boolean wasAlive = isAlive;
         isAlive = true;
+        if (!wasAlive)
+            PeerCheckCache.peersChanged();
     }
 
-    void markDead()
+    @VisibleForTesting
+    public void markDead()
     {
+        boolean wasAlive = isAlive;
         isAlive = false;
+        if (wasAlive)
+            PeerCheckCache.peersChanged();
     }
 
     /**

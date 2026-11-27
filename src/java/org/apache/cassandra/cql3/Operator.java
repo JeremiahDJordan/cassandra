@@ -515,6 +515,18 @@ public enum Operator
     }
 
     /**
+     * Whether this operator only exists in DataStax's Cassandra, so that only nodes on a DataStax messaging version
+     * ({@code MessagingService.VERSION_DS_10} or later) can deserialize it. Apache Cassandra 4.0 and 4.1 nodes only
+     * know the operators up to {@link #LIKE}, and fail to deserialize a read command carrying any other one.
+     *
+     * @return {@code true} if this operator can't be sent to nodes on a messaging version below DS 10
+     */
+    public boolean isDataStaxOnly()
+    {
+        return b > LIKE.b;
+    }
+
+    /**
      * Deserializes a <code>Operator</code> instance from the specified input.
      *
      * @param input the input to read from

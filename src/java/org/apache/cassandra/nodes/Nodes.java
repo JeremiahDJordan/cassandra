@@ -67,6 +67,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.gms.PeerCheckCache;
 import org.apache.cassandra.io.FSReadError;
 import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.util.File;
@@ -806,10 +807,16 @@ public class Nodes
             if (closed)
                 throw new IllegalStateException("Nodes instance already closed");
 
-            PeerInfo peerInfo = peers.computeIfAbsent(peer, PeerInfo::new);
+            PeerInfo existing = peers.get(peer);
+            PeerInfo peerInfo = existing != null ? existing : peers.computeIfAbsent(peer, PeerInfo::new);
+            String datacenter = peerInfo.getDataCenter();
             updater.accept(peerInfo);
             if (peerInfo.isDirty())
                 updateExecutor.submit(this::saveToDisk);
+
+            // the peers and their datacenter are read by the checks of the nodes that the reads can contact
+            if (existing == null || !Objects.equals(datacenter, peerInfo.getDataCenter()))
+                PeerCheckCache.peersChanged();
         }
 
         /**
@@ -825,10 +832,7 @@ public class Nodes
             if (closed)
                 throw new IllegalStateException("Nodes instance already closed");
 
-            PeerInfo peerInfo = peers.computeIfAbsent(peer, PeerInfo::new);
-            updater.accept(peerInfo, value);
-            if (peerInfo.isDirty())
-                updateExecutor.submit(this::saveToDisk);
+            update(peer, peerInfo -> updater.accept(peerInfo, value));
         }
 
         /**
@@ -845,7 +849,10 @@ public class Nodes
                 throw new IllegalStateException("Nodes instance already closed");
 
             if (peers.remove(peer) != null)
+            {
                 updateExecutor.submit(this::saveToDisk);
+                PeerCheckCache.peersChanged();
+            }
         }
 
         /**

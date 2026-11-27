@@ -60,6 +60,17 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - SELECT queries using the parts of the WHERE and ORDER BY clauses that only DataStax supports, or that nodes on a
+      messaging version below DS 10, such as Apache Cassandra 4.0 and 4.1 nodes, would evaluate differently or fail
+      to evaluate, are rejected with an InvalidRequestException while the query can contact such a node: the OR
+      operator (nested restrictions), NOT CONTAINS, NOT CONTAINS KEY and NOT LIKE, IN on a filtered or indexed
+      column, map entry comparisons other than = (e.g. m['a'] > 1), the : operator, restrictions that an analyzed index
+      evaluates (= on an analyzed index, CONTAINS and CONTAINS KEY on an analyzed collection index), ANN,
+      GEO_DISTANCE, BM25 and SAI ORDER BY on non-clustering columns. NOT IN and != are accepted. A query can contact
+      the nodes of the local datacenter at LOCAL_ONE, LOCAL_QUORUM and LOCAL_SERIAL, and every node in the ring at the
+      other consistency levels. Nodes known to be below DS 10 count, and so do live nodes whose version isn't known
+      yet. A read that still reaches such a node fails for that node. Queries that only run locally, such as internal
+      queries on non-system keyspaces, are rejected too.
 
 Deprecation
 ---------
