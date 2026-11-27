@@ -28,6 +28,7 @@ import java.util.TreeSet;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Sets;
@@ -58,6 +59,7 @@ import org.apache.cassandra.db.partitions.SingletonUnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.Unfiltered;
@@ -526,7 +528,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         // data is being tracked. This is only requested after an initial digest mismatch
         UnfilteredRowIterator partition = cfs.isRowCacheEnabled() && !executionController.isTrackingRepairedStatus()
                                         ? getThroughCache(cfs, executionController)
-                                        : queryMemtableAndDisk(cfs, executionController, true);
+                                        : queryMemtableAndDisk(cfs, executionController);
         return new SingletonUnfilteredPartitionIterator(partition);
     }
 
@@ -568,7 +570,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 // Some other read is trying to cache the value, just do a normal non-caching read
                 Tracing.trace("Row cache miss (race)");
                 cfs.metric.rowCacheMiss.inc();
-                return queryMemtableAndDisk(cfs, executionController, true);
+                return queryMemtableAndDisk(cfs, executionController);
             }
 
             CachedPartition cachedPartition = (CachedPartition)cached;
@@ -585,7 +587,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
             cfs.metric.rowCacheHitOutOfRange.inc();
             Tracing.trace("Ignoring row cache as cached value could not satisfy query");
-            return queryMemtableAndDisk(cfs, executionController, true);
+            return queryMemtableAndDisk(cfs, executionController);
         }
 
         cfs.metric.rowCacheMiss.inc();
@@ -686,7 +688,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         }
 
         Tracing.trace("Fetching data but not populating cache as query does not query from the start of the partition");
-        return queryMemtableAndDisk(cfs, executionController, true);
+        return queryMemtableAndDisk(cfs, executionController);
     }
 
     /**
@@ -706,22 +708,13 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
      */
     public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, ReadExecutionController executionController)
     {
-        return queryMemtableAndDisk(cfs, executionController, false);
-    }
-
-    /**
-     * @param rereadsRows whether the caller reads again the rows that may need cells that the sstables skipped, see
-     * {@link ReadCommand#sstableColumnFilter}
-     */
-    private UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs, ReadExecutionController executionController, boolean rereadsRows)
-    {
         assert executionController != null && executionController.validForReadOn(cfs);
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Executing single-partition query on {}; stage READ pending: {}, active: {}", cfs.name, Stage.READ.getPendingTaskCount(), Stage.READ.getActiveTaskCount());
 
         Tracing.trace("Acquiring sstable references");
         ColumnFamilyStore.ViewFragment view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));
-        return queryMemtableAndDiskInternal(cfs, view, null, executionController, Clock.Global.nanoTime(), rereadsRows);
+        return queryMemtableAndDisk(cfs, view, null, executionController);
     }
 
     public UnfilteredRowIterator queryMemtableAndDisk(ColumnFamilyStore cfs,
@@ -733,21 +726,20 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Executing single-partition query on {}; stage READ pending: {}, active: {}", cfs.name, Stage.READ.getPendingTaskCount(), Stage.READ.getActiveTaskCount());
 
-        return queryMemtableAndDiskInternal(cfs, view, rowTransformer, executionController, Clock.Global.nanoTime(), false);
+        return queryMemtableAndDiskInternal(cfs, view, rowTransformer, executionController, Clock.Global.nanoTime());
     }
 
     private UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs, ReadExecutionController controller, long startTimeNanos)
     {
         var view = cfs.select(View.select(SSTableSet.LIVE, partitionKey()));
-        return queryMemtableAndDiskInternal(cfs, view, null, controller, startTimeNanos, false);
+        return queryMemtableAndDiskInternal(cfs, view, null, controller, startTimeNanos);
     }
 
     private UnfilteredRowIterator queryMemtableAndDiskInternal(ColumnFamilyStore cfs,
                                                                ColumnFamilyStore.ViewFragment view,
                                                                Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer,
                                                                ReadExecutionController controller,
-                                                               long startTimeNanos,
-                                                               boolean rereadsRows)
+                                                               long startTimeNanos)
     {
         /*
          * We have 2 main strategies:
@@ -771,7 +763,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             && !queriesMulticellType()
             && !controller.isTrackingRepairedStatus())
         {
-            return queryMemtableAndSSTablesInTimestampOrder(cfs, view, rowTransformer, (ClusteringIndexNamesFilter)clusteringIndexFilter(), controller, startTimeNanos, rereadsRows);
+            return queryMemtableAndSSTablesInTimestampOrder(cfs, view, rowTransformer, (ClusteringIndexNamesFilter)clusteringIndexFilter(), controller, startTimeNanos);
         }
 
         if (Tracing.traceSinglePartitions())
@@ -785,7 +777,6 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         try
         {
             SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
-            boolean hasMemtableData = false;
 
             boolean onlyPurgeRepairedTombstones = cfs.onlyPurgeRepairedTombstones();
             for (Memtable memtable : view.memtables)
@@ -793,8 +784,6 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 UnfilteredRowIterator iter = memtable.rowIterator(partitionKey(), filter.getSlices(metadata()), columnFilter(), filter.isReversed(), metricsCollector);
                 if (iter == null)
                     continue;
-
-                hasMemtableData = true;
 
                 if (memtable.getMinTimestamp() != Memtable.NO_MIN_TIMESTAMP)
                     minTimestamp = Math.min(minTimestamp, memtable.getMinTimestamp());
@@ -825,9 +814,6 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             view.sstables.sort(SSTableReader.maxTimestampDescending);
             int nonIntersectingSSTables = 0;
             int includedDueToTombstones = 0;
-            ColumnFilter sstableColumnFilter = hasMemtableData && !rereadsRows
-                                               ? columnFilter()
-                                               : sstableColumnFilter(view.sstables, hasMemtableData ? view.memtables : Collections.emptyList(), controller);
 
             if (controller.isTrackingRepairedStatus())
                 Tracing.trace("Collecting data from sstables and tracking repaired status");
@@ -862,8 +848,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                         controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
 
                     // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
-                    iter = intersects ? makeRowIteratorWithLowerBound(cfs, sstable, sstableColumnFilter, metricsCollector)
-                                                            : makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, sstableColumnFilter, metricsCollector);
+                    iter = intersects ? makeRowIteratorWithLowerBound(cfs, sstable, metricsCollector)
+                                                            : makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, metricsCollector);
                 }
                 else
                 {
@@ -875,7 +861,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     // an iterator figure out that (see `StatsMetadata.hasPartitionLevelDeletions`)
 
                     // 'iter' is added to iterators which is closed on exception, or through the closing of the final merged iterator
-                    iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, sstableColumnFilter, metricsCollector);
+                    iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, metricsCollector);
 
                     // if the sstable contains a partition delete, then we must include it regardless of whether it
                     // shadows any other data seen locally as we can't guarantee that other replicas have seen it
@@ -913,7 +899,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
             StorageHook.instance.reportRead(cfs.metadata().id, partitionKey());
 
             List<UnfilteredRowIterator> iterators = inputCollector.finalizeIterators(cfs, nowInSec(), controller.oldestUnrepairedTombstone());
-            return withSSTablesIterated(iterators, controller, view.sstables.size(), cfs.metric, metricsCollector, startTimeNanos);
+            return withSSTablesIterated(iterators, cfs, view, rowTransformer, controller, metricsCollector, startTimeNanos);
         }
         catch (RuntimeException | Error e)
         {
@@ -937,14 +923,13 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
     private UnfilteredRowIteratorWithLowerBound makeRowIteratorWithLowerBound(ColumnFamilyStore cfs,
                                                                               SSTableReader sstable,
-                                                                              ColumnFilter columnFilter,
                                                                               SSTableReadsListener listener)
     {
         return StorageHook.instance.makeRowIteratorWithLowerBound(cfs,
                                                                   sstable,
                                                                   partitionKey(),
                                                                   clusteringIndexFilter(),
-                                                                  columnFilter,
+                                                                  columnFilter(),
                                                                   listener);
 
     }
@@ -952,28 +937,26 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
     private UnfilteredRowIterator makeRowIterator(ColumnFamilyStore cfs,
                                                   SSTableReader sstable,
                                                   ClusteringIndexNamesFilter clusteringIndexFilter,
-                                                  ColumnFilter columnFilter,
                                                   SSTableReadsListener listener)
     {
         return StorageHook.instance.makeRowIterator(cfs,
                                                     sstable,
                                                     partitionKey(),
                                                     clusteringIndexFilter.getSlices(cfs.metadata()),
-                                                    columnFilter,
+                                                    columnFilter(),
                                                     clusteringIndexFilter.isReversed(),
                                                     listener);
     }
 
     private UnfilteredRowIterator makeRowIteratorWithSkippedNonStaticContent(ColumnFamilyStore cfs,
                                                                              SSTableReader sstable,
-                                                                             ColumnFilter columnFilter,
                                                                              SSTableReadsListener listener)
     {
         return StorageHook.instance.makeRowIterator(cfs,
                                                     sstable,
                                                     partitionKey(),
                                                     Slices.NONE,
-                                                    columnFilter,
+                                                    columnFilter(),
                                                     clusteringIndexFilter().isReversed(),
                                                     listener);
     }
@@ -984,15 +967,16 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
      * would cause all iterators to be initialized and hence all sstables to be accessed.
      */
     private UnfilteredRowIterator withSSTablesIterated(List<UnfilteredRowIterator> iterators,
+                                                       ColumnFamilyStore cfs,
+                                                       ColumnFamilyStore.ViewFragment view,
+                                                       Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer,
                                                        ReadExecutionController controller,
-                                                       int totalIntersectingSSTables,
-                                                       TableMetrics metrics,
                                                        SSTableReadMetricsCollector metricsCollector,
                                                        long startTimeNanos)
     {
-        UnfilteredRowIterator merged = UnfilteredRowIterators.merge(iterators);
+        UnfilteredRowIterator merged = mergeReadingAgain(iterators, cfs, view, rowTransformer, controller);
 
-        return withSSTablesIterated(merged, controller, totalIntersectingSSTables, metrics, metricsCollector, startTimeNanos);
+        return withSSTablesIterated(merged, controller, view.sstables.size(), cfs.metric, metricsCollector, startTimeNanos);
     }
 
     private UnfilteredRowIterator withSSTablesIterated(UnfilteredRowIterator iterator,
@@ -1040,14 +1024,19 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
      * no collection or counters are included).
      * This method assumes the filter is a {@code ClusteringIndexNamesFilter}.
      */
-    private UnfilteredRowIterator queryMemtableAndSSTablesInTimestampOrder(ColumnFamilyStore cfs, ColumnFamilyStore.ViewFragment view, Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer, ClusteringIndexNamesFilter filter, ReadExecutionController controller, long startTimeNanos, boolean rereadsRows)
+    private UnfilteredRowIterator queryMemtableAndSSTablesInTimestampOrder(ColumnFamilyStore cfs, ColumnFamilyStore.ViewFragment view, Function<CellSourceIdentifier, Transformation<BaseRowIterator<?>>> rowTransformer, ClusteringIndexNamesFilter filter, ReadExecutionController controller, long startTimeNanos)
     {
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Acquiring sstable references");
 
         ImmutableBTreePartition result = null;
         SSTableReadMetricsCollector metricsCollector = new SSTableReadMetricsCollector();
-        boolean hasMemtableData = false;
+        DroppingRows droppingRows = mayNeedRowsReadAgain() ? new DroppingRows() : null;
+        // The sources applied the column filter: a filter that drops not queried cells would drop them from the merged
+        // rows against their merged liveness info, which isn't the liveness info of each source
+        ColumnFilter mergedRowsFilter = columnFilter().allFetchedColumnsAreQueried()
+                                        ? columnFilter()
+                                        : ColumnFilter.selection(columnFilter().fetchedColumns());
 
         if (Tracing.traceSinglePartitions())
             Tracing.trace("Merging memtable contents");
@@ -1060,24 +1049,20 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                 if (iter == null)
                     continue;
 
-                hasMemtableData = true;
-
                 // Memtable data is always considered unrepaired
                 controller.updateMinOldestUnrepairedTombstone(memtable, onlyPurgeRepairedTombstones);
 
                 UnfilteredRowIterator wrapped = rowTransformer != null ? Transformation.apply(iter, rowTransformer.apply(memtable))
                                                                        : iter;
-                result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false),
+                result = add(DroppingRows.apply(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.MEMTABLE, false), droppingRows),
                              result,
-                             filter);
+                             filter,
+                             mergedRowsFilter);
             }
         }
 
         /* add the SSTables on disk */
         view.sstables.sort(SSTableReader.maxTimestampDescending);
-        ColumnFilter sstableColumnFilter = hasMemtableData && !rereadsRows
-                                           ? columnFilter()
-                                           : sstableColumnFilter(view.sstables, hasMemtableData ? view.memtables : Collections.emptyList(), controller);
         // read sorted sstables
         for (SSTableReader sstable : view.sstables)
         {
@@ -1107,7 +1092,7 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                     continue; // no tombstone at all, we can skip that sstable
 
                 // We need to get the partition deletion and include it if it's live. In any case though, we're done with that sstable.
-                try (UnfilteredRowIterator iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, sstableColumnFilter, metricsCollector))
+                try (UnfilteredRowIterator iter = makeRowIteratorWithSkippedNonStaticContent(cfs, sstable, metricsCollector))
                 {
                     if (!iter.partitionLevelDeletion().isLive())
                     {
@@ -1119,7 +1104,8 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                                                                            iter.partitionLevelDeletion(),
                                                                            filter.isReversed()),
                                      result,
-                                     filter);
+                                     filter,
+                                     mergedRowsFilter);
                     }
                     else
                     {
@@ -1128,16 +1114,17 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
 
                         if (!sstable.isRepaired())
                             controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
-                        result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false),
+                        result = add(DroppingRows.apply(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false), droppingRows),
                                      result,
-                                     filter);
+                                     filter,
+                                     mergedRowsFilter);
                     }
                 }
 
                 continue;
             }
 
-            try (UnfilteredRowIterator iter = makeRowIterator(cfs, sstable, filter, sstableColumnFilter, metricsCollector))
+            try (UnfilteredRowIterator iter = makeRowIterator(cfs, sstable, filter, metricsCollector))
             {
                 if (iter.isEmpty())
                     continue;
@@ -1145,9 +1132,10 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
                                                                        : iter;
                 if (!sstable.isRepaired())
                     controller.updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
-                result = add(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false),
+                result = add(DroppingRows.apply(RTBoundValidator.validate(wrapped, RTBoundValidator.Stage.SSTABLE, false), droppingRows),
                      result,
-                     filter);
+                     filter,
+                     mergedRowsFilter);
             }
         }
 
@@ -1161,18 +1149,53 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         cfs.metric.topReadPartitionSSTableCount.addSample(key.getKey(), metricsCollector.getMergedSSTables());
         StorageHook.instance.reportRead(cfs.metadata.id, partitionKey());
 
-        UnfilteredRowIterator iterator = result.unfilteredIterator(columnFilter(), Slices.ALL, clusteringIndexFilter().isReversed());
+        UnfilteredRowIterator iterator = result.unfilteredIterator(mergedRowsFilter, Slices.ALL, clusteringIndexFilter().isReversed());
+        if (droppingRows != null && droppingRows.seen)
+        {
+            iterator = Transformation.apply(iterator, new Transformation<>()
+            {
+                @Override
+                protected Row applyToRow(Row row)
+                {
+                    return mayNeedReadAgain(row) ? readAgain(cfs, view, rowTransformer, controller, partitionKey(), row) : row;
+                }
+            });
+        }
         return withSSTablesIterated(iterator, controller, view.sstables.size(), cfs.metric, metricsCollector, startTimeNanos);
 
     }
 
-    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter)
+    /**
+     * Records whether a row of the sources it is applied to has a liveness info that drops cells (see
+     * {@link ReadCommand#mayNeedRowsReadAgain}): the rows of the read whose merged liveness info isn't live are then read
+     * again.
+     */
+    private static final class DroppingRows extends Transformation<UnfilteredRowIterator>
+    {
+        private boolean seen;
+
+        private static UnfilteredRowIterator apply(UnfilteredRowIterator iter, @Nullable DroppingRows droppingRows)
+        {
+            return droppingRows == null ? iter : Transformation.apply(iter, droppingRows);
+        }
+
+        @Override
+        protected Row applyToRow(Row row)
+        {
+            if (DeserializationHelper.dropsOlderNotQueriedCells(row.primaryKeyLivenessInfo()))
+                seen = true;
+            return row;
+        }
+    }
+
+    private ImmutableBTreePartition add(UnfilteredRowIterator iter, ImmutableBTreePartition result, ClusteringIndexNamesFilter filter, ColumnFilter mergedRowsFilter)
     {
         int maxRows = Math.max(filter.requestedRows().size(), 1);
         if (result == null)
             return ImmutableBTreePartition.create(iter, maxRows);
 
-        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(Arrays.asList(iter, result.unfilteredIterator(columnFilter(), Slices.ALL, filter.isReversed()))))
+        // the merged rows are kept as merged, as at the end of the read (see queryMemtableAndSSTablesInTimestampOrder)
+        try (UnfilteredRowIterator merged = UnfilteredRowIterators.merge(Arrays.asList(iter, result.unfilteredIterator(mergedRowsFilter, Slices.ALL, filter.isReversed()))))
         {
             return ImmutableBTreePartition.create(merged, maxRows);
         }

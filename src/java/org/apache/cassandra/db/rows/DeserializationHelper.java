@@ -52,8 +52,6 @@ public class DeserializationHelper
     private final ColumnFilter columnsToFetch;
     private ColumnFilter.Tester tester;
 
-    private final boolean dropsNotQueriedCellsOlderThanRow;
-
     private final boolean hasDroppedColumns;
     private final boolean mayHaveDroppedColumnsNewerThanDrop;
     private final Map<ByteBuffer, DroppedColumn> droppedColumns;
@@ -74,7 +72,6 @@ public class DeserializationHelper
         this.flag = flag;
         this.version = version;
         this.columnsToFetch = columnsToFetch;
-        this.dropsNotQueriedCellsOlderThanRow = columnsToFetch != null && columnsToFetch.dropsNotQueriedCellsOlderThanRow();
         this.droppedColumns = metadata.droppedColumns;
         this.hasDroppedColumns = droppedColumns.size() > 0;
         this.mayHaveDroppedColumnsNewerThanDrop = hasDroppedColumns && mayHaveDroppedColumnsNewerThanDrop;
@@ -103,22 +100,42 @@ public class DeserializationHelper
 
     public boolean includes(Cell<?> cell, LivenessInfo rowLiveness)
     {
-        // During queries, some columns are included even though they are not queried by the user because
-        // we always need to distinguish between having a row (with potentially only null values) and not
-        // having a row at all (see #CASSANDRA-7085 for background). The values of those cells are skipped
-        // (canSkipValue), but the cells are kept until the sources are merged, see ReadCommand#withoutSkippableCells,
-        // except simple cells older than the row's liveness info when the filter allows it
-        // (ColumnFilter#withNotQueriedCellsOlderThanRowDropped).
         if (columnsToFetch == null)
             return true;
 
+        // During queries, some columns are included even though they are not queried by the user because
+        // we always need to distinguish between having a row (with potentially only null values) and not
+        // having a row at all (see #CASSANDRA-7085 for background). In the case where the column is not
+        // actually requested by the user however (canSkipValue), we can skip the full cell if the cell
+        // timestamp is lower than the row one and the row's liveness can't expire, because in that case, the row
+        // timestamp is enough proof of the liveness of the row (see ReadCommand#mayNeedRowsReadAgain for a newer
+        // liveness of another source). Otherwise, we'll only be able to skip the values of those cells.
         ColumnMetadata column = cell.column();
         if (column.isComplex())
-            return includes(cell.path());
+        {
+            if (!includes(cell.path()))
+                return false;
 
-        return !dropsNotQueriedCellsOlderThanRow
-               || cell.timestamp() >= rowLiveness.timestamp()
-               || columnsToFetch.fetchedColumnIsQueried(column);
+            return !canSkipValue(cell.path()) || !isOlderThanDroppingLiveness(cell, rowLiveness);
+        }
+        else
+        {
+            return columnsToFetch.fetchedColumnIsQueried(column) || !isOlderThanDroppingLiveness(cell, rowLiveness);
+        }
+    }
+
+    /**
+     * Whether a row liveness info proves that its row exists for good, so that the cells of fetched but not queried
+     * columns that are older than it can be dropped: a live liveness info that can't expire.
+     */
+    public static boolean dropsOlderNotQueriedCells(LivenessInfo rowLiveness)
+    {
+        return !rowLiveness.isEmpty() && !rowLiveness.isExpiring();
+    }
+
+    private static boolean isOlderThanDroppingLiveness(Cell<?> cell, LivenessInfo rowLiveness)
+    {
+        return dropsOlderNotQueriedCells(rowLiveness) && cell.timestamp() < rowLiveness.timestamp();
     }
 
     public boolean includes(CellPath path)

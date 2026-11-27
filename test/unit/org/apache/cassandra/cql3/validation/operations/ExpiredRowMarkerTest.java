@@ -18,6 +18,7 @@
 
 package org.apache.cassandra.cql3.validation.operations;
 
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
@@ -43,16 +44,15 @@ import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.Cell;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.ColumnMetadata;
-import org.apache.cassandra.sensors.ActiveRequestSensors;
-import org.apache.cassandra.sensors.Context;
-import org.apache.cassandra.sensors.RequestTracker;
-import org.apache.cassandra.sensors.Type;
+import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.FBUtilities;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 
@@ -64,6 +64,7 @@ public class ExpiredRowMarkerTest extends CQLTester
 {
     private static final String TABLE = "CREATE TABLE %s (k int, c int, r int, x int, l set<int>, m map<text, int>, s int static, PRIMARY KEY (k, c))";
 
+    private static final String LIVE_MARKER = "INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10";
     private static final String EXPIRING_MARKER = "INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10 AND TTL 1";
     private static final String LIVE_EXPIRING_MARKER = "INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10 AND TTL 100000";
 
@@ -101,6 +102,9 @@ public class ExpiredRowMarkerTest extends CQLTester
         static final Storage[] WITH_MEMTABLE = { MEMTABLE, SSTABLE_AND_MEMTABLE };
 
         static final Storage[] NOT_COMPACTED = { MEMTABLE, SSTABLE, SSTABLE_AND_MEMTABLE, SSTABLES };
+
+        // the older writes and the row marker end up in the same row of a memtable or an sstable
+        static final Storage[] SAME_SOURCE = { MEMTABLE, SSTABLE, COMPACTED };
 
         final boolean flushOlderWrites;
         final boolean flushMarker;
@@ -199,7 +203,8 @@ public class ExpiredRowMarkerTest extends CQLTester
 
     /**
      * The older cell and a newer row marker without TTL are in the same source, and the expired row marker is in
-     * another one: the row marker of the first source is live, but it is superseded by the expired one.
+     * another one (SSTABLE_AND_MEMTABLE, SSTABLES): the row marker of the first source is live, but it is superseded by
+     * the expired one, in range reads, slices and reads by name.
      */
     @Test
     public void testRowAliveByOlderCellWithSupersededLiveMarker() throws Throwable
@@ -217,6 +222,98 @@ public class ExpiredRowMarkerTest extends CQLTester
                 assertRowsInternalAndNet(table, "SELECT k, c, x FROM %s" + restriction, row(1, 1, null));
                 assertRowsInternalAndNet(table, "SELECT k, c, writetime(x) FROM %s" + restriction, row(1, 1, null));
             }
+        }
+    }
+
+    /**
+     * Three sstables, read by name newest first: the first has the older cell and a row marker without TTL, the second
+     * a newer row marker with a TTL, live, and the third an even newer row marker, expired.
+     */
+    @Test
+    public void testRowAliveByOlderCellWithSupersededMarkersInThreeSources() throws Throwable
+    {
+        createTable(TABLE);
+        disableCompaction();
+        execute("INSERT INTO %s (k, c, r) VALUES (1, 1, 7) USING TIMESTAMP 1");
+        execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10");
+        execute("INSERT INTO %s (k, c, r) VALUES (2, 1, 7) USING TIMESTAMP 100");
+        flush();
+        execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 15 AND TTL 100000");
+        execute("INSERT INTO %s (k, c, r) VALUES (3, 1, 7) USING TIMESTAMP 50");
+        flush();
+        execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 20 AND TTL 1");
+        flush();
+        awaitMarkerExpiry();
+
+        for (String restriction : RESTRICTIONS)
+        {
+            if (!restriction.startsWith(" WHERE k = 1"))
+                continue;
+            assertRows(execute("SELECT k, c, x FROM %s" + restriction), row(1, 1, null));
+            assertRows(execute("SELECT k, c, r FROM %s" + restriction), row(1, 1, 7));
+        }
+    }
+
+    /**
+     * A row whose older cell is in four sstables, each with a newer row marker without TTL, superseded by an expired
+     * row marker, is read again once by a read by name.
+     */
+    @Test
+    public void testRowWithSupersededMarkersReadAgainOnce() throws Throwable
+    {
+        createTable(TABLE);
+        disableCompaction();
+        for (int sstable = 1; sstable <= 4; sstable++)
+        {
+            execute("INSERT INTO %s (k, c, r) VALUES (1, 1, 7) USING TIMESTAMP ?", 2L * sstable);
+            execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP ?", 2L * sstable + 1);
+            execute("INSERT INTO %s (k, c, r) VALUES (2, 1, 7) USING TIMESTAMP ?", 2L * sstable);
+            flush();
+        }
+        execute(EXPIRING_MARKER.replace("TIMESTAMP 10", "TIMESTAMP 100"));
+        awaitMarkerExpiry();
+
+        var reads = getCurrentColumnFamilyStore().metric.sstablesPerReadHistogram.tableOrKeyspaceHistogram();
+        long before = reads.getCount();
+        assertRows(execute("SELECT k, c, x FROM %s WHERE k = 2 AND c = 1"), row(2, 1, null));
+        long oneRead = reads.getCount() - before;
+
+        before = reads.getCount();
+        assertRows(execute("SELECT k, c, x FROM %s WHERE k = 1 AND c = 1"), row(1, 1, null));
+        assertEquals(oneRead + 1, reads.getCount() - before);
+    }
+
+    /**
+     * Reading a row again doesn't change the digest of the repaired data: the repaired sstable has the older cell and
+     * a newer row marker without TTL, and an expired row marker is added in the memtable.
+     */
+    @Test
+    public void testReadAgainKeepsRepairedDataDigest() throws Throwable
+    {
+        createTable(TABLE);
+        disableCompaction();
+        execute("INSERT INTO %s (k, c, r) VALUES (1, 1, 7) USING TIMESTAMP 1");
+        execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10");
+        execute("INSERT INTO %s (k, c, r, x) VALUES (1, 2, 8, 8) USING TIMESTAMP 10");
+        flush();
+        for (SSTableReader sstable : getCurrentColumnFamilyStore().getLiveSSTables())
+        {
+            sstable.descriptor.getMetadataSerializer().mutateRepairMetadata(sstable.descriptor, 1, null, false);
+            sstable.reloadSSTableMetadata();
+        }
+
+        String[] queries = { "SELECT k, c, x FROM %s WHERE k = 1", "SELECT k, c, x FROM %s" };
+        List<ByteBuffer> digests = new ArrayList<>();
+        for (String query : queries)
+            digests.add(repairedDataDigest(query));
+
+        execute(EXPIRING_MARKER.replace("TIMESTAMP 10", "TIMESTAMP 20"));
+        awaitMarkerExpiry();
+
+        for (int i = 0; i < queries.length; i++)
+        {
+            assertRows(execute(queries[i]), row(1, 1, null), row(1, 2, 8));
+            assertEquals(queries[i], digests.get(i), repairedDataDigest(queries[i]));
         }
     }
 
@@ -262,46 +359,54 @@ public class ExpiredRowMarkerTest extends CQLTester
     }
 
     /**
-     * When the row marker is live, a replica doesn't return the cells of the columns that are fetched but not queried
-     * and older than the marker, wherever the cells and the marker are stored.
+     * A replica drops the cells of the columns that are fetched but not queried and older than the row marker of the
+     * same source when that marker has no TTL, and returns them with their values skipped when it has one, live or
+     * expired, as another source or replica can have a newer row marker that has expired.
      */
     @Test
-    public void testOlderNotQueriedCellsSkippedWithLiveMarker() throws Throwable
+    public void testOlderNotQueriedCellsDroppedOnlyUnderMarkerWithoutTTL() throws Throwable
     {
-        for (Storage storage : new Storage[]{ Storage.MEMTABLE, Storage.SSTABLE, Storage.SSTABLE_AND_MEMTABLE, Storage.SSTABLES })
+        for (String marker : new String[]{ LIVE_MARKER, LIVE_EXPIRING_MARKER, EXPIRING_MARKER })
         {
-            createTable(TABLE);
-            disableCompaction();
-            execute("INSERT INTO %s (k, c, r) VALUES (1, 1, 7) USING TIMESTAMP 1");
-            if (storage.flushOlderWrites)
-                flush();
-            execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10");
-            if (storage.flushMarker)
-                flush();
-
-            ColumnMetadata r = currentTableMetadata().getColumn(ColumnIdentifier.getInterned("r", false));
-            for (String restriction : RESTRICTIONS)
+            Map<Storage, String> tables = writeRows(marker, "INSERT INTO %s (k, c, r) VALUES (1, 1, 7) USING TIMESTAMP 1");
+            for (Storage storage : Storage.SAME_SOURCE)
             {
-                int rows = 0;
-                for (Partition partition : Util.getAllUnfiltered(parseReadCommand("SELECT k, c, x FROM %s" + restriction)))
+                String table = tables.get(storage);
+                ColumnMetadata r = Schema.instance.getTableMetadata(KEYSPACE, table).getColumn(ColumnIdentifier.getInterned("r", false));
+                for (String restriction : RESTRICTIONS)
                 {
-                    for (Row row : partition.rows())
+                    String query = String.format("SELECT k, c, x FROM %s" + restriction, KEYSPACE + '.' + table);
+                    String message = marker + ", " + storage + ": " + query;
+                    int rows = 0;
+                    for (Partition partition : Util.getAllUnfiltered(parseReadCommand(query)))
                     {
-                        assertNull(storage + ": " + restriction, row.getCell(r));
-                        rows++;
+                        for (Row row : partition.rows())
+                        {
+                            Cell<?> cell = row.getCell(r);
+                            if (marker.equals(LIVE_MARKER))
+                            {
+                                assertNull(message, cell);
+                            }
+                            else
+                            {
+                                assertNotNull(message, cell);
+                                assertEquals(message, 0, cell.buffer().remaining());
+                            }
+                            rows++;
+                        }
                     }
+                    assertEquals(message, 1, rows);
                 }
-                assertEquals(storage + ": " + restriction, 1, rows);
             }
         }
     }
 
     /**
-     * Whether the row marker is live or has expired, a replica doesn't return the tombstones of the columns that are
-     * fetched but not queried and older than the marker, as they don't keep the row alive.
+     * Whether a row marker with a TTL is live or has expired, a replica returns the tombstones of the columns that are
+     * fetched but not queried and older than the marker, as they can shadow the cells of another replica.
      */
     @Test
-    public void testOlderNotQueriedTombstonesSkipped() throws Throwable
+    public void testOlderNotQueriedTombstonesKept() throws Throwable
     {
         for (String marker : new String[]{ EXPIRING_MARKER, LIVE_EXPIRING_MARKER })
         {
@@ -311,16 +416,21 @@ public class ExpiredRowMarkerTest extends CQLTester
 
             for (Map.Entry<Storage, String> table : tables.entrySet())
             {
+                // compaction purges the tombstones
+                if (table.getKey() == Storage.PURGED)
+                    continue;
+
                 for (String restriction : RESTRICTIONS)
                 {
                     String query = String.format("SELECT k, c, x FROM %s" + restriction, KEYSPACE + '.' + table.getValue());
+                    ColumnMetadata r = Schema.instance.getTableMetadata(KEYSPACE, table.getValue()).getColumn(ColumnIdentifier.getInterned("r", false));
                     int rows = 0;
                     for (Partition partition : Util.getAllUnfiltered(parseReadCommand(query)))
                     {
                         for (Row row : partition.rows())
                         {
-                            for (Cell<?> cell : row.cells())
-                                assertTrue(table.getKey() + ": " + query + ": " + cell, cell.isLive(FBUtilities.nowInSeconds()));
+                            Cell<?> cell = row.getCell(r);
+                            assertTrue(table.getKey() + ": " + query, cell != null && !cell.isLive(FBUtilities.nowInSeconds()));
                             rows++;
                         }
                     }
@@ -377,18 +487,37 @@ public class ExpiredRowMarkerTest extends CQLTester
     }
 
     /**
+     * A read by name of a deleted partition returns the same digest whether the partition deletion is in a memtable or
+     * in an sstable that the read doesn't intersect.
+     */
+    @Test
+    public void testNamesReadDigestOfDeletedPartitionMatchesAcrossStorages() throws Throwable
+    {
+        createTable(TABLE);
+        disableCompaction();
+        execute("DELETE FROM %s USING TIMESTAMP 10 WHERE k = 1");
+        long nowInSec = FBUtilities.nowInSeconds();
+        String query = formatQuery("SELECT k, c, x FROM %s WHERE k = 1 AND c = 1");
+        String inMemtable = digest(query, nowInSec);
+        flush();
+        assertEquals(inMemtable, digest(query, nowInSec));
+    }
+
+    /**
      * A replica returns the same digest wherever the cells and the row marker are stored, with every memtable
-     * implementation, when the not queried cells are older than the row marker, live or expired, or are tombstones.
+     * implementation, when the not queried cells are older than a row marker with a TTL, live or expired, or are
+     * tombstones.
      */
     @Test
     public void testDigestsMatchAcrossStoragesAndMemtables() throws Throwable
     {
         String olderWrite = "INSERT INTO %s (k, c, r, l, m) VALUES (1, 1, 7, {7}, {'a': 1, 'b': 2}) USING TIMESTAMP 1";
-        String liveMarker = "INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10";
-        String[][] scenarios = { { liveMarker, olderWrite },
+        String[][] scenarios = { { LIVE_EXPIRING_MARKER, olderWrite },
                                  { EXPIRING_MARKER, olderWrite },
-                                 { liveMarker, olderWrite, "DELETE r, m['b'] FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 1" } };
+                                 { LIVE_EXPIRING_MARKER, olderWrite, "DELETE r, m['b'] FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 1" } };
 
+        // The digests include the local deletion and expiration times, so every write is done at the same time.
+        long writeNowInSec = FBUtilities.nowInSeconds();
         List<Map<String, String>> tables = new ArrayList<>();
         for (String[] scenario : scenarios)
         {
@@ -398,22 +527,20 @@ public class ExpiredRowMarkerTest extends CQLTester
             {
                 for (Storage storage : Storage.NOT_COMPACTED)
                 {
-                    String table = createTable(TABLE + " WITH memtable = '" + memtable + '\'');
+                    String table = createTable(TABLE + withMemtable(memtable));
                     disableCompaction();
                     scenarioTables.put(memtable + ", " + storage, table);
                     storages.put(table, storage);
                 }
             }
 
-            // The digests include the local deletion and expiration times, so each write is done to every table in
-            // the same second.
-            writeInOneSecond(storages.keySet(), Arrays.copyOfRange(scenario, 1, scenario.length));
+            writeAt(writeNowInSec, storages.keySet(), Arrays.copyOfRange(scenario, 1, scenario.length));
             for (Map.Entry<String, Storage> table : storages.entrySet())
             {
                 if (table.getValue().flushOlderWrites)
                     flush(KEYSPACE, table.getKey());
             }
-            writeInOneSecond(storages.keySet(), scenario[0]);
+            writeAt(writeNowInSec, storages.keySet(), scenario[0]);
             for (Map.Entry<String, Storage> table : storages.entrySet())
             {
                 if (table.getValue().flushMarker)
@@ -439,50 +566,23 @@ public class ExpiredRowMarkerTest extends CQLTester
         }
     }
 
-    /**
-     * Applies the writes to every table, starting at the beginning of a second and checking that they are done
-     * within that second.
-     */
-    private void writeInOneSecond(Iterable<String> tables, String... writes) throws Throwable
+    private static void writeAt(long nowInSec, Iterable<String> tables, String... writes)
     {
-        while (System.currentTimeMillis() % 1000 > 100)
-            Thread.sleep(10);
-        long second = FBUtilities.nowInSeconds();
         for (String table : tables)
         {
             for (String write : writes)
-                execute(String.format(write, KEYSPACE + '.' + table));
+                QueryProcessor.executeInternalWithNowInSec(String.format(write, KEYSPACE + '.' + table), nowInSec);
         }
-        assertEquals("the writes took more than a second", second, FBUtilities.nowInSeconds());
     }
 
-    /**
-     * The read bytes sensor doesn't count the cells of the columns that are fetched but not queried and older than a
-     * live row marker, which are not returned, wherever they are stored.
-     */
-    @Test
-    public void testReadBytesSensorExcludesSkippedCells() throws Throwable
+    private ByteBuffer repairedDataDigest(String query)
     {
-        for (Storage storage : Storage.NOT_COMPACTED)
+        ReadCommand command = parseReadCommand(query);
+        try (ReadExecutionController controller = command.executionController(true);
+             UnfilteredPartitionIterator partitions = command.executeLocally(controller))
         {
-            createTable(TABLE);
-            disableCompaction();
-            execute("INSERT INTO %s (k, c, r) VALUES (1, 1, 7) USING TIMESTAMP 1");
-            if (storage.flushOlderWrites)
-                flush();
-            execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10");
-            execute("INSERT INTO %s (k, c) VALUES (1, 2) USING TIMESTAMP 10");
-            if (storage.flushMarker)
-                flush();
-
-            // c = 1 has the older r cell, c = 2 has the row marker only
-            for (String restriction : new String[]{ " WHERE k = 1 AND c = %d", " WHERE k = 1 AND c >= %1$d AND c <= %1$d" })
-            {
-                double markerOnly = readBytes(formatQuery("SELECT k, c, x FROM %s" + String.format(restriction, 2)));
-                double withOlderCell = readBytes(formatQuery("SELECT k, c, x FROM %s" + String.format(restriction, 1)));
-                assertTrue(storage + ": " + markerOnly, markerOnly > 0);
-                assertEquals(storage + ": " + String.format(restriction, 1), markerOnly, withOlderCell, 0);
-            }
+            ReadResponse.createDataResponse(partitions, command, controller.getRepairedDataInfo());
+            return controller.getRepairedDataDigest();
         }
     }
 
@@ -503,25 +603,6 @@ public class ExpiredRowMarkerTest extends CQLTester
         {
             return ByteBufferUtil.bytesToHex(ReadResponse.createDigestResponse(iterator, command).digest(command));
         }
-    }
-
-    private double readBytes(String query)
-    {
-        ReadCommand command = parseReadCommand(query);
-        ActiveRequestSensors sensors = new ActiveRequestSensors();
-        Context context = Context.from(command);
-        sensors.registerSensor(context, Type.READ_BYTES);
-        RequestTracker.instance.set(sensors);
-        try (ReadExecutionController controller = command.executionController();
-             UnfilteredPartitionIterator iterator = command.executeLocally(controller))
-        {
-            ReadResponse.createDataResponse(iterator, command, controller.getRepairedDataInfo());
-        }
-        finally
-        {
-            RequestTracker.instance.set(null);
-        }
-        return sensors.getSensor(context, Type.READ_BYTES).get().getValue();
     }
 
     /**
@@ -552,7 +633,7 @@ public class ExpiredRowMarkerTest extends CQLTester
      */
     private String createRowTable(String memtable, Storage storage, String markerWrite, String... olderWrites) throws Throwable
     {
-        String table = createTable(TABLE + " WITH memtable = '" + memtable + '\'' + (storage == Storage.PURGED ? " AND gc_grace_seconds = 0" : ""));
+        String table = createTable(TABLE + withMemtable(memtable) + (storage == Storage.PURGED ? " AND gc_grace_seconds = 0" : ""));
         disableCompaction();
         for (String write : olderWrites)
         {
@@ -567,6 +648,11 @@ public class ExpiredRowMarkerTest extends CQLTester
         if (storage.flushMarker)
             flush();
         return table;
+    }
+
+    private static String withMemtable(String memtable)
+    {
+        return " WITH memtable = '" + memtable + '\'';
     }
 
     /** Also waits for the expired row marker to be purgeable with gc_grace_seconds = 0. */

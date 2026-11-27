@@ -35,15 +35,18 @@ import static org.junit.Assert.assertNull;
 
 /**
  * Tests SAI queries, filtered and ordered (generic and ANN ordering), on a row whose row marker (primary key liveness
- * info) is newer than its other cells: the row is returned whether the marker is live or has expired, and with a live
- * marker, a replica doesn't return the older cells that the query doesn't select.
+ * info) is newer than its other cells: the row is returned whether the marker is live or has expired, and a replica
+ * drops the older cells that the query doesn't select under a marker without TTL, and returns them with their values
+ * skipped under a marker with a TTL.
  */
 public class ExpiredRowMarkerIndexTest extends SAITester
 {
     private static final String TABLE = "CREATE TABLE %s (k int, c int, a int, r int, x int, l set<int>, v vector<float, 2>, PRIMARY KEY (k, c))";
     private static final String OLDER_WRITE = "INSERT INTO %s (k, c, a, r, l, v) VALUES (1, 1, 5, 7, {7}, [1.0, 2.0]) USING TIMESTAMP 1";
 
-    private static final String[] QUERIES = { "SELECT k, c, x FROM %s WHERE a = 5",
+    // the query on c finds the row alive by cells that the query doesn't select
+    private static final String[] QUERIES = { "SELECT k, c, x FROM %s WHERE c = 1",
+                                              "SELECT k, c, x FROM %s WHERE a = 5",
                                               "SELECT k, c, x FROM %s ORDER BY v ANN OF [1.0, 2.0] LIMIT 3",
                                               "SELECT k, c, x FROM %s WHERE a = 5 ORDER BY v ANN OF [1.0, 2.0] LIMIT 3",
                                               "SELECT k, c, x FROM %s ORDER BY a LIMIT 3" };
@@ -67,35 +70,78 @@ public class ExpiredRowMarkerIndexTest extends SAITester
         }
     }
 
+    /**
+     * The older cells and a newer row marker without TTL are in an sstable, and an even newer row marker, expired, in
+     * the memtable or in a second sstable: the row is read again from the sources that the query reads.
+     */
     @Test
-    public void testOlderNotQueriedCellsSkippedWithLiveMarker() throws Throwable
+    public void testRowAliveByOlderCellsUnderSupersededMarker() throws Throwable
     {
+        Map<String, String> tables = new LinkedHashMap<>();
         for (boolean flush : new boolean[]{ false, true })
         {
-            String table = createIndexedTable("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10", flush);
-            TableMetadata metadata = currentTableMetadata();
-            ColumnMetadata r = metadata.getColumn(ColumnIdentifier.getInterned("r", false));
-            ColumnMetadata v = metadata.getColumn(ColumnIdentifier.getInterned("v", false));
+            String table = createIndexedTable("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 2", true);
+            execute("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10 AND TTL 1");
+            if (flush)
+                flush();
+            tables.put(flush ? "sstables" : "sstable and memtable", table);
+        }
+
+        Thread.sleep(2500);
+
+        for (Map.Entry<String, String> table : tables.entrySet())
+        {
             for (String query : QUERIES)
             {
-                String formattedQuery = String.format(query, KEYSPACE + '.' + table);
-                String message = (flush ? "sstable: " : "memtable: ") + formattedQuery;
-                assertRow(message, formattedQuery);
-
-                int rows = 0;
-                for (Partition partition : Util.getAllUnfiltered(parseReadCommand(formattedQuery)))
-                {
-                    for (Row row : partition.rows())
-                    {
-                        // r is older than the row marker and not queried, unlike the ordering column v
-                        assertNull(message, row.getCell(r));
-                        if (query.contains(" v ANN "))
-                            assertNotNull(message, row.getCell(v));
-                        rows++;
-                    }
-                }
-                assertEquals(message, 1, rows);
+                String formattedQuery = String.format(query, KEYSPACE + '.' + table.getValue());
+                assertRow(table.getKey() + ": " + formattedQuery, formattedQuery);
             }
+        }
+    }
+
+    @Test
+    public void testOlderNotQueriedCellsDroppedOnlyUnderMarkerWithoutTTL() throws Throwable
+    {
+        for (String ttl : new String[]{ "", " AND TTL 100000" })
+        {
+            for (boolean flush : new boolean[]{ false, true })
+                testOlderNotQueriedCells("INSERT INTO %s (k, c) VALUES (1, 1) USING TIMESTAMP 10" + ttl, flush, !ttl.isEmpty());
+        }
+    }
+
+    private void testOlderNotQueriedCells(String markerWrite, boolean flush, boolean kept) throws Throwable
+    {
+        String table = createIndexedTable(markerWrite, flush);
+        TableMetadata metadata = currentTableMetadata();
+        ColumnMetadata r = metadata.getColumn(ColumnIdentifier.getInterned("r", false));
+        ColumnMetadata v = metadata.getColumn(ColumnIdentifier.getInterned("v", false));
+        for (String query : QUERIES)
+        {
+            String formattedQuery = String.format(query, KEYSPACE + '.' + table);
+            String message = markerWrite + (flush ? ", sstable: " : ", memtable: ") + formattedQuery;
+            assertRow(message, formattedQuery);
+
+            int rows = 0;
+            for (Partition partition : Util.getAllUnfiltered(parseReadCommand(formattedQuery)))
+            {
+                for (Row row : partition.rows())
+                {
+                    // r is older than the row marker and not queried, unlike the ordering column v
+                    if (kept)
+                    {
+                        assertNotNull(message, row.getCell(r));
+                        assertEquals(message, 0, row.getCell(r).buffer().remaining());
+                    }
+                    else
+                    {
+                        assertNull(message, row.getCell(r));
+                    }
+                    if (query.contains(" v ANN "))
+                        assertNotNull(message, row.getCell(v));
+                    rows++;
+                }
+            }
+            assertEquals(message, 1, rows);
         }
     }
 
@@ -114,6 +160,7 @@ public class ExpiredRowMarkerIndexTest extends SAITester
     private String createIndexedTable(String markerWrite, boolean flush) throws Throwable
     {
         String table = createTable(TABLE);
+        createIndex("CREATE CUSTOM INDEX ON %s(c) USING 'StorageAttachedIndex'");
         createIndex("CREATE CUSTOM INDEX ON %s(a) USING 'StorageAttachedIndex'");
         createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
         disableCompaction();

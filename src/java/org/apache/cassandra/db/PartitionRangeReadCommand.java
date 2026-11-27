@@ -372,7 +372,6 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
                 inputCollector.addMemtableIterator(RTBoundValidator.validate(iter, RTBoundValidator.Stage.MEMTABLE, false));
             }
 
-            ColumnFilter sstableColumnFilter = sstableColumnFilter(view.sstables, view.memtables, controller);
             int selectedSSTablesCnt = 0;
             for (SSTableReader sstable : view.sstables)
             {
@@ -383,7 +382,7 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
                 if (!intersects && !hasPartitionLevelDeletions && !hasRequiredStatics)
                     continue;
 
-                UnfilteredPartitionIterator iter = sstable.partitionIterator(sstableColumnFilter, dataRange(), readCountUpdater);
+                UnfilteredPartitionIterator iter = sstable.partitionIterator(columnFilter(), dataRange(), readCountUpdater);
                 inputCollector.addSSTableIterator(sstable, RTBoundValidator.validate(iter, RTBoundValidator.Stage.SSTABLE, false));
 
                 if (!sstable.isRepaired())
@@ -399,7 +398,8 @@ public class PartitionRangeReadCommand extends ReadCommand implements PartitionR
                 return EmptyIterators.unfilteredPartition(metadata());
 
             List<UnfilteredPartitionIterator> finalizedIterators = inputCollector.finalizeIterators(cfs, nowInSec(), controller.oldestUnrepairedTombstone());
-            UnfilteredPartitionIterator merged = UnfilteredPartitionIterators.mergeLazily(finalizedIterators);
+            UnfilteredPartitionIterator merged = UnfilteredPartitionIterators.mergeLazily(finalizedIterators,
+                                                                                          versions -> mergeReadingAgain(versions, cfs, null, null, controller));
             return checkCacheFilter(Transformation.apply(merged, new Transformation<UnfilteredRowIterator>()
             {
                 @Override

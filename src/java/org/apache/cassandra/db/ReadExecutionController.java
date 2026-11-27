@@ -69,8 +69,6 @@ public class ReadExecutionController implements AutoCloseable
 
     private ScannedTombstones scannedTombstones = ScannedTombstones.NONE;
 
-    private boolean mayNeedSkippedCells;
-
     ReadExecutionController(ReadCommand command,
                             OpOrder.Group baseOp,
                             TableMetadata baseMetadata,
@@ -176,6 +174,17 @@ public class ReadExecutionController implements AutoCloseable
             if (!sstable.isRepaired())
                 updateMinOldestUnrepairedTombstone(sstable.getMinLocalDeletionTime());
         }
+    }
+
+    /**
+     * A controller for another read of the same table as part of this one, in this controller's op order group, that
+     * doesn't track the repaired data. It isn't closed: closing this controller ends the group.
+     */
+    ReadExecutionController withoutRepairedDataTracking()
+    {
+        return isTrackingRepairedStatus()
+               ? new ReadExecutionController(command, baseOp, baseMetadata, null, null, NO_SAMPLING, false)
+               : this;
     }
 
     boolean validForReadOn(ColumnFamilyStore cfs)
@@ -364,22 +373,6 @@ public class ReadExecutionController implements AutoCloseable
          * until it knows whether it returns them, would cross the failure threshold; {@code held} is the last of them.
          */
         void checkHeld(DecoratedKey partitionKey, Unfiltered held, long heldTombstones);
-    }
-
-    /**
-     * Whether sstables of the read skipped cells that a row merged with memtable data may need, see
-     * {@link ReadCommand#sstableColumnFilter}, since the last call.
-     */
-    boolean takeMayNeedSkippedCells()
-    {
-        boolean value = mayNeedSkippedCells;
-        mayNeedSkippedCells = false;
-        return value;
-    }
-
-    void setMayNeedSkippedCells()
-    {
-        mayNeedSkippedCells = true;
     }
 
     private void addSample()

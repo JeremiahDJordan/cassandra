@@ -305,25 +305,6 @@ public abstract class ColumnFilter
     public abstract Tester newTester(ColumnMetadata column);
 
     /**
-     * Whether a source read with this filter drops the cells of the fetched but not queried simple columns that are
-     * older than the primary key liveness info of their row, see {@link #withNotQueriedCellsOlderThanRowDropped}.
-     */
-    public boolean dropsNotQueriedCellsOlderThanRow()
-    {
-        return false;
-    }
-
-    /**
-     * Returns this filter for a source that drops the cells of the fetched but not queried simple columns that are
-     * older than the primary key liveness info of their row. This filter is local to a replica and is not serialized.
-     * See {@code ReadCommand#sstableColumnFilter} for when a read may use it.
-     */
-    public ColumnFilter withNotQueriedCellsOlderThanRowDropped()
-    {
-        return this;
-    }
-
-    /**
      * Returns this filter without its synthetic columns. See {@code ReadCommand#columnFilter(int)} for the nodes that
      * are sent it.
      */
@@ -697,8 +678,6 @@ public abstract class ColumnFilter
 
         private final SortedSetMultimap<ColumnIdentifier, ColumnSubselection> subSelections; // can be null
 
-        private final boolean dropsNotQueriedCellsOlderThanRow;
-
         public static SelectionColumnFilter newInstance(FetchingStrategy fetchingStrategy,
                                                         TableMetadata metadata,
                                                         RegularAndStaticColumns queried,
@@ -729,15 +708,6 @@ public abstract class ColumnFilter
                                      RegularAndStaticColumns fetched,
                                      SortedSetMultimap<ColumnIdentifier, ColumnSubselection> subSelections)
         {
-            this(fetchingStrategy, queried, fetched, subSelections, false);
-        }
-
-        private SelectionColumnFilter(FetchingStrategy fetchingStrategy,
-                                      RegularAndStaticColumns queried,
-                                      RegularAndStaticColumns fetched,
-                                      SortedSetMultimap<ColumnIdentifier, ColumnSubselection> subSelections,
-                                      boolean dropsNotQueriedCellsOlderThanRow)
-        {
             assert queried != null;
             assert fetched.includes(queried);
 
@@ -745,21 +715,6 @@ public abstract class ColumnFilter
             this.queried = queried;
             this.fetched = fetched;
             this.subSelections = subSelections;
-            this.dropsNotQueriedCellsOlderThanRow = dropsNotQueriedCellsOlderThanRow;
-        }
-
-        @Override
-        public boolean dropsNotQueriedCellsOlderThanRow()
-        {
-            return dropsNotQueriedCellsOlderThanRow;
-        }
-
-        @Override
-        public ColumnFilter withNotQueriedCellsOlderThanRowDropped()
-        {
-            if (dropsNotQueriedCellsOlderThanRow || allFetchedColumnsAreQueried())
-                return this;
-            return new SelectionColumnFilter(fetchingStrategy, queried, fetched, subSelections, true);
         }
 
         @Override
@@ -900,14 +855,13 @@ public abstract class ColumnFilter
             return otherCf.fetchingStrategy == this.fetchingStrategy &&
                    Objects.equals(otherCf.queried, this.queried) &&
                    Objects.equals(otherCf.fetched, this.fetched) &&
-                   Objects.equals(otherCf.subSelections, this.subSelections) &&
-                   otherCf.dropsNotQueriedCellsOlderThanRow == this.dropsNotQueriedCellsOlderThanRow;
+                   Objects.equals(otherCf.subSelections, this.subSelections);
         }
 
         @Override
         public int hashCode()
         {
-            return Objects.hash(fetchingStrategy, queried, fetched, subSelections, dropsNotQueriedCellsOlderThanRow);
+            return Objects.hash(fetchingStrategy, queried, fetched, subSelections);
         }
 
         @Override

@@ -997,10 +997,10 @@ public class ColumnFilterRowTest
     }
 
     @Test
-    public void testFilterKeepsFetchedNotQueriedCellsOlderThanRowLiveness()
+    public void testFilterSkipsFetchedNotQueriedCellsOlderThanRowLiveness()
     {
-        // Cells of fetched but not queried columns are kept with a skipped value, even when they are older than the
-        // row's primary key liveness; see ReadCommand#withoutSkippableCells.
+        // Cells of fetched but not queried columns older than the row's primary key liveness are skipped, as in
+        // sstable reads (see #10657); newer ones are kept with a skipped value.
         Row.Builder builder = newBuilder(clustering);
         builder.newRow(clustering);
         builder.addPrimaryKeyLivenessInfo(LivenessInfo.create(TIMESTAMP, FBUtilities.nowInSeconds()));
@@ -1010,31 +1010,58 @@ public class ColumnFilterRowTest
         builder.addCell(cell(v2, cellPath(2), 202, TIMESTAMP + 1));
         Row row = builder.build();
 
-        // v1 is queried: its older cell is kept with its value, and the v2 cells with a skipped value.
+        // v1 is queried: its older cell is kept with its value.
         ColumnFilter queriesV1 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v1).build();
         Row filtered = row.filter(queriesV1, metadata);
         assertNotNull(filtered);
         assertEquals(100, ByteBufferUtil.toInt(filtered.getCell(v1).buffer()));
-        assertEquals(0, filtered.getCell(v2, cellPath(0)).buffer().remaining());
+        assertNull(filtered.getCell(v2, cellPath(0)));
         assertEquals(0, filtered.getCell(v2, cellPath(1)).buffer().remaining());
         assertEquals(0, filtered.getCell(v2, cellPath(2)).buffer().remaining());
-        assertEquals(3, filtered.getComplexColumnData(v2).cellsCount());
+        assertEquals(2, filtered.getComplexColumnData(v2).cellsCount());
 
-        // v2 is queried: all its cells are kept with their values, and the older v1 cell with a skipped value.
+        // v2 is queried: all its cells are kept with their values, and the older v1 cell is skipped.
         ColumnFilter queriesV2 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v2).build();
         filtered = row.filter(queriesV2, metadata);
         assertNotNull(filtered);
-        assertEquals(0, filtered.getCell(v1).buffer().remaining());
+        assertNull(filtered.getCell(v1));
         assertEquals(200, ByteBufferUtil.toInt(filtered.getCell(v2, cellPath(0)).buffer()));
         assertEquals(3, filtered.getComplexColumnData(v2).cellsCount());
 
-        // An active deletion that shadows the row's liveness removes it and the cells it shadows.
+        // An active deletion that shadows the row's liveness also removes the cells older than it.
         filtered = row.filter(queriesV1, DeletionTime.build(TIMESTAMP, LOCAL_DELETION_TIME), false, metadata);
         assertNotNull(filtered);
         assertTrue(filtered.primaryKeyLivenessInfo().isEmpty());
         assertNull(filtered.getCell(v1));
         assertEquals(0, filtered.getCell(v2, cellPath(2)).buffer().remaining());
         assertEquals(1, filtered.getComplexColumnData(v2).cellsCount());
+    }
+
+    @Test
+    public void testFilterKeepsFetchedNotQueriedCellsOlderThanExpiringRowLiveness()
+    {
+        // A primary key liveness with a TTL proves nothing once it expires: cells of fetched but not queried columns
+        // older than it are kept, with a skipped value.
+        Row.Builder builder = newBuilder(clustering);
+        builder.newRow(clustering);
+        builder.addPrimaryKeyLivenessInfo(LivenessInfo.expiring(TIMESTAMP, 100, FBUtilities.nowInSeconds()));
+        builder.addCell(cell(v1, 100, TIMESTAMP - 1));
+        builder.addCell(cell(v2, cellPath(0), 200, TIMESTAMP - 1));
+        Row row = builder.build();
+
+        ColumnFilter queriesV1 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v1).build();
+        Row filtered = row.filter(queriesV1, metadata);
+        assertNotNull(filtered);
+        assertEquals(100, ByteBufferUtil.toInt(filtered.getCell(v1).buffer()));
+        assertNotNull(filtered.getCell(v2, cellPath(0)));
+        assertEquals(0, filtered.getCell(v2, cellPath(0)).buffer().remaining());
+
+        ColumnFilter queriesV2 = ColumnFilter.allRegularColumnsBuilder(metadata, false).add(v2).build();
+        filtered = row.filter(queriesV2, metadata);
+        assertNotNull(filtered);
+        assertNotNull(filtered.getCell(v1));
+        assertEquals(0, filtered.getCell(v1).buffer().remaining());
+        assertEquals(200, ByteBufferUtil.toInt(filtered.getCell(v2, cellPath(0)).buffer()));
     }
 
     @Test
