@@ -35,9 +35,10 @@ import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
-import org.apache.cassandra.db.Memtable;
+import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.utils.btree.BTree;
 
+import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.UNIT_TESTS;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -78,7 +79,7 @@ public class PartitionRowAccountingTest extends CQLTester
     {
         for (Keyspace ks : Keyspace.all())
             for (ColumnFamilyStore c : ks.getColumnFamilyStores())
-                c.forceBlockingFlush();
+                c.forceBlockingFlush(UNIT_TESTS);
     }
 
     private static final int MAX_ROUND_ATTEMPTS = 10;
@@ -210,7 +211,7 @@ public class PartitionRowAccountingTest extends CQLTester
             assertOwnsNonNegative(cfs, "after op=" + op);
         }
 
-        cfs.forceBlockingFlush();
+        cfs.forceBlockingFlush(UNIT_TESTS);
         assertOwnsNonNegative(cfs, "after flush");
     }
 
@@ -380,12 +381,12 @@ public class PartitionRowAccountingTest extends CQLTester
 
     private static long ownsOnHeapNow(ColumnFamilyStore cfs)
     {
-        return cfs.getTracker().getView().getCurrentMemtable().getAllocator().onHeap().owns();
+        return Memtable.getMemoryUsage(cfs.getTracker().getView().getCurrentMemtable()).ownsOnHeap;
     }
 
     private static long ownsOffHeapNow(ColumnFamilyStore cfs)
     {
-        return cfs.getTracker().getView().getCurrentMemtable().getAllocator().offHeap().owns();
+        return Memtable.getMemoryUsage(cfs.getTracker().getView().getCurrentMemtable()).ownsOffHeap;
     }
 
     /**
@@ -490,10 +491,10 @@ public class PartitionRowAccountingTest extends CQLTester
     {
         for (Memtable mt : cfs.getTracker().getView().getAllMemtables())
         {
-            assertThat(mt.getAllocator().onHeap().owns())
+            assertThat(Memtable.getMemoryUsage(mt).ownsOnHeap)
             .as("ON-heap owns went NEGATIVE [" + step + "]")
             .isGreaterThanOrEqualTo(0L);
-            assertThat(mt.getAllocator().offHeap().owns())
+            assertThat(Memtable.getMemoryUsage(mt).ownsOffHeap)
             .as("OFF-heap owns went NEGATIVE [" + step + "]")
             .isGreaterThanOrEqualTo(0L);
         }
