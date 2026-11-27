@@ -169,12 +169,23 @@ public class RowFilter
         return false;
     }
 
+    private boolean hasStaticExpression()
+    {
+        for (Expression expression : expressions())
+        {
+            if (expression.column().isStatic())
+                return true;
+        }
+        return false;
+    }
+
     protected Transformation<BaseRowIterator<?>> filter(TableMetadata metadata, int nowInSec)
     {
         FilterElement partitionLevelOperation = root.partitionLevelTree();
         FilterElement rowLevelOperation = root.rowLevelTree();
 
         final boolean filterNonStaticColumns = !rowLevelOperation.isEmpty();
+        final boolean filterStaticColumns = hasStaticExpression();
 
         return new Transformation<>()
         {
@@ -185,8 +196,19 @@ public class RowFilter
             {
                 pk = partition.partitionKey();
 
+                // As for the other rows (see applyToRow), the expressions expect a static row without deleted cells:
+                // otherwise a deleted cell would be seen as an empty value, and a deleted or expired element of a
+                // static collection as a live element.
+                Row staticRow = partition.staticRow();
+                if (filterStaticColumns)
+                {
+                    staticRow = staticRow.purge(DeletionPurger.PURGE_ALL, nowInSec, metadata.enforceStrictLiveness());
+                    if (staticRow == null)
+                        staticRow = Rows.EMPTY_STATIC_ROW;
+                }
+
                 // Short-circuit all partitions that won't match based on static and partition keys
-                if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), partition.staticRow()))
+                if (!partitionLevelOperation.isSatisfiedBy(metadata, partition.partitionKey(), staticRow))
                 {
                     partition.close();
                     return null;
