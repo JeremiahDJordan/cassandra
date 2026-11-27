@@ -113,7 +113,7 @@ abstract public class AlterSchemaStatement implements CQLStatement.SingleKeyspac
         if (null != keyspace && keyspace.isVirtual())
             throw ire("Virtual keyspace '%s' is not user-modifiable", keyspaceName);
 
-        validateKeyspaceName(keyspaceName, AlterSchemaStatement::ire);
+        validateKeyspaceName(keyspaceName, InvalidRequestException::new);
 
         SchemaTransformationResult result = Schema.instance.transform(this, locally);
 

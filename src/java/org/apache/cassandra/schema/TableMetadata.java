@@ -479,7 +479,7 @@ public class TableMetadata implements SchemaElement
 
     public void validate()
     {
-        validateKeyspaceName(keyspace, this::prepareConfigurationException);
+        validateKeyspaceName(keyspace, message -> prepareConfigurationException("%s", message));
 
         validateTableName();
 
