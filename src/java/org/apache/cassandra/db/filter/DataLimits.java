@@ -36,6 +36,9 @@ import org.apache.cassandra.db.partitions.CachedPartition;
 import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.rows.BaseRowIterator;
+import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.ColumnData;
+import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.Rows;
@@ -163,6 +166,39 @@ public abstract class DataLimits
             assert dseCompatibilityOrdinal != UNDEFINED : "DSE compatibility ordinal not defined for kind " + this;
             return dseCompatibilityOrdinal;
         }
+    }
+
+    /**
+     * The size of the given row as DataStax 4.0 counts it towards a bytes limit: {@link Row#liveDataSize}, but with the
+     * local deletion time of the cells it counts, and the expiration time of an expiring row liveness, on 4 bytes, where
+     * this release has 8. A replica counts so for a DataStax 4.0 coordinator, which takes a response that it counts
+     * under the bytes limit for the end of the data.
+     */
+    @VisibleForTesting
+    static int dataStax40LiveDataSize(Row row, long nowInSec)
+    {
+        int narrowed = TypeSizes.LONG_SIZE - TypeSizes.INT_SIZE;
+        int size = row.liveDataSize(nowInSec);
+        LivenessInfo liveness = row.primaryKeyLivenessInfo();
+        if (liveness.isExpiring() && liveness.isLive(nowInSec))
+            size -= narrowed;
+        for (ColumnData data : row)
+        {
+            if (data.column().isSimple())
+            {
+                if (((Cell<?>) data).isLive(nowInSec))
+                    size -= narrowed;
+            }
+            else if (((ComplexColumnData) data).complexDeletion().isLive())
+            {
+                for (Cell<?> cell : (ComplexColumnData) data)
+                {
+                    if (cell.isLive(nowInSec))
+                        size -= narrowed;
+                }
+            }
+        }
+        return size;
     }
 
     public static DataLimits cqlLimits(int cqlRowLimit)
@@ -359,6 +395,9 @@ public abstract class DataLimits
         // false means we do not propagate our stop signals onto the iterator, we only count
         protected boolean enforceLimits = true;
 
+        // true means we count the bytes of rows at their full size, see countingFullRowSize()
+        private boolean countsFullRowSize;
+
         protected Counter(long nowInSec, boolean assumeLiveData, boolean enforceStrictLiveness)
         {
             this.nowInSec = nowInSec;
@@ -370,6 +409,32 @@ public abstract class DataLimits
         {
             this.enforceLimits = false;
             return this;
+        }
+
+        /**
+         * Counts the bytes of rows with {@link Row#dataSize()} instead of {@link Row#liveDataSize(long)}, for the
+         * responses of replicas, which hold the rows before purge. No replica, of this release or an earlier one,
+         * counts more bytes for a row, so a response that this counts under the byte limit didn't stop at it.
+         */
+        public Counter countingFullRowSize()
+        {
+            this.countsFullRowSize = true;
+            return this;
+        }
+
+        protected int rowSize(Row row)
+        {
+            if (countsFullRowSize)
+                return row.dataSize();
+            return countsBytesAsDataStax40() ? dataStax40LiveDataSize(row, nowInSec) : row.liveDataSize(nowInSec);
+        }
+
+        /**
+         * Whether this counts the bytes of rows as DataStax 4.0 does (see {@link #dataStax40LiveDataSize}).
+         */
+        protected boolean countsBytesAsDataStax40()
+        {
+            return false;
         }
 
         public PartitionIterator applyTo(PartitionIterator partitions)
@@ -482,6 +547,10 @@ public abstract class DataLimits
 
         // Whether the query is a distinct query or not.
         protected final boolean isDistinct;
+
+        // Whether the bytes are counted as DataStax 4.0 counts them, in the limits of a read from a DataStax 4.0
+        // coordinator (see Serializer#deserialize).
+        protected boolean dataStax40BytesCount;
 
         private CQLLimits(int bytesLimit, int rowsLimit, int perPartitionLimit, boolean isDistinct)
         {
@@ -615,6 +684,12 @@ public abstract class DataLimits
 
         protected class CQLCounter extends Counter
         {
+            @Override
+            protected boolean countsBytesAsDataStax40()
+            {
+                return dataStax40BytesCount;
+            }
+
             /**
              * Bytes and rows counted by this counter.
              */
@@ -641,14 +716,14 @@ public abstract class DataLimits
             {
                 rowsInCurrentPartition = 0;
                 hasLiveStaticRow = !staticRow.isEmpty() && isLive(staticRow);
-                staticRowBytes = hasLiveStaticRow && bytesLimit != NO_LIMIT ? staticRow.liveDataSize(nowInSec) : 0;
+                staticRowBytes = hasLiveStaticRow && bytesLimit != NO_LIMIT ? rowSize(staticRow) : 0;
             }
 
             @Override
             public Row applyToRow(Row row)
             {
                 if (isLive(row))
-                    incrementRowCount(bytesLimit != NO_LIMIT ? row.liveDataSize(nowInSec) : 0);
+                    incrementRowCount(bytesLimit != NO_LIMIT ? rowSize(row) : 0);
                 return row;
             }
 
@@ -1037,6 +1112,12 @@ public abstract class DataLimits
 
         protected class GroupByAwareCounter extends Counter
         {
+            @Override
+            protected boolean countsBytesAsDataStax40()
+            {
+                return dataStax40BytesCount;
+            }
+
             private final GroupMaker groupMaker;
 
             protected final boolean countPartitionsWithOnlyStaticData;
@@ -1135,7 +1216,7 @@ public abstract class DataLimits
                     }
                     hasReturnedRowsFromCurrentPartition = false;
                     hasLiveStaticRow = !staticRow.isEmpty() && isLive(staticRow);
-                    staticRowBytes = hasLiveStaticRow ? staticRow.liveDataSize(nowInSec) : 0;
+                    staticRowBytes = hasLiveStaticRow ? rowSize(staticRow) : 0;
                 }
                 currentPartitionKey = partitionKey;
                 // If we are done we need to preserve the groupInCurrentPartition and rowsCountedInCurrentPartition
@@ -1201,7 +1282,7 @@ public abstract class DataLimits
                 if (isLive(row))
                 {
                     hasUnfinishedGroup = true;
-                    incrementRowCount(bytesLimit != NO_LIMIT ? row.liveDataSize(nowInSec) : 0);
+                    incrementRowCount(bytesLimit != NO_LIMIT ? rowSize(row) : 0);
                     hasReturnedRowsFromCurrentPartition = true;
                 }
 
@@ -1493,6 +1574,15 @@ public abstract class DataLimits
         }
 
         public DataLimits deserialize(DataInputPlus in, int version, TableMetadata metadata) throws IOException
+        {
+            DataLimits limits = deserializeLimits(in, version, metadata);
+            // a read with a bytes limit at an earlier version comes from a DataStax 4.0 coordinator
+            if (limits.bytes() != NO_LIMIT && version < MessagingService.VERSION_DS_20)
+                ((CQLLimits) limits).dataStax40BytesCount = true;
+            return limits;
+        }
+
+        private DataLimits deserializeLimits(DataInputPlus in, int version, TableMetadata metadata) throws IOException
         {
             int ordinal = in.readUnsignedByte();
             Kind kind = version == MessagingService.VERSION_30 ?
