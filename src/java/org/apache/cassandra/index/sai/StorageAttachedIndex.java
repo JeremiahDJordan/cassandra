@@ -56,6 +56,8 @@ import org.apache.cassandra.cql3.restrictions.Restriction;
 import org.apache.cassandra.cql3.restrictions.SingleColumnRestriction;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.CassandraWriteContext;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.ReadCommand;
@@ -68,7 +70,11 @@ import org.apache.cassandra.db.guardrails.Guardrails;
 import org.apache.cassandra.db.guardrails.MaxThreshold;
 import org.apache.cassandra.db.lifecycle.LifecycleNewTracker;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.ByteBufferAccessor;
+import org.apache.cassandra.db.marshal.CollectionType;
 import org.apache.cassandra.db.marshal.FloatType;
+import org.apache.cassandra.db.marshal.TupleType;
+import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.db.rows.Row;
@@ -104,12 +110,14 @@ import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.IndexMetadata;
 import org.apache.cassandra.schema.TableMetadata;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.service.ClientState;
 import org.apache.cassandra.service.ClientWarn;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.NoSpamLogger;
 import org.apache.cassandra.utils.Pair;
+import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 import org.apache.cassandra.utils.concurrent.Future;
 import org.apache.cassandra.utils.concurrent.FutureCombiner;
 import org.apache.cassandra.utils.concurrent.ImmediateFuture;
@@ -145,6 +153,13 @@ public class StorageAttachedIndex implements Index
     private static final NoSpamLogger noSpamLogger = NoSpamLogger.getLogger(logger, 1, TimeUnit.MINUTES);
 
     public static final String TERM_OVERSIZE_MESSAGE = "Term in column '%s' for key '%s' is too large and cannot be indexed. (term size: %s)";
+    public static final String EMPTY_CLUSTERING_FIELD_ERROR =
+    "Cannot write a row whose clustering has an empty value, such as blobAsInt(0x), in a tuple or UDT field of a " +
+    "type that orders it like a null value, to a table with storage-attached index %s; use null instead";
+    public static final String EMPTY_CLUSTERING_FIELD_ROW_ERROR =
+    "Cannot index the row %s: its clustering has an empty value, such as blobAsInt(0x), in a tuple or UDT field of " +
+    "a type that orders it like a null value, and storage-attached indexes cannot order it with the rows that have " +
+    "a null value there";
 
     // Used to build indexes on newly added SSTables:
     private static final StorageAttachedIndexBuildingSupport INDEX_BUILDER_SUPPORT = new StorageAttachedIndexBuildingSupport();
@@ -520,6 +535,18 @@ public class StorageAttachedIndex implements Index
     @Override
     public void validate(PartitionUpdate update, ClientState state) throws InvalidRequestException
     {
+        // rows without live data aren't indexed
+        if (update.metadata().comparator.size() > 0)
+        {
+            long nowInSec = FBUtilities.nowInSeconds();
+            for (Row row : update)
+            {
+                if (row.hasLiveData(nowInSec, update.metadata().enforceStrictLiveness())
+                    && hasEmptyFieldEncodedAsNull(update.metadata().comparator, row.clustering()))
+                    throw new InvalidRequestException(String.format(EMPTY_CLUSTERING_FIELD_ERROR, indexIdentifier.indexName));
+            }
+        }
+
         DecoratedKey key = update.partitionKey();
 
         if (indexTermType.columnMetadata().isStatic())
@@ -527,6 +554,71 @@ public class StorageAttachedIndex implements Index
         else
             for (Row row : update)
                 validateTermSizeForRow(key, row, true, state);
+    }
+
+    /**
+     * Whether the clustering has an empty value, such as {@code blobAsInt(0x)}, in a field of a tuple or UDT (also
+     * nested in another one, in a frozen collection or in a vector) of a type that encodes an empty value as null. The
+     * field then has the byte-comparable form of a null field, which sorts before it, so the byte-comparable order of
+     * primary keys, which SAI requires to be the order of the rows, can differ from it, and the row decodes with a null
+     * field.
+     */
+    public static boolean hasEmptyFieldEncodedAsNull(ClusteringComparator comparator, Clustering<?> clustering)
+    {
+        for (int i = 0; i < clustering.size(); i++)
+        {
+            ByteBuffer value = clustering.bufferAt(i);
+            if (value != null && hasEmptyFieldEncodedAsNull(comparator.subtype(i), value))
+                return true;
+        }
+        return false;
+    }
+
+    private static boolean hasEmptyFieldEncodedAsNull(AbstractType<?> type, ByteBuffer value)
+    {
+        type = type.unwrap();
+        if (!value.hasRemaining())
+            return false;
+
+        if (type instanceof TupleType)
+        {
+            TupleType tupleType = (TupleType) type;
+            ByteBuffer[] fields = tupleType.split(ByteBufferAccessor.instance, value);
+            for (int i = 0; i < fields.length; i++)
+            {
+                ByteBuffer field = fields[i];
+                if (field == null)
+                    continue;
+                AbstractType<?> fieldType = tupleType.type(i).unwrap();
+                if (field.hasRemaining() ? hasEmptyFieldEncodedAsNull(fieldType, field)
+                                         : fieldType.asComparableBytes(ByteBufferAccessor.instance, field, ByteComparable.Version.OSS50) == null)
+                    return true;
+            }
+        }
+        else if (type instanceof CollectionType)
+        {
+            // the elements of a frozen list or set, or the keys and values of a frozen map
+            List<AbstractType<?>> elementTypes = type.subTypes();
+            int count = CollectionSerializer.readCollectionSize(value, ByteBufferAccessor.instance) * elementTypes.size();
+            int offset = CollectionSerializer.sizeOfCollectionSize();
+            for (int i = 0; i < count; i++)
+            {
+                ByteBuffer element = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset);
+                offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance);
+                if (element != null && hasEmptyFieldEncodedAsNull(elementTypes.get(i % elementTypes.size()), element))
+                    return true;
+            }
+        }
+        else if (type instanceof VectorType)
+        {
+            VectorType<?> vectorType = (VectorType<?>) type;
+            for (ByteBuffer element : vectorType.split(value))
+            {
+                if (element != null && hasEmptyFieldEncodedAsNull(vectorType.elementType, element))
+                    return true;
+            }
+        }
+        return false;
     }
 
     @Override

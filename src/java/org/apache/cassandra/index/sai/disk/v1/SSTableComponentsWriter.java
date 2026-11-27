@@ -24,7 +24,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.config.CassandraRelevantProperties;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.PerSSTableIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
@@ -50,6 +52,7 @@ public class SSTableComponentsWriter implements PerSSTableIndexWriter
     private long partitionId = -1;
     // This is used to record the number of rows in each partition
     private long partitionRowCount = 0;
+    private PrimaryKey previousKey;
 
     public SSTableComponentsWriter(IndexDescriptor indexDescriptor) throws IOException
     {
@@ -103,7 +106,23 @@ public class SSTableComponentsWriter implements PerSSTableIndexWriter
         partitionRowsWriter.add(partitionId);
         partitionRowCount++;
         if (indexDescriptor.hasClustering())
-            clusteringKeysWriter.add(indexDescriptor.clusteringComparator.asByteComparable(primaryKey.clustering()));
+        {
+            try
+            {
+                clusteringKeysWriter.add(indexDescriptor.clusteringComparator.asByteComparable(primaryKey.clustering()));
+            }
+            catch (IllegalArgumentException e)
+            {
+                ClusteringComparator comparator = indexDescriptor.clusteringComparator;
+                // the row with such a field is this one, or with a descending order the one before
+                PrimaryKey row = StorageAttachedIndex.hasEmptyFieldEncodedAsNull(comparator, primaryKey.clustering()) ? primaryKey : previousKey;
+                if (row == null || !StorageAttachedIndex.hasEmptyFieldEncodedAsNull(comparator, row.clustering()))
+                    throw e;
+                String message = String.format(StorageAttachedIndex.EMPTY_CLUSTERING_FIELD_ROW_ERROR, row);
+                throw new IllegalArgumentException(indexDescriptor.logMessage(message), e);
+            }
+        }
+        previousKey = primaryKey;
     }
 
     @Override
