@@ -23,6 +23,7 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 
 import java.nio.channels.FileChannel;
+import java.nio.file.Files;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.CRC32;
 
@@ -38,6 +39,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.io.IndexInputReader;
 import org.apache.cassandra.index.sai.disk.io.IndexOutputWriter;
+import org.apache.cassandra.io.FSWriteError;
 import org.apache.cassandra.io.compress.BufferType;
 import org.apache.cassandra.io.storage.StorageProvider;
 import org.apache.cassandra.io.util.File;
@@ -81,6 +83,19 @@ public class IndexFileUtils
     public IndexOutputWriter openOutput(File file, ByteOrder order, boolean append, Version version) throws IOException
     {
         assert writerOption.finishOnClose() : "IndexOutputWriter relies on close() to sync with disk.";
+        // SequentialWriter doesn't truncate an existing file: delete a leftover of the same name (files opened to
+        // append are deleted before a build, see StorageAttachedIndexBuilder#deleteLeftoversUnderNewBuildNames).
+        if (!append)
+        {
+            try
+            {
+                Files.deleteIfExists(file.toPath());
+            }
+            catch (IOException e)
+            {
+                throw new FSWriteError(e, file);
+            }
+        }
         var checksumWriter = new IncrementalChecksumSequentialWriter(file, writerOption, append);
         return new IndexOutputWriter(checksumWriter, order, version);
     }

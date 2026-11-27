@@ -37,6 +37,8 @@ import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.sai.IndexContext;
 import org.apache.cassandra.index.sai.SSTableIndex;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
+import org.apache.cassandra.index.sai.disk.PerIndexFilesOwner;
 import org.apache.cassandra.index.sai.disk.PerIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
@@ -51,6 +53,7 @@ import org.apache.cassandra.index.sai.metrics.IndexMetrics;
 import org.apache.cassandra.index.sai.utils.NamedMemoryLimiter;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
 import org.apache.cassandra.index.sai.utils.TypeUtil;
+import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.storage.StorageProvider;
 import org.apache.cassandra.utils.FBUtilities;
 import org.apache.cassandra.utils.Throwables;
@@ -73,6 +76,12 @@ public class SSTableIndexWriter implements PerIndexWriter
     private final long keyCount;
 
     private boolean aborted = false;
+    // The ownership of the files this writer writes, from its first call (an early-opened compaction output is live
+    // while they are written) until the SSTable's index writer has finished with the TOC, unless its index is dropped
+    // by then
+    private PerIndexFilesOwner owner;
+    private boolean ownershipTaken = false;
+    private boolean completed = false;
 
     // segment writer
     private SegmentBuilder currentBuilder;
@@ -188,7 +197,16 @@ public class SSTableIndexWriter implements PerIndexWriter
             }
 
             writeSegmentsMetadata();
-            perIndexComponents.markComplete();
+
+            // No completion marker once the index is dropped: an index of the same name created since may have
+            // deleted some of these files (see StorageAttachedIndex#onAddedToExistingTable)
+            synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+            {
+                if (maybeAbort())
+                    return;
+                perIndexComponents.markComplete();
+                completed = true;
+            }
         }
         finally
         {
@@ -222,9 +240,37 @@ public class SSTableIndexWriter implements PerIndexWriter
         }
 
         if (CassandraRelevantProperties.DELETE_CORRUPT_SAI_COMPONENTS.getBoolean())
-            perIndexComponents.forceDeleteAllComponents();
+            deleteComponents();
         else
             logger.debug("Skipping delete of index components after failure on index build of {}.{}", perIndexComponents.indexDescriptor(), indexContext);
+    }
+
+    private void deleteComponents()
+    {
+        if (!completed)
+        {
+            perIndexComponents.forceDeleteAllComponents();
+            return;
+        }
+
+        // Once this writer has released its files after the completion marker, nothing owns the files of a dropped
+        // index unless a build of it still does: they may then be the files of a new index of the same name. An aborted
+        // flush or compaction deletes all the files of its SSTable anyway.
+        synchronized (StorageAttachedIndex.SAME_NAME_FILES_LOCK)
+        {
+            Descriptor descriptor = perIndexComponents.descriptor();
+            String name = indexContext.getIndexName();
+            if (isIndexDropped.getAsBoolean() && !PerIndexFilesOwner.hasOwnerOfDroppedIndex(descriptor, name))
+                return;
+            perIndexComponents.forceDeleteAllComponents();
+        }
+    }
+
+    @Override
+    public void releaseOwnership()
+    {
+        if (owner != null)
+            owner.close();
     }
 
     /**
@@ -236,6 +282,14 @@ public class SSTableIndexWriter implements PerIndexWriter
     {
         if (aborted)
             return true;
+
+        if (!ownershipTaken)
+        {
+            ownershipTaken = true;
+            owner = PerIndexFilesOwner.tryOwn(perIndexComponents.descriptor(),
+                                              indexContext.getIndexName(),
+                                              isIndexDropped);
+        }
 
         boolean dropped = isIndexDropped.getAsBoolean();
         boolean unloaded = isIndexUnloaded.getAsBoolean();

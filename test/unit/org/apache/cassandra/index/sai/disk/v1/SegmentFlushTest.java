@@ -163,15 +163,23 @@ public class SegmentFlushTest
         DecoratedKey key1 = keys.get(0);
         ByteBuffer term1 = UTF8Type.instance.decompose("a");
         Row row1 = createRow(column, term1);
-        writer.addRow(SAITester.TEST_FACTORY.create(key1, Clustering.EMPTY), row1, sstableRowId1);
-
-        // expect a flush if exceed max rowId per segment
         DecoratedKey key2 = keys.get(1);
         ByteBuffer term2 = UTF8Type.instance.decompose("b");
         Row row2 = createRow(column, term2);
-        writer.addRow(SAITester.TEST_FACTORY.create(key2, Clustering.EMPTY), row2, sstableRowId2);
+        try
+        {
+            writer.addRow(SAITester.TEST_FACTORY.create(key1, Clustering.EMPTY), row1, sstableRowId1);
 
-        writer.complete(Stopwatch.createStarted());
+            // expect a flush if exceed max rowId per segment
+            writer.addRow(SAITester.TEST_FACTORY.create(key2, Clustering.EMPTY), row2, sstableRowId2);
+
+            writer.complete(Stopwatch.createStarted());
+        }
+        finally
+        {
+            // no SSTable writer releases the files of this writer
+            writer.releaseOwnership();
+        }
 
         MetadataSource source = MetadataSource.loadMetadata(components);
 
