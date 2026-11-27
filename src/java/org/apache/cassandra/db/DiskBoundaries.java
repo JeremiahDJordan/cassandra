@@ -157,6 +157,9 @@ public class DiskBoundaries
 
     public boolean isInCorrectLocation(SSTableReader sstable, Directories.DataDirectory currentLocation)
     {
+        if (positions == null)
+            return true;
+
         int diskIndex = getDiskIndexFromKey(sstable);
         Token diskLast = positions.get(diskIndex);
         return directories.get(diskIndex).equals(currentLocation) && sstable.last.getToken().compareTo(diskLast) <= 0;
