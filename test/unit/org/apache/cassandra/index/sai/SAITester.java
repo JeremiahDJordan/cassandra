@@ -369,10 +369,20 @@ public class SAITester extends CQLTester
     {
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(currentTable());
         cfs.indexManager.listIndexes().forEach(index -> ((StorageAttachedIndexGroup)cfs.indexManager.getIndexGroup(index)).reset());
+        // as a node starts, its indexes are building from before their initial builds (SecondaryIndexManager#createIndex)
+        Set<Index> notBuilding = cfs.indexManager.listIndexes()
+                                                 .stream()
+                                                 .filter(index -> !cfs.indexManager.isIndexBuilding(index.getIndexMetadata().name))
+                                                 .collect(Collectors.toSet());
+        cfs.indexManager.markIndexesBuilding(notBuilding, true, true);
         cfs.indexManager.listIndexes().forEach(cfs.indexManager::buildIndex);
         cfs.indexManager.executePreJoinTasksBlocking(true);
         if (wait)
         {
+            // the pre-join task can make an index queryable before its initial build is over
+            waitForAssert(() -> assertTrue(cfs.indexManager.listIndexes()
+                                                           .stream()
+                                                           .noneMatch(index -> cfs.indexManager.isIndexBuilding(index.getIndexMetadata().name))));
             waitForTableIndexesQueryable();
         }
     }

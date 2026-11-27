@@ -16,6 +16,7 @@
 
 package org.apache.cassandra.index.sai;
 
+import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -33,6 +34,7 @@ import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injections;
 import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.Assert.assertEquals;
@@ -147,6 +149,48 @@ public class StoppedIndexBuildTest extends SAITester
         assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("w"));
     }
 
+    /**
+     * The full rebuild of w has built SSTables, and w loses one of them (it is loaded again without per-SSTable
+     * components) before the rebuild completes: the rebuild fails rather than make w queryable without the SSTable.
+     */
+    @Test
+    public void testFullRebuildCompletingAfterItsSSTableIsLost() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        String w = createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
+        writeSSTables();
+        StorageAttachedIndex index = (StorageAttachedIndex) cfs.indexManager.getIndexByName(w);
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+
+        // a builder of the rebuild is held once it is done
+        holdBuilders(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("build").atExit());
+        CompletableFuture<Throwable> rebuild = rebuildAsync(cfs, w);
+        waitForBuildersHeld();
+        SSTableReader lost = index.getIndexContext().getView().getIndexes().iterator().next().getSSTable();
+
+        // that SSTable loses its per-SSTable components, and is loaded again
+        group.descriptorFor(lost).perSSTableComponents().invalidate(lost, cfs.getTracker());
+        group.onSSTableChanged(Collections.singleton(lost), Collections.singleton(lost), group.getIndexes(), false);
+        assertFalse(index.getIndexContext().getView().containsSSTableIndex(lost.descriptor));
+        assertFalse(rebuild.isDone());
+
+        holdBuilders = false;
+        Throwable failure = rebuild.get(180, TimeUnit.SECONDS);
+        Injections.deleteAll();
+        waitForIndexBuildsToSettle();
+        assertNotNull("the rebuild must fail", failure);
+        assertThat(failure).hasStackTraceContaining("lost data while it was being built");
+        assertFalse("w must not be queryable without the SSTable", cfs.indexManager.isIndexQueryable(w));
+
+        // a rebuild brings it back
+        cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(w));
+        assertTrue(cfs.indexManager.isIndexQueryable(w));
+        assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("w"));
+    }
+
     private void waitForIndexBuildsToSettle()
     {
         waitForAssert(() -> assertThat(CompactionManager.instance.active.getTableOperations()
@@ -159,12 +203,15 @@ public class StoppedIndexBuildTest extends SAITester
     /** holds the builders inside their writer, once it has started writing the components of an SSTable */
     private void holdBuilders() throws Throwable
     {
+        holdBuilders(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexWriter.class).onMethod("startPartition"));
+    }
+
+    private void holdBuilders(InvokePointBuilder at) throws Throwable
+    {
         buildersHeld.set(0);
         holdBuilders = true;
         Injections.inject(Injections.newCustom("hold_builders_" + System.nanoTime())
-                                    .add(InvokePointBuilder.newInvokePoint()
-                                                           .onClass(StorageAttachedIndexWriter.class)
-                                                           .onMethod("startPartition"))
+                                    .add(at)
                                     .add(ActionBuilder.newActionBuilder()
                                                       .actions()
                                                       .doAction(Expression.expr(StoppedIndexBuildTest.class.getName())
