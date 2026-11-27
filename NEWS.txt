@@ -98,6 +98,18 @@ New features
 
 Upgrading
 ---------
+    - Filtering queries at consistency levels that need reconciliation that restrict a static column and a
+      clustering or regular column, without an index, no longer miss the rows whose match needs the static row of
+      one replica and the rows of another, such as the rows after a page that ends with the last matching row of the
+      replica that has the static value. Coordinators of this release ask the replicas, with the
+      "ds.static.candidates" message parameter, for the static row of each partition whose static row matches a
+      static restriction but none of whose rows do; the replicas count these partitions as rows in their limits, and
+      the coordinator asks for more rows where a replica stopped at its limit, also when it reads a single replica,
+      asking for up to twice as many each time. Pages over many partitions that match only the static restriction
+      take more round trips. Replicas of earlier releases, and coordinators of earlier releases or of Apache
+      Cassandra, read these queries as before. Queries with an index are unchanged. SERIAL and LOCAL_SERIAL reads
+      with paxos_variant v2 are unchanged. With repaired_data_tracking_for_range_reads_enabled, these queries can
+      report repaired data mismatches between replicas of this release and of earlier releases during an upgrade.
     - Filtering queries with an expression on a static column, at consistency levels that need reconciliation, can
       now make more replica filtering protection reads: a whole partition from each replica whose static row selects
       fewer rows than the static row of the partition, has different data for a LIKE or analyzed expression, or is

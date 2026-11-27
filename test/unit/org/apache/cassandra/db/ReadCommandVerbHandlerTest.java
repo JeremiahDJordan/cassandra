@@ -127,6 +127,19 @@ public class ReadCommandVerbHandlerTest
         assertFalse(command.isTrackingRepairedData());
     }
 
+    /**
+     * Replicas return static candidates only to coordinators that ask for them with the custom message parameter.
+     */
+    @Test
+    public void coordinatorAsksForStaticCandidatesOnlyWithTheParameter()
+    {
+        ReadCommand command = new TrackingSinglePartitionReadCommand(metadata);
+
+        Message<ReadCommand> withoutParam = Message.builder(READ_REQ, command).from(peer()).withId(messageId()).build();
+        assertFalse(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(withoutParam));
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(ReadCommand.withStaticCandidatesParam(withoutParam)));
+    }
+
     @Test (expected = InvalidRequestException.class)
     public void rejectsRequestWithNonMatchingTransientness()
     {
