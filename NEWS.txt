@@ -103,8 +103,7 @@ Upgrading
       have as many groups, or doesn't have all the rows of the replica's last group: such a replica may have more
       groups, and it used to be taken for a replica without more data, so groups were lost. This applies to queries
       over several partitions, and to queries restricted to one partition when the replicas' digests don't match. When
-      the replicas return the same groups, no such request is made, except for queries with a PER PARTITION LIMIT or a
-      filter on a static column.
+      the replicas return the same groups, no such request is made, except for queries with a PER PARTITION LIMIT.
     - Replica filtering protection now caches whole partitions for GROUP BY queries with a filter that are restricted
       to one partition, as it already did for queries over several partitions, and the rows of the short read
       protection requests above add to the rows it caches, so GROUP BY queries with a filter can now reach the

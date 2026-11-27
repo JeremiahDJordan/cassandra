@@ -21,6 +21,7 @@ package org.apache.cassandra.service.reads;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.NavigableSet;
@@ -144,7 +145,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /** Tracks the current partitions when not consuming entire partitions in {@link #queryProtectedPartitions}. */
     private RowIterator currentRowIterator = null;
 
-    /** Counts the first-phase rows that the second phase returns, if they can be counted for the query's limits. */
+    /** Counts the first-phase rows that the second phase returns, unless the query has no limits. */
     @Nullable
     private final CompleteRows completeRows;
 
@@ -184,15 +185,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         mergeListener = new QueryMergeListener();
 
-        // Per-partition limits would need the rows counted by partition. Without a row or group limit (no limit, or
-        // only a limit in bytes), the rows would be held and never counted. A filter on a static column can stop
-        // matching the rows of a partition when its static row is completed.
-        DataLimits limits = command.limits();
-        completeRows = limits.count() == DataLimits.NO_LIMIT
-                       || limits.perPartitionCount() != DataLimits.NO_LIMIT
-                       || command.rowFilter().hasStaticExpression()
-                       ? null
-                       : new CompleteRows(firstPhaseCounter, rowFilter);
+        completeRows = command.limits().isUnlimited() ? null : new CompleteRows(firstPhaseCounter, rowFilter);
     }
 
     private UnfilteredPartitionIterator executeReadCommand(ReadCommand cmd, Replica source, ReplicaPlan.Shared<EndpointsForToken, ReplicaPlan.ForTokenRead> replicaPlan)
@@ -305,8 +298,13 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 }
             }
 
-            if (complete && completeRows != null && !merged.isStatic())
-                completeRows.add(key, merged);
+            if (completeRows != null)
+            {
+                if (merged.isStatic())
+                    completeRows.setStaticRow(complete ? merged : null);
+                else
+                    completeRows.add(merged, complete);
+            }
         }
 
         @Override
@@ -520,8 +518,11 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /**
      * Counts, in the first phase's merged result counter, the rows that no replica is silent about and that match the
      * row filter: the second phase returns them as they are, so short read protection stops asking for more rows once
-     * they fill the limit. The rows are filtered and counted in batches big enough to fill the rest of the limit, or
-     * one at a time for GROUP BY.
+     * they fill the limits. The rows are counted one at a time as they come, after the start of their merged partition,
+     * for every kind of limit, and so is the static row of a partition without merged rows, when the next partition
+     * starts. Each row is filtered with the merged static row of its partition, as the second phase filters it. The
+     * rows of a partition whose static row some replica is silent about aren't counted, as the static row that the
+     * second phase completes can stop matching the filter.
      * <p>
      * A GROUP BY counter closes a group when the next one starts and expects each partition once, so it is given the
      * start of each merged partition and each row as they come. A group whose last row is the last row of a replica's
@@ -532,95 +533,94 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     {
         private final DataLimits.Counter counter;
         private final UnaryOperator<PartitionIterator> rowFilter;
-        private final boolean groupBy;
-        // whether the coordinator filter filters rows (see DataResolver#preCountFilterForReplicaFilteringProtection)
-        private final boolean filtersRows;
-        private final List<DecoratedKey> keys = new ArrayList<>();
-        private final List<List<Row>> rows = new ArrayList<>();
-        private int pending = 0;
+
+        private DecoratedKey partitionKey;
+        // the merged static row of the partition, or null if some replica is silent about it
+        private Row staticRow;
+        // whether the second phase can return rows of the partition, instead of its static row alone
+        private boolean mayHaveRows;
+        // whether the second phase can return rows of the partition that aren't counted, which, with a per-partition
+        // limit, take the place of the rows after them
+        private boolean mayHaveUncountedRows;
 
         private CompleteRows(DataLimits.Counter counter, UnaryOperator<PartitionIterator> rowFilter)
         {
             this.counter = counter;
             this.rowFilter = rowFilter;
-            this.groupBy = command.limits().isGroupByLimit();
-            this.filtersRows = command.rowFilter().hasNonKeyExpression();
         }
 
         private void startPartition(DecoratedKey key)
         {
-            if (groupBy && !counter.isDone())
+            // the second phase returns a partition without rows for its static row if the filter keeps it
+            if (partitionKey != null && staticRow != null && !staticRow.isEmpty() && !mayHaveRows && !counter.isDone() && isKept(null))
+                counter.countStaticRow(staticRow);
+
+            partitionKey = key;
+            staticRow = Rows.EMPTY_STATIC_ROW;
+            mayHaveRows = false;
+            mayHaveUncountedRows = false;
+            if (!counter.isDone())
                 counter.countPartitionStart(key);
         }
 
-        private void add(DecoratedKey key, Row merged)
+        /**
+         * @param merged the merged static row, or {@code null} if some replica is silent about it
+         */
+        private void setStaticRow(@Nullable Row merged)
         {
-            if (counter.isDone())
-                return;
-
-            // The second phase purges the merged rows before filtering them
-            Row row = merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
-            if (row == null)
-                return;
-
-            if (groupBy)
+            if (merged == null)
             {
-                // The filter has no static expression, so this is what the coordinator filter does with the row
-                if (!filtersRows || command.rowFilter().root().isSatisfiedBy(command.metadata(), key, row, command.nowInSec()))
-                    counter.countRow(row);
+                staticRow = null;
                 return;
             }
+            Row row = purge(merged);
+            staticRow = row == null ? Rows.EMPTY_STATIC_ROW : row;
+        }
 
-            if (keys.isEmpty() || !keys.get(keys.size() - 1).equals(key))
+        /**
+         * @param complete whether no replica is silent about the row
+         */
+        private void add(Row merged, boolean complete)
+        {
+            mayHaveRows = true;
+            mayHaveUncountedRows |= !complete;
+            // an iteration with the counter applied doesn't go past the rows that fill the limits of the partition
+            if (!complete || staticRow == null || counter.isDoneForPartition()
+                || (mayHaveUncountedRows && command.limits().perPartitionCount() != DataLimits.NO_LIMIT))
+                return;
+
+            Row row = purge(merged);
+            if (row != null && isKept(row))
+                counter.countRow(row);
+        }
+
+        // The second phase purges the merged rows before filtering them
+        private Row purge(Row merged)
+        {
+            return merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
+        }
+
+        /**
+         * Whether the row filter of the second phase keeps the given row of the partition, or the partition without
+         * rows if the row is {@code null}.
+         */
+        private boolean isKept(@Nullable Row row)
+        {
+            try (PartitionIterator partitions = rowFilter.apply(PartitionIterators.singletonIterator(partition(row))))
             {
-                keys.add(key);
-                rows.add(new ArrayList<>());
+                if (!partitions.hasNext())
+                    return false;
+
+                try (RowIterator partition = partitions.next())
+                {
+                    return partition != null && (row == null || partition.hasNext());
+                }
             }
-            rows.get(rows.size() - 1).add(row);
-
-            if (++pending >= command.limits().count() - counter.rowsCounted())
-                count();
         }
 
-        private void count()
+        private RowIterator partition(@Nullable Row row)
         {
-            try (PartitionIterator partitions = counter.applyTo(rowFilter.apply(pendingPartitions())))
-            {
-                PartitionIterators.consume(partitions);
-            }
-
-            keys.clear();
-            rows.clear();
-            pending = 0;
-        }
-
-        private PartitionIterator pendingPartitions()
-        {
-            Iterator<DecoratedKey> keyIterator = keys.iterator();
-            Iterator<List<Row>> rowsIterator = rows.iterator();
-            return new PartitionIterator()
-            {
-                @Override
-                public boolean hasNext()
-                {
-                    return keyIterator.hasNext();
-                }
-
-                @Override
-                public RowIterator next()
-                {
-                    return partition(keyIterator.next(), rowsIterator.next().iterator());
-                }
-
-                @Override
-                public void close()
-                {
-                }
-            };
-        }
-
-        private RowIterator partition(DecoratedKey key, Iterator<Row> partitionRows)
-        {
+            Iterator<Row> partitionRows = row == null ? Collections.emptyIterator() : Collections.singletonList(row).iterator();
             return new RowIterator()
             {
                 @Override
@@ -644,13 +644,13 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 @Override
                 public DecoratedKey partitionKey()
                 {
-                    return key;
+                    return partitionKey;
                 }
 
                 @Override
                 public Row staticRow()
                 {
-                    return Rows.EMPTY_STATIC_ROW;
+                    return staticRow;
                 }
 
                 @Override

@@ -19,17 +19,30 @@
 package org.apache.cassandra.distributed.test;
 
 import java.io.IOException;
+import java.util.Collections;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.cql3.PageSize;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.SimpleQueryResult;
 import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.assertj.core.api.Assertions;
 import org.assertj.core.api.ListAssert;
 
@@ -176,6 +189,321 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
                    row(1, 0), row(1, 1));
         assertEquals(0, shortReadProtectionRequestCount(cluster.get(1), tableName));
         assertEquals(0, protectionQueryCount(cluster.get(1), tableName));
+    }
+
+    /**
+     * Replicas that agree return all the rows that a query with a per-partition limit, a filter on a static column, a
+     * page in bytes or an aggregate read in pages of bytes needs, so short read protection asks them for no more rows.
+     * Without a row limit, a range read with a per-partition limit asks each replica once for the partitions after its
+     * last one.
+     */
+    @Test
+    public void testNoShortReadProtectionRequestsOnAgreeingReplicas()
+    {
+        String tableName = "srp_on_agreeing_replicas";
+        String table = createAgreeingTable(tableName);
+        int subPageSize = cluster.get(1).callOnInstance(() -> DatabaseDescriptor.getAggregationSubPageSize().bytes());
+        cluster.get(1).runOnInstance(() -> DatabaseDescriptor.setAggregationSubPageSize(PageSize.inBytes(1024)));
+        try
+        {
+            assertShortReadProtectionRequests(REPLICAS, tableName, "SELECT k, c FROM " + table + " WHERE v = 7 PER PARTITION LIMIT 2 ALLOW FILTERING",
+                                              row(1, 0), row(1, 1), row(0, 0), row(0, 1));
+            assertShortReadProtectionRequests(0, tableName, "SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 5 ALLOW FILTERING",
+                                              row(1, 0), row(1, 1), row(1, 2), row(1, 3), row(1, 4));
+            assertShortReadProtectionRequests(0, tableName, "SELECT count(*) FROM " + table + " WHERE v = 7 ALLOW FILTERING",
+                                              row(32L));
+            assertShortReadProtectionRequests(0, tableName, "SELECT k, count(*) FROM " + table + " WHERE v = 7 GROUP BY k ALLOW FILTERING",
+                                              row(1, 16L), row(0, 16L));
+
+            long requests = shortReadProtectionRequestCount(cluster.get(1), tableName);
+            assertEquals(32, rowsInPagesOfBytes("SELECT k, c, t FROM " + table + " WHERE v = 7 ALLOW FILTERING", 256));
+            assertEquals(requests, shortReadProtectionRequestCount(cluster.get(1), tableName));
+        }
+        finally
+        {
+            cluster.get(1).runOnInstance(() -> DatabaseDescriptor.setAggregationSubPageSize(PageSize.inBytes(subPageSize)));
+        }
+    }
+
+    /**
+     * A small row of partition 1 on node 1 only comes before a row of 500 bytes on both nodes, and the second phase
+     * returns it in place of that row for PER PARTITION LIMIT 1. Node 1 stops its page of 256 bytes at a row of
+     * partition 0 that node 2 has a newer non-match of, so the row of partition 2 needs a short read protection request.
+     */
+    @Test
+    public void testRowOnOneReplicaBeforePerPartitionLimit()
+    {
+        String table = createTable("row_on_one_replica_before_per_partition_limit", "(k int, c int, v int, t text, PRIMARY KEY (k, c))");
+        String text = "x".repeat(500);
+        write(1, "INSERT INTO %s (k, c, v, t) VALUES (1, 0, 1, 'a') USING TIMESTAMP 1", table);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v, t) VALUES (1, 1, 1, ?) USING TIMESTAMP 1", ALL, text);
+        write(1, "INSERT INTO %s (k, c, v, t) VALUES (0, 0, 1, '" + text + "') USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, c, v, t) VALUES (0, 0, 0, '" + text + "') USING TIMESTAMP 2", table);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v, t) VALUES (2, 0, 1, 'z') USING TIMESTAMP 1", ALL);
+
+        assertEquals(2, rowsInPagesOfBytes("SELECT k, c, t FROM " + table + " WHERE v = 1 PER PARTITION LIMIT 1 ALLOW FILTERING", 256));
+    }
+
+    /**
+     * Partition 1 has a static row of 1200 bytes on both nodes and a row on each node only, so the second phase returns
+     * its two rows rather than its static row. Each node stops its page of 1 KiB at a static row that the other node has
+     * a newer non-match of, so the row of partition 4 needs a short read protection request.
+     */
+    @Test
+    public void testStaticRowOfPartitionWithRowsOnOneReplica()
+    {
+        String table = createTable("static_row_with_rows_on_one_replica", "(k int, c int, s text static, v int, PRIMARY KEY (k, c))");
+        String text = "s".repeat(1200);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, s) VALUES (1, ?) USING TIMESTAMP 1", ALL, text);
+        write(1, "INSERT INTO %s (k, c, v) VALUES (1, 0, 1) USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, c, v) VALUES (1, 1, 1) USING TIMESTAMP 1", table);
+        write(1, "INSERT INTO %s (k, s) VALUES (0, '" + text + "') USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, s) VALUES (0, 'other') USING TIMESTAMP 2", table);
+        write(2, "INSERT INTO %s (k, s) VALUES (2, '" + text + "') USING TIMESTAMP 1", table);
+        write(1, "INSERT INTO %s (k, s) VALUES (2, 'other') USING TIMESTAMP 2", table);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s, v) VALUES (4, 0, ?, 1) USING TIMESTAMP 1", ALL, text);
+
+        assertEquals(3, rowsInPagesOfBytes("SELECT k, c, v FROM " + table + " WHERE s = '" + text + "' ALLOW FILTERING", 1024));
+    }
+
+    /**
+     * Partition 1 has a row on both nodes and a static list [7, 7, 8] from which each node deletes another 7, so it
+     * matches sl CONTAINS 7 on each node but not once reconciled. Partition 0, next in token order, has a matching row
+     * on node 1 only.
+     */
+    @Test
+    public void testRowsOfPartitionWhoseStaticRowFailsFilterOnceReconciled()
+    {
+        String table = createTable("rows_static_row_failing_once_reconciled", "(k int, c int, sl list<int> static, PRIMARY KEY (k, c))");
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, sl) VALUES (1, 0, [7, 7, 8]) USING TIMESTAMP 1", ALL);
+        write(1, "DELETE sl[0] FROM %s USING TIMESTAMP 2 WHERE k = 1", table);
+        write(2, "DELETE sl[1] FROM %s USING TIMESTAMP 2 WHERE k = 1", table);
+        write(1, "INSERT INTO %s (k, c, sl) VALUES (0, 0, [7]) USING TIMESTAMP 1", table);
+
+        String query = "SELECT k, c FROM " + table + " WHERE sl CONTAINS 7 LIMIT 1 ALLOW FILTERING";
+        assertRows(cluster.coordinator(1).execute(query, ALL), row(0, 0));
+        assertRows(cluster.coordinator(1).executeWithPaging(query, ALL, 1), row(0, 0));
+        assertRows(cluster.coordinator(1).execute("SELECT k, c, count(*) FROM " + table + " WHERE sl CONTAINS 7 GROUP BY k, c LIMIT 1 ALLOW FILTERING", ALL),
+                   row(0, 0, 1L));
+    }
+
+    /**
+     * Partitions 1, 0 and 2 have only a static list [7, 7, 8] from which each node deletes another 7, so it matches
+     * sl CONTAINS 7 on each node but not once reconciled. Partition 4, next in token order, has a matching row on node 1
+     * only.
+     */
+    @Test
+    public void testStaticOnlyPartitionsFailingFilterOnceReconciled()
+    {
+        String table = createTable("static_only_failing_once_reconciled", "(k int, c int, sl list<int> static, PRIMARY KEY (k, c))");
+        for (int k : new int[]{ 1, 0, 2 })
+        {
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, sl) VALUES (?, [7, 7, 8]) USING TIMESTAMP 1", ALL, k);
+            write(1, "DELETE sl[0] FROM %s USING TIMESTAMP 2 WHERE k = " + k, table);
+            write(2, "DELETE sl[1] FROM %s USING TIMESTAMP 2 WHERE k = " + k, table);
+        }
+        write(1, "INSERT INTO %s (k, c, sl) VALUES (4, 0, [7]) USING TIMESTAMP 1", table);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE sl CONTAINS 7 LIMIT 1 ALLOW FILTERING", ALL), row(4, 0));
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE sl CONTAINS 7 LIMIT 2 ALLOW FILTERING", ALL), row(4, 0));
+        assertRows(cluster.coordinator(1).execute("SELECT k, count(*) FROM " + table + " WHERE sl CONTAINS 7 GROUP BY k LIMIT 2 ALLOW FILTERING", ALL),
+                   row(4, 1L));
+    }
+
+    /**
+     * Rows c = 0 of partitions 1 and 0 have a list [7, 7, 8] from which each node deletes another 7, so they match
+     * l CONTAINS 7 on each node but not once reconciled. Partition 1 has c = 1, 2 and 3 on both nodes, and partition 0
+     * c = 1, so short read protection reads c = 2 and c = 3 of partition 1 from both nodes.
+     */
+    @Test
+    public void testRowsAfterPerPartitionLimitMatchingOnEachNode()
+    {
+        String table = createTable("rows_after_ppl_matching_on_each_node", "(k int, c int, l list<int>, PRIMARY KEY (k, c))");
+        for (int k : new int[]{ 1, 0 })
+        {
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, l) VALUES (?, 0, [7, 7, 8]) USING TIMESTAMP 1", ALL, k);
+            write(1, "DELETE l[0] FROM %s USING TIMESTAMP 2 WHERE k = " + k + " AND c = 0", table);
+            write(2, "DELETE l[1] FROM %s USING TIMESTAMP 2 WHERE k = " + k + " AND c = 0", table);
+        }
+        for (int c = 1; c <= 3; c++)
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, l) VALUES (1, ?, [7]) USING TIMESTAMP 1", ALL, c);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, l) VALUES (0, 1, [7]) USING TIMESTAMP 1", ALL);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE l CONTAINS 7 PER PARTITION LIMIT 2 LIMIT 3 ALLOW FILTERING", ALL),
+                   row(1, 1), row(1, 2), row(0, 1));
+        assertRows(cluster.coordinator(1).execute("SELECT k, c, count(*) FROM " + table + " WHERE l CONTAINS 7 GROUP BY k, c PER PARTITION LIMIT 2 LIMIT 3 ALLOW FILTERING", ALL),
+                   row(1, 1, 1L), row(1, 2, 1L), row(0, 1, 1L));
+    }
+
+    /**
+     * Partition 1 has a static row s = 7 and c = 0 and 1 on both nodes, c = 2 on node 1 only and c = 3 on node 2 only,
+     * each deleted later on the other node, and partition 0 has s = 7 and c = 0 and 1 on both nodes. Each node stops
+     * at LIMIT 4 before the last row of partition 0, and c = 2 and c = 3 are reconciled away, so short read protection
+     * must read that row.
+     */
+    @Test
+    public void testStaticRowOfPartitionWithCountedRows()
+    {
+        String table = createTable("static_row_with_counted_rows", "(k int, c int, s int static, v int, PRIMARY KEY (k, c))");
+        for (int k : new int[]{ 1, 0 })
+            for (int c = 0; c < 2; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s, v) VALUES (?, ?, 7, 1) USING TIMESTAMP 1", ALL, k, c);
+        write(1, "INSERT INTO %s (k, c, v) VALUES (1, 2, 1) USING TIMESTAMP 1", table);
+        write(2, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 2", table);
+        write(2, "INSERT INTO %s (k, c, v) VALUES (1, 3, 1) USING TIMESTAMP 1", table);
+        write(1, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 3", table);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 4 ALLOW FILTERING", ALL),
+                   row(1, 0), row(1, 1), row(0, 0), row(0, 1));
+    }
+
+    /**
+     * Partition 1 has a newer non-match of c = 0 on node 2 and a newer deletion of c = 1 on node 1, and partition 0,
+     * next in token order, has them the other way around, so that short read protection reads more rows of each
+     * partition from both nodes. A page of rows that continues a partition counts the rows of the partition that the
+     * previous pages returned towards the per-partition limit.
+     */
+    @Test
+    public void testPerPartitionLimitAcrossPagesOfRangeRead()
+    {
+        String table = createTable("ppl_across_pages_of_range_read", "(k int, c int, v int, PRIMARY KEY (k, c))");
+        for (int k = 0; k <= 1; k++)
+            for (int c = 0; c < 6; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (?, ?, 1) USING TIMESTAMP 1", ALL, k, c);
+        write(2, "INSERT INTO %s (k, c, v) VALUES (1, 0, 2) USING TIMESTAMP 2", table);
+        write(1, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 1", table);
+        write(1, "INSERT INTO %s (k, c, v) VALUES (0, 0, 2) USING TIMESTAMP 2", table);
+        write(2, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 0 AND c = 1", table);
+
+        assertRows(cluster.coordinator(1).executeWithPaging("SELECT k, c FROM " + table + " WHERE v = 1 PER PARTITION LIMIT 3 ALLOW FILTERING", ALL, 2),
+                   row(1, 2), row(1, 3), row(1, 4), row(0, 2), row(0, 3), row(0, 4));
+    }
+
+    /**
+     * Partition 1 has only a static row s = 7 on node 1, and a newer s = 0 on node 2, which doesn't return the
+     * partition, so the second phase completes its static row to s = 0. Partition 0, next in token order, has s = 7 and
+     * a row on both nodes, and partition 2 s = 7 and a row on node 1 only, past LIMIT 2 of node 1.
+     */
+    @Test
+    public void testStaticOnlyPartitionWithNewerStaticRowOnOtherReplica()
+    {
+        String table = createTable("static_only_with_newer_static_row", "(k int, c int, s int static, PRIMARY KEY (k, c))");
+        write(1, "INSERT INTO %s (k, s) VALUES (1, 7) USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, s) VALUES (1, 0) USING TIMESTAMP 2", table);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s) VALUES (0, 0, 7) USING TIMESTAMP 1", ALL);
+        write(1, "INSERT INTO %s (k, c, s) VALUES (2, 0, 7) USING TIMESTAMP 1", table);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 2 ALLOW FILTERING", ALL), row(0, 0), row(2, 0));
+    }
+
+    /**
+     * Agreeing replicas return one row of each partition of 16 rows to a query with a per-partition limit of 1, a filter
+     * on a static column and a limit of 1, or a page of 256 bytes, so replica filtering protection caches fewer rows
+     * than a fail threshold of 8.
+     */
+    @Test
+    public void testAgreeingReplicasBelowCachingFailThreshold()
+    {
+        String table = createAgreeingTable("agreeing_replicas_cache_fail");
+        cluster.get(1).runOnInstance(() -> StorageService.instance.setCachedReplicaRowsFailThreshold(8));
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE v = 7 PER PARTITION LIMIT 1 ALLOW FILTERING", ALL),
+                   row(1, 0), row(0, 0));
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 1 ALLOW FILTERING", ALL),
+                   row(1, 0));
+        assertEquals(32, rowsInPagesOfBytes("SELECT k, c, t FROM " + table + " WHERE v = 7 ALLOW FILTERING", 256));
+    }
+
+    /**
+     * Partitions 0 to 3 have only a static row, and partition 4 has 16 rows, on both replicas. The partitions without
+     * rows whose static row matches the filter count towards the limit, so short read protection asks the replicas
+     * for no more rows.
+     */
+    @Test
+    public void testNoShortReadProtectionRequestsOnStaticOnlyPartitions()
+    {
+        String tableName = "srp_on_static_only_partitions";
+        String table = createTable(tableName, "(k int, c int, s int static, v int, PRIMARY KEY (k, c))");
+        for (int k = 0; k < 4; k++)
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, s) VALUES (?, 7)", ALL, k);
+        for (int c = 0; c < 16; c++)
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s, v) VALUES (4, ?, 7, 7)", ALL, c);
+
+        assertShortReadProtectionRequests(0, tableName, "SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 5 ALLOW FILTERING",
+                                          row(1, null), row(0, null), row(2, null), row(4, 0), row(4, 1));
+    }
+
+    /**
+     * Rows that both replicas return after the rows that fill the per-partition limit don't count towards the limit.
+     * Partition 1 has c = 0, 3, 4 and 5 on both nodes, and c = 1 and c = 2 each match on one node and not on the other,
+     * so that short read protection reads c = 3 and c = 4 from both. Partition 0, next in token order, has such rows
+     * c = 0 and c = 1 before c = 2 and c = 3.
+     */
+    @Test
+    public void testRowsAfterPerPartitionLimit()
+    {
+        String table = createTable("rows_after_per_partition_limit", "(k int, c int, v int, PRIMARY KEY (k, c))");
+        for (int c : new int[]{ 0, 3, 4, 5 })
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (1, ?, 1) USING TIMESTAMP 1", ALL, c);
+        for (int c : new int[]{ 2, 3 })
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (0, ?, 1) USING TIMESTAMP 1", ALL, c);
+        for (int k : new int[]{ 1, 0 })
+        {
+            int c = k == 1 ? 1 : 0;
+            write(1, "INSERT INTO %s (k, c, v) VALUES (" + k + ", " + c + ", 1) USING TIMESTAMP 1", table);
+            write(2, "INSERT INTO %s (k, c, v) VALUES (" + k + ", " + c + ", 0) USING TIMESTAMP 2", table);
+            write(2, "INSERT INTO %s (k, c, v) VALUES (" + k + ", " + (c + 1) + ", 1) USING TIMESTAMP 1", table);
+            write(1, "INSERT INTO %s (k, c, v) VALUES (" + k + ", " + (c + 1) + ", 0) USING TIMESTAMP 2", table);
+        }
+
+        String query = "SELECT k, c FROM " + table + " WHERE v = 1 PER PARTITION LIMIT 2 LIMIT 3 ALLOW FILTERING";
+        String groupByQuery = "SELECT k, c, count(*) FROM " + table + " WHERE v = 1 GROUP BY k, c PER PARTITION LIMIT 2 LIMIT 3 ALLOW FILTERING";
+        assertRows(cluster.coordinator(1).execute(query, ALL), row(1, 0), row(1, 3), row(0, 2));
+        assertRows(cluster.coordinator(1).execute(groupByQuery, ALL), row(1, 0, 1L), row(1, 3, 1L), row(0, 2, 1L));
+        assertRows(cluster.coordinator(1).executeWithPaging(query, ALL, 3), row(1, 0), row(1, 3), row(0, 2));
+        assertRows(cluster.coordinator(1).executeWithPaging(groupByQuery, ALL, 3), row(1, 0, 1L), row(1, 3, 1L), row(0, 2, 1L));
+    }
+
+    /**
+     * Creates a table with partitions 0 and 1 of 16 rows of about 512 bytes each, written to both replicas.
+     */
+    private String createAgreeingTable(String name)
+    {
+        String table = createTable(name, "(k int, c int, s int static, v int, t text, PRIMARY KEY (k, c))");
+        String text = "x".repeat(500);
+        for (int k = 0; k <= 1; k++)
+            for (int c = 0; c < 16; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s, v, t) VALUES (?, ?, 7, 7, ?)", ALL, k, c, text);
+        return table;
+    }
+
+    /**
+     * Reads all the pages of the query on node 1 at ALL, in pages of the given size in bytes, and returns the number of
+     * rows.
+     */
+    private static int rowsInPagesOfBytes(String query, int pageSizeInBytes)
+    {
+        return cluster.get(1).callOnInstance(() -> {
+            SelectStatement statement = (SelectStatement) QueryProcessor.getStatement(query, ClientState.forInternalCalls());
+            int rows = 0;
+            PagingState pagingState = null;
+            do
+            {
+                QueryOptions options = QueryOptions.create(ConsistencyLevel.ALL, Collections.emptyList(), false, PageSize.inBytes(pageSizeInBytes),
+                                                           pagingState, null, ProtocolVersion.CURRENT, null);
+                ResultMessage.Rows page = statement.execute(QueryState.forInternalCalls(), options, Dispatcher.RequestTime.forImmediateExecution());
+                rows += page.result.rows.size();
+                pagingState = page.result.metadata.getPagingState();
+            }
+            while (pagingState != null);
+            return rows;
+        });
+    }
+
+    private void assertShortReadProtectionRequests(long expected, String tableName, String query, Object[]... rows)
+    {
+        long requests = shortReadProtectionRequestCount(cluster.get(1), tableName);
+        assertRows(cluster.coordinator(1).execute(query, ALL), rows);
+        assertEquals(query, expected, shortReadProtectionRequestCount(cluster.get(1), tableName) - requests);
     }
 
     private String createTable(String name, String columns)
