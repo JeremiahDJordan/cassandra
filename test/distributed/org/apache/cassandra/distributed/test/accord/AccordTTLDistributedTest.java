@@ -171,6 +171,31 @@ public class AccordTTLDistributedTest extends AccordTestBase
         });
     }
 
+    @Test
+    public void testRowAliveByCellOlderThanSupersededRowMarkerAfterTTLExpires() throws Exception
+    {
+        test("CREATE TABLE " + qualifiedAccordTableName + " (k int, c int, v int, x int, PRIMARY KEY (k, c)) " +
+             "WITH " + transactionalMode.asCqlParam(), cluster -> {
+            ICoordinator coordinator = cluster.coordinator(1);
+            String table = qualifiedAccordTableName;
+            // the older cell and a newer row marker without TTL in one sstable, an expiring row marker in the memtable
+            coordinator.execute("UPDATE " + table + " SET v = 0 WHERE k = 0 AND c = 0", QUORUM);
+            coordinator.execute("INSERT INTO " + table + " (k, c) VALUES (0, 0)", QUORUM);
+            for (IInvokableInstance instance : cluster)
+            {
+                Awaitility.await().atMost(30, TimeUnit.SECONDS).pollInterval(100, TimeUnit.MILLISECONDS)
+                          .until(() -> hasRowMarkerAndCell(instance, accordTableName, 0));
+                instance.flush(KEYSPACE);
+            }
+            coordinator.execute("INSERT INTO " + table + " (k, c) VALUES (0, 0) USING TTL 1", QUORUM);
+            Thread.sleep(2500);
+
+            assertRows(coordinator.execute(wrapInTxn("SELECT k, c, x FROM " + table + " WHERE k = 0 AND c = 0"), QUORUM), row(0, 0, null));
+            assertRows(coordinator.execute("SELECT k, c, x FROM " + table + " WHERE k = 0", QUORUM), row(0, 0, null));
+            assertRows(coordinator.execute("SELECT k, c, x FROM " + table, QUORUM), row(0, 0, null));
+        });
+    }
+
     private static void assertRemainingTTL(Object[][] rows, int ttl)
     {
         assertEquals("Expected exactly one row", 1, rows.length);
@@ -228,6 +253,22 @@ public class AccordTTLDistributedTest extends AccordTestBase
                     contents.append(partition.next().toString(partition.metadata(), true)).append('\n');
             });
             return contents.toString();
+        });
+    }
+
+    private static boolean hasRowMarkerAndCell(IInvokableInstance instance, String table, int k)
+    {
+        return instance.callOnInstance(() -> {
+            boolean[] found = { false };
+            readLocal(table, k, partition -> {
+                while (partition.hasNext())
+                {
+                    Unfiltered unfiltered = partition.next();
+                    if (unfiltered.isRow() && !((Row) unfiltered).primaryKeyLivenessInfo().isEmpty() && ((Row) unfiltered).cells().iterator().hasNext())
+                        found[0] = true;
+                }
+            });
+            return found[0];
         });
     }
 
