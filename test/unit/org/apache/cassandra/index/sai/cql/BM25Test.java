@@ -1353,15 +1353,15 @@ public class BM25Test extends SAITester
         // Verify hybrid queries
 
         assertThatPlanFor("SELECT c FROM %s WHERE n = 1 ORDER BY s BM25 OF 'apple' LIMIT 5", row(0), row(1), row(2))
-                .uses(Plan.Bm25IndexScan.class);
+                .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
         assertThatPlanFor("SELECT c FROM %s WHERE n = 1 ORDER BY s BM25 OF 'orange' LIMIT 5", row(3), row(4), row(5), row(6), row(7))
-                .uses(Plan.Bm25IndexScan.class);
+                .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
         assertThatPlanFor("SELECT c FROM %s WHERE n = 1 ORDER BY s BM25 OF 'banana' LIMIT 5")
                 .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
         assertThatPlanFor("SELECT c FROM %s WHERE n = 0 ORDER BY s BM25 OF 'apple' LIMIT 5")
                 .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
         assertThatPlanFor("SELECT c FROM %s WHERE n = 0 ORDER BY s BM25 OF 'orange' LIMIT 5", row(8), row(9))
-                .uses(Plan.NumericIndexScan.class);
+                .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
         assertThatPlanFor("SELECT c FROM %s WHERE n = 0 ORDER BY s BM25 OF 'banana' LIMIT 5")
                 .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
         assertThatPlanFor("SELECT c FROM %s WHERE n = -1 ORDER BY s BM25 OF 'apple' LIMIT 5")
@@ -1371,7 +1371,7 @@ public class BM25Test extends SAITester
         assertThatPlanFor("SELECT c FROM %s WHERE n = -1 ORDER BY s BM25 OF 'banana' LIMIT 5")
                 .uses(Plan.NumericIndexScan.class);
 
-        // Verify index hints with a hybrid query that would use the sort-then-filter index without hints
+        // Verify index hints with a hybrid query that would use filter-then-sort with the BM25 term scan without hints
 
         assertThatPlanFor("SELECT c FROM %s WHERE n = 1 ORDER BY s BM25 OF 'apple' LIMIT 5 WITH included_indexes = {" + numericIndex + '}',
                           row(0), row(1), row(2))
@@ -1391,7 +1391,7 @@ public class BM25Test extends SAITester
         // Verify index hints with a hybrid query that would use filter-then-sort without hints
 
         assertThatPlanFor("SELECT c FROM %s WHERE n = 0 ORDER BY s BM25 OF 'orange' LIMIT 5 WITH included_indexes = {" + numericIndex + '}', row(8), row(9))
-                .uses(Plan.NumericIndexScan.class);
+                .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
         assertThatPlanFor("SELECT c FROM %s WHERE n = 0 ORDER BY s BM25 OF 'orange' LIMIT 5 WITH included_indexes = {" + literalIndex + '}', row(8), row(9))
                 .uses(Plan.Bm25IndexScan.class);
         assertInvalidMessage(IndexContext.MULTIPLE_HINTS_WITH_ORDER_BY_ERROR_MESSAGE,
@@ -1423,9 +1423,10 @@ public class BM25Test extends SAITester
         execute("INSERT INTO %s (k, a, b, s) VALUES (8, 1, 1, 'orange')");
         execute("INSERT INTO %s (k, a, b, s) VALUES (9, 1, 1, 'orange')");
 
-        // When the BM25 orderer is more selective than the WHERE intersection, sort-then-filter (Bm25IndexScan) is chosen
+        // The BM25 term scan narrows a WHERE intersection that doesn't match every row, so filter-then-sort is chosen even
+        // when the BM25 orderer is more selective
         assertThatPlanFor("SELECT k FROM %s WHERE a = 1 AND b = 1 ORDER BY s BM25 OF 'apple' LIMIT 1")
-                .uses(Plan.Bm25IndexScan.class);
+                .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
 
         // When the WHERE filters combined with the BM25 term are more selective than the BM25 orderer alone,
         // filter-then-sort is chosen and the BM25 term scan is included in the intersection.
@@ -1444,9 +1445,9 @@ public class BM25Test extends SAITester
         assertThatPlanFor("SELECT k FROM %s WHERE a = 0 ORDER BY s BM25 OF 'orange' LIMIT 1")
                 .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
 
-        // Single non-selective filter vs selective BM25 orderer chooses sort-then-filter
+        // Single non-selective filter vs selective BM25 orderer: the BM25 term scan narrows the filter, so filter-then-sort
         assertThatPlanFor("SELECT k FROM %s WHERE a = 1 ORDER BY s BM25 OF 'apple' LIMIT 1", row(2))
-                .uses(Plan.Bm25IndexScan.class);
+                .uses(Plan.NumericIndexScan.class, Plan.LiteralIndexScan.class);
 
         // Single filter vs identical BM25 orderer chooses sort-then-filter
         assertThatPlanFor("SELECT k FROM %s WHERE s : 'apple' ORDER BY s BM25 OF 'apple' LIMIT 1", row(1))
