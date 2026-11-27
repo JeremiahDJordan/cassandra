@@ -18,6 +18,8 @@
 
 package org.apache.cassandra.locator;
 
+import org.apache.cassandra.gms.PeerCheckCache;
+
 public class DefaultTokenMetadataProvider implements TokenMetadataProvider
 {
     private volatile TokenMetadata tokenMetadata;
@@ -43,5 +45,6 @@ public class DefaultTokenMetadataProvider implements TokenMetadataProvider
     public void replaceTokenMetadata(TokenMetadata newTokenMetadata)
     {
         this.tokenMetadata = newTokenMetadata;
+        PeerCheckCache.peersChanged();
     }
 }
