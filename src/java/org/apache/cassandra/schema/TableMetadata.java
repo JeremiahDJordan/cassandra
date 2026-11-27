@@ -456,7 +456,7 @@ public class TableMetadata implements SchemaElement
      */
     public void validate(@Nullable TableMetadata previous)
     {
-        KeyspaceMetadata.validateKeyspaceName(keyspace, this::prepareConfigurationException);
+        KeyspaceMetadata.validateKeyspaceName(keyspace, message -> prepareConfigurationException("%s", message));
 
         validateTableName();
 

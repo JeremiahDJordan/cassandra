@@ -39,6 +39,7 @@ import org.apache.cassandra.cql3.functions.UDAggregate;
 import org.apache.cassandra.cql3.functions.UDFunction;
 import org.apache.cassandra.cql3.functions.UserFunction;
 import org.apache.cassandra.db.marshal.AbstractType;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UserType;
 import org.apache.cassandra.service.StorageService;
 
@@ -164,6 +165,15 @@ public class KeyspaceMetadataTest extends CQLTester
                 .isThrownBy(() -> createTableMayThrow("CREATE KEYSPACE \"non-alphanumeric\" with replication = " +
                                                       "{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }"))
                 .withMessageContaining("Keyspace name must not be empty and must contain alphanumeric or underscore characters only (got \"non-alphanumeric\")");
+
+        assertThatExceptionOfType(InvalidRequestException.class)
+                .isThrownBy(() -> createTableMayThrow("CREATE KEYSPACE \"percent%%sign\" with replication = " +
+                                                      "{ 'class' : 'SimpleStrategy', 'replication_factor' : 1 }"))
+                .withMessageContaining("Keyspace name must not be empty and must contain alphanumeric or underscore characters only (got \"percent%sign\")");
+
+        assertThatExceptionOfType(ConfigurationException.class)
+                .isThrownBy(() -> TableMetadata.builder("percent%sign", "t").addPartitionKeyColumn("k", Int32Type.instance).build().validate(null))
+                .withMessageContaining("Keyspace name must not be empty and must contain alphanumeric or underscore characters only (got \"percent%sign\")");
 
         String longKeyspaceName = "test_create_k8yq1r75bpzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
         assertThatExceptionOfType(InvalidRequestException.class)
