@@ -672,7 +672,7 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
     {
         assert !cfStore.isIndex();
         Keyspace keyspace = cfStore.keyspace;
-        if (!StorageService.instance.getTokenMetadata().getPendingRanges(keyspace.getName(), FBUtilities.getBroadcastAddressAndPort()).isEmpty())
+        if (!StorageService.instance.getTokenMetadataForKeyspace(keyspace.getName()).getPendingRanges(keyspace.getName(), FBUtilities.getBroadcastAddressAndPort()).isEmpty())
         {
             logger.info("Cleanup cannot run while node has pending ranges for keyspace {} table {}, wait for node addition/decommission to complete and try again", cfStore.keyspace.getName(), cfStore.getTableName());
             return AllSSTableOpStatus.ABORTED;
