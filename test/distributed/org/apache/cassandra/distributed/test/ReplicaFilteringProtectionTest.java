@@ -20,6 +20,7 @@ package org.apache.cassandra.distributed.test;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Iterators;
 
@@ -32,11 +33,13 @@ import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.SimpleQueryResult;
+import org.apache.cassandra.distributed.test.sai.SAIUtil;
 import org.apache.cassandra.distributed.upgrade.BytePagingReads;
 import org.apache.cassandra.exceptions.OverloadedException;
 import org.apache.cassandra.service.StorageService;
 import org.assertj.core.api.Assertions;
 import org.assertj.core.api.ListAssert;
+import org.awaitility.Awaitility;
 
 import static org.apache.cassandra.config.ReplicaFilteringProtectionOptions.DEFAULT_FAIL_THRESHOLD;
 import static org.apache.cassandra.config.ReplicaFilteringProtectionOptions.DEFAULT_WARN_THRESHOLD;
@@ -480,6 +483,46 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
 
         assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 4 ALLOW FILTERING", ALL),
                    row(1, 0), row(1, 1), row(0, 0), row(0, 1));
+    }
+
+    /**
+     * Partition 1 has only a static row s = 7 on node 1, and a newer s = 0 on node 2, which doesn't return the
+     * partition, so the second phase completes its static row to s = 0. Partition 0, next in token order, has s = 7 and
+     * a row on both nodes, and partition 2 s = 7 and a row on node 1 only, past LIMIT 2 of node 1.
+     */
+    @Test
+    public void testStaticOnlyPartitionWithNewerStaticRowOnOtherReplica()
+    {
+        String table = createTable("static_only_with_newer_static_row", "(k int, c int, s int static, PRIMARY KEY (k, c))");
+        write(1, "INSERT INTO %s (k, s) VALUES (1, 7) USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, s) VALUES (1, 0) USING TIMESTAMP 2", table);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s) VALUES (0, 0, 7) USING TIMESTAMP 1", ALL);
+        write(1, "INSERT INTO %s (k, c, s) VALUES (2, 0, 7) USING TIMESTAMP 1", table);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 2 ALLOW FILTERING", ALL), row(0, 0), row(2, 0));
+    }
+
+    /**
+     * Partition (9, 1) has only a static row s = 7 on node 1, and a newer partition deletion on node 2, whose index
+     * doesn't return it, so the second phase completes it to nothing. Partitions (7, 1) and (4, 1), next in token order,
+     * have s = 7 and a row, on both nodes and on node 1 only, past LIMIT 2 of node 1. The filter, on a partition key
+     * column, has no static expression.
+     */
+    @Test
+    public void testStaticOnlyPartitionWithNewerDeletionOnOtherReplica()
+    {
+        String tableName = "static_only_with_newer_deletion";
+        String table = createTable(tableName, "(k1 int, k2 int, c int, s int static, PRIMARY KEY ((k1, k2), c))");
+        cluster.schemaChange("CREATE INDEX k2_idx ON " + table + " (k2) USING 'sai'");
+        cluster.forEach(i -> Awaitility.waitAtMost(30, TimeUnit.SECONDS)
+                                       .until(() -> SAIUtil.isIndexQueryable(i, KEYSPACE, tableName, "k2_idx")));
+        write(1, "INSERT INTO %s (k1, k2, s) VALUES (9, 1, 7) USING TIMESTAMP 1", table);
+        write(2, "DELETE FROM %s USING TIMESTAMP 2 WHERE k1 = 9 AND k2 = 1", table);
+        cluster.get(2).flush(KEYSPACE);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k1, k2, c, s) VALUES (7, 1, 0, 7) USING TIMESTAMP 1", ALL);
+        write(1, "INSERT INTO %s (k1, k2, c, s) VALUES (4, 1, 0, 7) USING TIMESTAMP 1", table);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k1, c FROM " + table + " WHERE k2 = 1 LIMIT 2", ALL), row(7, 0), row(4, 0));
     }
 
     /**
