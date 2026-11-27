@@ -218,6 +218,7 @@ parser.add_argument('--coverage', action='store_true',
 parser.add_argument("--encoding", help="Specify a non-default encoding for output."
                     + " (Default: %s)" % (UTF8,))
 parser.add_argument("--cqlshrc", help="Specify an alternative cqlshrc file location.")
+parser.add_argument("--credentials", help="Specify an alternative credentials file location.")
 parser.add_argument('--cqlversion', default=None,
                     help='Specify a particular CQL version, '
                     'by default the highest version supported by the server will be used.'
