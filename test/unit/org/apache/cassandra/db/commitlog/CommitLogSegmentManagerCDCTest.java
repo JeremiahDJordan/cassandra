@@ -261,6 +261,26 @@ public class CommitLogSegmentManagerCDCTest extends CQLTester
     }
 
     @Test
+    public void testDeleteLinkOnReplayNoCDC() throws Throwable
+    {
+        createTable("CREATE TABLE %s (idx int, data text, primary key(idx)) WITH cdc=false;");
+        execute("INSERT INTO %s (idx, data) VALUES (1, '1');");
+        CommitLogSegment currentSegment = CommitLog.instance.getSegmentManager().allocatingFrom();
+        File logFile = currentSegment.logFile;
+        File linked = currentSegment.getCDCFile();
+        CommitLog.instance.sync(true);
+
+        // A node that stops without discarding its segments leaves the segment and its hard link behind
+        CommitLog.instance.stopUnsafe(false);
+        Assert.assertTrue("Segment does not exist: " + logFile, logFile.exists());
+        FileUtils.createHardLink(logFile, linked);
+
+        CommitLog.instance.restartUnsafe();
+        Assert.assertFalse("Expected replayed segment to be deleted: " + logFile, logFile.exists());
+        Assert.assertFalse("Expected hard link to replayed non-cdc segment to be deleted: " + linked, linked.exists());
+    }
+
+    @Test
     public void testRetainLinkOnDiscardCDC() throws Throwable
     {
         createTable("CREATE TABLE %s (idx int, data text, primary key(idx)) WITH cdc=true;");
