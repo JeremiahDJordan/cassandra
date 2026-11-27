@@ -206,11 +206,11 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                 return false;
 
             // A single result needs no reconciliation, so it can't be short, unless the replica returned rows that
-            // don't match the row filter for us to filter out (CASSANDRA-19018): it stopped at the limit counting
-            // them, so it can have more matching rows, which we have to ask for. This happens when the consistency
-            // level needs reconciliation but reads a single replica, such as LOCAL_QUORUM in a datacenter with one
-            // replica.
-            return replicas.size() > 1 || command.returnsCandidateRows();
+            // don't match the row filter for us to filter out (CASSANDRA-19018), or partitions without matching rows
+            // (see ReadCommand#returnsStaticCandidates): it stopped at the limit counting them, so it can have more
+            // matching rows, which we have to ask for. This happens when the consistency level needs reconciliation
+            // but reads a single replica, such as LOCAL_QUORUM in a datacenter with one replica.
+            return replicas.size() > 1 || command.returnsCandidateRows() || command.returnsStaticCandidates();
         }
     }
 

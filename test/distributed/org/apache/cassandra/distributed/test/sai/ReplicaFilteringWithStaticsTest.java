@@ -213,6 +213,51 @@ public class ReplicaFilteringWithStaticsTest extends TestBaseImpl
         assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ALL, 1), row(true, 5.0));
     }
 
+    @Test
+    public void testPagedStaticAndRegularMatchOnDifferentReplicas()
+    {
+        String table = "paged_static_and_regular";
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s." + table + " (pk0 int, ck0 int, s0 int static, v0 int, PRIMARY KEY (pk0, ck0)) WITH read_repair = 'NONE'"));
+
+        // Only node 1 has the static value. Row 2 is only on node 2 and matches with node 1's static row, but the
+        // page after row 1 has no match on either replica's own data.
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, ck0, s0, v0) VALUES (0, 1, 1, 1) USING TIMESTAMP 1"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, ck0, v0) VALUES (0, 2, 1) USING TIMESTAMP 1"));
+
+        // The static value is on node 1 alone and the row on node 2 alone.
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, s0) VALUES (1, 2) USING TIMESTAMP 1"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, ck0, v0) VALUES (1, 1, 1) USING TIMESTAMP 1"));
+
+        String select = withKeyspace("SELECT pk0, ck0 FROM %s." + table + " WHERE s0 = 1 AND v0 = 1 ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).execute(select, ALL), row(0, 1), row(0, 2));
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ALL, 1), row(0, 1), row(0, 2));
+
+        select = withKeyspace("SELECT pk0, ck0 FROM %s." + table + " WHERE pk0 = 0 AND s0 = 1 AND v0 = 1 ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ALL, 1), row(0, 1), row(0, 2));
+
+        select = withKeyspace("SELECT pk0, ck0 FROM %s." + table + " WHERE s0 = 2 AND v0 = 1 ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).execute(select, ALL), row(1, 1));
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ALL, 1), row(1, 1));
+    }
+
+    @Test
+    public void testRowSplitBetweenReplicasReturningOnlyTheStaticRow()
+    {
+        String table = "split_row_static_only";
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s." + table + " (pk0 int, ck0 int, s0 int static, v0 int, v1 int, PRIMARY KEY (pk0, ck0)) WITH read_repair = 'NONE'"));
+
+        // Every node has the static value. Row 1 only matches with the columns of nodes 1 and 2, which have no
+        // matching row of their own, and row 2 is on node 3 alone.
+        for (int node = 1; node <= 3; node++)
+            CLUSTER.get(node).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, s0) VALUES (0, 1) USING TIMESTAMP 1"));
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, ck0, v0) VALUES (0, 1, 1) USING TIMESTAMP 1"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, ck0, v1) VALUES (0, 1, 1) USING TIMESTAMP 1"));
+        CLUSTER.get(3).executeInternal(withKeyspace("INSERT INTO %s." + table + " (pk0, ck0, v0, v1) VALUES (0, 2, 1, 1) USING TIMESTAMP 1"));
+
+        String select = withKeyspace("SELECT pk0, ck0 FROM %s." + table + " WHERE s0 = 1 AND v0 = 1 AND v1 = 1 ALLOW FILTERING");
+        assertRows(CLUSTER.coordinator(1).execute(select, ALL), row(0, 1), row(0, 2));
+    }
+
     @Before
     public void setUp()
     {

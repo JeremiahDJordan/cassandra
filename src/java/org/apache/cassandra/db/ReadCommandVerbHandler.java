@@ -138,6 +138,11 @@ public class ReadCommandVerbHandler implements IVerbHandler<ReadCommand>
             }
         }
 
+        // Replicas return static candidates (see ReadCommand#returnsStaticCandidates) only if the coordinator asks for
+        // them, as it then filters the reconciled rows and counts the candidates as the replicas do.
+        if (command.rowFilter().canReturnStaticCandidates() && coordinatorAsksForStaticCandidates(message))
+            command.allowStaticCandidates();
+
         ReadResponse response;
         long readStartNanos = Clock.Global.nanoTime();
         try (ReadExecutionController controller = command.executionController(message.trackRepairedData());
@@ -208,6 +213,18 @@ public class ReadCommandVerbHandler implements IVerbHandler<ReadCommand>
     {
         Map<String, byte[]> customParams = message.header.customParams();
         return customParams != null && customParams.containsKey(ReadCommand.NON_STRICT_FILTERING_PARAM);
+    }
+
+    /**
+     * Whether the coordinator of a read asks the replicas for its static candidates with
+     * {@link ReadCommand#STATIC_CANDIDATES_PARAM}. Other coordinators, including Apache Cassandra's and earlier
+     * DataStax releases, don't send the parameter and get strict filtering.
+     */
+    @VisibleForTesting
+    static boolean coordinatorAsksForStaticCandidates(Message<ReadCommand> message)
+    {
+        Map<String, byte[]> customParams = message.header.customParams();
+        return customParams != null && customParams.containsKey(ReadCommand.STATIC_CANDIDATES_PARAM);
     }
 
     private void validateTransientStatus(Message<ReadCommand> message)

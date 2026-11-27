@@ -171,12 +171,12 @@ public class StaticFilterRowSelectionCasesTest extends TestBaseImpl
         { "X13", "st = 5 OR v = 1", "3,5",
           "1: INSERT INTO %s (pk, st, sx) VALUES ($PK, 5, 1) USING TIMESTAMP 1", "1: " + row(1, 2, 1), "1: " + row(2, 1, 1), "1: " + row(4, 2, 1),
           "23: " + st(0, 2), "23: " + del(2, 3), "23: " + row(3, 1, 1), "23: " + row(5, 1, 1) },
-        // the static row that matches is newer on two nodes; the last row is on the third alone (see KNOWN_GAPS)
+        // the static row that matches is newer on two nodes; the last row is on the third alone (see KNOWN_GAPS for
+        // indexes)
         { "X14", "st = 5 AND v = 1", "1,2,3",
           "1: " + ST0, "1: " + row(1, 1, 1), "1: " + row(3, 1, 1), "23: " + st(5, 2), "23: " + row(2, 1, 1) },
-        // a match split between replicas under an AND. X9: the only static row is on a replica that returns nothing
-        // (see KNOWN_GAPS); X10: the two static columns of the AND are newer on different replicas
-        // (see KNOWN_GAP_CASES)
+        // a match split between replicas under an AND. X9: the only static row is on a replica without matching rows;
+        // X10: the two static columns of the AND are newer on different replicas (see KNOWN_GAP_CASES)
         { "X9", "(st = 5 AND v = 1) OR v = 2", "1,2",
           "1: INSERT INTO %s (pk, st) VALUES ($PK, 5) USING TIMESTAMP 1", "2: " + row(1, 1, 1), "2: " + row(2, 2, 1) },
         { "X10", "(st = 5 AND sx = 5) OR v = 1", "1,2",
@@ -194,27 +194,25 @@ public class StaticFilterRowSelectionCasesTest extends TestBaseImpl
     };
 
     /**
-     * Paged reads without a LIMIT, pinned (with indexes the right rows are accepted too): a page whose match only
-     * replicas that return nothing have is not completed by replica filtering protection.
+     * Paged reads without a LIMIT, pinned (with indexes the right rows are accepted too), on both tables unless a table
+     * is given: a page whose match needs the rows of several replicas that only return the static row isn't completed
+     * by replica filtering protection, and the indexes of strict replicas don't return a partition for its static row.
      */
     private static final String[][] KNOWN_GAPS = {
         // the split row is first in clustering order, so alone on the last page in reverse order
         { "X1d", "DESC", "1", "2" },
         { "X2c", "DESC", "1", "2" },
-        // row 1 is alone on the last page in reverse order: node 2 doesn't return it without the static row of node 1
-        { "X9", "DESC", "1", "2" },
-        { "X14", "ASC", "1", "1,2" },
-        { "X14", "ASC", "2", "1,2" },
-        { "X14", "DESC", "1", "3,2" },
-        { "X14", "DESC", "2", "3,2" },
+        { "X14", "ASC", "1", "1,2", "indexed" },
+        { "X14", "ASC", "2", "1,2", "indexed" },
     };
 
-    private static List<String> knownGap(String testCase, String query, int pageSize)
+    private static List<String> knownGap(String testCase, String table, String query, int pageSize)
     {
         if (query.contains("LIMIT"))
             return null;
         for (String[] gap : KNOWN_GAPS)
-            if (gap[0].equals(testCase) && gap[1].equals(query.contains(" DESC") ? "DESC" : "ASC") && Integer.parseInt(gap[2]) == pageSize)
+            if (gap[0].equals(testCase) && gap[1].equals(query.contains(" DESC") ? "DESC" : "ASC") && Integer.parseInt(gap[2]) == pageSize
+                && (gap.length < 5 || gap[4].equals(table)))
                 return Arrays.asList(gap[3].split(","));
         return null;
     }
@@ -301,7 +299,7 @@ public class StaticFilterRowSelectionCasesTest extends TestBaseImpl
                     {
                         String select = "SELECT pk, ck FROM " + KEYSPACE + '.' + table + " WHERE " + query + " ALLOW FILTERING";
                         List<String> actual = rows(cluster, select, pageSize, c);
-                        List<String> gap = gapOfCase != null ? gapOfCase : knownGap(testCase[0], query, pageSize);
+                        List<String> gap = gapOfCase != null ? gapOfCase : knownGap(testCase[0], table, query, pageSize);
                         boolean rightAccepted = table.equals("indexed") || !query.startsWith("pk = ");
                         boolean right = gap == null ? actual.equals(expected)
                                                     : actual.equals(gap) || (rightAccepted && actual.equals(expected));

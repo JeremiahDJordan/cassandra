@@ -94,6 +94,8 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         this.lastQueried = command.limits().count() != DataLimits.NO_LIMIT
                            ? command.limits().count()
                            : command.limits().perPartitionCount();
+        if (lastQueried == DataLimits.NO_LIMIT)
+            lastQueried = command.limits().rows();
     }
 
     @Override
@@ -210,6 +212,9 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         int toQuery = command.limits().count() != DataLimits.NO_LIMIT
                       ? command.limits().count() - mergedResultCounter.counted()
                       : command.limits().perPartitionCount();
+        // a GROUP BY without a limit has no number of groups to aim for: ask for as many rows as the read's row limit
+        if (toQuery == DataLimits.NO_LIMIT)
+            toQuery = command.limits().rows();
         toQuery = ShortReadProtection.fetchSize(command, toQuery, lastQueried);
         lastQueried = toQuery;
 

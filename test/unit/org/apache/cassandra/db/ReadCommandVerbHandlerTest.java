@@ -176,6 +176,23 @@ public class ReadCommandVerbHandlerTest
         }
     }
 
+    /**
+     * Replicas return static candidates only to coordinators that ask for them with the custom message parameter.
+     */
+    @Test
+    public void coordinatorAsksForStaticCandidatesOnlyWithTheParameter() throws IOException
+    {
+        ReadCommand command = new TrackingSinglePartitionReadCommand(metadata);
+
+        Message<ReadCommand> withoutParam = Message.builder(READ_REQ, command).from(peer()).withId(messageId()).build();
+        assertFalse(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(withoutParam));
+        Message<ReadCommand> withParam = ReadCommand.withStaticCandidatesParam(ReadCommand.withNonStrictFilteringParam(withoutParam));
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(withParam));
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withParam));
+        assertFalse(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(ReadCommand.withNonStrictFilteringParam(withoutParam)));
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(serializeRoundTrip(withParam)));
+    }
+
     private static Message<ReadCommand> serializeRoundTrip(Message<ReadCommand> message) throws IOException
     {
         int version = MessagingService.current_version;

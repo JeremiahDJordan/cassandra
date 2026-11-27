@@ -528,6 +528,20 @@ Upgrading
       queries with a limit, a page size or a per-partition limit read their partition in steps instead. Replica
       filtering protection can also read a whole partition from a replica whose static row is older than the other
       replicas', even when that replica's index already returned the matching rows.
+    - Filtering queries at consistency levels that need reconciliation that restrict a static column and a
+      clustering or regular column, without an index, no longer miss the rows whose match needs the static row of
+      one replica and the rows of another, such as the rows after a page that ends with the last matching row of the
+      replica that has the static value. Coordinators of this release ask the replicas, with the
+      "ds.static.candidates" message parameter, for the static row of each partition whose static row matches a
+      static restriction but none of whose rows do; the replicas count these partitions as rows in their limits, and
+      the coordinator asks for more rows where a replica stopped at its limit, also when it reads a single replica.
+      Pages over many partitions that match only the static restriction take more round trips, and these queries run
+      short read protection more often: about 4 times slower in a test over 80,000 such partitions with 800 matching
+      rows. Replicas of earlier releases, and coordinators of earlier releases or of Apache Cassandra, read these
+      queries as before. SAI queries and queries served by a legacy index are unchanged. SERIAL and LOCAL_SERIAL
+      reads with paxos_variant v2 are unchanged. With repaired_data_tracking_for_range_reads_enabled, these queries
+      can report repaired data mismatches between replicas of this release and of earlier releases during an
+      upgrade.
     - To take fewer round trips, short read protection asks the replicas of filtering queries for twice as many rows
       as the previous time, up to 4096 rows per request whatever their size, and each request also stops at the byte
       limit of the read, if it has one (a page size in bytes, or the page weight guardrail). This applies to the

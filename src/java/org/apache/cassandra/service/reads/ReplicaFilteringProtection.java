@@ -404,12 +404,30 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
             if (command.rowFilter().hasStaticExpression())
             {
+                fetchWhereOnlyStaticRowIsReturned();
                 fetchWhereStaticRowIsStricter();
                 completeFetchedPartitions();
             }
 
             for (int i = 0; i < sources.size(); i++)
                 originalPartitions.get(i).add(builders.get(i));
+        }
+
+        /**
+         * Fetches the entire partition from each replica that returned it without rows while another replica returned
+         * rows of it. A read that returns static candidates gets a partition without matching rows as its static row
+         * alone from a replica whose static row satisfies a static expression (see ReadCommand#returnsStaticCandidates),
+         * and that replica can still have rows that match with the columns of other replicas, which it would have been
+         * read for in full had it returned nothing.
+         */
+        private void fetchWhereOnlyStaticRowIsReturned()
+        {
+            if (!command.returnsStaticCandidates() || !Iterables.any(builders, builder -> builder.returnedRows))
+                return;
+
+            for (PartitionBuilder builder : builders)
+                if (builder.returnedPartition && !builder.returnedRows)
+                    builder.fetchEntirePartition();
         }
 
         /**
@@ -828,6 +846,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         private boolean unresolvedStatic = false;
         private ReadResponse fetched;
         private final boolean returnedPartition;
+        private boolean returnedRows;
 
         private PartitionBuilder(DecoratedKey key, Replica source, RegularAndStaticColumns columns, EncodingStats stats, boolean returned)
         {
@@ -860,6 +879,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             }
             else
             {
+                returnedRows = true;
                 addReopenMarker();
                 contents.add(row);
             }
