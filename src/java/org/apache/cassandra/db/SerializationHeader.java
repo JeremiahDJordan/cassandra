@@ -73,6 +73,8 @@ public class SerializationHeader
 
     private final Map<ByteBuffer, AbstractType<?>> typeMap;
 
+    private volatile DropTimes dropTimes;
+
     private SerializationHeader(boolean isForSSTable,
                                 AbstractType<?> keyType,
                                 List<AbstractType<?>> clusteringTypes,
@@ -144,6 +146,74 @@ public class SerializationHeader
     public RegularAndStaticColumns columns()
     {
         return columns;
+    }
+
+    /**
+     * Whether a column of this header that {@code filter} does not fetch, although it fetches all columns, has a drop
+     * record in {@code metadata} with a drop time before {@code timestamp}, so that data at or before
+     * {@code timestamp} can have cells of it that are newer than the drop.
+     */
+    public boolean hasDroppedColumnNotFetched(TableMetadata metadata, long timestamp, ColumnFilter filter)
+    {
+        DropTimes times = dropTimes(metadata);
+        if (times == null || times.earliest >= timestamp)
+            return false;
+
+        for (int i = 0; i < times.columns.length; i++)
+        {
+            ColumnMetadata column = times.columns[i];
+            if (times.droppedTimes[i] < timestamp
+                && filter.fetchesAllColumns(column.isStatic())
+                && !filter.fetchedColumns().contains(column))
+                return true;
+        }
+        return false;
+    }
+
+    /**
+     * The drop times of the columns of this header that have a drop record in {@code metadata}, or null if there are
+     * none. Computed once for each table metadata instance.
+     */
+    private DropTimes dropTimes(TableMetadata metadata)
+    {
+        if (metadata.droppedColumns.isEmpty())
+            return null;
+
+        DropTimes times = dropTimes;
+        if (times == null || times.metadata != metadata)
+            dropTimes = times = new DropTimes(metadata, columns);
+        return times.any ? times : null;
+    }
+
+    private static final class DropTimes
+    {
+        final TableMetadata metadata;
+        final boolean any;
+        final ColumnMetadata[] columns;
+        final long[] droppedTimes;
+        final long earliest;
+
+        DropTimes(TableMetadata metadata, RegularAndStaticColumns columns)
+        {
+            List<ColumnMetadata> withDrop = new ArrayList<>();
+            for (ColumnMetadata column : columns)
+            {
+                if (metadata.droppedColumns.containsKey(column.name.bytes))
+                    withDrop.add(column);
+            }
+
+            this.metadata = metadata;
+            this.any = !withDrop.isEmpty();
+            this.columns = withDrop.toArray(new ColumnMetadata[0]);
+            this.droppedTimes = new long[this.columns.length];
+            long earliest = Long.MAX_VALUE;
+            for (int i = 0; i < this.columns.length; i++)
+            {
+                droppedTimes[i] = metadata.droppedColumns.get(this.columns[i].name.bytes).droppedTime;
+                earliest = Math.min(earliest, droppedTimes[i]);
+            }
+            this.earliest = earliest;
+        }
     }
 
     public boolean hasStatic()
