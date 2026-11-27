@@ -36,6 +36,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -212,16 +213,16 @@ public class AbstractTypeTest
         dse68cndbTypesCompatibility.assertLoaded();
 
         // test whether this patch version is compatible with the last release for which the compatibility file was created
-        testBackwardCompatibility(currentTypesCompatibility, cc40TypesCompatibility);
+        testBackwardCompatibility(currentTypesCompatibility, cc40TypesCompatibility, t -> true, t -> true, true);
         // test whether we can downgrade to the last release for which the compatibility file was created
         testBackwardCompatibility(cc40TypesCompatibility, currentTypesCompatibility);
 
         // test the mutual compatibility between this and DSE
-        testBackwardCompatibility(currentTypesCompatibility, dse68cndbTypesCompatibility, t -> t != VectorType.class && t != DateRangeType.class, t -> ! ((t instanceof VectorType) || (t instanceof DateRangeType)));
+        testBackwardCompatibility(currentTypesCompatibility, dse68cndbTypesCompatibility, t -> t != VectorType.class && t != DateRangeType.class, t -> ! ((t instanceof VectorType) || (t instanceof DateRangeType)), true);
         testBackwardCompatibility(dse68cndbTypesCompatibility, currentTypesCompatibility, t -> t != VectorType.class && t != DateRangeType.class, t -> ! ((t instanceof VectorType) || (t instanceof DateRangeType)));
 
         // test mutual compatibility between this and legacy CC
-        testBackwardCompatibility(currentTypesCompatibility, legacyCC40TypesCompatibility, t -> t != VectorType.class, t -> ! (t instanceof VectorType));
+        testBackwardCompatibility(currentTypesCompatibility, legacyCC40TypesCompatibility, t -> t != VectorType.class, t -> ! (t instanceof VectorType), true);
         testBackwardCompatibility(legacyCC40TypesCompatibility, currentTypesCompatibility, t -> t != VectorType.class, t -> ! (t instanceof VectorType));
     }
 
@@ -243,7 +244,26 @@ public class AbstractTypeTest
 
     public void testBackwardCompatibility(TypesCompatibility upgradeTo, TypesCompatibility upgradeFrom, Predicate<Class<? extends AbstractType>> classFilter, Predicate<AbstractType<?>> typeFilter)
     {
+        testBackwardCompatibility(upgradeTo, upgradeFrom, classFilter, typeFilter, false);
+    }
+
+    /**
+     * @param multiCellValuesMustBeSerializationCompatible whether {@code upgradeTo} is deliberately stricter than
+     *                                                     {@code upgradeFrom} for non-frozen collections, see
+     *                                                     {@link #isMultiCellValuesDifference}
+     */
+    public void testBackwardCompatibility(TypesCompatibility upgradeTo, TypesCompatibility upgradeFrom, Predicate<Class<? extends AbstractType>> classFilter, Predicate<AbstractType<?>> typeFilter, boolean multiCellValuesMustBeSerializationCompatible)
+    {
         SoftAssertions assertions = new SoftAssertionsWithLimit(100);
+        AtomicInteger multiCellValuesDifferences = new AtomicInteger();
+        Predicate<Boolean> expectedDifference = isDifference -> {
+            if (multiCellValuesMustBeSerializationCompatible && isDifference)
+            {
+                multiCellValuesDifferences.incrementAndGet();
+                return true;
+            }
+            return false;
+        };
 
         assertions.assertThat(upgradeTo.knownTypes().stream().filter(classFilter).collect(Collectors.toSet())).containsAll(upgradeFrom.knownTypes().stream().filter(classFilter).collect(Collectors.toSet()));
         assertions.assertThat(upgradeTo.primitiveTypes().stream().filter(typeFilter).collect(Collectors.toSet())).containsAll(upgradeFrom.primitiveTypes().stream().filter(typeFilter).collect(Collectors.toSet()));
@@ -255,15 +275,36 @@ public class AbstractTypeTest
             if (typeFilter.test(l) && typeFilter.test(r))
             {
                 if (upgradeFrom.expectCompatibleWith(l, r))
-                    assertions.assertThat(upgradeTo.expectCompatibleWith(l, r)).describedAs(isCompatibleWithDesc(l, r)).isTrue();
+                    assertions.assertThat(upgradeTo.expectCompatibleWith(l, r) || expectedDifference.test(isMultiCellValuesDifference(l, r))).describedAs(isCompatibleWithDesc(l, r)).isTrue();
             if (upgradeFrom.expectSerializationCompatibleWith(l, r))
                 assertions.assertThat(upgradeTo.expectSerializationCompatibleWith(l, r)).describedAs(isSerializationCompatibleWithDesc(l, r)).isTrue();
                 if (upgradeFrom.expectValueCompatibleWith(l, r))
-                    assertions.assertThat(upgradeTo.expectValueCompatibleWith(l, r)).describedAs(isValueCompatibleWithDesc(l, r)).isTrue();
+                    assertions.assertThat(upgradeTo.expectValueCompatibleWith(l, r) || expectedDifference.test(isMultiCellValuesDifference(l, r))).describedAs(isValueCompatibleWithDesc(l, r)).isTrue();
             }
         });
 
+        if (multiCellValuesMustBeSerializationCompatible)
+            assertions.assertThat(multiCellValuesDifferences.get()).describedAs("non-frozen collection differences between %s and %s", upgradeFrom, upgradeTo).isPositive();
+
         assertions.assertAll();
+    }
+
+    /**
+     * Whether the only reason the two non-frozen collections are not compatible is that the values of a non-frozen
+     * collection must be serialization-compatible, not only value-compatible, because a fixed-length and a
+     * variable-length type are framed differently in a cell ({@link CollectionType#isCompatibleWhenNonFrozenWith}).
+     * DataStax 4.0 releases before CASSANDRA-16905 only required value compatibility.
+     */
+    private static boolean isMultiCellValuesDifference(AbstractType<?> left, AbstractType<?> right)
+    {
+        if (!(left instanceof CollectionType) || !left.isMultiCell() || !right.isMultiCell() || left.getClass() != right.getClass())
+            return false;
+
+        CollectionType<?> l = (CollectionType<?>) left;
+        CollectionType<?> r = (CollectionType<?>) right;
+        return l.nameComparator().isCompatibleWith(r.nameComparator())
+               && l.valueComparator().isValueCompatibleWith(r.valueComparator())
+               && !l.valueComparator().isSerializationCompatibleWith(r.valueComparator());
     }
 
     @Test
