@@ -437,7 +437,7 @@ public class BigTableReader extends SSTableReaderWithFilter implements IndexSumm
     @Override
     public long estimatedKeys()
     {
-        return indexSummary.getEstimatedKeyCount();
+        return indexSummary == null ? 0 : indexSummary.getEstimatedKeyCount();
     }
 
     /**
