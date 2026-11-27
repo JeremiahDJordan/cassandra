@@ -711,7 +711,7 @@ public class TableMetricsTest
             for (ColumnFamilyStore cfs : toPause)
             {
                 successfullyPaused.ensureCapacity(successfullyPaused.size() + 1); // to avoid OOM after pausing the strategies
-                cfs.getCompactionStrategyManager().pause();
+                cfs.getCompactionStrategy().pause();
                 successfullyPaused.add(cfs);
             }
             return () -> maybeFail(resumeAll(null, toPause));
@@ -729,7 +729,7 @@ public class TableMetricsTest
         {
             try
             {
-                cfs.getCompactionStrategyManager().resume();
+                cfs.getCompactionStrategy().resume();
             }
             catch (Throwable t)
             {
