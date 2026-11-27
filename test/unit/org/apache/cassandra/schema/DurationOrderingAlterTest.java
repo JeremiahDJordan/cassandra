@@ -38,7 +38,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  * Tests that a table with an existing duration where values are sorted (see
  * {@link org.apache.cassandra.db.marshal.AbstractType#hasSortedDuration}), as Apache Cassandra or nodes
  * before CNDB-9753 created it, can still be altered, as can its keyspace and the types it uses, while a schema change
- * that would give another column such a duration is still rejected.
+ * that would add such a duration to a column is still rejected.
  */
 public class DurationOrderingAlterTest extends CQLTester
 {
@@ -77,11 +77,15 @@ public class DurationOrderingAlterTest extends CQLTester
         String keyspace = createKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}");
         execute(String.format("CREATE TYPE %s.unrelated (a int)", keyspace));
         execute(String.format("CREATE TYPE %s.with_duration (d duration, i int)", keyspace));
+        execute(String.format("CREATE TYPE %s.in_tuple_with_duration (a int)", keyspace));
+        execute(String.format("CREATE TYPE %s.clustering_with_duration (d duration)", keyspace));
         execute(String.format("CREATE TYPE %s.in_clustering (a int)", keyspace));
         execute(String.format("CREATE TYPE %s.in_set (a int)", keyspace));
         execute(String.format("CREATE TYPE %s.in_regular (a int)", keyspace));
         createTableFromPeer(keyspace, COLUMNS);
         createTableFromPeer(keyspace, "pk int PRIMARY KEY, s set<frozen<with_duration>>");
+        createTableFromPeer(keyspace, "pk int PRIMARY KEY, s set<frozen<tuple<duration, frozen<in_tuple_with_duration>>>>");
+        createTableFromPeer(keyspace, "pk int, ck frozen<clustering_with_duration>, PRIMARY KEY (pk, ck)");
         execute(String.format("CREATE TABLE %s.t_clustering (pk int, ck frozen<in_clustering>, PRIMARY KEY (pk, ck))", keyspace));
         execute(String.format("CREATE TABLE %s.t_set (pk int PRIMARY KEY, s set<frozen<in_set>>)", keyspace));
         execute(String.format("CREATE TABLE %s.t_regular (pk int PRIMARY KEY, r frozen<in_regular>)", keyspace));
@@ -90,9 +94,16 @@ public class DurationOrderingAlterTest extends CQLTester
         execute(String.format("ALTER TYPE %s.unrelated ADD b int", keyspace));
         execute(String.format("ALTER TYPE %s.unrelated RENAME a TO c", keyspace));
 
-        // The type of a column that already has a duration where values are sorted
+        // The type of a column that already has a duration where values are sorted, but not another such duration
         execute(String.format("ALTER TYPE %s.with_duration ADD e int", keyspace));
-        execute(String.format("ALTER TYPE %s.with_duration ADD f duration", keyspace));
+        assertThatThrownBy(() -> execute(String.format("ALTER TYPE %s.with_duration ADD f duration", keyspace)))
+        .hasMessageContaining(DURATION_ERROR + " within non-frozen sets");
+        execute(String.format("ALTER TYPE %s.in_tuple_with_duration ADD b int", keyspace));
+        assertThatThrownBy(() -> execute(String.format("ALTER TYPE %s.in_tuple_with_duration ADD d duration", keyspace)))
+        .hasMessageContaining(DURATION_ERROR + " within non-frozen sets");
+        execute(String.format("ALTER TYPE %s.clustering_with_duration ADD i int", keyspace));
+        assertThatThrownBy(() -> execute(String.format("ALTER TYPE %s.clustering_with_duration ADD e duration", keyspace)))
+        .hasMessageContaining(DURATION_ERROR + " within PRIMARY KEY columns");
 
         // A duration where values are sorted would be new for these columns
         assertThatThrownBy(() -> execute(String.format("ALTER TYPE %s.in_clustering ADD d duration", keyspace)))
@@ -105,7 +116,9 @@ public class DurationOrderingAlterTest extends CQLTester
 
         Types types = Schema.instance.getKeyspaceMetadata(keyspace).types;
         assertThat(types.getNullable(bytes("unrelated")).fieldNames()).hasSize(2);
-        assertThat(types.getNullable(bytes("with_duration")).fieldNames()).hasSize(4);
+        assertThat(types.getNullable(bytes("with_duration")).fieldNames()).hasSize(3);
+        assertThat(types.getNullable(bytes("in_tuple_with_duration")).fieldNames()).hasSize(2);
+        assertThat(types.getNullable(bytes("clustering_with_duration")).fieldNames()).hasSize(2);
         assertThat(types.getNullable(bytes("in_clustering")).fieldNames()).hasSize(1);
         assertThat(types.getNullable(bytes("in_set")).fieldNames()).hasSize(1);
         assertThat(types.getNullable(bytes("in_regular")).fieldNames()).hasSize(2);
