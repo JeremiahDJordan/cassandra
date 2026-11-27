@@ -551,6 +551,50 @@ public class BackgroundCompactionRunnerTest
         assertThat(runner.getMarkedCFSs()).contains(cfs);
     }
 
+    // a failure to create an upgrade task fails the request and releases the upgrade slot and the transaction
+    @Test
+    public void handleUpgradeTaskFailure() throws Exception
+    {
+        SSTableReader sstable = mock(SSTableReader.class);
+        Tracker tracker = mock(Tracker.class);
+        LifecycleTransaction txn = mock(LifecycleTransaction.class);
+        when(cfs.getCandidatesForUpgrade()).thenReturn(Collections.singletonList(sstable));
+        when(cfs.getTracker()).thenReturn(tracker);
+        when(tracker.tryModify(sstable, OperationType.UPGRADE_SSTABLES)).thenReturn(txn);
+        when(compactionStrategy.createCompactionTask(same(txn), anyLong(), anyLong())).thenThrow(new IllegalStateException("upgrade failure"));
+
+        Promise<RequestResult> result = runner.markForCompactionCheck(cfs);
+        capturedCheckRunnables.getValue().run();
+
+        assertThatThrownBy(() -> result.get()).hasCauseInstanceOf(IllegalStateException.class);
+        verify(txn).abort(notNull());
+        verifyState(0, 0);
+    }
+
+    // a strategy that fails to give its tasks fails the request, and the check goes on with the other CFSs
+    @Test
+    public void handleStrategyFailure() throws Exception
+    {
+        ColumnFamilyStore otherCfs = mock(ColumnFamilyStore.class);
+        CompactionStrategy otherStrategy = mock(CompactionStrategy.class);
+        when(otherCfs.isValid()).thenReturn(true);
+        when(otherCfs.isCompactionActive()).thenReturn(true);
+        when(otherCfs.getCompactionStrategy()).thenReturn(otherStrategy);
+        when(otherCfs.getCandidatesForUpgrade()).thenReturn(Lists.emptyList());
+        when(otherStrategy.getNextBackgroundTasks(anyLong())).thenReturn(Lists.emptyList());
+        when(compactionStrategy.getNextBackgroundTasks(anyLong())).thenThrow(new IllegalStateException("strategy failure"));
+
+        Promise<RequestResult> result = runner.markForCompactionCheck(cfs);
+        Promise<RequestResult> otherResult = runner.markForCompactionCheck(otherCfs);
+        capturedCheckRunnables.getValue().run();
+
+        assertThatThrownBy(() -> result.get()).hasCauseInstanceOf(IllegalStateException.class);
+        assertThat(otherResult).isDone();
+        assertThat(otherResult.get()).isEqualTo(RequestResult.NOT_NEEDED);
+        assertThat(runner.getMarkedCFSs()).isEmpty();
+        verifyState(0, 0);
+    }
+
     // handling task interruption
     @Test
     public void handleTaskInterruption() throws Exception
