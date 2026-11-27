@@ -296,9 +296,19 @@ public class BackgroundCompactionRunner implements Runnable
 
             logger.trace("Running a background task check for {} with {}", cfs, cfs.getCompactionStrategy().getName());
 
-            CompletableFuture<Void> compactionTasks = startCompactionTasks(cfs);
-            if (compactionTasks == null)
-                compactionTasks = startUpgradeTasks(cfs);
+            CompletableFuture<Void> compactionTasks;
+            try
+            {
+                compactionTasks = startCompactionTasks(cfs);
+                if (compactionTasks == null)
+                    compactionTasks = startUpgradeTasks(cfs);
+            }
+            catch (Throwable t)
+            {
+                handleCompactionError(t, cfs);
+                promise.completeExceptionallyInternal(t);
+                continue;
+            }
 
             if (compactionTasks != null)
             {
@@ -468,15 +478,26 @@ public class BackgroundCompactionRunner implements Runnable
 
         if (ongoingUpgrades.incrementAndGet() <= DatabaseDescriptor.maxConcurrentAutoUpgradeTasks())
         {
-            List<SSTableReader> potentialUpgrade = cfs.getCandidatesForUpgrade();
-            for (SSTableReader sstable : potentialUpgrade)
+            LifecycleTransaction txn = null;
+            try
             {
-                LifecycleTransaction txn = cfs.getTracker().tryModify(sstable, OperationType.UPGRADE_SSTABLES);
-                if (txn != null)
+                List<SSTableReader> potentialUpgrade = cfs.getCandidatesForUpgrade();
+                for (SSTableReader sstable : potentialUpgrade)
                 {
-                    logger.debug("Found tasks for automatic sstable upgrade of {}", sstable);
-                    return cfs.getCompactionStrategy().createCompactionTask(txn, Integer.MIN_VALUE, Long.MAX_VALUE);
+                    txn = cfs.getTracker().tryModify(sstable, OperationType.UPGRADE_SSTABLES);
+                    if (txn != null)
+                    {
+                        logger.debug("Found tasks for automatic sstable upgrade of {}", sstable);
+                        return cfs.getCompactionStrategy().createCompactionTask(txn, Integer.MIN_VALUE, Long.MAX_VALUE);
+                    }
                 }
+            }
+            catch (Throwable t)
+            {
+                ongoingUpgrades.decrementAndGet();
+                if (txn != null)
+                    txn.abort(t);
+                throw t;
             }
         }
         else
