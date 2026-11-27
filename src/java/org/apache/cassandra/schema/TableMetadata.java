@@ -500,7 +500,20 @@ public class TableMetadata implements SchemaElement
         return false;
     }
 
-    public void validate()
+    public final void validate()
+    {
+        validate(null);
+    }
+
+    /**
+     * Validates this table as the result of a schema change.
+     *
+     * @param previous the table before the schema change (the base table for a new view), or {@code null} for a new
+     *                 table. A column that has durations where values are sorted in {@code previous} can keep them, so
+     *                 that such a table, its keyspace and its types can still be altered; it cannot get another one,
+     *                 and new columns cannot have one.
+     */
+    public void validate(@Nullable TableMetadata previous)
     {
         KeyspaceMetadata.validateKeyspaceName(keyspace, this::prepareConfigurationException);
 
@@ -508,7 +521,15 @@ public class TableMetadata implements SchemaElement
 
         params.validate();
 
-        columns().forEach(c -> c.validate(isCounter()));
+        for (ColumnMetadata column : columns())
+        {
+            ColumnMetadata before = previous == null ? null : previous.getColumn(column.name);
+            boolean keepsSortedDurations = before != null
+                                           && before.isPrimaryKeyColumn() == column.isPrimaryKeyColumn()
+                                           && column.type.sortedDurations(column.isPrimaryKeyColumn())
+                                              <= before.type.sortedDurations(before.isPrimaryKeyColumn());
+            column.validate(isCounter(), keepsSortedDurations);
+        }
 
         // All tables should have a partition key
         if (partitionKeyColumns.isEmpty())
@@ -1804,9 +1825,10 @@ public class TableMetadata implements SchemaElement
             return compactValueColumn.type instanceof EmptyType;
         }
 
-        public void validate()
+        @Override
+        public void validate(@Nullable TableMetadata previous)
         {
-            super.validate();
+            super.validate(previous);
 
             // A compact table should always have a clustering
             if (!Flag.isCQLTable(flags) && clusteringColumns.isEmpty())
