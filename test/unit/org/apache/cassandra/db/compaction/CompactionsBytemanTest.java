@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -205,6 +206,54 @@ public class CompactionsBytemanTest extends CQLTester
         Util.spinAssertEquals(true, () -> cfs.getCompactingSSTables().size() == 0, 5);
         FBUtilities.waitOnFuture(CompactionManager.instance.submitBackground(cfs));
         assertEquals(0, CompactionManager.instance.getOngoingBackgroundCompactionsCount());
+    }
+
+    static volatile String FAIL_COMPACTIONS_OF_TABLE;
+    static final AtomicInteger FAILED_COMPACTIONS = new AtomicInteger();
+
+    public static boolean failCompaction(String table)
+    {
+        if (!table.equals(FAIL_COMPACTIONS_OF_TABLE))
+            return false;
+        FAILED_COMPACTIONS.incrementAndGet();
+        return true;
+    }
+
+    @Test
+    @BMRule(name = "Fail compaction tasks",
+            targetClass = "CompactionTask",
+            targetMethod = "runMayThrow",
+            targetLocation = "AT ENTRY",
+            condition = "org.apache.cassandra.db.compaction.CompactionsBytemanTest.failCompaction($0.realm.getTableName())",
+            action = "throw new java.lang.IllegalStateException(\"Injected compaction failure\")")
+    public void testFailedBackgroundCompactionBacksOff() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k INT, c INT, v INT, PRIMARY KEY (k, c)) WITH compaction = {'class':'UnifiedCompactionStrategy', 'num_shards':'1'}");
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        cfs.disableAutoCompaction();
+        for (int i = 0; i < 4; i++)
+        {
+            execute("INSERT INTO %s (k, c, v) VALUES (?, ?, ?)", 0, i, i);
+            Util.flush(cfs);
+        }
+
+        FAILED_COMPACTIONS.set(0);
+        FAIL_COMPACTIONS_OF_TABLE = currentTable();
+        try
+        {
+            cfs.enableAutoCompaction(false);
+            Util.spinAssertEquals(true, () -> FAILED_COMPACTIONS.get() > 0, 5);
+            FBUtilities.sleepQuietly(2000);
+            // a check can still pick the SSTables between the failure and the start of the backoff
+            assertTrue("Failed compactions: " + FAILED_COMPACTIONS.get(), FAILED_COMPACTIONS.get() <= 2);
+        }
+        finally
+        {
+            FAIL_COMPACTIONS_OF_TABLE = null;
+        }
+
+        // the compaction is retried when the backoff ends
+        Util.spinAssertEquals(1, () -> cfs.getLiveSSTables().size(), (int) BackgroundCompactionRunner.FAILURE_BACKOFF_SECONDS + 10);
     }
 
     private void createPossiblyExpiredSSTable(final ColumnFamilyStore cfs, final boolean expired) throws Throwable

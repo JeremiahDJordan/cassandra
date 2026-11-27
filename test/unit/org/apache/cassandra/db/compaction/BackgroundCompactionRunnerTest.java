@@ -543,6 +543,33 @@ public class BackgroundCompactionRunnerTest
 
         // another check should be schedued upon task completion
         verifyCFSWasMarkedForCompaction();
+
+        // but it should not look for new tasks for that CFS until the backoff ends
+        clearInvocations(compactionStrategy);
+        capturedCheckRunnables.getValue().run();
+        verify(compactionStrategy, never()).getNextBackgroundTasks(anyLong());
+        assertThat(runner.getMarkedCFSs()).contains(cfs);
+    }
+
+    // handling task interruption
+    @Test
+    public void handleTaskInterruption() throws Exception
+    {
+        Promise<RequestResult> result = markCFSAndRunCheck();
+        clearInvocations(checkExecutor);
+
+        doThrow(new CompactionInterruptedException("test", TableOperation.StopTrigger.UNIT_TESTS)).when(compactionTasks.get(0)).execute(activeOperations);
+        capturedCompactionRunnables.getValue().run();
+
+        // so we expect that:
+        assertThatThrownBy(() -> result.get()).isInstanceOf(ExecutionException.class);
+        verifyState(0, 0);
+        verifyCFSWasMarkedForCompaction();
+
+        // and the next check should look for new tasks for that CFS at once
+        clearInvocations(compactionStrategy);
+        capturedCheckRunnables.getValue().run();
+        verify(compactionStrategy).getNextBackgroundTasks(anyLong());
     }
 
     @Test
