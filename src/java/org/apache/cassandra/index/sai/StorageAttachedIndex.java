@@ -351,7 +351,8 @@ public class StorageAttachedIndex implements Index
     public static final Object SAME_NAME_FILES_LOCK = new Object();
 
     /** How many times the initial build of an index builds the sstables it missed, see buildSSTablesMissedByInitialBuild. */
-    private static final int MAX_BUILDS_OF_MISSED_SSTABLES = 10;
+    @VisibleForTesting
+    static final int MAX_BUILDS_OF_MISSED_SSTABLES = 10;
 
     /**
      * The compactions that the initial build of an index stops, and waits for, before it selects the sstables to build:
@@ -1150,7 +1151,7 @@ public class StorageAttachedIndex implements Index
         if (group == null || !group.containsIndex(this))
             return;
 
-        for (int attempt = 0; attempt < MAX_BUILDS_OF_MISSED_SSTABLES; attempt++)
+        for (int builds = 0; ; builds++)
         {
             // Usually, every sstable is in the view: don't reload the index on all of them to find that out.
             View view = indexContext.getView();
@@ -1159,6 +1160,8 @@ public class StorageAttachedIndex implements Index
                 anyMissing |= !view.containsSSTableIndex(sstable.descriptor) && !sstable.isMarkedCompacted();
             if (!anyMissing)
                 return;
+            if (builds == MAX_BUILDS_OF_MISSED_SSTABLES)
+                throw new IllegalStateException(indexContext.logMessage("SSTables are still without this index after its initial build"));
 
             List<SSTableReader> nonIndexed = findNonIndexedSSTables(baseCfs, group, false);
             if (nonIndexed.isEmpty() || !group.containsIndex(this))
@@ -1168,7 +1171,6 @@ public class StorageAttachedIndex implements Index
                         nonIndexed.size(), nonIndexed.stream().map(sstable -> sstable.descriptor).collect(Collectors.toList()));
             buildSSTables(group, nonIndexed);
         }
-        throw new IllegalStateException(indexContext.logMessage("SSTables are still without this index after its initial build"));
     }
 
     /**
