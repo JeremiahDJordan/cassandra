@@ -136,9 +136,9 @@ public class SchemaCQLHelperTest extends CQLTester
 
         assertEquals(typeStatements, SchemaCQLHelper.getUserTypesAsCQL(cfs.metadata(), cfs.keyspace.getMetadata().types, true).collect(Collectors.toList()));
 
-        List<String> allStatements = SchemaCQLHelper.reCreateStatementsForSchemaCql(cfm, Types.of(userTypes)).collect(Collectors.toList());
+        List<String> allStatements = SchemaCQLHelper.reCreateStatementsForSchemaCql(cfm, cfs.keyspace.getMetadata()).collect(Collectors.toList());
 
-        String createTableStatement = SchemaCQLHelper.getTableMetadataAsCQL(cfm, true, true, true);
+        String createTableStatement = SchemaCQLHelper.getTableMetadataAsCQL(cfm, true, true, true, cfs.keyspace.getMetadata());
 
         assertEquals(3, typeStatements.size());
         assertEquals(4, allStatements.size());
@@ -560,7 +560,7 @@ public class SchemaCQLHelperTest extends CQLTester
         ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(tableName);
         cfs.snapshot(SNAPSHOT);
 
-        String schema = Files.toString(cfs.getDirectories().getSnapshotSchemaFile(SNAPSHOT), Charset.defaultCharset());
+        String schema = Files.toString(cfs.getDirectories().getSnapshotSchemaFile(SNAPSHOT).toJavaIOFile(), Charset.defaultCharset());
         schema = schema.substring(schema.indexOf("CREATE TABLE")); // trim to ensure order
         String expected = "CREATE TABLE IF NOT EXISTS " + keyspace() + "." + tableName + " (\n" +
                           "    pk1 varint,\n" +
@@ -602,7 +602,7 @@ public class SchemaCQLHelperTest extends CQLTester
         ColumnFamilyStore cfs = Keyspace.open(keyspace()).getColumnFamilyStore(tableName);
         cfs.snapshot(SNAPSHOT);
 
-        String schema = Files.toString(cfs.getDirectories().getSnapshotSchemaFile(SNAPSHOT), Charset.defaultCharset());
+        String schema = Files.toString(cfs.getDirectories().getSnapshotSchemaFile(SNAPSHOT).toJavaIOFile(), Charset.defaultCharset());
         schema = schema.substring(schema.indexOf("CREATE TABLE")); // trim to ensure order
         String expected = "CREATE TABLE IF NOT EXISTS " + keyspace() + "." + tableName + " (\n" +
                           "    pk1 varint PRIMARY KEY,\n" +
