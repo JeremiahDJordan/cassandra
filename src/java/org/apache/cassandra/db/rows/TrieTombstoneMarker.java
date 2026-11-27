@@ -193,11 +193,16 @@ public interface TrieTombstoneMarker extends RangeState<TrieTombstoneMarker>, IM
             return right;
         if (right == null)
             return left;
-        if (left.supersedes(right))
-            return left;
-        if (right.supersedes(left))
-            return right;
-        return left.deletionKind.compareTo(right.deletionKind) < 0 ? left : right;
+        int cmp = Long.compare(left.markedForDeleteAt(), right.markedForDeleteAt());
+        if (cmp == 0)
+        {
+            cmp = Long.compare(left.localDeletionTime(), right.localDeletionTime());
+            // Tie-break on kind so that a lower-scale covering state is never picked over a broader one, which
+            // could make some boundaries (or level markers) use the wrong covering kind.
+            if (cmp == 0)
+                cmp = right.deletionKind.compareTo(left.deletionKind); // smaller ordinal is the broader kind
+        }
+        return cmp < 0 ? right : left;
     }
 
     /// Returns `value` if it survives (i.e. supersedes) `deletion`.

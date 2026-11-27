@@ -29,7 +29,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.LongAdder;
-import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.NotThreadSafe;
 
@@ -52,6 +51,7 @@ import org.apache.cassandra.index.sai.disk.apache.ApacheNumericIndexWriter;
 import org.apache.cassandra.index.sai.disk.apache.ApacheTermType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
+import org.apache.cassandra.index.sai.disk.format.OnDiskFormat;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.kdtree.BKDTreeRamBuffer;
 import org.apache.cassandra.index.sai.disk.v1.kdtree.MutableOneDimPointValues;
@@ -223,11 +223,14 @@ public abstract class SegmentBuilder
         @Override
         protected long addInternal(List<ByteBuffer> terms, int segmentRowId)
         {
-            var bytesRefs = terms.stream()
-                                 .map(term -> components.onDiskFormat().encodeForTrie(term, termComparator))
-                                 .map(encodedTerm -> ByteSourceInverse.readBytes(encodedTerm.asComparableBytes(byteComparableVersion)))
-                                 .map(BytesRef::new)
-                                 .collect(Collectors.toList());
+            OnDiskFormat onDiskFormat = components.onDiskFormat();
+            List<BytesRef> bytesRefs = new ArrayList<>(terms.size());
+            for (ByteBuffer term : terms)
+            {
+                ByteComparable encodedTerm = onDiskFormat.encodeForTrie(term, termComparator);
+                byte[] bytes = ByteSourceInverse.readBytes(encodedTerm.asComparableBytes(byteComparableVersion));
+                bytesRefs.add(new BytesRef(bytes));
+            }
             // ramIndexer is responsible for merging duplicate (term, row) pairs
             return ramIndexer.addAll(bytesRefs, segmentRowId);
         }

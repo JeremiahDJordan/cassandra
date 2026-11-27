@@ -157,6 +157,24 @@ public class EqualTimestampTombstoneTest extends CQLTester
         checkFlushAndCompaction();
     }
 
+    /// A deletion of a complex column inside a range, with a tied partition and range deletion around it.
+    @Test
+    public void testComplexColumnDeletion()
+    {
+        createTable(withMemtable("CREATE TABLE %s (pk int, ck1 int, ck2 int, c2 set<int>, PRIMARY KEY (pk, ck1, ck2))"));
+        disableCompaction();
+        execute("DELETE c2 FROM %s USING TIMESTAMP 5 WHERE pk = 0 AND ck1 = 3 AND ck2 = 2");
+        execute("DELETE FROM %s USING TIMESTAMP 4 WHERE pk = 0");
+        execute("DELETE FROM %s USING TIMESTAMP 4 WHERE pk = 0 AND (ck1, ck2) > (2, 1)");
+        execute("DELETE FROM %s USING TIMESTAMP 5 WHERE pk = 0 AND ck1 >= 0");
+
+        assertEmpty(execute("SELECT * FROM %s WHERE pk = 0"));
+        flush();
+        assertEmpty(execute("SELECT * FROM %s WHERE pk = 0"));
+        compact();
+        assertEmpty(execute("SELECT * FROM %s WHERE pk = 0"));
+    }
+
     private void checkSaiQueries(String createTable, String[] deletes)
     {
         createTable(withMemtable(createTable));
