@@ -22,6 +22,7 @@
 package org.apache.cassandra.index.sai;
 
 import java.io.IOException;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.HashMap;
@@ -396,23 +397,26 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             {
                 // A stop by a truncate that removed the SSTables this build hasn't built isn't a failure of the index
                 boolean truncated = t instanceof CompactionInterruptedException && removedByTruncate();
-                indexWriter.abort(t, !truncated);
+                try
+                {
+                    indexWriter.abort(t, !truncated);
+                }
+                finally
+                {
+                    // once the abort has deleted what the writer wrote
+                    if (!truncated)
+                        removeFromViews(sstable, indexes, t);
+                }
             }
             else
             {
+                Set<StorageAttachedIndex> lostFiles = new HashSet<>();
                 for (StorageAttachedIndex index : indexes)
                 {
-                    if (!lostPerSSTable && !lostPerIndex.contains(index))
-                        continue;
-                    try
-                    {
-                        index.makeIndexNonQueryable();
-                    }
-                    catch (Throwable e)
-                    {
-                        t.addSuppressed(e);
-                    }
+                    if (lostPerSSTable || lostPerIndex.contains(index))
+                        lostFiles.add(index);
                 }
+                removeFromViews(sstable, makeNonQueryable(lostFiles, t), t);
             }
 
             if (t instanceof InterruptedException)
@@ -462,6 +466,51 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             if (buildLock != null)
                 unlockForBuild(sstable, buildLock);
             owners.values().forEach(PerIndexFilesOwner::close);
+        }
+    }
+
+    /** @return the provided indexes that this has made non-queryable */
+    private static Set<StorageAttachedIndex> makeNonQueryable(Collection<StorageAttachedIndex> indexes, Throwable failure)
+    {
+        Set<StorageAttachedIndex> nonQueryable = new HashSet<>();
+        for (StorageAttachedIndex index : indexes)
+        {
+            try
+            {
+                index.makeIndexNonQueryable();
+                nonQueryable.add(index);
+            }
+            catch (Throwable e)
+            {
+                failure.addSuppressed(e);
+            }
+        }
+        return nonQueryable;
+    }
+
+    /**
+     * Removes the SSTable from the views of the provided indexes, which its failed build has made non-queryable, as it
+     * may have deleted their files on it, and makes them non-queryable again: a build of one of them that looks at
+     * its view after the removal builds the SSTable, and one that looked before (and so forgot that the index was made
+     * non-queryable, see StorageAttachedIndex#buildSSTablesMissedByInitialBuild) fails, or leaves the index
+     * non-queryable if it is over. Not for an index dropped meanwhile, whose drop cleans up the files of the SSTables
+     * in its view.
+     */
+    private void removeFromViews(SSTableReader sstable, Collection<StorageAttachedIndex> indexes, Throwable failure)
+    {
+        for (StorageAttachedIndex index : indexes)
+        {
+            if (!group.containsIndex(index))
+                continue;
+            try
+            {
+                index.getIndexContext().prepareSSTablesForRebuild(Collections.singleton(sstable));
+                index.makeIndexNonQueryable();
+            }
+            catch (Throwable e)
+            {
+                failure.addSuppressed(e);
+            }
         }
     }
 
@@ -678,6 +727,9 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                                                    "components they were built on are gone"),
                         index.getIndexContext().getIndexName(), sstable.descriptor);
             components.invalidate(sstable, tracker);
+            index.makeIndexNonQueryable();
+            index.getIndexContext().prepareSSTablesForRebuild(Collections.singleton(sstable));
+            // as for a failed build, see removeFromViews
             index.makeIndexNonQueryable();
         }
     }
