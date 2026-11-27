@@ -39,9 +39,11 @@ import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.virtual.*;
 import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.net.FrameEncoder;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.transport.messages.QueryMessage;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.memory.BufferPools;
 import org.awaitility.Awaitility;
 
 import static org.junit.Assert.assertEquals;
@@ -296,11 +298,34 @@ public class ClientResourceLimitsTest extends CQLTester
 
     private QueryMessage queryMessage()
     {
+        return queryMessage(LOW_LIMIT * 2);
+    }
+
+    private QueryMessage queryMessage(long valueSize)
+    {
         StringBuilder query = new StringBuilder("INSERT INTO atable (pk, v) VALUES (1, '");
-        for (int i=0; i < LOW_LIMIT * 2; i++)
+        for (int i=0; i < valueSize; i++)
             query.append('a');
         query.append("')");
         return new QueryMessage(query.toString(), V5_DEFAULT_OPTIONS);
+    }
+
+    @Test
+    public void testMultiFrameMessagesReleaseTheirBuffers()
+    {
+        ClientResourceLimits.setGlobalLimit(HIGH_LIMIT);
+        ClientResourceLimits.setEndpointLimit(HIGH_LIMIT);
+        int messageSize = FrameEncoder.Payload.MAX_SIZE * 3;
+        try (SimpleClient client = client(false))
+        {
+            client.execute(new QueryMessage("CREATE TABLE atable (pk int PRIMARY KEY, v text)", V5_DEFAULT_OPTIONS));
+
+            long used = BufferPools.forNetworking().usedSizeInBytes();
+            for (int i = 0; i < 10; i++)
+                client.execute(queryMessage(messageSize));
+            long usedAfter = BufferPools.forNetworking().usedSizeInBytes();
+            assertTrue("network buffers in use grew from " + used + " to " + usedAfter, usedAfter < used + messageSize);
+        }
     }
 
     @Test
