@@ -29,6 +29,24 @@ import static org.apache.cassandra.distributed.shared.AssertUtils.row;
 public class SinglePartitionReadCommandTest extends TestBaseImpl
 {
     @Test
+    public void testNonCompactTableWithOnlyUpdatedColumnUnderExpiredRowMarkerOfAnotherSource() throws Throwable
+    {
+        try (Cluster cluster = init(builder().withNodes(1).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int, ck int, v1 int, v2 int, PRIMARY KEY (pk, ck))"));
+            cluster.get(1).executeInternal(withKeyspace("UPDATE %s.tbl USING TIMESTAMP 1000 SET v1 = 1 WHERE pk = 1 AND ck = 1"));
+            cluster.get(1).flush(KEYSPACE);
+            cluster.get(1).executeInternal(withKeyspace("INSERT INTO %s.tbl (pk, ck) VALUES (1, 1) USING TIMESTAMP 2000 AND TTL 1"));
+            Thread.sleep(2500);
+
+            assertRows(cluster.coordinator(1).execute(withKeyspace("SELECT pk, ck, v2 FROM %s.tbl WHERE pk = 1"), ConsistencyLevel.ONE),
+                       row(1, 1, null));
+            assertRows(cluster.coordinator(1).execute(withKeyspace("SELECT * FROM %s.tbl WHERE pk = 1"), ConsistencyLevel.ONE),
+                       row(1, 1, 1, null));
+        }
+    }
+
+    @Test
     public void testNonCompactTableWithOnlyUpdatedColumnOnOneNodeAndColumnDeletionOnTheOther() throws Throwable
     {
         try (Cluster cluster = init(builder().withNodes(2).start()))

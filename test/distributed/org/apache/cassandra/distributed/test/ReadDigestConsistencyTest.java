@@ -66,6 +66,23 @@ public class ReadDigestConsistencyTest extends TestBaseImpl
         }
     }
 
+    @Test
+    public void testDigestConsistencyWithNotQueriedCellsOlderThanRowMarker() throws Exception
+    {
+        try (Cluster cluster = init(builder().withNodes(2).start()))
+        {
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.older_cells (k int, c int, v int, x int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+            cluster.coordinator(1).execute(withKeyspace("UPDATE %s.older_cells USING TIMESTAMP 1 SET v = 1 WHERE k = 1 AND c = 1"), ConsistencyLevel.ALL);
+            cluster.forEach(i -> i.flush(KEYSPACE));
+            cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.older_cells (k, c) VALUES (1, 1) USING TIMESTAMP 10"), ConsistencyLevel.ALL);
+            for (int node = 1; node <= 2; node++)
+            {
+                checkTraceForDigestMismatch(cluster.coordinator(node), withKeyspace("SELECT k, c, x FROM %s.older_cells WHERE k = 1"));
+                checkTraceForDigestMismatch(cluster.coordinator(node), withKeyspace("SELECT k, c, x FROM %s.older_cells WHERE k = 1 AND c = 1"));
+            }
+        }
+    }
+
     public static void checkTraceForDigestMismatch(ICoordinator coordinator, String query, Object... boundValues)
     {
         UUID sessionId = TimeUUID.Generator.nextTimeUUID().asUUID();

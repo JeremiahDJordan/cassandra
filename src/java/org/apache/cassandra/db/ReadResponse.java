@@ -680,7 +680,10 @@ public abstract class ReadResponse
         // The method adjusts the iterator to produce results in the same way as the deserialized path, to avoid a digest mismatch.
         private static UnfilteredRowIterator unfilteredIteratorAsRead(ImmutableBTreePartition partition, ColumnFilter columnFilter, boolean reversed)
         {
-            UnfilteredRowIterator iter = partition.unfilteredIterator(columnFilter, Slices.ALL, reversed);
+            // The read applied the column filter to each of its sources: applying it again to the merged rows would drop the
+            // not queried cells older than the merged liveness info, which the deserialized response keeps
+            ColumnFilter selection = columnFilter.allFetchedColumnsAreQueried() ? columnFilter : ColumnFilter.selection(columnFilter.fetchedColumns());
+            UnfilteredRowIterator iter = partition.unfilteredIterator(selection, Slices.ALL, reversed);
 
             // A partition with nothing in it is serialized as a flag and read back without columns and without a static row
             if (iter.isEmpty())
