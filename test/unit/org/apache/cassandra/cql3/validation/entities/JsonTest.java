@@ -985,6 +985,7 @@ public class JsonTest extends CQLTester
         assertRows(execute("SELECT to_json([[i, i2]]) FROM %s"), row("[[1, null]]"));
         assertRows(execute("SELECT to_json((map<int, int>){1: i, 2: i2}) FROM %s"), row("{\"1\": 1, \"2\": null}"));
         assertRows(execute("SELECT to_json((map<int, int>){i2: i}) FROM %s"), row("{\"null\": 1}"));
+        assertRows(execute("SELECT to_json({{i}, {i, i2}}) FROM %s"), row("[[null, 1], [1]]"));
         assertRows(execute("SELECT JSON [i, i2] FROM %s"), row("{\"[i, i2]\": [1, null]}"));
     }
 
