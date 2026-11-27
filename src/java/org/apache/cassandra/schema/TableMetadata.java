@@ -446,8 +446,9 @@ public class TableMetadata implements SchemaElement
      * Validates this table as the result of a schema change.
      *
      * @param previous the table before the schema change (the base table for a new view), or {@code null} for a new
-     *                 table. A column that has a duration where values are sorted in {@code previous} can keep it, so
-     *                 that such a table, its keyspace and its types can still be altered; new columns cannot have one.
+     *                 table. A column that has durations where values are sorted in {@code previous} can keep them, so
+     *                 that such a table, its keyspace and its types can still be altered; it cannot get another one,
+     *                 and new columns cannot have one.
      */
     public void validate(@Nullable TableMetadata previous)
     {
@@ -462,10 +463,11 @@ public class TableMetadata implements SchemaElement
         for (ColumnMetadata column : columns())
         {
             ColumnMetadata before = previous == null ? null : previous.getColumn(column.name);
-            boolean hadSortedDuration = before != null
-                                        && before.isPrimaryKeyColumn() == column.isPrimaryKeyColumn()
-                                        && before.type.hasSortedDuration(before.isPrimaryKeyColumn());
-            column.validate(isCounter(), hadSortedDuration);
+            boolean keepsSortedDurations = before != null
+                                           && before.isPrimaryKeyColumn() == column.isPrimaryKeyColumn()
+                                           && column.type.sortedDurations(column.isPrimaryKeyColumn())
+                                              <= before.type.sortedDurations(before.isPrimaryKeyColumn());
+            column.validate(isCounter(), keepsSortedDurations);
         }
 
         // All tables should have a partition key
