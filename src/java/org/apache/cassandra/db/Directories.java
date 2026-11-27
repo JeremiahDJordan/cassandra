@@ -1052,7 +1052,7 @@ public class Directories
                                                         pair.left.directory,
                                                         metadata.keyspace,
                                                         metadata.name,
-                                                        pair.left.generation,
+                                                        pair.left.id,
                                                         pair.left.formatType);
                         }
                         else
