@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from cassandra.metadata import maybe_escape_name
+from cassandra.metadata import cql_keywords, maybe_escape_name
 from cqlshlib import helptopics
 from cqlshlib.cqlhandling import CqlParsingRuleSet, Hint
 
@@ -1583,8 +1583,14 @@ def username_name_completer(ctxt, cass):
     if ctxt.matched[0][1].upper() == 'CREATE':
         return [Hint('<username>')]
 
+    # user names are identifiers or string literals, not quoted names, and no keyword, such as user, is an identifier
+    def maybe_quote(name):
+        if maybe_escape_name(name) == name and name not in cql_keywords:
+            return name
+        return "'%s'" % name.replace("'", "''")
+
     session = cass.session
-    return map(maybe_escape_name, [row['name'] for row in session.execute("LIST USERS")])
+    return [maybe_quote(row['name']) for row in session.execute("LIST USERS")]
 
 
 @completer_for('rolename', 'role')

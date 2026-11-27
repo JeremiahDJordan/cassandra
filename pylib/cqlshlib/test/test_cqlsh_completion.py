@@ -21,6 +21,7 @@
 import locale
 import os
 import re
+from cqlshlib.cql3handling import CqlRuleSet
 from .basecase import BaseTestCase, cqlsh, cqlshlog
 from .cassconnect import create_db, remove_db, testrun_cqlsh
 from .run_cqlsh import TimeoutError
@@ -859,3 +860,32 @@ class TestCqlshCompletion(CqlshCompletionCase):
     def test_complete_in_create_role(self):
         self.trycompletions('CREATE ROLE ', choices=['<rolename>'])
         self.trycompletions('CREATE USER ', choices=['<username>', 'IF'])
+
+
+class FakeUsersSession(object):
+    def __init__(self, names):
+        self.names = names
+
+    def execute(self, query):
+        assert query == 'LIST USERS'
+        return [{'name': name} for name in self.names]
+
+
+class FakeUsersConnection(object):
+    def __init__(self, names):
+        self.session = FakeUsersSession(names)
+
+
+class TestCqlshUserNameCompletion(unittest.TestCase):
+
+    def test_complete_in_alter_and_drop_user(self):
+        # user names can't be quoted names, and no keyword, such as user, is an identifier there, so the names that
+        # aren't plain identifiers or are keywords complete as string literals
+        cass = FakeUsersConnection(['jane', 'Jane Doe', "o'brien", 'user'])
+        for statement in ('ALTER USER ', 'DROP USER IF EXISTS '):
+            self.assertCountEqual(CqlRuleSet.cql_complete(statement, '', cassandra_conn=cass),
+                                  ['jane', "'Jane Doe'", "'o''brien'", "'user'"])
+            # a single completion comes with what follows it, a space or the closing ;
+            for prefix, name in (('ja', 'jane'), ("'Jane", "'Jane Doe'"), ("'us", "'user'")):
+                completions = CqlRuleSet.cql_complete(statement, prefix, cassandra_conn=cass)
+                self.assertEqual([c.rstrip(' ;') for c in completions], [name])
