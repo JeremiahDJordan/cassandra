@@ -44,6 +44,7 @@ public class RequestFailureReasonTest
     { 2, "TIMEOUT" },
     { 3, "INCOMPATIBLE_SCHEMA" },
     { 6, "INDEX_NOT_AVAILABLE" },
+    { 12, "TRUNCATE_FAILED" },
     { 500, "UNKNOWN_COLUMN" },
     { 501, "UNKNOWN_TABLE" },
     { 502, "REMOTE_STORAGE_FAILURE" },
