@@ -316,7 +316,7 @@ public class PreV5Handlers
                     future.addListener((ChannelFutureListener) f -> ctx.close());
             }
             
-            ExceptionHandlers.logClientNetworkingExceptions(cause);
+            ExceptionHandlers.logClientNetworkingExceptions(cause, ctx.channel().remoteAddress());
             JVMStabilityInspector.inspectThrowable(cause);
         }
 
