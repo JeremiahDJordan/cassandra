@@ -226,6 +226,7 @@ public class PreV5Handlers
 
                     endpointPayloadTracker));
             
+            request.getSource().release();
             throw ErrorMessage.wrap(exception, request.getSource().header.streamId);
         }
 
