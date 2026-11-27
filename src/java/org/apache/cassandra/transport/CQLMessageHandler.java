@@ -837,7 +837,17 @@ public class CQLMessageHandler<M extends Message> extends AbstractMessageHandler
                 else
                     handleErrorAndRelease(buildOverloadedException(endpointReserveCapacity, globalReserveCapacity, requestRateLimiter, overload), header);
             else if (!isCorrupt)
-                processRequest(assembleFrame(), backpressure);
+            {
+                try
+                {
+                    processRequest(assembleFrame(), backpressure);
+                }
+                finally
+                {
+                    // the request is decoded by now, and its body is a view of the buffers
+                    releaseBuffers();
+                }
+            }
         }
 
         @Override
