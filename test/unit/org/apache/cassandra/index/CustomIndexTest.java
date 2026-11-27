@@ -1050,7 +1050,8 @@ public class CustomIndexTest extends CQLTester
                                   RegularAndStaticColumns columns,
                                   int nowInSec,
                                   WriteContext ctx,
-                                  IndexTransaction.Type transactionType)
+                                  IndexTransaction.Type transactionType,
+                                  Memtable memtable)
         {
             return new Indexer()
             {
