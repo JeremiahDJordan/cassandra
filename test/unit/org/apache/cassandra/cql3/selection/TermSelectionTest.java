@@ -604,6 +604,27 @@ public class TermSelectionTest extends CQLTester
         assertEquals(pack(Arrays.asList(null, ByteBufferUtil.bytes(0)), 1),
                      selectedValue("SELECT (map<int, int>){i2: i, i2: k} FROM %s"));
 
+        // a set, list or map with a null element, as a set element or a map key, is sorted with the null first
+        ByteBuffer setWithNull = pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 2);
+        ByteBuffer set = pack(Arrays.asList(ByteBufferUtil.bytes(7)), 1);
+        ByteBuffer listWithNull = pack(Arrays.asList(ByteBufferUtil.bytes(7), null), 2);
+        ByteBuffer list = pack(Arrays.asList(ByteBufferUtil.bytes(7), ByteBufferUtil.bytes(7)), 2);
+        ByteBuffer mapWithNullKey = pack(Arrays.asList(null, ByteBufferUtil.bytes(7)), 1);
+        ByteBuffer mapWithNullValue = pack(Arrays.asList(ByteBufferUtil.bytes(7), null), 1);
+        ByteBuffer map = pack(Arrays.asList(ByteBufferUtil.bytes(7), ByteBufferUtil.bytes(7)), 1);
+        assertEquals(pack(Arrays.asList(setWithNull), 1),
+                     selectedValue("SELECT {{i, i2}} FROM %s"));
+        assertEquals(pack(Arrays.asList(setWithNull, set), 2),
+                     selectedValue("SELECT {{i}, {i, i2}} FROM %s"));
+        assertEquals(pack(Arrays.asList(listWithNull, list), 2),
+                     selectedValue("SELECT {[i, i], [i, i2]} FROM %s"));
+        assertEquals(pack(Arrays.asList(mapWithNullKey, map), 2),
+                     selectedValue("SELECT {(map<int, int>){i: i}, (map<int, int>){i2: i}} FROM %s"));
+        assertEquals(pack(Arrays.asList(mapWithNullValue, map), 2),
+                     selectedValue("SELECT {(map<int, int>){i: i}, (map<int, int>){i: i2}} FROM %s"));
+        assertEquals(pack(Arrays.asList(setWithNull, ByteBufferUtil.bytes(1), set, ByteBufferUtil.bytes(2)), 2),
+                     selectedValue("SELECT (map<frozen<set<int>>, int>){{i}: 2, {i, i2}: 1} FROM %s"));
+
         assertEquals(new HashSet<>(Arrays.asList(null, "x")), executeNet("SELECT {t, t2} FROM %s").one().getSet(0, String.class));
         assertEquals(2, executeNet("SELECT {u, u2} FROM %s").one().getSet(0, UDTValue.class).size());
         assertEquals(Collections.singletonMap(null, 7), executeNet("SELECT (map<text, int>){t2: i} FROM %s").one().getMap(0, String.class, Integer.class));
