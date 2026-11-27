@@ -227,7 +227,7 @@ final class LogRecord
             toVerify = new ArrayList<>(files.size() - 1);
             for (File f : files)
             {
-                if (!f.getName().endsWith(TMP_EXT))
+                if (!f.name().endsWith(TMP_EXT))
                 {
                     Component component = Descriptor.fromFilenameWithComponent(f).right;
                     if (component == Component.STATS)
