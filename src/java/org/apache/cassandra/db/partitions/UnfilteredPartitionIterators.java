@@ -20,6 +20,7 @@ package org.apache.cassandra.db.partitions;
 import java.io.IOError;
 import java.io.IOException;
 import java.util.*;
+import java.util.function.Function;
 
 import org.apache.cassandra.db.*;
 import org.apache.cassandra.db.filter.ColumnFilter;
@@ -219,6 +220,15 @@ public abstract class UnfilteredPartitionIterators
 
     public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators)
     {
+        return mergeLazily(iterators, UnfilteredRowIterators::merge);
+    }
+
+    /**
+     * @param merger merges the versions of a partition
+     */
+    public static UnfilteredPartitionIterator mergeLazily(final List<? extends UnfilteredPartitionIterator> iterators,
+                                                          final Function<List<UnfilteredRowIterator>, UnfilteredRowIterator> merger)
+    {
         assert !iterators.isEmpty();
 
         if (iterators.size() == 1)
@@ -241,7 +251,7 @@ public abstract class UnfilteredPartitionIterators
                 {
                     protected UnfilteredRowIterator initializeIterator()
                     {
-                        return UnfilteredRowIterators.merge(toMerge);
+                        return merger.apply(toMerge);
                     }
                 };
             }
