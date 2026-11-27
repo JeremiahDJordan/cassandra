@@ -311,6 +311,53 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
     }
 
     /**
+     * Rows c = 0 of partitions 1 and 0 have a list [7, 7, 8] from which each node deletes another 7, so they match
+     * l CONTAINS 7 on each node but not once reconciled. Partition 1 has c = 1, 2 and 3 on both nodes, and partition 0
+     * c = 1, so short read protection reads c = 2 and c = 3 of partition 1 from both nodes.
+     */
+    @Test
+    public void testRowsAfterPerPartitionLimitMatchingOnEachNode()
+    {
+        String table = createTable("rows_after_ppl_matching_on_each_node", "(k int, c int, l list<int>, PRIMARY KEY (k, c))");
+        for (int k : new int[]{ 1, 0 })
+        {
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, l) VALUES (?, 0, [7, 7, 8]) USING TIMESTAMP 1", ALL, k);
+            write(1, "DELETE l[0] FROM %s USING TIMESTAMP 2 WHERE k = " + k + " AND c = 0", table);
+            write(2, "DELETE l[1] FROM %s USING TIMESTAMP 2 WHERE k = " + k + " AND c = 0", table);
+        }
+        for (int c = 1; c <= 3; c++)
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, l) VALUES (1, ?, [7]) USING TIMESTAMP 1", ALL, c);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, l) VALUES (0, 1, [7]) USING TIMESTAMP 1", ALL);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE l CONTAINS 7 PER PARTITION LIMIT 2 LIMIT 3 ALLOW FILTERING", ALL),
+                   row(1, 1), row(1, 2), row(0, 1));
+        assertRows(cluster.coordinator(1).execute("SELECT k, c, count(*) FROM " + table + " WHERE l CONTAINS 7 GROUP BY k, c PER PARTITION LIMIT 2 LIMIT 3 ALLOW FILTERING", ALL),
+                   row(1, 1, 1L), row(1, 2, 1L), row(0, 1, 1L));
+    }
+
+    /**
+     * Partition 1 has a static row s = 7 and c = 0 and 1 on both nodes, c = 2 on node 1 only and c = 3 on node 2 only,
+     * each deleted later on the other node, and partition 0 has s = 7 and c = 0 and 1 on both nodes. Each node stops
+     * at LIMIT 4 before the last row of partition 0, and c = 2 and c = 3 are reconciled away, so short read protection
+     * must read that row.
+     */
+    @Test
+    public void testStaticRowOfPartitionWithCountedRows()
+    {
+        String table = createTable("static_row_with_counted_rows", "(k int, c int, s int static, v int, PRIMARY KEY (k, c))");
+        for (int k : new int[]{ 1, 0 })
+            for (int c = 0; c < 2; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s, v) VALUES (?, ?, 7, 1) USING TIMESTAMP 1", ALL, k, c);
+        write(1, "INSERT INTO %s (k, c, v) VALUES (1, 2, 1) USING TIMESTAMP 1", table);
+        write(2, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 2", table);
+        write(2, "INSERT INTO %s (k, c, v) VALUES (1, 3, 1) USING TIMESTAMP 1", table);
+        write(1, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 3", table);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 4 ALLOW FILTERING", ALL),
+                   row(1, 0), row(1, 1), row(0, 0), row(0, 1));
+    }
+
+    /**
      * Agreeing replicas return one row of each partition of 16 rows to a query with a per-partition limit of 1, a filter
      * on a static column and a limit of 1, or a page of 256 bytes, so replica filtering protection caches fewer rows
      * than a fail threshold of 8.
