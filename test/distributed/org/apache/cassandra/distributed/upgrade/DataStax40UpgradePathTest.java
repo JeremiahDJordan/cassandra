@@ -30,26 +30,18 @@ import org.junit.Test;
 
 import org.apache.cassandra.distributed.UpgradeableCluster;
 import org.apache.cassandra.distributed.api.IUpgradeableInstance;
-import org.apache.cassandra.distributed.impl.AbstractCluster;
-import org.apache.cassandra.distributed.impl.InstanceConfig;
 import org.apache.cassandra.distributed.shared.Versions.Version;
 
-import static org.apache.cassandra.config.CassandraRelevantProperties.TEST_DATASTAX_40_DTEST_JAR_DIR;
 import static org.apache.cassandra.distributed.api.ConsistencyLevel.ALL;
-import static org.apache.cassandra.distributed.api.Feature.GOSSIP;
-import static org.apache.cassandra.distributed.api.Feature.NATIVE_PROTOCOL;
-import static org.apache.cassandra.distributed.api.Feature.NETWORK;
 import static org.apache.cassandra.distributed.impl.AbstractCluster.CURRENT_VERSION;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
 
 /**
- * DataStax 4.0 nodes moved along the upgrade procedure keep their node metadata. The 4.0 nodes run from the single
- * dtest jar in the directory named by {@code cassandra.test.datastax_40_dtest_jar_dir}; without that property the
- * tests are skipped.
+ * DataStax 4.0 nodes moved along the upgrade procedure keep their node metadata.
  */
-public class DataStax40UpgradePathTest extends UpgradeTestBase
+public class DataStax40UpgradePathTest extends DataStax40UpgradeTestBase
 {
     private static final int NODES = 2;
     private static final int ROWS = 10;
@@ -63,12 +55,12 @@ public class DataStax40UpgradePathTest extends UpgradeTestBase
             Map<Integer, List<Object>> ids = nodeIds(cluster);
             for (int node = NODES; node >= 1; node--)
             {
-                restart(cluster.get(node), CURRENT_VERSION, "HCD_1");
+                restart(cluster, node, CURRENT_VERSION, "HCD_1");
                 assertNodeMetadata(cluster, ids, ROWS);
             }
             for (int node = NODES; node >= 1; node--)
             {
-                restart(cluster.get(node), v40, null);
+                restart(cluster, node, v40, null);
                 assertNodeMetadata(cluster, ids, ROWS);
             }
 
@@ -76,7 +68,7 @@ public class DataStax40UpgradePathTest extends UpgradeTestBase
             cluster.coordinator(1).execute(withKeyspace("TRUNCATE %s.tbl"), ALL);
             for (int node = NODES; node >= 1; node--)
             {
-                restart(cluster.get(node), CURRENT_VERSION, "HCD_1");
+                restart(cluster, node, CURRENT_VERSION, "HCD_1");
                 assertTruncationRecorded(cluster.get(node));
                 assertNodeMetadata(cluster, ids, 0);
             }
@@ -90,7 +82,7 @@ public class DataStax40UpgradePathTest extends UpgradeTestBase
         {
             Map<Integer, List<Object>> ids = nodeIds(cluster);
             for (int node = NODES; node >= 1; node--)
-                restart(cluster.get(node), CURRENT_VERSION, "HCD_1");
+                restart(cluster, node, CURRENT_VERSION, "HCD_1");
             cluster.coordinator(1).execute(withKeyspace("TRUNCATE %s.tbl"), ALL);
             cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.tbl (pk, v) VALUES (0, 0)"), ALL);
 
@@ -99,7 +91,7 @@ public class DataStax40UpgradePathTest extends UpgradeTestBase
                 for (int node = NODES; node >= 1; node--)
                 {
                     IUpgradeableInstance instance = cluster.get(node);
-                    restart(instance, CURRENT_VERSION, mode);
+                    restart(cluster, node, CURRENT_VERSION, mode);
                     assertFalse(Files.exists(metadataDirectory(instance).resolve("nodes")));
                     assertTrue(Files.isDirectory(metadataDirectory(instance).resolve("nodes.migrated")));
                     // the truncation made in HCD_1 stays recorded, so the truncated writes aren't replayed from the commit log
@@ -112,28 +104,12 @@ public class DataStax40UpgradePathTest extends UpgradeTestBase
 
     private static UpgradeableCluster startCluster(Version v40) throws Throwable
     {
-        UpgradeableCluster cluster = UpgradeableCluster.build(NODES)
-                                                       .withVersion(v40)
-                                                       .withConfig(config -> config.with(NETWORK, GOSSIP, NATIVE_PROTOCOL))
-                                                       // DataStax 4.0's NativeLibrary classes have other method signatures than this build's
-                                                       .withSharedClasses(name -> !name.startsWith("org.apache.cassandra.utils.NativeLibrary") && AbstractCluster.SHARED_PREDICATE.test(name))
-                                                       .start();
+        UpgradeableCluster cluster = clusterBuilder(NODES, v40).start();
         cluster.schemaChange(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': " + NODES + '}'));
         cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int PRIMARY KEY, v int)"));
         for (int pk = 0; pk < ROWS; pk++)
             cluster.coordinator(1).execute(withKeyspace("INSERT INTO %s.tbl (pk, v) VALUES (?, ?)"), ALL, pk, pk);
         return cluster;
-    }
-
-    private static void restart(IUpgradeableInstance instance, Version version, String mode) throws Exception
-    {
-        instance.shutdown().get();
-        if (mode == null)
-            ((InstanceConfig) instance.config()).remove("storage_compatibility_mode");
-        else
-            instance.config().set("storage_compatibility_mode", mode);
-        instance.setVersion(version);
-        instance.startup();
     }
 
     /**
@@ -170,10 +146,5 @@ public class DataStax40UpgradePathTest extends UpgradeTestBase
     private static Path metadataDirectory(IUpgradeableInstance instance)
     {
         return Paths.get((String) instance.config().get("metadata_directory"));
-    }
-
-    private static Version dataStax40Version()
-    {
-        return ApacheMixedClusterTestBase.dtestJarVersion(TEST_DATASTAX_40_DTEST_JAR_DIR);
     }
 }
