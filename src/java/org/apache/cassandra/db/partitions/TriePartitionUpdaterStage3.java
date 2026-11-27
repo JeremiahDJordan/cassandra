@@ -199,7 +199,10 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
     {
         RowData updated = existing.delete(deletion);
         if (updated != existing)
+        {
+            this.dataSize += (updated != null ? updated.dataSize() : 0) - existing.dataSize();
             this.heapSize += (updated != null ? updated.unsharedHeapSizeExcludingData() : 0) - existing.unsharedHeapSizeExcludingData();
+        }
         if (updated == null)
             currentPartition.markInsertedRows(-1);
 
@@ -283,6 +286,7 @@ implements InMemoryBaseTrie.UpsertTransformer<Object, Object>
 
         LivenessInfo existingLiveness = existing.livenessInfo;
         LivenessInfo livenessInfo = LivenessInfo.merge(update.livenessInfo, existingLiveness);
+        this.dataSize += livenessInfo.dataSize() - existingLiveness.dataSize();
         this.heapSize += livenessInfo.unsharedHeapSize() - existingLiveness.unsharedHeapSize();
 
         Object[] tree = BTreeRow.mergeRowBTrees(this,
