@@ -171,7 +171,7 @@ public class EncryptionConfig
                 className = "org.apache.cassandra.crypto." + className;
             }
 
-            return FBUtilities.classForName(className, IKeyProviderFactory.class, "key provider factory");
+            return FBUtilities.classForNameWithoutInitialization(className, "key provider factory", IKeyProviderFactory.class);
         }
 
         private int getIvLength(String algorithm)

@@ -76,7 +76,7 @@ public class EncryptionConfigTest
         Map<String, String> options = Collections.singletonMap(KEY_PROVIDER, ClassLoadingTestNonAssignable.class.getName());
         assertThatThrownBy(() -> configFor(options))
         .isInstanceOf(ConfigurationException.class)
-        .hasMessageContaining("is not a " + IKeyProviderFactory.class.getName());
+        .hasMessageContaining("must extend or implement " + IKeyProviderFactory.class.getName());
 
         assertFalse(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class));
     }
