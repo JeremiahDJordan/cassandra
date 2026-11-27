@@ -41,6 +41,7 @@ import org.slf4j.LoggerFactory;
 import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.apache.cassandra.cql3.statements.SelectOptions;
 import org.apache.cassandra.db.filter.ClusteringIndexFilter;
+import org.apache.cassandra.db.filter.ClusteringIndexNamesFilter;
 import org.apache.cassandra.db.filter.ColumnFilter;
 import org.apache.cassandra.db.filter.DataLimits;
 import org.apache.cassandra.db.filter.RowFilter;
@@ -51,9 +52,12 @@ import org.apache.cassandra.db.partitions.PartitionIterator;
 import org.apache.cassandra.db.partitions.PurgeFunction;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterator;
 import org.apache.cassandra.db.partitions.UnfilteredPartitionIterators;
+import org.apache.cassandra.db.rows.BaseRowIterator;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.DeserializationHelper;
 import org.apache.cassandra.db.rows.RangeTombstoneMarker;
 import org.apache.cassandra.db.rows.Row;
+import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.db.transform.RTBoundCloser;
@@ -790,6 +794,115 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     public abstract Verb verb();
+
+    /**
+     * Whether a source can drop cells that this read needs to tell whether a row exists. A source drops the cells of
+     * the fetched but not queried columns that are older than its row's liveness info when that info can't expire (see
+     * DeserializationHelper#dropsOlderNotQueriedCells). When a newer liveness info of another source supersedes it and
+     * isn't live, whether the row exists depends on those cells (see #readAgain). That doesn't apply to a table that
+     * enforces strict liveness, whose rows are dead without a live liveness info.
+     * <p>
+     * A replica only knows its own data: when its liveness info without TTL, superseded or not by a live one with a TTL,
+     * made a source drop cells, or a read by name stopped at its live liveness info with a TTL without reading older
+     * sources, and another replica has a newer liveness info with a TTL that has expired, the coordinator reconciles the
+     * row without those cells, as in Apache Cassandra.
+     */
+    boolean mayNeedRowsReadAgain()
+    {
+        return !columnFilter().allFetchedColumnsAreQueried() && !metadata().enforceStrictLiveness();
+    }
+
+    /**
+     * Whether a merged row may lack cells that its sources dropped (see #mayNeedRowsReadAgain), if one of its versions
+     * had a liveness info that drops cells: its liveness info isn't live.
+     */
+    boolean mayNeedReadAgain(Row merged)
+    {
+        LivenessInfo liveness = merged.primaryKeyLivenessInfo();
+        return !merged.isStatic() && !liveness.isEmpty() && !liveness.isLive(nowInSec());
+    }
+
+    /**
+     * A listener for the merge of the sources of the given partition that reads again the rows that need it (see
+     * #mayNeedReadAgain), or null if no row can need it.
+     *
+     * @param view the sources of the read, or null to select them again
+     * @param rowTransformer the transformation of each source's rows, if any
+     */
+    UnfilteredRowIterators.MergeListener readAgainListener(ColumnFamilyStore cfs,
+                                                           @Nullable ColumnFamilyStore.ViewFragment view,
+                                                           @Nullable Function<Object, Transformation<BaseRowIterator<?>>> rowTransformer,
+                                                           ReadExecutionController controller,
+                                                           DecoratedKey partitionKey)
+    {
+        if (!mayNeedRowsReadAgain())
+            return null;
+
+        return new UnfilteredRowIterators.MergeListener()
+        {
+            @Override
+            public void onMergedPartitionLevelDeletion(DeletionTime mergedDeletion, DeletionTime[] versions)
+            {
+            }
+
+            @Override
+            public Row onMergedRows(Row merged, Row[] versions)
+            {
+                if (!mayNeedReadAgain(merged))
+                    return merged;
+
+                for (Row version : versions)
+                {
+                    if (version != null && DeserializationHelper.dropsOlderNotQueriedCells(version.primaryKeyLivenessInfo()))
+                        return readAgain(cfs, view, rowTransformer, controller, partitionKey, merged);
+                }
+                return merged;
+            }
+
+            @Override
+            public void onMergedRangeTombstoneMarkers(RangeTombstoneMarker merged, RangeTombstoneMarker[] versions)
+            {
+            }
+
+            @Override
+            public void close()
+            {
+            }
+        };
+    }
+
+    /**
+     * Reads the given merged row again from all its sources with every column queried, so that no source drops any of
+     * its cells, and returns it with this read's column filter applied. The read doesn't add to this read's repaired
+     * data digest.
+     */
+    Row readAgain(ColumnFamilyStore cfs,
+                  @Nullable ColumnFamilyStore.ViewFragment view,
+                  @Nullable Function<Object, Transformation<BaseRowIterator<?>>> rowTransformer,
+                  ReadExecutionController controller,
+                  DecoratedKey partitionKey,
+                  Row merged)
+    {
+        ClusteringIndexNamesFilter filter = new ClusteringIndexNamesFilter(FBUtilities.singleton(merged.clustering(), metadata().comparator), false);
+        SinglePartitionReadCommand command = SinglePartitionReadCommand.create(metadata(), nowInSec(), partitionKey, ColumnFilter.all(metadata()), filter);
+        ReadExecutionController readAgainController = controller.withoutRepairedDataTracking();
+        try (UnfilteredRowIterator partition = view == null
+                                               ? command.queryMemtableAndDisk(cfs, readAgainController)
+                                               : command.queryMemtableAndDisk(cfs, view, rowTransformer, readAgainController))
+        {
+            while (partition.hasNext())
+            {
+                Unfiltered unfiltered = partition.next();
+                if (unfiltered.isRow())
+                    return ((Row) unfiltered).filter(columnFilter(), metadata());
+            }
+        }
+        finally
+        {
+            controller.updateMinOldestUnrepairedTombstone(readAgainController.oldestUnrepairedTombstone());
+        }
+        return merged;
+    }
 
     // Skip purgeable tombstones. We do this because it's safe to do (post-merge of the memtable and sstable at least), it
     // can save us some bandwith, and avoid making us throw a TombstoneOverwhelmingException for purgeable tombstones (which
