@@ -53,9 +53,11 @@ import org.apache.cassandra.dht.IPartitioner;
 import org.apache.cassandra.dht.LengthPartitioner;
 import org.apache.cassandra.dht.Murmur3Partitioner;
 import org.apache.cassandra.dht.RandomPartitioner;
+import org.apache.cassandra.serializers.CollectionSerializer;
 import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TypeSerializer;
+import org.apache.cassandra.transport.ProtocolVersion;
 import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.UUIDGen;
 
@@ -787,6 +789,26 @@ public class AbstractTypeByteSourceTest
                                                                100);
         testValuesForType(SetType.getInstance(UUIDType.instance, false), uuidSets);
         testValuesForType(SetType.getInstance(UUIDType.instance, true), uuidSets);
+    }
+
+    @Test
+    public void testCollectionTypesWithEmptyElements()
+    {
+        ByteBuffer zero = Int32Type.instance.decompose(0);
+        ByteBuffer one = Int32Type.instance.decompose(1);
+        ByteBuffer empty = ByteBufferUtil.EMPTY_BYTE_BUFFER;
+        assertDecodesExactly(ListType.getInstance(Int32Type.instance, false),
+                             CollectionSerializer.pack(Arrays.asList(one, empty, one), 3, ProtocolVersion.V3));
+        assertDecodesExactly(SetType.getInstance(Int32Type.instance, false),
+                             CollectionSerializer.pack(Arrays.asList(empty, one), 2, ProtocolVersion.V3));
+        assertDecodesExactly(MapType.getInstance(Int32Type.instance, Int32Type.instance, false),
+                             CollectionSerializer.pack(Arrays.asList(empty, one, zero, empty), 2, ProtocolVersion.V3));
+    }
+
+    private void assertDecodesExactly(AbstractType<?> type, ByteBuffer value)
+    {
+        ByteSource.Peekable bytes = ByteSource.peekable(type.asComparableBytes(value, version));
+        Assert.assertEquals(ByteBufferUtil.bytesToHex(value), ByteBufferUtil.bytesToHex(type.fromComparableBytes(bytes, version)));
     }
 
     @Test
