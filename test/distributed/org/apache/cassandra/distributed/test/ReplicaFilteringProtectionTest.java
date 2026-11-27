@@ -552,6 +552,28 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
     }
 
     /**
+     * Partition 1 has a newer non-match of c = 0 on node 2 and a newer deletion of c = 1 on node 1, and partition 0,
+     * next in token order, has them the other way around, so that short read protection reads more rows of each
+     * partition from both nodes. A page of rows that continues a partition counts the rows of the partition that the
+     * previous pages returned towards the per-partition limit.
+     */
+    @Test
+    public void testPerPartitionLimitAcrossPagesOfRangeRead()
+    {
+        String table = createTable("ppl_across_pages_of_range_read", "(k int, c int, v int, PRIMARY KEY (k, c))");
+        for (int k = 0; k <= 1; k++)
+            for (int c = 0; c < 6; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (?, ?, 1) USING TIMESTAMP 1", ALL, k, c);
+        write(2, "INSERT INTO %s (k, c, v) VALUES (1, 0, 2) USING TIMESTAMP 2", table);
+        write(1, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 1", table);
+        write(1, "INSERT INTO %s (k, c, v) VALUES (0, 0, 2) USING TIMESTAMP 2", table);
+        write(2, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 0 AND c = 1", table);
+
+        assertRows(cluster.coordinator(1).executeWithPaging("SELECT k, c FROM " + table + " WHERE v = 1 PER PARTITION LIMIT 3 ALLOW FILTERING", ALL, 2),
+                   row(1, 2), row(1, 3), row(1, 4), row(0, 2), row(0, 3), row(0, 4));
+    }
+
+    /**
      * Creates a table with partitions 0 and 1 of 16 rows of about 512 bytes each, written to both replicas.
      */
     private String createAgreeingTable(String name)
