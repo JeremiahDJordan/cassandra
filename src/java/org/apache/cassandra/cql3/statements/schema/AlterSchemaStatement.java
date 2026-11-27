@@ -133,7 +133,7 @@ public abstract class AlterSchemaStatement implements CQLStatement.SingleKeyspac
         if (null != keyspace && keyspace.isVirtual())
             throw ire("Virtual keyspace '%s' is not user-modifiable", keyspaceName);
 
-        validateKeyspaceName(keyspaceName, AlterSchemaStatement::ire);
+        validateKeyspaceName(keyspaceName, InvalidRequestException::new);
 
         List<InetAddressAndPort> withoutModes = ApacheUpgradePath.membersWithoutModes();
         if (!withoutModes.isEmpty())
