@@ -42,6 +42,7 @@ import org.apache.cassandra.gms.EndpointState;
 import org.apache.cassandra.gms.FailureDetector;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.PeerCheckCache;
+import org.apache.cassandra.index.Index;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injection;
@@ -529,6 +530,48 @@ public class RowFilterPeerGateTest extends CQLTester
         {
             return false;
         }
+    }
+
+    /**
+     * While a node that a read can contact is below DS 10, the read of a row with an analyzed restriction names the
+     * index of the analyzer, and an analyzed CONTAINS doesn't prefer another index, as that node would compare the raw
+     * values without it.
+     */
+    @Test
+    public void testAnalyzedRestrictionsBelowDS10() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, s set<text>, t text, v int)");
+        createIndex("CREATE CUSTOM INDEX s_idx ON %s(s) USING 'StorageAttachedIndex' WITH OPTIONS = {'case_sensitive': 'false'}");
+        createIndex("CREATE CUSTOM INDEX t_idx ON %s(t) USING 'StorageAttachedIndex' WITH OPTIONS = {'case_sensitive': 'false'}");
+        createIndex("CREATE INDEX v_idx ON %s(v) USING 'legacy_local_table'");
+        String rowRead = "SELECT k FROM %s WHERE k = 1 AND t = 'apple'";
+        String containsRead = "SELECT k FROM %s WHERE v = 1 AND s CONTAINS 'apple' ALLOW FILTERING";
+        InetAddressAndPort peer = InetAddressAndPort.getByName("127.0.0.8");
+        addToRing(peer);
+        try
+        {
+            assertThat(parseReadCommand(rowRead).indexQueryPlan()).isNull();
+            assertThat(indexNames(containsRead)).containsExactly("v_idx");
+
+            MessagingService.instance().versions.set(peer, MessagingService.VERSION_50);
+            assertThat(indexNames(rowRead)).containsExactly("t_idx");
+            assertThat(indexNames(containsRead)).containsExactly("s_idx");
+        }
+        finally
+        {
+            StorageService.instance.getTokenMetadata().removeEndpoint(peer);
+            MessagingService.instance().versions.reset(peer);
+        }
+    }
+
+    private List<String> indexNames(String query)
+    {
+        Index.QueryPlan plan = parseReadCommand(query).indexQueryPlan();
+        assertThat(plan).as(query).isNotNull();
+        List<String> names = new ArrayList<>();
+        for (Index index : plan.getIndexes())
+            names.add(index.getIndexMetadata().name);
+        return names;
     }
 
     /** Removes the given peer from the known peers and from gossip. */
