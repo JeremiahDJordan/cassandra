@@ -113,6 +113,14 @@ import static org.apache.cassandra.index.sai.disk.v1.IndexWriterConfig.MAX_TOP_K
 public class StorageAttachedIndex implements Index
 {
     public static final String NAME = "sai";
+    public static final String EMPTY_CLUSTERING_FIELD_ERROR =
+    "Cannot write a row whose clustering has an empty value, such as blobAsInt(0x), in a tuple or UDT field of a " +
+    "type that orders it like a null value, to a table with storage-attached index %s: use null instead, or a range " +
+    "deletion to delete such a row";
+    public static final String EMPTY_CLUSTERING_FIELD_ROW_ERROR =
+    "Cannot index the row %s: its clustering has an empty value, such as blobAsInt(0x), in a tuple or UDT field of " +
+    "a type that orders it like a null value, and storage-attached indexes cannot order it with the rows that have " +
+    "a null value there";
     public static final String NGRAM_WITHOUT_QUERY_ANALYZER_WARNING =
     "Using an ngram analyzer without defining a query_analyzer. " +
     "This means that the same ngram analyzer will be applied to both indexed and queried column values. " +
@@ -845,6 +853,15 @@ public class StorageAttachedIndex implements Index
     @Override
     public void validate(PartitionUpdate update, ClientState state) throws InvalidRequestException
     {
+        if (update.metadata().comparator.size() > 0)
+        {
+            for (Row row : update.rows())
+            {
+                if (TypeUtil.hasEmptyFieldEncodedAsNull(update.metadata().comparator, row.clustering()))
+                    throw new InvalidRequestException(String.format(EMPTY_CLUSTERING_FIELD_ERROR, indexContext.getIndexName()));
+            }
+        }
+
         if (!VALIDATE_TERMS_AT_COORDINATOR)
             return;
 

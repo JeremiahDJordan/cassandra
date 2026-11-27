@@ -25,6 +25,8 @@ import com.google.common.base.Stopwatch;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.cassandra.db.ClusteringComparator;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.index.sai.disk.PerSSTableWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponents;
 import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
@@ -32,6 +34,7 @@ import org.apache.cassandra.index.sai.disk.v1.MetadataWriter;
 import org.apache.cassandra.index.sai.disk.v1.bitpack.NumericValuesWriter;
 import org.apache.cassandra.index.sai.disk.v2.sortedterms.SortedTermsWriter;
 import org.apache.cassandra.index.sai.utils.PrimaryKey;
+import org.apache.cassandra.index.sai.utils.TypeUtil;
 import org.apache.cassandra.utils.Throwables;
 import org.apache.lucene.util.IOUtils;
 
@@ -44,6 +47,7 @@ public class V2SSTableComponentsWriter implements PerSSTableWriter
     private final NumericValuesWriter tokenWriter;
     private final NumericValuesWriter blockFPWriter;
     private final SortedTermsWriter sortedTermsWriter;
+    private PrimaryKey previousKey;
 
     public V2SSTableComponentsWriter(IndexComponents.ForWrite perSSTableComponents) throws IOException
     {
@@ -64,7 +68,21 @@ public class V2SSTableComponentsWriter implements PerSSTableWriter
     public void nextRow(PrimaryKey primaryKey) throws IOException
     {
         tokenWriter.add(primaryKey.token().getLongValue());
-        sortedTermsWriter.add(v -> primaryKey.asComparableBytes(v));
+        try
+        {
+            sortedTermsWriter.add(v -> primaryKey.asComparableBytes(v));
+        }
+        catch (IllegalArgumentException e)
+        {
+            ClusteringComparator comparator = perSSTableComponents.comparator();
+            // the row with such a field is this one, or with a descending order the one before
+            PrimaryKey row = TypeUtil.hasEmptyFieldEncodedAsNull(comparator, primaryKey.clustering()) ? primaryKey : previousKey;
+            if (row == null || !TypeUtil.hasEmptyFieldEncodedAsNull(comparator, row.clustering()))
+                throw e;
+            String message = String.format(StorageAttachedIndex.EMPTY_CLUSTERING_FIELD_ROW_ERROR, row);
+            throw new IllegalArgumentException(perSSTableComponents.logMessage(message), e);
+        }
+        previousKey = primaryKey;
     }
 
     @Override
