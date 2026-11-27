@@ -112,6 +112,8 @@ implements InMemoryTrie.UpsertTransformerWithKeyProducer<Object, Object>
         DeletionTime deletion = DeletionTime.merge(update.deletion, existing.deletion);
         if (deletion.deletes(livenessInfo))
             livenessInfo = LivenessInfo.EMPTY;
+        this.dataSize += (livenessInfo.dataSize() + deletion.dataSize())
+                         - (existing.livenessInfo.dataSize() + existing.deletion.dataSize());
         this.heapSize += (livenessInfo.unsharedHeapSize() + deletion.unsharedHeapSize())
                          - (existing.livenessInfo.unsharedHeapSize() + existing.deletion.unsharedHeapSize());
 
