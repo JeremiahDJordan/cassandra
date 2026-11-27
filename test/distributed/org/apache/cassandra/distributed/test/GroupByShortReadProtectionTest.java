@@ -390,6 +390,91 @@ public class GroupByShortReadProtectionTest extends TestBaseImpl
     }
 
     /**
+     * Two groups that match on every replica but not once reconciled come before the one that matches.
+     */
+    @Test
+    public void testTwoGroupsFailingFilterOnceReconciled()
+    {
+        createListTable("two_failing_groups");
+        for (int c = 1; c <= 3; c++)
+            insertList("two_failing_groups", 0, c, 0);
+        for (int c = 1; c <= 2; c++)
+            deleteOtherElementOnEachNode("two_failing_groups", 0, c, 0);
+
+        List<String> mismatches = new ArrayList<>();
+        checkAll("two_failing_groups", "SELECT k, c, count(*) FROM %s WHERE l CONTAINS 7 GROUP BY k, c LIMIT 1 ALLOW FILTERING", "", new int[]{ 0, 1, 2 }, mismatches,
+                 "[0, 3, 1]");
+        checkAll("two_failing_groups", "SELECT k, c, count(*) FROM %s WHERE k = 0 AND l CONTAINS 7 GROUP BY k, c LIMIT 1 ALLOW FILTERING", "", new int[]{ 0, 1, 2 }, mismatches,
+                 "[0, 3, 1]");
+        assertThat(mismatches).isEmpty();
+    }
+
+    /**
+     * A group that fails the filter once reconciled, followed by a matching group of two rows.
+     */
+    @Test
+    public void testMatchingGroupOfTwoRowsAfterGroupFailingFilterOnceReconciled()
+    {
+        createListTable("two_row_group");
+        insertList("two_row_group", 0, 1, 0);
+        insertList("two_row_group", 0, 2, 0);
+        insertList("two_row_group", 0, 2, 1);
+        deleteOtherElementOnEachNode("two_row_group", 0, 1, 0);
+
+        List<String> mismatches = new ArrayList<>();
+        checkAll("two_row_group", "SELECT k, c, count(*) FROM %s WHERE l CONTAINS 7 GROUP BY k, c LIMIT 1 ALLOW FILTERING", "", new int[]{ 0, 1, 2 }, mismatches,
+                 "[0, 2, 2]");
+        checkAll("two_row_group", "SELECT k, c, count(*) FROM %s WHERE k = 0 AND l CONTAINS 7 GROUP BY k, c LIMIT 1 ALLOW FILTERING", "", new int[]{ 0, 1, 2 }, mismatches,
+                 "[0, 2, 2]");
+        assertThat(mismatches).isEmpty();
+    }
+
+    /**
+     * A partition whose only row fails the filter once reconciled, followed by a partition that matches (token order
+     * 5, 1), in a table with a static column.
+     */
+    @Test
+    public void testMatchingPartitionAfterPartitionFailingFilterOnceReconciled()
+    {
+        createListTable("failing_partition");
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.failing_partition (k, s) VALUES (5, 105) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.failing_partition (k, s) VALUES (1, 101) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+        insertList("failing_partition", 5, 1, 0);
+        insertList("failing_partition", 1, 1, 0);
+        deleteOtherElementOnEachNode("failing_partition", 5, 1, 0);
+
+        List<String> mismatches = new ArrayList<>();
+        checkAll("failing_partition", "SELECT k, c, s, count(*) FROM %s WHERE l CONTAINS 7 GROUP BY k, c LIMIT 1 ALLOW FILTERING", "", new int[]{ 0, 1, 2 }, mismatches,
+                 "[1, 1, 101, 1]");
+        checkAll("failing_partition", "SELECT k, s, count(*) FROM %s WHERE l CONTAINS 7 GROUP BY k LIMIT 1 ALLOW FILTERING", "", new int[]{ 0, 1, 2 }, mismatches,
+                 "[1, 101, 1]");
+        assertThat(mismatches).isEmpty();
+    }
+
+    private static void createListTable(String table)
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s." + table + " (k int, c int, d int, s int static, l list<int>, PRIMARY KEY (k, c, d)) WITH read_repair = 'NONE'"));
+    }
+
+    /**
+     * Writes l = [7, 7] on every node, with the same cell paths.
+     */
+    private static void insertList(String table, int k, int c, int d)
+    {
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s." + table + " (k, c, d, l) VALUES (?, ?, ?, [7, 7]) USING TIMESTAMP 1"), ConsistencyLevel.ALL, k, c, d);
+    }
+
+    /**
+     * Deletes another element of l = [7, 7] on node 2 than on nodes 1 and 3: each node still has a 7, the reconciled
+     * list is empty.
+     */
+    private static void deleteOtherElementOnEachNode(String table, int k, int c, int d)
+    {
+        write(table, new int[]{ 1, 3 }, "DELETE l[0] FROM %s USING TIMESTAMP 2 WHERE k = ? AND c = ? AND d = ?", k, c, d);
+        write(table, new int[]{ 2 }, "DELETE l[1] FROM %s USING TIMESTAMP 2 WHERE k = ? AND c = ? AND d = ?", k, c, d);
+    }
+
+    /**
      * A paged GROUP BY over two partitions of RF 2 on nodes 2 and 3, each of which deletes every third row of one of
      * them: a replica stops at the group limit of a page with its last group still open, and the rest of its partition
      * must not be skipped.
