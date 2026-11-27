@@ -168,6 +168,9 @@ otherwise the node does not start ("Invalid yaml. Please remove properties [...]
       `memtable.configurations` and its `default` entry instead.
     - `commitlog_sync_batch_window_in_ms`, `commitlog_periodic_queue_size`, `concurrent_replicates` and
       `native_transport_max_negotiable_protocol_version`, removed in 5.0.
+Reads paged in bytes (a page size in bytes, or the page weight guardrail) can miss rows while HCD 1.2 nodes older
+than 4.0.X and 5.0 nodes share the cluster. If reads are paged in bytes, first upgrade the HCD 1.2 nodes to 4.0.X or
+later, then upgrade them to this release.
 Behaviour that differs from HCD 1.2:
     - Existing tables with a duration where values are sorted (in a primary key column, or in the keys or elements of
       a non-frozen map or set) now always load, from `system_schema`, from a peer's schema and from sstable headers,
