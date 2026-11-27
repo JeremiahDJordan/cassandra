@@ -20,7 +20,9 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
@@ -125,6 +127,15 @@ public abstract class ReadCommand extends AbstractReadQuery
     protected static final Logger logger = LoggerFactory.getLogger(ReadCommand.class);
     public static final IVersionedSerializer<ReadCommand> serializer = new Serializer();
 
+    /**
+     * The key of the custom message parameter that coordinators add to the reads that return static candidates (see
+     * {@link #returnsStaticCandidates()}), to tell the replicas that the coordinator filters the reconciled rows and
+     * counts those partitions as the replicas do, so that the replicas can return them (see
+     * {@link ReadCommandVerbHandler#coordinatorAsksForStaticCandidates}). Nodes that don't know it ignore it.
+     */
+    public static final String STATIC_CANDIDATES_PARAM = "ds.static.candidates";
+    private static final byte[] STATIC_CANDIDATES_PARAM_VALUE = { 1 };
+
     // Expose the active command running so transitive calls can lookup this command.
     // This is useful for a few reasons, but mainly because the CQL query is here.
     private static final FastThreadLocal<ReadCommand> COMMAND = new FastThreadLocal<>();
@@ -137,6 +148,13 @@ public abstract class ReadCommand extends AbstractReadQuery
     private int digestVersion;
 
     private boolean trackWarnings;
+
+    /**
+     * Whether this replica must not return static candidates (see {@link #returnsStaticCandidates()}), because the
+     * coordinator doesn't ask for them. This isn't serialized: commands received from other nodes have it until
+     * {@link ReadCommandVerbHandler} finds that their coordinator asks for them.
+     */
+    private boolean staticCandidatesWithheld;
 
     protected final DataRange dataRange;
 
@@ -294,6 +312,46 @@ public abstract class ReadCommand extends AbstractReadQuery
     }
 
     /**
+     * Stops this replica from returning static candidates, because the coordinator that sent the command doesn't ask
+     * for them.
+     */
+    public void withholdStaticCandidates()
+    {
+        staticCandidatesWithheld = true;
+    }
+
+    /**
+     * Lets this replica return static candidates, because the coordinator that sent the command asks for them.
+     */
+    public void allowStaticCandidates()
+    {
+        staticCandidatesWithheld = false;
+    }
+
+    /**
+     * Returns whether this read returns, from each replica, the partitions without matching rows whose static row
+     * satisfies a static expression, as their static row alone, and counts them as rows in its limits (see
+     * {@link RowFilter#canReturnStaticCandidates()}). Reads with an index query plan don't. The coordinator of such a
+     * read asks the replicas for them with {@link #STATIC_CANDIDATES_PARAM}, filters the reconciled rows, counts those
+     * partitions in each replica's response as the replica does, and asks a replica that stopped at its limit for more,
+     * also when it reads a single replica; replicas that don't know the parameter filter strictly, and return none.
+     * Those partitions have no rows, so the responses of single-partition reads can be compared by digest.
+     */
+    public boolean returnsStaticCandidates()
+    {
+        return indexQueryPlan == null && !staticCandidatesWithheld && rowFilter().canReturnStaticCandidates();
+    }
+
+    /**
+     * Whether the limits of this read count a partition with only a static row as a row: if the read selects full
+     * partitions, or if it returns static candidates.
+     */
+    public boolean countsPartitionsWithOnlyStaticData()
+    {
+        return selectsFullPartition() || returnsStaticCandidates();
+    }
+
+    /**
      * Index query plan chosen for this query. Can be null.
      *
      * @return index query plan chosen for this query
@@ -447,7 +505,7 @@ public abstract class ReadCommand extends AbstractReadQuery
     
     public DataLimits.Counter createLimitedCounter(boolean assumeLiveData)
     {
-        return limits().newCounter(nowInSec(), assumeLiveData, selectsFullPartition(), metadata().enforceStrictLiveness()).onlyCount();
+        return limits().newCounter(nowInSec(), assumeLiveData, countsPartitionsWithOnlyStaticData(), metadata().enforceStrictLiveness()).onlyCount();
     }
 
     public DataLimits.Counter createUnlimitedCounter(boolean assumeLiveData)
@@ -559,7 +617,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                  * would be more efficient (the sooner we discard stuff we know we don't care, the less useless
                  * processing we do on it).
                  */
-                iterator = filter.filter(iterator, nowInSec());
+                iterator = filter.filter(iterator, nowInSec(), returnsStaticCandidates());
 
                 // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
                 // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
@@ -568,7 +626,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                 if (executionController.isTrackingRepairedStatus())
                 {
                     DataLimits.Counter limit =
-                    limits().newCounter(nowInSec(), false, selectsFullPartition(), metadata().enforceStrictLiveness());
+                    limits().newCounter(nowInSec(), false, countsPartitionsWithOnlyStaticData(), metadata().enforceStrictLiveness());
                     iterator = limit.applyTo(iterator);
                     // ensure that a consistent amount of repaired data is read on each replica. This causes silent
                     // overreading from the repaired data set, up to limits(). The extra data is not visible to
@@ -577,7 +635,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                 }
                 else
                 {
-                    iterator = limits().filter(iterator, nowInSec(), selectsFullPartition());
+                    iterator = limits().filter(iterator, nowInSec(), countsPartitionsWithOnlyStaticData());
                 }
 
                 // because of the above, we need to append an artifical end bound if the source iterator was stopped short by a counter.
@@ -1004,10 +1062,24 @@ public abstract class ReadCommand extends AbstractReadQuery
         if (trackRepairedData)
             flags.add(MessageFlag.TRACK_REPAIRED_DATA);
 
-        return Message.outWithFlags(verb(),
-                                    this,
-                                    requestTime,
-                                    flags);
+        Message<ReadCommand> message = Message.outWithFlags(verb(),
+                                                            this,
+                                                            requestTime,
+                                                            flags);
+        return returnsStaticCandidates() ? withStaticCandidatesParam(message) : message;
+    }
+
+    /**
+     * Adds {@link #STATIC_CANDIDATES_PARAM} to the custom parameters of the given message, to ask the replicas for the
+     * static candidates of the read (see {@link ReadCommandVerbHandler#coordinatorAsksForStaticCandidates}).
+     */
+    @VisibleForTesting
+    static Message<ReadCommand> withStaticCandidatesParam(Message<ReadCommand> message)
+    {
+        Map<String, byte[]> existing = message.header.customParams();
+        Map<String, byte[]> customParams = existing == null ? new HashMap<>() : new HashMap<>(existing);
+        customParams.put(STATIC_CANDIDATES_PARAM, STATIC_CANDIDATES_PARAM_VALUE);
+        return message.withParam(ParamType.CUSTOM_MAP, customParams);
     }
 
     protected abstract boolean intersects(SSTableReader sstable);
@@ -1361,8 +1433,11 @@ public abstract class ReadCommand extends AbstractReadQuery
                 }
             }
 
-            return kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion, acceptsTransient, 
-                                                          metadata, nowInSec, columnFilter, rowFilter, limits, indexQueryPlan);
+            ReadCommand command = kind.selectionDeserializer.deserialize(in, version, isDigest, digestVersion, acceptsTransient,
+                                                                         metadata, nowInSec, columnFilter, rowFilter, limits, indexQueryPlan);
+            // the filter can't say whether its coordinator asks for static candidates, see ReadCommandVerbHandler
+            command.withholdStaticCandidates();
+            return command;
         }
 
         private @Nullable IndexMetadata deserializeIndexMetadata(DataInputPlus in, int version, TableMetadata metadata) throws IOException

@@ -1049,6 +1049,8 @@ public class Paxos
         int failedAttemptsDueToContention = 0;
         Ballot minimumBallot = null;
         SinglePartitionReadCommand read = group.queries.get(0);
+        // the reads piggybacked on prepare messages don't ask the replicas for static candidates, so none return them
+        read.withholdStaticCandidates();
         ClientRequestsMetrics metrics = ClientRequestsMetricsProvider.instance.metrics(read.metadata().keyspace);
         try (PaxosOperationLock lock = PaxosState.lock(read.partitionKey(), read.metadata(), deadline, consistencyForConsensus, false))
         {

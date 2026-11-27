@@ -200,11 +200,17 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
             if (command.isTopK())
                 return false;
 
-            // If we have only one result, there is no read repair to do and we can't get short reads
-            // Also, so-called "short reads" stems from nodes returning only a subset of the results they have for a
-            // partition due to the limit, but that subset not being enough post-reconciliation. So if we don't have limit,
-            // don't bother protecting against short reads.
-            return replicas.size() > 1 && !command.limits().isUnlimited();
+            // So-called "short reads" stem from nodes returning only a subset of the results they have for a
+            // partition due to the limit, but that subset not being enough post-reconciliation. So if we don't have
+            // a limit, don't bother protecting against short reads.
+            if (command.limits().isUnlimited())
+                return false;
+
+            // A single result needs no reconciliation, so it can't be short, unless the replica returned partitions
+            // without matching rows (see ReadCommand#returnsStaticCandidates): it stopped at the limit counting them,
+            // so it can have more matching rows, which we have to ask for. This happens when the consistency level
+            // needs reconciliation but reads a single replica, such as LOCAL_QUORUM in a datacenter with one replica.
+            return replicas.size() > 1 || command.returnsStaticCandidates();
         }
     }
 
