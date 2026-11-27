@@ -64,6 +64,7 @@ import org.apache.cassandra.concurrent.NamedThreadFactory;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.QueryProcessor;
 import org.apache.cassandra.db.ColumnFamilyStore;
+import org.apache.cassandra.db.Directories;
 import org.apache.cassandra.db.SystemKeyspace;
 import org.apache.cassandra.db.commitlog.CommitLogPosition;
 import org.apache.cassandra.dht.Token;
@@ -205,7 +206,10 @@ public class Nodes
     {
         Path snapshotPath = baseDirectory.resolve("snapshots");
         if (snapshotName != null && !snapshotName.isEmpty())
+        {
+            Directories.validateSnapshotNameToClear(snapshotName);
             snapshotPath = snapshotPath.resolve(snapshotName);
+        }
         if (Files.isDirectory(snapshotPath))
             FileUtils.deleteRecursive(new File(snapshotPath));
     }
