@@ -79,8 +79,8 @@
                     <pathelement location="${async-profiler.base}/lib/converter.jar"/>
                 </classpath>
 
-                <jvmarg line="${test-jvmargs}"/>
-                <jvmarg line="${java11-jvmargs}"/>
+                <jvmarg line="${java-jvmargs}"/>
+                <jvmarg line="${_std-test-jvmargs}"/>
 
                 <arg value="-foe"/>
                 <arg value="true"/>
