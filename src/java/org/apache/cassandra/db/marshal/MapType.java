@@ -166,7 +166,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             offsetL += CollectionSerializer.sizeOfValue(k1, accessorL, protocolVersion);
             TR k2 = CollectionSerializer.readValue(right, accessorR, offsetR, protocolVersion);
             offsetR += CollectionSerializer.sizeOfValue(k2, accessorR, protocolVersion);
-            int cmp = keysComparator.compare(k1, accessorL, k2, accessorR);
+            int cmp = compareElements(keysComparator, k1, accessorL, k2, accessorR);
             if (cmp != 0)
                 return cmp;
 
@@ -174,7 +174,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             offsetL += CollectionSerializer.sizeOfValue(v1, accessorL, protocolVersion);
             TR v2 = CollectionSerializer.readValue(right, accessorR, offsetR, protocolVersion);
             offsetR += CollectionSerializer.sizeOfValue(v2, accessorR, protocolVersion);
-            cmp = valuesComparator.compare(v1, accessorL, v2, accessorR);
+            cmp = compareElements(valuesComparator, v1, accessorL, v2, accessorR);
             if (cmp != 0)
                 return cmp;
         }

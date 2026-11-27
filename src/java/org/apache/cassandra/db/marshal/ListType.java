@@ -150,7 +150,7 @@ public class ListType<T> extends CollectionType<List<T>>
             offsetL += CollectionSerializer.sizeOfValue(v1, accessorL, ProtocolVersion.V3);
             VR v2 = CollectionSerializer.readValue(right, accessorR, offsetR, ProtocolVersion.V3);
             offsetR += CollectionSerializer.sizeOfValue(v2, accessorR, ProtocolVersion.V3);
-            int cmp = elementsComparator.compare(v1, accessorL, v2, accessorR);
+            int cmp = compareElements(elementsComparator, v1, accessorL, v2, accessorR);
             if (cmp != 0)
                 return cmp;
         }
