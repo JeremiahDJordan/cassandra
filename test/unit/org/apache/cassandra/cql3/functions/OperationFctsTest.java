@@ -20,11 +20,13 @@ package org.apache.cassandra.cql3.functions;
 import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.Date;
+import java.util.List;
 import java.util.Optional;
 
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQL3Type;
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.marshal.AbstractType;
@@ -33,6 +35,8 @@ import org.apache.cassandra.exceptions.OperationExecutionException;
 import org.apache.cassandra.serializers.SimpleDateSerializer;
 import org.apache.cassandra.serializers.TimestampSerializer;
 import org.apache.cassandra.transport.ProtocolVersion;
+
+import static org.junit.Assert.assertEquals;
 
 public class OperationFctsTest extends CQLTester
 {
@@ -939,16 +943,38 @@ public class OperationFctsTest extends CQLTester
                                       "WITH CLUSTERING ORDER BY (a %1$s, b %1$s, c %1$s, d %1$s, e %1$s, f %1$s, g %1$s, h %1$s)", order));
 
             execute("INSERT INTO %s (pk, a, b, c, d, e, f, g, h) VALUES (0, 1 + 1, 1 + 2, 2 + 2, 2 + 3, 2.5 + 3, 3.5 + 3, 3 + 4, 4.5 + 4)");
-            assertRows(execute("SELECT a, b, c, d, e, f, g, h FROM %s WHERE pk = 0"),
-                       row((byte) 2, (short) 3, 4, 5L, 5.5F, 6.5, BigInteger.valueOf(7), BigDecimal.valueOf(8.5)));
+            assertNumericRow(execute("SELECT a, b, c, d, e, f, g, h FROM %s WHERE pk = 0"),
+                             (byte) 2, (short) 3, 4, 5L, 5.5F, 6.5, BigInteger.valueOf(7), BigDecimal.valueOf(8.5));
 
-            assertRows(execute("SELECT a, b, c, d, e, f, g, h FROM %s " +
-                               "WHERE pk = 0 AND a = 1 + 1 AND b = 1 + 2 AND c = 2 + 2 AND d = 2 + 3 AND e = 2.5 + 3 AND f = 3.5 + 3 AND g = 3 + 4 AND h = 4.5 + 4"),
-                       row((byte) 2, (short) 3, 4, 5L, 5.5F, 6.5, BigInteger.valueOf(7), BigDecimal.valueOf(8.5)));
+            assertNumericRow(execute("SELECT a, b, c, d, e, f, g, h FROM %s " +
+                                     "WHERE pk = 0 AND a = 1 + 1 AND b = 1 + 2 AND c = 2 + 2 AND d = 2 + 3 AND e = 2.5 + 3 AND f = 3.5 + 3 AND g = 3 + 4 AND h = 4.5 + 4"),
+                             (byte) 2, (short) 3, 4, 5L, 5.5F, 6.5, BigInteger.valueOf(7), BigDecimal.valueOf(8.5));
 
-            assertRows(execute("SELECT a + a, b + b, c + c, d + d, e + e, f + f, g + g, h + h FROM %s " +
-                               "WHERE pk = 0 AND a = 1 + 1 AND b = 1 + 2 AND c = 2 + 2 AND d = 2 + 3 AND e = 2.5 + 3 AND f = 3.5 + 3 AND g = 3 + 4 AND h = 4.5 + 4"),
-                       row((byte) 4, (short) 6, 8, 10L, 11.0F, 13.0, BigInteger.valueOf(14), BigDecimal.valueOf(17.0)));
+            assertNumericRow(execute("SELECT a + a, b + b, c + c, d + d, e + e, f + f, g + g, h + h FROM %s " +
+                                     "WHERE pk = 0 AND a = 1 + 1 AND b = 1 + 2 AND c = 2 + 2 AND d = 2 + 3 AND e = 2.5 + 3 AND f = 3.5 + 3 AND g = 3 + 4 AND h = 4.5 + 4"),
+                             (byte) 4, (short) 6, 8, 10L, 11.0F, 13.0, BigInteger.valueOf(14), BigDecimal.valueOf(17.0));
+        }
+    }
+
+    /**
+     * Asserts a single-row result, comparing decimals by numeric value: the trie memtable stores clustering values in
+     * byte-comparable form, which does not preserve a decimal's scale (8.5 reads back as 8.50).
+     */
+    private static void assertNumericRow(UntypedResultSet result, Object... expected)
+    {
+        assertEquals(1, result.size());
+        UntypedResultSet.Row row = result.one();
+        List<ColumnSpecification> columns = row.getColumns();
+        assertEquals(expected.length, columns.size());
+        for (int i = 0; i < expected.length; i++)
+        {
+            ColumnSpecification column = columns.get(i);
+            Object actual = column.type.compose(row.getBytes(column.name.toString()));
+            if (expected[i] instanceof BigDecimal)
+                assertEquals(column.name.toString() + ": expected " + expected[i] + " but got " + actual,
+                             0, ((BigDecimal) expected[i]).compareTo((BigDecimal) actual));
+            else
+                assertEquals(column.name.toString(), expected[i], actual);
         }
     }
 
