@@ -166,7 +166,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             offsetL += CollectionSerializer.sizeOfValue(k1, accessorL, protocolVersion);
             TR k2 = CollectionSerializer.readValue(right, accessorR, offsetR, protocolVersion);
             offsetR += CollectionSerializer.sizeOfValue(k2, accessorR, protocolVersion);
-            int cmp = keysComparator.compare(k1, accessorL, k2, accessorR);
+            int cmp = compareElements(keysComparator, k1, accessorL, k2, accessorR);
             if (cmp != 0)
                 return cmp;
 
@@ -174,7 +174,7 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             offsetL += CollectionSerializer.sizeOfValue(v1, accessorL, protocolVersion);
             TR v2 = CollectionSerializer.readValue(right, accessorR, offsetR, protocolVersion);
             offsetR += CollectionSerializer.sizeOfValue(v2, accessorR, protocolVersion);
-            cmp = valuesComparator.compare(v1, accessorL, v2, accessorR);
+            cmp = compareElements(valuesComparator, v1, accessorL, v2, accessorR);
             if (cmp != 0)
                 return cmp;
         }
@@ -332,7 +332,8 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             // map keys must be JSON strings, so convert non-string keys to strings
             ByteBuffer kv = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset, protocolVersion);
             offset += CollectionSerializer.sizeOfValue(kv, ByteBufferAccessor.instance, protocolVersion);
-            String key = keys.toJSONString(kv, protocolVersion);
+            // a map built by a selector, like {k: v}, has a null key for a null value
+            String key = kv == null ? "null" : keys.toJSONString(kv, protocolVersion);
             if (key.startsWith("\""))
                 sb.append(key);
             else
@@ -341,7 +342,10 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
             sb.append(": ");
             ByteBuffer vv = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset, protocolVersion);
             offset += CollectionSerializer.sizeOfValue(vv, ByteBufferAccessor.instance, protocolVersion);
-            sb.append(values.toJSONString(vv, protocolVersion));
+            if (vv == null)
+                sb.append("null");
+            else
+                sb.append(values.toJSONString(vv, protocolVersion));
         }
         return sb.append('}').toString();
     }

@@ -150,7 +150,7 @@ public class ListType<T> extends CollectionType<List<T>>
             offsetL += CollectionSerializer.sizeOfValue(v1, accessorL, ProtocolVersion.V3);
             VR v2 = CollectionSerializer.readValue(right, accessorR, offsetR, ProtocolVersion.V3);
             offsetR += CollectionSerializer.sizeOfValue(v2, accessorR, ProtocolVersion.V3);
-            int cmp = elementsComparator.compare(v1, accessorL, v2, accessorR);
+            int cmp = compareElements(elementsComparator, v1, accessorL, v2, accessorR);
             if (cmp != 0)
                 return cmp;
         }
@@ -273,7 +273,11 @@ public class ListType<T> extends CollectionType<List<T>>
                 sb.append(", ");
             ByteBuffer element = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset, protocolVersion);
             offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance, protocolVersion);
-            sb.append(elementsType.toJSONString(element, protocolVersion));
+            // a list built by a selector, like [v1, v2], has a null element for a null value
+            if (element == null)
+                sb.append("null");
+            else
+                sb.append(elementsType.toJSONString(element, protocolVersion));
         }
         return sb.append(']').toString();
     }
