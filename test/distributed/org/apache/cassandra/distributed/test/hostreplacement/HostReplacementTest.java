@@ -51,6 +51,7 @@ import org.apache.cassandra.gms.EndpointState;
 import org.apache.cassandra.gms.Gossiper;
 import org.apache.cassandra.gms.VersionedValue;
 import org.apache.cassandra.io.sstable.Component;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -324,7 +325,10 @@ public class HostReplacementTest extends TestBaseImpl
     public void replaceHostAbortsStreamingWhenDigestValidationCatchesCorruption() throws IOException, TimeoutException
     {
         TokenSupplier even = TokenSupplier.evenlyDistributedTokens(2);
-        try (Cluster cluster = Cluster.build(2)
+        // with BTI, the test default, the sender reads Data.db through the partition index while planning the stream
+        // and so fails on the corruption before the receiver's digest check can run; BIG does not
+        try (WithProperties properties = new WithProperties(SSTableFormat.FORMAT_DEFAULT_PROP, SSTableFormat.Type.BIG.name);
+             Cluster cluster = Cluster.build(2)
                                       .withConfig(c -> c.with(Feature.GOSSIP, Feature.NETWORK)
                                                         .set("entire_sstable_stream_digest_validation_enabled", true))
                                       .withTokenSupplier(node -> even.token(node == 3 ? 2 : node))
