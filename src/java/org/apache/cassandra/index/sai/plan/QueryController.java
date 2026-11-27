@@ -518,8 +518,37 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
 
         Expression halfRange = new Expression(originPredicate.context);
         halfRange.add(op, originPredicate.lower.value.raw);
-        long matchingRowCount = Math.min(estimateMatchingRowCount(halfRange), planFactory.tableMetrics.rows);
-        return planFactory.indexScan(halfRange, matchingRowCount);
+        return buildIndexScanPlan(halfRange);
+    }
+
+    /**
+     * Builds the plan of an index scan for the given predicate, which can be a NOT CONTAINS or NOT CONTAINS KEY but
+     * not a != (see #buildInequalityPlan).
+     */
+    private Plan.KeysIteration buildIndexScanPlan(Expression predicate)
+    {
+        assert predicate.getOp() != Expression.Op.NOT_EQ : "inequalities are planned by buildInequalityPlan";
+        if (predicate.hasUnindexedEmptyValue())
+        {
+            // The index can't search an empty value it doesn't store, but we know which indexed values it selects.
+            // The searches and the estimates do the same rewrite (see KeyRangeTermIterator#build and
+            // #estimateMatchingRowCount); doing it here plans nothing or a full index scan instead.
+            if (predicate.getOp().isNonEquality())
+            {
+                // The empty value matches no indexed value, so the negation matches all the keys
+                // (see IndexContext#getNonEqIterator and SSTableIndex#getNonEqIterator).
+                return planFactory.indexScan(predicate, planFactory.tableMetrics.rows);
+            }
+
+            predicate = predicate.withoutUnindexedEmptyBounds();
+            if (predicate == null)
+                return planFactory.nothing;
+            if (predicate.getOp() == Expression.Op.RANGE && predicate.lower == null && predicate.upper == null)
+                return planFactory.fullIndexScan(predicate.context);
+        }
+
+        long matchingRowCount = Math.min(estimateMatchingRowCount(predicate), planFactory.tableMetrics.rows);
+        return planFactory.indexScan(predicate, matchingRowCount);
     }
 
     /**
@@ -580,10 +609,7 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
                 if (expression.getOp() == Expression.Op.NOT_EQ)
                     builder.add(buildInequalityPlan(expression));
                 else
-                {
-                    long expectedMatchingRowCount = Math.min(estimateMatchingRowCount(expression), planFactory.tableMetrics.rows);
-                    builder.add(planFactory.indexScan(expression, expectedMatchingRowCount));
-                }
+                    builder.add(buildIndexScanPlan(expression));
             }
         }
     }
@@ -617,8 +643,15 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
                                                                       orderer.context.getIndexName()));
         }
 
-        MemtableSearcher memtableSearcher = index -> index.orderBy(queryContext, orderer, predicate, mergeRange, softLimit);
-        SSTableSearcher ssTableSearcher = (index, totalRows) -> index.orderBy(orderer, predicate, mergeRange, queryContext, softLimit, totalRows);
+        Expression searched = predicate == null ? null : predicate.withoutUnindexedEmptyBounds();
+        if (predicate != null && searched == null)
+            return CloseableIterator.emptyIterator();
+        if (searched != null && searched.getOp() == Expression.Op.RANGE && searched.lower == null && searched.upper == null)
+            searched = null; // all the indexed values
+
+        Expression orderedPredicate = searched;
+        MemtableSearcher memtableSearcher = index -> index.orderBy(queryContext, orderer, orderedPredicate, mergeRange, softLimit);
+        SSTableSearcher ssTableSearcher = (index, totalRows) -> index.orderBy(orderer, orderedPredicate, mergeRange, queryContext, softLimit, totalRows);
         return searchTopKRows(memtableSearcher, ssTableSearcher);
     }
 
@@ -962,6 +995,16 @@ public class QueryController implements Plan.Executor, Plan.CostEstimator
      */
     private long estimateMatchingRowCount(Expression predicate)
     {
+        if (predicate.hasUnindexedEmptyValue())
+        {
+            // the negation of such a value matches all the keys (see IndexContext#getNonEqIterator)
+            if (predicate.getOp().isNonEquality())
+                return planFactory.tableMetrics.rows;
+            predicate = predicate.withoutUnindexedEmptyBounds();
+            if (predicate == null)
+                return 0;
+        }
+
         switch (predicate.getOp())
         {
             case EQ:
