@@ -20,7 +20,7 @@ package org.apache.cassandra.schema;
 
 import org.junit.Test;
 
-import org.apache.cassandra.db.compaction.AbstractCompactionStrategy;
+import org.apache.cassandra.db.compaction.CompactionStrategy;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.utils.ClassLoadingTestNonAssignable;
 import org.apache.cassandra.utils.ClassLoadingTestSupport;
@@ -37,7 +37,7 @@ public class CompactionParamsTest
 
         assertThatThrownBy(() -> CompactionParams.classFromName(ClassLoadingTestNonAssignable.class.getName()))
         .isInstanceOf(ConfigurationException.class)
-        .hasMessageContaining("must extend or implement " + AbstractCompactionStrategy.class.getName());
+        .hasMessageContaining("must extend or implement " + CompactionStrategy.class.getName());
 
         assertThat(ClassLoadingTestSupport.wasInitialized(ClassLoadingTestNonAssignable.class)).isFalse();
     }
