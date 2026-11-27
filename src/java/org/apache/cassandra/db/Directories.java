@@ -1126,6 +1126,9 @@ public class Directories
     {
         // If snapshotName is empty or null, we will delete the entire snapshot directory
         String tag = snapshotName == null ? "" : snapshotName;
+        if (!tag.isEmpty())
+            validateSnapshotNameToClear(tag);
+
         for (File dir : snapshotDirectories)
         {
             File snapshotDir = new File(dir, join(SNAPSHOT_SUBDIR, tag));
@@ -1145,6 +1148,17 @@ public class Directories
                 }
             }
         }
+    }
+
+    /**
+     * Refuses a snapshot name that is an absolute path or has a {@code .} or {@code ..} component: it would not name a
+     * directory inside the snapshots directory.
+     */
+    public static void validateSnapshotNameToClear(String snapshotName)
+    {
+        Path snapshotPath = new File(snapshotName).toPath();
+        if (snapshotPath.isAbsolute() || Iterables.any(snapshotPath, name -> name.toString().equals(".") || name.toString().equals("..")))
+            throw new IllegalArgumentException("Snapshot name '" + snapshotName + "' does not name a directory inside " + SNAPSHOT_SUBDIR);
     }
 
     // The snapshot must exist
