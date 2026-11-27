@@ -17,7 +17,6 @@
  */
 package org.apache.cassandra.distributed.test.streaming;
 
-import java.io.File;
 import java.io.IOException;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
@@ -44,6 +43,7 @@ import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.RangeAwareSSTableWriter;
 import org.apache.cassandra.io.sstable.format.SSTableFormat;
 import org.apache.cassandra.io.sstable.format.Version;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.streaming.IncomingStream;
 import org.apache.cassandra.streaming.StreamSession;
