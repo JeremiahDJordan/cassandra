@@ -99,13 +99,10 @@ public class BTreePartitionUpdater extends BasePartitionUpdater implements Updat
 
         try
         {
-            indexer.start();
-
             return makeMergedPartition(current, update);
         }
         finally
         {
-            indexer.commit();
             reportAllocatedMemory();
         }
     }

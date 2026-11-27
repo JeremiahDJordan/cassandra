@@ -608,6 +608,11 @@ public interface Index
      * order. This can also include duplicate calls, in cases where a memtable partition is under contention from
      * several updates. In that scenario, the same set of events may be delivered to the Indexer as memtable update
      * which failed due to contention is re-applied.
+     * </p>
+     * On a memtable that applies updates atomically (see {@link Memtable#appliesUpdatesAtomically()}), the events of an
+     * update are delivered together when its transaction commits, after the update is visible and before the next write
+     * to the partition, and not at all if the memtable fails to apply it. On other memtables they are delivered while
+     * the memtable merges the update.
      */
     interface Indexer
     {
