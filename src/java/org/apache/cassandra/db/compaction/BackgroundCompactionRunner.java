@@ -33,12 +33,14 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableSet;
 import org.apache.cassandra.concurrent.ScheduledExecutorPlus;
+import org.apache.cassandra.concurrent.ScheduledExecutors;
 import org.apache.cassandra.concurrent.WrappedExecutorPlus;
 import org.apache.cassandra.utils.concurrent.*;
 import org.slf4j.Logger;
@@ -59,12 +61,19 @@ import org.apache.cassandra.utils.JVMStabilityInspector;
 import org.apache.cassandra.utils.Throwables;
 
 import static org.apache.cassandra.concurrent.ExecutorFactory.Global.executorFactory;
+import static org.apache.cassandra.utils.Clock.Global.nanoTime;
 
 public class BackgroundCompactionRunner implements Runnable
 {
     private static final Logger logger = LoggerFactory.getLogger(BackgroundCompactionRunner.class);
 
     public static final String NO_SPACE_LEFT_MESSAGE = "No space left on device";
+
+    /**
+     * How long the compaction checks of a table wait after one of its compaction tasks failed
+     */
+    @VisibleForTesting
+    static final long FAILURE_BACKOFF_SECONDS = 10;
 
     public enum RequestResult
     {
@@ -90,6 +99,11 @@ public class BackgroundCompactionRunner implements Runnable
      * CFSs for which a compaction was requested mapped to the promise returned to the requesting code
      */
     private final ConcurrentMap<ColumnFamilyStore, FutureRequestResult> compactionRequests = new ConcurrentHashMap<>();
+
+    /**
+     * CFSs whose compaction checks wait after a failed compaction task, mapped to the time of that failure
+     */
+    private final ConcurrentMap<ColumnFamilyStore, Long> failureBackoffs = new ConcurrentHashMap<>();
 
     private final AtomicInteger ongoingUpgrades = new AtomicInteger(0);
 
@@ -264,6 +278,13 @@ public class BackgroundCompactionRunner implements Runnable
                 return;
             }
 
+            // The request stays until the backoff ends, which schedules a new check
+            if (failureBackoffs.containsKey(cfs))
+            {
+                logger.trace("Delaying compactions check for {} after a failed compaction", cfs);
+                continue;
+            }
+
             FutureRequestResult promise = compactionRequests.remove(cfs);
             assert promise != null : "Background compaction checker must be single-threaded";
 
@@ -414,6 +435,12 @@ public class BackgroundCompactionRunner implements Runnable
                 {
                     task.execute(activeOperations);
                 }
+                catch (Throwable t)
+                {
+                    if (!(t instanceof CompactionInterruptedException))
+                        startFailureBackoff(cfs);
+                    throw t;
+                }
                 finally
                 {
                     ongoingCompactions.decrementAndGet();
@@ -430,6 +457,24 @@ public class BackgroundCompactionRunner implements Runnable
             ongoingCompactions.decrementAndGet();
             logger.debug("Background compaction task for {} was rejected", cfs);
             return CompletableFuture.completedFuture(null);
+        }
+    }
+
+    private void startFailureBackoff(ColumnFamilyStore cfs)
+    {
+        Long failedAt = nanoTime();
+        failureBackoffs.put(cfs, failedAt);
+        try
+        {
+            ScheduledExecutors.optionalTasks.schedule(() -> {
+                if (failureBackoffs.remove(cfs, failedAt))
+                    maybeScheduleNextCheck();
+            }, FAILURE_BACKOFF_SECONDS, TimeUnit.SECONDS);
+        }
+        catch (RejectedExecutionException ex)
+        {
+            failureBackoffs.remove(cfs, failedAt);
+            logger.debug("Background compactions check for {} after a failed compaction was rejected", cfs);
         }
     }
 
