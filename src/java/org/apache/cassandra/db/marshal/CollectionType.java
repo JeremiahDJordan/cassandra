@@ -290,12 +290,23 @@ public abstract class CollectionType<T> extends AbstractType<T>
             offsetL += CollectionSerializer.sizeOfValue(v1, accessorL);
             VR v2 = CollectionSerializer.readValue(right, accessorR, offsetR);
             offsetR += CollectionSerializer.sizeOfValue(v2, accessorR);
-            int cmp = elementsComparator.compare(v1, accessorL, v2, accessorR);
+            int cmp = compareElements(elementsComparator, v1, accessorL, v2, accessorR);
             if (cmp != 0)
                 return cmp;
         }
 
         return Integer.compare(sizeL, sizeR);
+    }
+
+    /**
+     * Compares two elements, keys or values of frozen collections, ordering a null first. A collection built in the
+     * selection, like {@code {v1, v2}}, has a null element for a null value.
+     */
+    static <VL, VR> int compareElements(AbstractType<?> comparator, VL left, ValueAccessor<VL> accessorL, VR right, ValueAccessor<VR> accessorR)
+    {
+        if (left == null || right == null)
+            return Boolean.compare(right == null, left == null);
+        return comparator.compare(left, accessorL, right, accessorR);
     }
 
     static <V> ByteSource asComparableBytesListOrSet(AbstractType<?> elementsComparator,
