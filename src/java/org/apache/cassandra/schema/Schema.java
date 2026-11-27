@@ -64,6 +64,7 @@ import org.apache.cassandra.schema.Keyspaces.KeyspacesDiff;
 import org.apache.cassandra.schema.SchemaTransformation.SchemaTransformationResult;
 import org.apache.cassandra.service.PendingRangeCalculatorService;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.utils.Pair;
 import org.apache.cassandra.utils.concurrent.LoadingMap;
 
 import static com.google.common.collect.Iterables.size;
@@ -543,7 +544,7 @@ public class Schema implements SchemaProvider
      */
     public synchronized Pair<Keyspaces, UUID> getSchemaBlocking()
     {
-        return Pair.create(keyspaces, version);
+        return Pair.create(distributedAndLocalKeyspaces(), version);
     }
 
     /**
