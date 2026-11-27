@@ -25,6 +25,7 @@ import org.apache.cassandra.utils.AbstractTypeGenerators;
 import org.assertj.core.api.Assertions;
 
 import static org.apache.cassandra.utils.ByteBufferUtil.EMPTY_BYTE_BUFFER;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.quicktheories.QuickTheory.qt;
 
 /**
@@ -43,6 +44,49 @@ public class EmptyValuesTest extends SAITester
                 testEmptyValues(cql3Type);
             }
         });
+    }
+
+    @Test
+    public void testEmptyFieldInClusteringRejected()
+    {
+        String udt = createType("CREATE TYPE %s (a int, b int)");
+        createTable("CREATE TABLE %s (pk int, ck frozen<tuple<int, int>>, ck2 frozen<" + udt + ">, v int, PRIMARY KEY (pk, ck, ck2)) WITH memtable = {'class': 'SkipListMemtable'}");
+        String index = createIndex(String.format(CREATE_INDEX_TEMPLATE, 'v'));
+        String error = String.format(StorageAttachedIndex.EMPTY_CLUSTERING_FIELD_ERROR, index);
+
+        assertInvalidMessage(error, "INSERT INTO %s (pk, ck, ck2, v) VALUES (0, (blobAsInt(0x), 1), {a: 1, b: 1}, 1)");
+        assertInvalidMessage(error, "INSERT INTO %s (pk, ck, ck2, v) VALUES (0, (1, 1), {a: 1, b: blobAsInt(0x)}, 1)");
+        assertInvalidMessage(error, "DELETE FROM %s WHERE pk = 0 AND ck = (blobAsInt(0x), 1) AND ck2 = {a: 1, b: 1}");
+
+        execute("INSERT INTO %s (pk, ck, ck2, v) VALUES (0, (null, 1), {a: 1, b: null}, 1)");
+        assertRows(execute("SELECT ck FROM %s WHERE v = 1"), row(tuple(null, 1)));
+    }
+
+    @Test
+    public void testEmptyFieldInCollectionInClusteringRejected()
+    {
+        createTable("CREATE TABLE %s (pk int, ck frozen<list<frozen<tuple<int, int>>>>, v int, PRIMARY KEY (pk, ck)) WITH memtable = {'class': 'SkipListMemtable'}");
+        String index = createIndex(String.format(CREATE_INDEX_TEMPLATE, 'v'));
+
+        assertInvalidMessage(String.format(StorageAttachedIndex.EMPTY_CLUSTERING_FIELD_ERROR, index),
+                             "INSERT INTO %s (pk, ck, v) VALUES (0, [(blobAsInt(0x), 1)], 1)");
+    }
+
+    @Test
+    public void testEmptyFieldInClusteringWrittenBeforeIndex()
+    {
+        for (String order : new String[]{ "ASC", "DESC" })
+        {
+            createTable("CREATE TABLE %s (pk int, ck frozen<tuple<int, int>>, v int, PRIMARY KEY (pk, ck)) WITH memtable = {'class': 'SkipListMemtable'} AND CLUSTERING ORDER BY (ck " + order + ")");
+            disableCompaction();
+            execute("INSERT INTO %s (pk, ck, v) VALUES (0, (null, 1), 1)");
+            flush();
+            execute("INSERT INTO %s (pk, ck, v) VALUES (0, (blobAsInt(0x), 1), 1)");
+            flush();
+            createIndex(String.format(CREATE_INDEX_TEMPLATE, 'v'));
+
+            assertThatThrownBy(this::compact).hasStackTraceContaining("its clustering has an empty value");
+        }
     }
 
     private void testEmptyValues(CQL3Type type)
