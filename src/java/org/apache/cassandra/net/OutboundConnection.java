@@ -50,6 +50,7 @@ import io.netty.util.concurrent.Promise; //checkstyle: permit this import
 import io.netty.util.concurrent.PromiseNotifier;
 import io.netty.util.concurrent.SucceededFuture;
 import org.apache.cassandra.config.DatabaseDescriptor;
+import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.io.util.DataOutputBufferFixed;
 import org.apache.cassandra.net.OutboundConnectionInitiator.Result.MessagingSuccess;
 import org.apache.cassandra.tracing.Tracing;
@@ -70,6 +71,7 @@ import static org.apache.cassandra.net.ResourceLimits.Outcome.*;
 import static org.apache.cassandra.net.SocketFactory.*;
 import static org.apache.cassandra.utils.FBUtilities.prettyPrintMemory;
 import static org.apache.cassandra.utils.MonotonicClock.Global.approxTime;
+import static org.apache.cassandra.utils.Throwables.getCauseOfType;
 import static org.apache.cassandra.utils.Throwables.isCausedBy;
 import static org.apache.cassandra.utils.concurrent.CountDownLatch.newCountDownLatch;
 
@@ -489,7 +491,14 @@ public class OutboundConnection
      */
     private void onFailedSerialize(Message<?> message, int messagingVersion, int bytesWrittenToNetwork, Throwable t)
     {
-        logger.warn("{} dropping message of type {} due to error", id(), message.verb(), t);
+        IncompatibleMessagingVersionException incompatible =
+            getCauseOfType(t, IncompatibleMessagingVersionException.class).orElse(null);
+        // keyed by connection and reason, to log each kind of refusal once a minute
+        if (incompatible != null)
+            NoSpamLogger.log(logger, NoSpamLogger.Level.WARN, id() + incompatible.getMessage(), 1, TimeUnit.MINUTES,
+                             "{} dropping message of type {}: {}", id(), message.verb(), incompatible.getMessage());
+        else
+            logger.warn("{} dropping message of type {} due to error", id(), message.verb(), t);
         JVMStabilityInspector.inspectThrowable(t);
         releaseCapacity(1, canonicalSize(message));
         errorCount += 1;

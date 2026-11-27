@@ -96,6 +96,7 @@ import org.apache.cassandra.db.DataRange;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.PartitionPosition;
 import org.apache.cassandra.db.PartitionRangeReadQuery;
+import org.apache.cassandra.db.ReadCommand;
 import org.apache.cassandra.db.ReadExecutionController;
 import org.apache.cassandra.db.ReadQuery;
 import org.apache.cassandra.db.SinglePartitionReadCommand;
@@ -623,6 +624,13 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
             checkFalse(aggregationSpec != null, TOPK_AGGREGATION_ERROR);
         }
 
+        // Reject the DataStax-only parts of the filter (operators, OR...) while there are nodes that can't
+        // deserialize them, or evaluate them differently, such as Apache Cassandra nodes during an upgrade. Local
+        // tables are never sent to them. Other queries that only run locally (e.g. internal ones) are rejected too, as
+        // where they run isn't known here.
+        if (!table.isVirtual() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
+            rowFilter.validateForPeers(table.keyspace, options.getConsistency(), isFilteredBySAI(query));
+
         query.validateSelectOptions(selectOptions, state);
 
         // If there's a secondary index that the command can use, have it validate the request parameters.
@@ -996,6 +1004,25 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
     public StatementRestrictions getRestrictions()
     {
         return restrictions;
+    }
+
+    /**
+     * Returns whether SAI filters the given read, or any of the single-partition reads that it groups.
+     */
+    private static boolean isFilteredBySAI(ReadQuery query)
+    {
+        if (query instanceof ReadCommand)
+            return ((ReadCommand) query).isFilteredBySAI();
+
+        if (query instanceof SinglePartitionReadQuery.Group)
+        {
+            for (SinglePartitionReadQuery partitionQuery : ((SinglePartitionReadQuery.Group<?>) query).queries)
+            {
+                if (partitionQuery instanceof ReadCommand && ((ReadCommand) partitionQuery).isFilteredBySAI())
+                    return true;
+            }
+        }
+        return false;
     }
 
     private ReadQuery getSliceCommands(QueryOptions options, ClientState state, ColumnFilter columnFilter,

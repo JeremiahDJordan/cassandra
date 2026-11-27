@@ -19,6 +19,7 @@
 package org.apache.cassandra.service.reads.range;
 
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 
 import org.apache.cassandra.concurrent.Stage;
@@ -55,14 +56,23 @@ public class NonGroupingRangeCommandIterator extends RangeCommandIterator
 
     protected PartitionIterator sendNextRequests()
     {
+        return sendNextRangeRequests(replicaPlans);
+    }
+
+    /**
+     * Sends the requests for the next ranges of the given replica plans, as many as the concurrency factor allows, with
+     * one request per range and replica.
+     */
+    PartitionIterator sendNextRangeRequests(Iterator<ReplicaPlan.ForRangeRead> plans)
+    {
         List<PartitionIterator> concurrentQueries = new ArrayList<>(concurrencyFactor);
         List<ReadRepair<?, ?>> readRepairs = new ArrayList<>(concurrencyFactor);
 
         try
         {
-            for (int i = 0; i < concurrencyFactor() && replicaPlans.hasNext(); )
+            for (int i = 0; i < concurrencyFactor() && plans.hasNext(); )
             {
-                ReplicaPlan.ForRangeRead replicaPlan = replicaPlans.next();
+                ReplicaPlan.ForRangeRead replicaPlan = plans.next();
                 readTracker.onReplicaPlan(replicaPlan);
 
                 @SuppressWarnings("resource") // response will be closed by concatAndBlockOnRepair, or in the catch block below

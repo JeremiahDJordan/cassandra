@@ -81,6 +81,7 @@ import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.UnknownIndexException;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.IndexRegistry;
+import org.apache.cassandra.index.sai.StorageAttachedIndex;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.util.DataInputPlus;
@@ -208,6 +209,14 @@ public abstract class ReadCommand extends AbstractReadQuery
     protected abstract void serializeSelection(DataOutputPlus out, int version) throws IOException;
     protected abstract long selectionSerializedSize(int version);
 
+    /**
+     * Throws if this command can't be sent to nodes on the given messaging version. Checked before the command writes
+     * anything, as a large message may be flushed to the network while it's being serialized.
+     */
+    protected void checkSerializable(int version)
+    {
+    }
+
     public abstract boolean isLimitedToOnePartition();
 
     /**
@@ -303,6 +312,15 @@ public abstract class ReadCommand extends AbstractReadQuery
     public Index.QueryPlan indexQueryPlan()
     {
         return indexQueryPlan;
+    }
+
+    /**
+     * Whether the replicas filter this read with SAI: they build their index query plan from the index that the read
+     * names (see Serializer#serialize).
+     */
+    public boolean isFilteredBySAI()
+    {
+        return indexQueryPlan != null && indexQueryPlan.getFirst() instanceof StorageAttachedIndex;
     }
 
     /**
@@ -1288,6 +1306,8 @@ public abstract class ReadCommand extends AbstractReadQuery
 
         public void serialize(ReadCommand command, DataOutputPlus out, int version) throws IOException
         {
+            command.checkSerializable(version);
+
             out.writeByte(command.kind.ordinal());
             out.writeByte(
                     digestFlag(command.isDigestQuery())
@@ -1300,7 +1320,7 @@ public abstract class ReadCommand extends AbstractReadQuery
             command.metadata().id.serialize(out);
             out.writeInt(MessagingService.Version.supportsExtendedDeletionTime(version) ? CassandraUInt.fromLong(command.nowInSec()) : (int) command.nowInSec());
             ColumnFilter.serializer.serialize(command.columnFilter(), out, version);
-            RowFilter.serializer.serialize(command.rowFilter(), out, version);
+            RowFilter.serializer.serialize(command.rowFilter(), out, version, command.isFilteredBySAI());
             DataLimits.serializer.serialize(command.limits(), out, version, command.metadata().comparator);
             // Using the name of one of the indexes in the plan to identify the index group because we want
             // to keep compatibility with legacy nodes. Each replica can create its own different index query plan

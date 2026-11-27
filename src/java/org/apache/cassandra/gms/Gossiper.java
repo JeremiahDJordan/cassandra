@@ -2918,6 +2918,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
             prev.maybeRemoveUpdater();
 
         state.maybeUpdate();
+        if (prev != state)
+            PeerCheckCache.peersChanged();
 
         return prev;
     }
@@ -2932,6 +2934,8 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
             state.maybeRemoveUpdater();
         else
             state.maybeUpdate();
+        if (prev == null)
+            PeerCheckCache.peersChanged();
 
         return prev;
     }
@@ -2940,7 +2944,10 @@ public class Gossiper implements IFailureDetectionEventListener, GossiperMBean, 
     {
         EndpointState removedState = endpointStateMap.remove(endpoint);
         if (removedState != null)
+        {
             removedState.maybeRemoveUpdater();
+            PeerCheckCache.peersChanged();
+        }
         return removedState;
     }
 }
