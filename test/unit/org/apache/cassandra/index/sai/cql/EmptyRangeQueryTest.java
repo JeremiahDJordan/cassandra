@@ -242,6 +242,8 @@ public class EmptyRangeQueryTest extends SAITester
     @Test
     public void testOrderBy() throws Throwable
     {
+        // ordering on a table with clustering columns is rejected for indexes that aren't row-aware
+        Assume.assumeTrue(version.onOrAfter(Version.ROW_AWARE_EARLIEST));
         createTable("CREATE TABLE %s (pk int, ck int, v bigint, PRIMARY KEY (pk, ck))");
         createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'org.apache.cassandra.index.sai.StorageAttachedIndex'");
         disableCompaction();
