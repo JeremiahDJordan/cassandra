@@ -250,17 +250,24 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         //   3) After a "complete" row is materialized, it must pass the row filter supplied by the original query
         //      before it counts against the limit. If this "pre-count" filter causes a short read, additional rows
         //      will be fetched from the first-phase iterator.
+        // The first phase doesn't apply its merged result counter, which would count rows that the second phase filters
+        // out. Replica filtering protection counts in it the first-phase rows that no replica is silent about and that
+        // match the row filter, which the second phase returns as they are, so that short read protection stops asking
+        // the replicas for more rows once those rows fill the limit.
 
+        // We need separate contexts, as each context has his own counter
+        ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
+        UnaryOperator<PartitionIterator> preCountFilter = preCountFilterForReplicaFilteringProtection();
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(coordinator, replicaPlan().keyspace(),
                                                                              command,
                                                                              replicaPlan().consistencyLevel(),
                                                                              requestTime,
                                                                              replicas,
                                                                              DatabaseDescriptor.getCachedReplicaRowsWarnThreshold(),
-                                                                             DatabaseDescriptor.getCachedReplicaRowsFailThreshold());
+                                                                             DatabaseDescriptor.getCachedReplicaRowsFailThreshold(),
+                                                                             firstPhaseContext.mergedResultCounter,
+                                                                             preCountFilter);
 
-        // We need separate contexts, as each context has his own counter
-        ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
         PartitionIterator firstPhasePartitions = resolveInternal(firstPhaseContext,
                                                                  rfp.mergeController(),
                                                                  i -> shortReadProtectedResponse(i, firstPhaseContext, null),
@@ -269,7 +276,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         ResolveContext secondPhaseContext = new ResolveContext(replicas, true);
         PartitionIterator completedPartitions = resolveWithReadRepair(secondPhaseContext,
                                                                       i -> rfp.queryProtectedPartitions(firstPhasePartitions, i),
-                                                                      preCountFilterForReplicaFilteringProtection(),
+                                                                      preCountFilter,
                                                                       repairedDataTracker);
 
         // Ensure that the RFP instance has a chance to record metrics when the iterator closes.
@@ -282,13 +289,11 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         if (!command.rowFilter().hasNonKeyExpression())
             return results -> results;
 
-        return results -> {
-            Index.Searcher searcher = command.indexSearcher();
-            // in case of "ALLOW FILTERING" without index
-            if (searcher == null)
-                return command.rowFilter().filter(results, command.metadata(), command.nowInSec());
-            return searcher.filterReplicaFilteringProtection(results);
-        };
+        Index.Searcher searcher = command.indexSearcher();
+        // in case of "ALLOW FILTERING" without index
+        if (searcher == null)
+            return results -> command.rowFilter().filter(results, command.metadata(), command.nowInSec());
+        return searcher::filterReplicaFilteringProtection;
     }
 
     private PartitionIterator resolveInternal(ResolveContext context,
