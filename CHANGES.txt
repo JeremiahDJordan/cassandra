@@ -1,4 +1,5 @@
 5.0.10
+ * Release the envelope of a native protocol v3/v4 request rejected as overloaded (CASSANDRA-XXXXX)
  * Assorted fixes for SAI replica reconciliation with multi-cell collections and range tombstones (CASSANDRA-21897)
  * Harden client STARTUP options (CASSANDRA-21755)
  * Assorted fixes for post-filtering on collection elements and inet columns (CASSANDRA-21863)
