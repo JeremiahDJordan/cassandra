@@ -83,7 +83,7 @@ public class DurationType extends AbstractType<Duration>
     }
 
     @Override
-    public boolean referencesDuration(boolean legacyMode)
+    public boolean referencesDuration()
     {
         return true;
     }

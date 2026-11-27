@@ -439,10 +439,17 @@ public class TableMetadata implements SchemaElement
 
     public final void validate()
     {
-        validate(false);
+        validate(null);
     }
 
-    public void validate(boolean durationLegacyMode)
+    /**
+     * Validates this table as the result of a schema change.
+     *
+     * @param previous the table before the schema change (the base table for a new view), or {@code null} for a new
+     *                 table. A column that has a duration where values are sorted in {@code previous} can keep it, so
+     *                 that such a table, its keyspace and its types can still be altered; new columns cannot have one.
+     */
+    public void validate(@Nullable TableMetadata previous)
     {
         if (!isValidName(keyspace, true))
             except("Keyspace name must not be empty or contain non-alphanumeric-underscore characters (got \"%s\")", keyspace);
@@ -452,7 +459,14 @@ public class TableMetadata implements SchemaElement
 
         params.validate();
 
-        columns().forEach(c -> c.validate(isCounter(), durationLegacyMode));
+        for (ColumnMetadata column : columns())
+        {
+            ColumnMetadata before = previous == null ? null : previous.getColumn(column.name);
+            boolean hadSortedDuration = before != null
+                                        && before.isPrimaryKeyColumn() == column.isPrimaryKeyColumn()
+                                        && before.type.hasSortedDuration(before.isPrimaryKeyColumn());
+            column.validate(isCounter(), hadSortedDuration);
+        }
 
         // All tables should have a partition key
         if (partitionKeyColumns.isEmpty())
@@ -1625,9 +1639,9 @@ public class TableMetadata implements SchemaElement
         }
 
         @Override
-        public void validate(boolean durationLegacyMode)
+        public void validate(@Nullable TableMetadata previous)
         {
-            super.validate(durationLegacyMode);
+            super.validate(previous);
 
             // A compact table should always have a clustering
             if (!Flag.isCQLTable(flags) && clusteringColumns.isEmpty())

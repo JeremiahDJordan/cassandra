@@ -200,7 +200,7 @@ public abstract class AlterTableStatement extends AlterSchemaStatement
             Views.Builder viewsBuilder = keyspace.views.unbuild();
             newColumns.forEach(c -> addColumn(keyspace, table, c, tableBuilder, viewsBuilder));
             TableMetadata tableMetadata = tableBuilder.build();
-            tableMetadata.validate();
+            tableMetadata.validate(table);
 
             Guardrails.columnsPerTable.guard(tableBuilder.numColumns(), tableName, false, queryState);
             newColumns.forEach(c -> c.type.validate(queryState, "Column " + c.name));

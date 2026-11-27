@@ -85,7 +85,7 @@ public abstract class AlterTypeStatement extends AlterSchemaStatement
         CreateTypeStatement.validate(updated);
 
         KeyspaceMetadata newKeyspace = keyspace.withUpdatedUserType(updated);
-        newKeyspace.validate();
+        newKeyspace.validate(keyspace);
 
         return schema.withAddedOrUpdated(newKeyspace);
     }
