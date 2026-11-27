@@ -21,6 +21,7 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.Set;
@@ -43,6 +44,7 @@ import org.apache.cassandra.db.rows.AbstractUnfilteredRowIterator;
 import org.apache.cassandra.db.rows.BTreeRow;
 import org.apache.cassandra.db.rows.BufferCell;
 import org.apache.cassandra.db.rows.Cell;
+import org.apache.cassandra.db.rows.CellPath;
 import org.apache.cassandra.db.rows.ColumnData;
 import org.apache.cassandra.db.rows.ComplexColumnData;
 import org.apache.cassandra.db.rows.EncodingStats;
@@ -368,6 +370,38 @@ public class ReadResponseTest
     }
 
     @Test
+    public void inMemoryResponseKeepsNotQueriedCellsOlderThanRowLiveness()
+    {
+        // The rows of a read are merged from its sources: a fetched but not queried cell older than a row's liveness
+        // info comes from a source without that liveness info, which kept it. The serialized response keeps it too.
+        int key = key();
+        ColumnMetadata coll = metadataWithCollection.getColumn(ByteBufferUtil.bytes("coll"));
+        ReadCommand command = command(key, metadataWithCollection, ColumnFilter.allRegularColumnsBuilder(metadataWithCollection, false).add(coll).build(), false);
+        StubRepairedDataInfo rdi = new StubRepairedDataInfo(ByteBufferUtil.EMPTY_BYTE_BUFFER, true);
+        DecoratedKey dk = metadataWithCollection.partitioner.decorateKey(ByteBufferUtil.bytes(key));
+        ColumnMetadata v = metadataWithCollection.getColumn(ByteBufferUtil.bytes("v"));
+
+        PartitionUpdate.Builder builder = new PartitionUpdate.Builder(metadataWithCollection, dk, command.columnFilter().fetchedColumns(), 2);
+        for (int c = 0; c < 2; c++)
+        {
+            Row.Builder row = BTreeRow.unsortedBuilder();
+            row.newRow(Clustering.make(ByteBufferUtil.bytes(c)));
+            row.addPrimaryKeyLivenessInfo(LivenessInfo.create(10));
+            row.addCell(BufferCell.live(v, 1, ByteBufferUtil.EMPTY_BYTE_BUFFER));
+            builder.add(row.build());
+        }
+        PartitionUpdate update = builder.build();
+
+        String serialized = describe(command, command.createResponse(singlePartitionIterator(update), rdi));
+        String inMemory = describe(command, ReadResponse.createInMemoryDataResponse(singlePartitionIterator(update), command, rdi, 0, 0));
+        String overflowed = describe(command, ReadResponse.createInMemoryDataResponse(singlePartitionIterator(update), command, rdi, 1, 0));
+
+        assertTrue(serialized, serialized.contains("v="));
+        assertEquals(serialized, inMemory);
+        assertEquals(serialized, overflowed);
+    }
+
+    @Test
     public void inMemoryResponseMatchesSerializedResponseForAnEmptyPartition()
     {
         // A partition that is returned but holds nothing is serialized as a flag on its own and read back without
@@ -396,7 +430,7 @@ public class ReadResponseTest
         for (int i = 0; i < 300; i++)
         {
             RandomPartition partition = randomPartition(rnd);
-            ReadCommand command = command(partition.key, metadataWithCollection, partition.reversed);
+            ReadCommand command = command(partition.key, metadataWithCollection, partition.columnFilter, partition.reversed);
             StubRepairedDataInfo rdi = new StubRepairedDataInfo(ByteBufferUtil.EMPTY_BYTE_BUFFER, true);
             String context = "seed " + seed + ", iteration " + i;
 
@@ -423,8 +457,11 @@ public class ReadResponseTest
 
         final int key;
         final boolean reversed;
+        final ColumnFilter columnFilter;
 
         private final PartitionUpdate update;
+        // a newer source with a row marker for some of the rows of update, which may have none
+        private final PartitionUpdate markers;
         private final Row staticRow;
         // report the columns of the content rather than the ones the filter fetches
         private final boolean contentColumns;
@@ -436,7 +473,8 @@ public class ReadResponseTest
         {
             key = rnd.nextInt();
             reversed = rnd.nextBoolean();
-            contentColumns = rnd.nextBoolean();
+            columnFilter = randomColumnFilter(rnd);
+            contentColumns = rnd.nextBoolean() && columnFilter.fetchedColumns().regulars.equals(metadataWithCollection.regularColumns());
             shadowingTimestamp = rnd.nextInt(3) == 0 ? ROW_TIMESTAMP + rnd.nextInt(2) * 10 : 0;
             shadowingLocalDeletionTime = LOCAL_DELETION_TIME + rnd.nextInt(100);
 
@@ -451,7 +489,9 @@ public class ReadResponseTest
                     staticRow = BTreeRow.emptyRow(Clustering.STATIC_CLUSTERING);
                     break;
                 default:
-                    staticRow = staticRow(metadataWithCollection, rnd.nextInt(100), ROW_TIMESTAMP);
+                    staticRow = columnFilter.fetchedColumns().statics.isEmpty()
+                                ? Rows.EMPTY_STATIC_ROW
+                                : staticRow(metadataWithCollection, rnd.nextInt(100), ROW_TIMESTAMP);
             }
 
             PartitionUpdate.SimpleBuilder builder = PartitionUpdate.simpleBuilder(metadataWithCollection, ByteBufferUtil.bytes(key));
@@ -460,10 +500,18 @@ public class ReadResponseTest
                 builder.timestamp(1).delete();  // older than the rows below, so it does not shadow them
             builder.timestamp(ROW_TIMESTAMP);
 
+            PartitionUpdate.SimpleBuilder markersBuilder = PartitionUpdate.simpleBuilder(metadataWithCollection, ByteBufferUtil.bytes(key));
+            markersBuilder.nowInSec(LOCAL_DELETION_TIME).timestamp(ROW_TIMESTAMP + 10);
+
             int rows = rnd.nextInt(5);
             for (int c = 0; c < rows; c++)
             {
+                if (rnd.nextBoolean())
+                    markersBuilder.row(c).ttl(rnd.nextBoolean() ? 1 : 0);
+
                 Row.SimpleBuilder row = builder.row(c);
+                if (rnd.nextBoolean())
+                    row.noPrimaryKeyLivenessInfo();
                 if (rnd.nextInt(5) == 0)
                     row.delete();
                 else
@@ -483,11 +531,36 @@ public class ReadResponseTest
             }
 
             update = builder.build();
+            markers = markersBuilder.build();
+        }
+
+        private ColumnFilter randomColumnFilter(Random rnd)
+        {
+            ColumnMetadata v = metadataWithCollection.getColumn(ByteBufferUtil.bytes("v"));
+            ColumnMetadata coll = metadataWithCollection.getColumn(ByteBufferUtil.bytes("coll"));
+            ColumnMetadata s = metadataWithCollection.getColumn(ByteBufferUtil.bytes("s"));
+            switch (rnd.nextInt(6))
+            {
+                case 0:
+                    return ColumnFilter.all(metadataWithCollection);
+                case 1:
+                    return ColumnFilter.allRegularColumnsBuilder(metadataWithCollection, false).add(v).build();
+                case 2:
+                    return ColumnFilter.allRegularColumnsBuilder(metadataWithCollection, false).add(coll).build();
+                case 3:
+                    return ColumnFilter.allRegularColumnsBuilder(metadataWithCollection, false).select(coll, CellPath.create(ByteBufferUtil.bytes(10 + rnd.nextInt(10)))).build();
+                case 4:
+                    return ColumnFilter.allRegularColumnsBuilder(metadataWithCollection, true).add(v).add(s).build();
+                default:
+                    return ColumnFilter.selectionBuilder().add(v).add(s).build();
+            }
         }
 
         UnfilteredPartitionIterator iterator(ReadCommand command)
         {
-            UnfilteredRowIterator rowIter = update.unfilteredIterator(command.columnFilter(), Slices.ALL, reversed);
+            // the read merges its sources, each filtered by the read's column filter
+            UnfilteredRowIterator rowIter = UnfilteredRowIterators.merge(Arrays.asList(update.unfilteredIterator(command.columnFilter(), Slices.ALL, reversed),
+                                                                                       markers.unfilteredIterator(command.columnFilter(), Slices.ALL, reversed)));
             RegularAndStaticColumns columns = contentColumns
                                               ? new RegularAndStaticColumns(Columns.from(staticRow), update.columns().regulars)
                                               : command.columnFilter().fetchedColumns();
@@ -1456,6 +1529,11 @@ public class ReadResponseTest
         return new StubReadCommand(key, metadata, false, reversed);
     }
 
+    private ReadCommand command(int key, TableMetadata metadata, ColumnFilter columnFilter, boolean reversed)
+    {
+        return new StubReadCommand(key, metadata, columnFilter, false, reversed);
+    }
+
     private static class StubRepairedDataInfo extends RepairedDataInfo
     {
         private final ByteBuffer repairedDigest;
@@ -1550,6 +1628,11 @@ public class ReadResponseTest
     {
         StubReadCommand(int key, TableMetadata metadata, boolean isDigest, boolean reversed)
         {
+            this(key, metadata, ColumnFilter.all(metadata), isDigest, reversed);
+        }
+
+        StubReadCommand(int key, TableMetadata metadata, ColumnFilter columnFilter, boolean isDigest, boolean reversed)
+        {
             super(metadata.epoch,
                   isDigest,
                   0,
@@ -1557,7 +1640,7 @@ public class ReadResponseTest
                   PotentialTxnConflicts.DISALLOW,
                   metadata,
                   FBUtilities.nowInSeconds(),
-                  ColumnFilter.all(metadata),
+                  columnFilter,
                   RowFilter.none(),
                   DataLimits.NONE,
                   metadata.partitioner.decorateKey(ByteBufferUtil.bytes(key)),
