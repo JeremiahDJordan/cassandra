@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.base.Predicates;
 import org.junit.After;
@@ -61,6 +62,7 @@ public class IndexBuildDuringCompactionTest extends SAITester
     private static volatile ColumnFamilyStore holdTable;
     private static volatile boolean hold;
     private static volatile boolean holding;
+    private static final AtomicInteger buildsToSkip = new AtomicInteger();
 
     @Before
     public void saveConfig()
@@ -252,6 +254,20 @@ public class IndexBuildDuringCompactionTest extends SAITester
     @Test
     public void testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped() throws Throwable
     {
+        testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped(0);
+    }
+
+    /**
+     * As above, when only the last of the builds of the sstables the initial build missed builds them.
+     */
+    @Test
+    public void testMissedSSTablesBuiltByTheLastBuild() throws Throwable
+    {
+        testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped(StorageAttachedIndex.MAX_BUILDS_OF_MISSED_SSTABLES - 1);
+    }
+
+    private void testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped(int skippedBuilds) throws Throwable
+    {
         createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int, pad blob)");
         disableCompaction();
         ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
@@ -275,6 +291,20 @@ public class IndexBuildDuringCompactionTest extends SAITester
         CompletableFuture<Void> compaction = startCompactionHeldOnceStartsAreMoved(cfs);
         stopCompactions(cfs, compaction);
 
+        buildsToSkip.set(skippedBuilds);
+        Injections.inject(Injections.newCustom("skip_builds_of_missed_sstables")
+                                    .add(InvokePointBuilder.newInvokePoint()
+                                                           .onClass(StorageAttachedIndex.class)
+                                                           .onMethod("buildSSTables"))
+                                    .add(ActionBuilder.newActionBuilder()
+                                                      .conditions()
+                                                      .when(Expression.expr(IndexBuildDuringCompactionTest.class.getName())
+                                                                      .method("skipBuild")
+                                                                      .args())
+                                                      .actions()
+                                                      .doReturn(""))
+                                    .build());
+
         // Let the initial build go on
         holdBuild.countDown();
         holdBuild.disable();
@@ -283,6 +313,13 @@ public class IndexBuildDuringCompactionTest extends SAITester
         assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
         assertAllRowsFound("v", SSTABLES * LARGE_ROWS_PER_SSTABLE);
         assertAllRowsFound("w", SSTABLES * LARGE_ROWS_PER_SSTABLE);
+    }
+
+    /** Called by the injected rule at each build of the sstables an initial build missed: whether to skip it. */
+    @SuppressWarnings("unused")
+    public static boolean skipBuild()
+    {
+        return buildsToSkip.getAndDecrement() > 0;
     }
 
     private CompletableFuture<Void> startCompactionHeldOnceStartsAreMoved(ColumnFamilyStore cfs) throws Throwable
