@@ -123,11 +123,13 @@ public class RangedAggregatesTest extends ShardingTestBase
             execute("INSERT INTO %s (k, t, v) VALUES (?, 1, ?)", i, i);
         flush();
         var originals = new HashSet<>(cfs.getLiveSSTables());
+        long expiredDropped = CompactionManager.instance.getMetrics().removedExpiredSSTables.getCount();
 
         runRangedAggregates(cfs, 4, 4, FBUtilities.nowInSeconds());
 
         // the fully expired sstable is an input of every part, so no part may delete it
         Assert.assertTrue(cfs.getLiveSSTables().containsAll(originals));
+        assertEquals(expiredDropped, CompactionManager.instance.getMetrics().removedExpiredSSTables.getCount());
     }
 
     /// Splits the maximal compaction into ranged aggregates and runs the tasks of each in turn.
