@@ -20,6 +20,7 @@ package org.apache.cassandra.index.sai.utils;
 
 import java.lang.annotation.Annotation;
 import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.rules.TestRule;
 import org.junit.runner.Description;
@@ -27,18 +28,13 @@ import org.junit.runners.model.Statement;
 
 import com.carrotsearch.randomizedtesting.rules.StatementAdapter;
 import com.carrotsearch.randomizedtesting.rules.TestRuleAdapter;
-import org.apache.cassandra.inject.Injections;
-import org.apache.cassandra.inject.InvokePointBuilder;
+import org.apache.cassandra.utils.concurrent.Ref;
 
 import static org.junit.Assert.assertEquals;
 
 public class ResourceLeakDetector implements TestRule
 {
-    private static final Injections.Counter RESOURCE_LEAK_COUNTER = Injections.newCounter("ResourceLeakCounter")
-                                                                              .add(InvokePointBuilder.newInvokePoint()
-                                                                                                     .onClass("org.apache.cassandra.utils.concurrent.Ref$State")
-                                                                                                     .onMethod("reportLeak"))
-                                                                              .build();
+    private static final AtomicInteger RESOURCE_LEAK_COUNTER = new AtomicInteger();
 
     @Override
     public Statement apply(Statement statement, Description description)
@@ -71,7 +67,7 @@ public class ResourceLeakDetector implements TestRule
 
     protected void before() throws Throwable
     {
-        Injections.inject(RESOURCE_LEAK_COUNTER);
+        Ref.setOnLeak(state -> RESOURCE_LEAK_COUNTER.incrementAndGet());
     }
 
     protected void afterIfSuccessful() throws Throwable
@@ -81,8 +77,8 @@ public class ResourceLeakDetector implements TestRule
 
     protected void afterAlways(List<Throwable> errors) throws Throwable
     {
-        Injections.deleteAll();
-        RESOURCE_LEAK_COUNTER.reset();
+        Ref.setOnLeak(null);
+        RESOURCE_LEAK_COUNTER.set(0);
     }
 
     private boolean isResourceLeakCheckEnabled(Description description)
