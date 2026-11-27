@@ -205,15 +205,7 @@ public class CompactionTask extends AbstractCompactionTask
             Set<SSTableReader> actuallyCompact = new HashSet<>(inputSSTables());
 
             final Set<SSTableReader> fullyExpiredSSTables = controller.getFullyExpiredSSTables();
-
-            maybeNotifyIndexersAboutRowsInFullyExpiredSSTables(fullyExpiredSSTables);
-
-            if (!fullyExpiredSSTables.isEmpty())
-            {
-                logger.debug("Compaction {} dropping expired sstables: {}", transaction.opIdString(), fullyExpiredSSTables);
-                fullyExpiredSSTables.forEach(transaction::obsolete);
-                actuallyCompact.removeAll(fullyExpiredSSTables);
-            }
+            actuallyCompact.removeAll(fullyExpiredSSTables);
 
             TimeUUID taskId = transaction.opId();
             // select SSTables to compact based on available disk space.
@@ -226,6 +218,16 @@ public class CompactionTask extends AbstractCompactionTask
                 // and tracker will reflect the changed set of sstables made by LifecycleTransaction.cancel(),
                 // so refreshing the overlaps will be based on the updated set of sstables.
                 controller.refreshOverlaps();
+            }
+
+            maybeNotifyIndexersAboutRowsInFullyExpiredSSTables(fullyExpiredSSTables);
+
+            // Obsoleting them now keeps early open from moving their starts. Tasks that keep their originals or share
+            // them with other tasks must not drop them on their own.
+            if (hasExpirations && !keepOriginals && tokenRange() == null)
+            {
+                logger.debug("Compaction {} dropping expired sstables: {}", transaction.opIdString(), fullyExpiredSSTables);
+                fullyExpiredSSTables.forEach(transaction::obsolete);
             }
 
             // sanity check: all sstables must belong to the same cfs
@@ -637,7 +639,7 @@ public class CompactionTask extends AbstractCompactionTask
             // A read error (e.g. a corrupt-but-expired SSTable, which was previously dropped without ever being read) or
             // a failure in a custom indexer must not silently leave the SSTable undropped, or every subsequent compaction
             // would hit the same failure, leaving the expired SSTables permanently stuck.
-            try (ISSTableScanner scanner = expiredSSTable.getScanner())
+            try (ISSTableScanner scanner = expiredSSTable.getScanner(tokenRange()))
             {
                 while (scanner.hasNext())
                 {

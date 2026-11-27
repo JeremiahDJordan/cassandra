@@ -64,7 +64,7 @@ public class StubIndex implements Index
     public List<DeletionTime> partitionDeletions = new ArrayList<>();
     public List<RangeTombstone> rangeTombstones = new ArrayList<>();
     public List<Row> rowsInserted = new ArrayList<>();
-    public List<Row> rowsDeleted = new ArrayList<>();
+    public List<Row> rowsDeleted = Collections.synchronizedList(new ArrayList<>());
     public List<Pair<Row,Row>> rowsUpdated = new ArrayList<>();
     public volatile boolean preJoinInvocation;
     private IndexMetadata indexMetadata;

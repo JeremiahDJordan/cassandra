@@ -808,6 +808,40 @@ public class CustomIndexTest extends CQLTester
     }
 
     @Test
+    public void notifyIndexesOfFullyExpiredSSTablesDuringParallelUCSMajorCompaction()
+    {
+        createTable("CREATE TABLE %s (pk int, ck int, v int, PRIMARY KEY (pk, ck)) " +
+                    "WITH compaction = {'class': 'UnifiedCompactionStrategy', 'base_shard_count': 4, 'min_sstable_size': '1KiB'} " +
+                    "AND gc_grace_seconds = 0");
+        disableCompaction();
+
+        createIndex(String.format("CREATE CUSTOM INDEX ucs_parallel_expired_index ON %%s(v) USING '%s'", StubIndex.class.getName()));
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        StubIndex index = (StubIndex) cfs.indexManager.getIndexByName("ucs_parallel_expired_index");
+
+        int rows = 1000;
+        for (int i = 0; i < rows; i++)
+            execute("INSERT INTO %s (pk, ck, v) VALUES (?, 0, ?) USING TTL 1", i, i);
+        flush();
+        Set<SSTableReader> expired = new HashSet<>(cfs.getLiveSSTables());
+        awaitFullyExpired(cfs);
+
+        // The live rows span the same shards, so the major compaction runs as parallel shard tasks
+        for (int i = 0; i < rows; i++)
+            execute("INSERT INTO %s (pk, ck, v) VALUES (?, 1, ?)", i, i);
+        flush();
+
+        index.reset();
+        compact();
+
+        // Each shard task notifies about the rows of its own range only
+        Assert.assertEquals(rows, index.rowsDeleted.size());
+        Assert.assertTrue(Collections.disjoint(expired, cfs.getLiveSSTables()));
+        assertRowCount(execute("SELECT * FROM %s"), rows);
+    }
+
+    @Test
     public void validateOptions()
     {
         createTable("CREATE TABLE %s(k int, c int, v1 int, v2 int, PRIMARY KEY(k,c))");
