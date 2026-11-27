@@ -31,6 +31,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.net.FrameEncoder;
 import org.apache.cassandra.transport.messages.QueryMessage;
+import org.apache.cassandra.utils.memory.BufferPools;
 import org.assertj.core.api.Assertions;
 
 public class MessageSizeLimitTest extends NativeProtocolLimitsTestBase
@@ -96,6 +97,18 @@ public class MessageSizeLimitTest extends NativeProtocolLimitsTestBase
 
         Assert.assertEquals("not all messages were sent successfully by all threads",
                             threadsCount, completedSuccessfully.get());
+    }
+
+    @Test
+    public void multiFrameMessagesReleaseTheirBuffers()
+    {
+        runClientLogic((client) ->
+               {
+                   long used = BufferPools.forNetworking().usedSizeInBytes();
+                   sendMessages(client, 10, NORMAL_MESSAGE_SIZE);
+                   Assertions.assertThat(BufferPools.forNetworking().usedSizeInBytes()).isLessThan(used + NORMAL_MESSAGE_SIZE);
+               }
+        );
     }
 
     private void sendMessages(SimpleClient client, int messagesCount, int messageSize)
