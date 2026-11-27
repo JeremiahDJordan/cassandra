@@ -284,14 +284,14 @@ public class GrantAndRevokeTest extends CQLTester
         Session nonsuperuser = session(USER);
         assertUnauthorizedQuery(nonsuperuser, "User user has no MODIFY permission on <table user_keyspace.t1> or any of its parents",
                                 "INSERT INTO user_keyspace.t1 (k) VALUES (0)");
-        assertUnauthorizedQuery(nonsuperuser, "User user has no MODIFY permission on <table system.local> or any of its parents",
-                                "INSERT INTO system.local(key) VALUES ('invalid')");
+        assertUnauthorizedQuery(nonsuperuser, "User user has no MODIFY permission on <table system.prepared_statements> or any of its parents",
+                                "INSERT INTO system.prepared_statements(prepared_id) VALUES (0x00)");
 
         superuser.execute(format("GRANT MODIFY ON ALL KEYSPACES TO %s", user));
         // User now has write permission on non-system keyspaces only
         nonsuperuser.execute("INSERT INTO user_keyspace.t1 (k) VALUES (0)");
-        assertUnauthorizedQuery(nonsuperuser, "User user has no MODIFY permission on <table system.local> or any of its parents",
-                                "INSERT INTO system.local(key) VALUES ('invalid')");
+        assertUnauthorizedQuery(nonsuperuser, "User user has no MODIFY permission on <table system.prepared_statements> or any of its parents",
+                                "INSERT INTO system.prepared_statements(prepared_id) VALUES (0x00)");
 
         // A non-superuser only has read access to a pre-defined set of system tables and all system_schema/traces
         // tables and granting ALL permissions on ALL keyspaces also does not affect this.
@@ -302,7 +302,7 @@ public class GrantAndRevokeTest extends CQLTester
         // A superuser can still read system tables
         maybeReadSystemTables(superuser, true);
         // and also write to them, though this is still strongly discouraged
-        superuser.execute("INSERT INTO system.peers(peer, data_center) VALUES ('127.0.100.100', 'invalid_dc')");
+        superuser.execute("DELETE FROM system.prepared_statements WHERE prepared_id = 0x00");
 
     }
 
