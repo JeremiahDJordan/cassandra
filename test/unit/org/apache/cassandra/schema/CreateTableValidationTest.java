@@ -21,6 +21,8 @@ package org.apache.cassandra.schema;
 import org.junit.Test;
 
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.exceptions.RequestValidationException;
@@ -123,6 +125,18 @@ public class CreateTableValidationTest extends CQLTester
         assertThat(execute(String.format("SELECT * from %s.%s", keyspaceName, tableName))).hasSize(1);
         flush(keyspaceName, tableName);
         assertThat(execute(String.format("SELECT * from %s.%s", keyspaceName, tableName))).hasSize(1);
+    }
+
+    @Test
+    public void testKeyspaceNameWithPercentSign()
+    {
+        String message = "Keyspace name must not be empty and must contain alphanumeric or underscore characters only (got \"percent%sign\")";
+        assertThatExceptionOfType(InvalidRequestException.class)
+        .isThrownBy(() -> QueryProcessor.executeOnceInternal("CREATE KEYSPACE \"percent%sign\" WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"))
+        .withMessage(message);
+        assertThatExceptionOfType(ConfigurationException.class)
+        .isThrownBy(() -> TableMetadata.builder("percent%sign", "t").addPartitionKeyColumn("k", Int32Type.instance).build().validate())
+        .withMessage("percent%sign.t: " + message);
     }
 
     @Test
