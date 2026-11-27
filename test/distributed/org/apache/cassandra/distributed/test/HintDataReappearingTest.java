@@ -27,7 +27,7 @@ import java.util.stream.IntStream;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
 
-import org.apache.cassandra.db.SystemKeyspace;
+import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.distributed.api.IIsolatedExecutor;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
 
@@ -190,7 +190,7 @@ public class HintDataReappearingTest extends AbstractHintWindowTest
             node2.forceCompact(KEYSPACE, "cf");
 
 
-            IIsolatedExecutor.CallableNoExcept<UUID> node2hostId = node2.callsOnInstance(SystemKeyspace::getLocalHostId);
+            IIsolatedExecutor.CallableNoExcept<UUID> node2hostId = node2.callsOnInstance(() -> StorageService.instance.getLocalHostUUID());
 
             transferHints(node1, node2hostId.call());
 
