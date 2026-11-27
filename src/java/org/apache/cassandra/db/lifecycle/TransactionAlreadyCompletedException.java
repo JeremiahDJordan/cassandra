@@ -18,8 +18,9 @@
 
 package org.apache.cassandra.db.lifecycle;
 
-import java.io.File;
 import java.util.List;
+
+import org.apache.cassandra.io.util.File;
 
 
 public class TransactionAlreadyCompletedException extends IllegalStateException
