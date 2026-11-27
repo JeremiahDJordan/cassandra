@@ -1827,8 +1827,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         // We let pass plans that don't satisfy the index hints so we can provide a better error message later,
         // at the validation at the end of this method. That validation will be done over the plan that is closest to
         // satisfying the index hints, so the error message will only complain about the missing parts.
+        // Nodes below DS 10 only apply an analyzer with the index it comes from (see RowFilter#requiresIndexBelowDS10),
+        // so while the read may contact them, analyzed indexes aren't put after the others for CONTAINS. The SAI plan
+        // then comes first unless sai_options.prioritize_over_legacy_index is off.
+        boolean analyzedIndexRequired = queryPlans.size() > 1 && rowFilter.requiresIndexBelowDS10(baseCfs.getKeyspaceName());
         Comparator<Index.QueryPlan> planComparator = rowFilter.indexHints.comparator()
-                                                              .thenComparing((Index.QueryPlan plan) -> !hasAnalyzerOnContains(plan, rowFilter))
+                                                              .thenComparing((Index.QueryPlan plan) -> analyzedIndexRequired || !hasAnalyzerOnContains(plan, rowFilter))
                                                               .thenComparing(Comparator.<Index.QueryPlan>naturalOrder().reversed());
 
         // find the best plan

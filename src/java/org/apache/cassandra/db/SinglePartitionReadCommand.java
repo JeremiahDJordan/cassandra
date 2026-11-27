@@ -242,11 +242,13 @@ public class SinglePartitionReadCommand extends ReadCommand implements SinglePar
         // and there are no hints telling us otherwise. But not if the row filter isn't strict: without an index, the
         // replicas would apply it strictly, each to its own data, and miss the rows whose columns are on different
         // replicas, which the coordinator finds by filtering the candidate rows of an index query (CASSANDRA-19018).
+        // Nor if replicas need the index to apply an analyzer (see RowFilter#requiresIndexBelowDS10).
         if (CassandraRelevantProperties.SKIP_INDEXES_ON_FULL_PRIMARY_KEYS.getBoolean()
             && clusteringIndexFilter instanceof ClusteringIndexNamesFilter
             && rowFilter.indexHints.included.isEmpty()
             && !rowFilter.hasOrdering()
-            && rowFilter.isStrict())
+            && rowFilter.isStrict()
+            && !rowFilter.requiresIndexBelowDS10(table.keyspace))
             return null;
 
         return findIndexQueryPlan(table, rowFilter);

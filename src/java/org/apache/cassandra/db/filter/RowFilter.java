@@ -513,6 +513,17 @@ public class RowFilter
     }
 
     /**
+     * Whether a read of this filter must name the indexes its analyzers come from, as it has an expression with an
+     * analyzer and may contact nodes below DS 10 (see {@link #mayHavePeersBelowDS10}): the analyzer isn't serialized,
+     * and Apache Cassandra 5.0 nodes only apply that of their index when the read names it, comparing raw values
+     * otherwise. The consistency level isn't known where the read is made, so every node of the keyspace counts.
+     */
+    public boolean requiresIndexBelowDS10(String keyspace)
+    {
+        return root.hasAnalyzer() && mayHavePeersBelowDS10(keyspace, ConsistencyLevel.ALL);
+    }
+
+    /**
      * @return {@code true} if this filter contains any expression with an ANN operator, {@code false} otherwise.
      */
     public boolean hasANN()
@@ -1553,6 +1564,21 @@ public class RowFilter
             for (FilterElement child : children)
             {
                 if (child.requiresIndex(ignoreAnalyzers))
+                    return true;
+            }
+            return false;
+        }
+
+        private boolean hasAnalyzer()
+        {
+            for (Expression expression : expressions)
+            {
+                if (expression.analyzer() != null)
+                    return true;
+            }
+            for (FilterElement child : children)
+            {
+                if (child.hasAnalyzer())
                     return true;
             }
             return false;

@@ -48,7 +48,7 @@ import static org.junit.Assert.assertTrue;
 
 /**
  * A node of this build in storage_compatibility_mode CASSANDRA_5 beside an Apache node: messaging version 13, Apache's
- * schema tables, equal schema versions, and batches and repair across both kinds of node.
+ * schema tables, equal schema versions, and batches, repair and analyzed index reads across both kinds of node.
  */
 public class Cassandra5ModeMixedClusterTest extends ApacheMixedClusterTestBase
 {
@@ -238,6 +238,45 @@ public class Cassandra5ModeMixedClusterTest extends ApacheMixedClusterTestBase
             expected.addAll(departingKeys);
             departing.nodetoolResult("decommission", "--force").asserts().success();
             assertEquals(expected, keys(apache.executeInternal(withKeyspace("SELECT pk FROM %s.indexed WHERE v = 'v'"))));
+        }
+    }
+
+    @Test
+    public void testAnalyzedRestrictionsOnFullPrimaryKey() throws Throwable
+    {
+        try (UpgradeableCluster cluster = startCluster(2,
+                                                       config -> {
+                                                           if (config.num() == 2)
+                                                               config.set("storage_compatibility_mode", "CASSANDRA_5");
+                                                       },
+                                                       apacheVersion(), CURRENT_VERSION))
+        {
+            cluster.schemaChange(withKeyspace("CREATE KEYSPACE %s WITH replication = {'class': 'SimpleStrategy', 'replication_factor': 1}"), false, cluster.get(2));
+            cluster.schemaChange(withKeyspace("CREATE TABLE %s.tbl (pk int PRIMARY KEY, s set<text>, l list<text>, m map<text, text>, t text, v int)"), false, cluster.get(2));
+            for (String target : Arrays.asList("s", "l", "keys(m)", "values(m)", "t"))
+                cluster.schemaChange(withKeyspace("CREATE INDEX ON %s.tbl (" + target + ") USING 'sai' WITH OPTIONS = {'case_sensitive': 'false'}"), false, cluster.get(2));
+            cluster.schemaChange(withKeyspace("CREATE INDEX ON %s.tbl (v) USING 'legacy_local_table'"), false, cluster.get(2));
+            assertSchemaAgreement(cluster);
+            for (int pk = 0; pk < 20; pk++)
+                cluster.coordinator(2).execute(withKeyspace("INSERT INTO %s.tbl (pk, s, l, m, t, v) VALUES (?, {'Apple'}, ['Apple'], {'Apple': 'Pear'}, 'Apple', 1)"), ALL, pk);
+
+            // a row of each node, read from each node; Apache Cassandra 5.0 has no : operator, and its coordinators read
+            // v = 1 AND s CONTAINS 'apple' through the legacy index, comparing raw values of s
+            for (int replica = 1; replica <= 2; replica++)
+            {
+                int pk = (int) cluster.get(replica).executeInternal(withKeyspace("SELECT pk FROM %s.tbl LIMIT 1"))[0][0];
+                for (int node = 1; node <= 2; node++)
+                {
+                    for (String restriction : Arrays.asList("t = 'apple'", "t : 'apple'", "s CONTAINS 'apple'", "l CONTAINS 'apple'", "m CONTAINS KEY 'apple'", "m CONTAINS 'pear'", "v = 1 AND s CONTAINS 'apple'"))
+                    {
+                        if (node == 1 && (restriction.contains(":") || restriction.contains("v = 1")))
+                            continue;
+                        String select = withKeyspace("SELECT pk FROM %s.tbl WHERE pk = ? AND ") + restriction + " ALLOW FILTERING";
+                        assertRows(cluster.coordinator(node).execute(select, ONE, pk), row(pk));
+                    }
+                }
+            }
+            assertEquals(20, cluster.coordinator(2).execute(withKeyspace("SELECT pk FROM %s.tbl WHERE v = 1 AND s CONTAINS 'apple' ALLOW FILTERING"), ONE).length);
         }
     }
 
