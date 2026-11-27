@@ -171,6 +171,14 @@ public abstract class ReadCommand extends AbstractReadQuery
 
     private boolean trackWarnings;
 
+    /**
+     * Whether this replica must not return static candidates (see {@link #returnsStaticCandidates()}), because the
+     * coordinator might not expect them: it is on a messaging version below {@link MessagingService#VERSION_60}, the
+     * command comes from an Accord transaction, or it is the read of a Paxos v2 prepare. This isn't serialized:
+     * {@link Serializer} and the Paxos v2 read paths set it.
+     */
+    private boolean staticCandidatesWithheld;
+
     protected final DataRange dataRange;
 
     @Nullable
@@ -331,6 +339,44 @@ public abstract class ReadCommand extends AbstractReadQuery
     public void trackWarnings()
     {
         trackWarnings = true;
+    }
+
+    /**
+     * Stops this replica from returning static candidates, because the coordinator that sent the command might not
+     * expect them.
+     */
+    public void withholdStaticCandidates()
+    {
+        staticCandidatesWithheld = true;
+    }
+
+    /**
+     * Returns whether this read returns, from each replica, the partitions without matching rows whose static row
+     * satisfies the static expressions, as their static row alone, and counts them as rows in its limits (see
+     * {@link RowFilter#canReturnStaticCandidates()}). Reads with an index query plan, and reads of tables that Accord
+     * reads or is migrated from, don't. The coordinator filters the reconciled rows, counts those partitions in each
+     * replica's response as the replica does, and asks a replica that stopped at its limit for more, also when it reads
+     * a single replica. Those partitions have no rows, so the responses of single-partition reads can be compared by
+     * digest. Replicas return them only to coordinators on messaging version 6.0 or later, which complete the rows that
+     * replica filtering protection reads in full; earlier coordinators get the strictly filtered rows, and so do the
+     * reads of 6.0 coordinators from earlier replicas.
+     */
+    public boolean returnsStaticCandidates()
+    {
+        return indexQueryPlan == null
+               && !staticCandidatesWithheld
+               && !metadata().isAccordEnabled()
+               && !metadata().migratingFromAccord()
+               && rowFilter().canReturnStaticCandidates();
+    }
+
+    /**
+     * Whether the limits of this read count a partition with only a static row as a row: if the read selects full
+     * partitions, or if it returns static candidates.
+     */
+    public boolean countsPartitionsWithOnlyStaticData()
+    {
+        return selectsFullPartition() || returnsStaticCandidates();
     }
 
     public boolean isTrackingWarnings()
@@ -573,7 +619,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                  * would be more efficient (the sooner we discard stuff we know we don't care, the less useless
                  * processing we do on it).
                  */
-                iterator = filter.filter(iterator, nowInSec());
+                iterator = filter.filter(iterator, nowInSec(), returnsStaticCandidates());
 
                 // apply the limits/row counter; this transformation is stopping and would close the iterator as soon
                 // as the count is observed; if that happens in the middle of an open RT, its end bound will not be included.
@@ -582,7 +628,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                 if (executionController.isTrackingRepairedStatus())
                 {
                     DataLimits.Counter limit =
-                    limits().newCounter(nowInSec(), false, selectsFullPartition(), metadata().enforceStrictLiveness());
+                    limits().newCounter(nowInSec(), false, countsPartitionsWithOnlyStaticData(), metadata().enforceStrictLiveness());
                     iterator = limit.applyTo(iterator);
                     // ensure that a consistent amount of repaired data is read on each replica. This causes silent
                     // overreading from the repaired data set, up to limits(). The extra data is not visible to
@@ -591,7 +637,7 @@ public abstract class ReadCommand extends AbstractReadQuery
                 }
                 else
                 {
-                    iterator = limits().filter(iterator, nowInSec(), selectsFullPartition());
+                    iterator = limits().filter(iterator, nowInSec(), countsPartitionsWithOnlyStaticData());
                 }
 
                 // because of the above, we need to append an aritifical end bound if the source iterator was stopped short by a counter.
@@ -1506,7 +1552,10 @@ public abstract class ReadCommand extends AbstractReadQuery
                 throw e;
             }
             long nowInSec = version >= MessagingService.VERSION_50 ? CassandraUInt.toLong(in.readInt()) : in.readInt();
-            return deserialize(kind.selectionDeserializer, flags, schemaVersion, digestVersion, nowInSec, tableMetadata, in, version);
+            ReadCommand command = deserialize(kind.selectionDeserializer, flags, schemaVersion, digestVersion, nowInSec, tableMetadata, in, version);
+            if (version < MessagingService.VERSION_60)
+                command.withholdStaticCandidates();
+            return command;
         }
 
         public ReadCommand deserializeForAccord(Seekable key, TableMetadatas tables, DataInputPlus in, int version) throws IOException
@@ -1518,7 +1567,9 @@ public abstract class ReadCommand extends AbstractReadQuery
 
             TableMetadata tableMetadata = tables.deserialize(in);
 
-            return deserialize(kind.accordSelectionDeserializer.apply(key), flags, tableMetadata.epoch, 0, 0, tableMetadata, in, version);
+            ReadCommand command = deserialize(kind.accordSelectionDeserializer.apply(key), flags, tableMetadata.epoch, 0, 0, tableMetadata, in, version);
+            command.withholdStaticCandidates();
+            return command;
         }
 
         /**

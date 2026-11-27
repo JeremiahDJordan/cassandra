@@ -299,10 +299,28 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             for (int i = 0; i < sources.size(); i++)
                 builders.get(i).closeOpenMarker(lastClustering);
 
+            fetchWhereOnlyStaticRowIsReturned();
             completeFetchedPartitions();
 
             for (int i = 0; i < sources.size(); i++)
                 originalPartitions.get(i).add(builders.get(i));
+        }
+
+        /**
+         * Fetches the entire partition from each replica that returned its static row but no rows while another
+         * replica returned rows of it. A read that returns static candidates gets a partition without matching rows as
+         * its static row alone from a replica whose static row satisfies the static expressions (see
+         * ReadCommand#returnsStaticCandidates), and that replica can still have rows that match with the columns of
+         * other replicas, which it would have been read for in full had it returned nothing.
+         */
+        private void fetchWhereOnlyStaticRowIsReturned()
+        {
+            if (!command.returnsStaticCandidates() || !Iterables.any(builders, builder -> builder.returnedRows))
+                return;
+
+            for (PartitionBuilder builder : builders)
+                if (!builder.staticRow.isEmpty() && !builder.returnedRows)
+                    builder.fetchEntirePartition();
         }
 
         /**
@@ -531,6 +549,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         private boolean unresolvedStatic = false;
         private ReadResponse fetched;
+        private boolean returnedRows;
 
         private PartitionBuilder(DecoratedKey key, Replica source, RegularAndStaticColumns columns, EncodingStats stats)
         {
@@ -562,6 +581,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             }
             else
             {
+                returnedRows = true;
                 addReopenMarker();
                 contents.add(row);
             }
@@ -648,6 +668,13 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
             };
 
             return unresolvedStatic ? mergeFetched(original) : original;
+        }
+
+        private void fetchEntirePartition()
+        {
+            if (toFetch == null)
+                toFetch = BTreeSet.builder(command.metadata().comparator);
+            unresolvedStatic = true;
         }
 
         private void addToFetch(Row row)

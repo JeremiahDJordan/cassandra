@@ -63,6 +63,7 @@ import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.RowIterator;
 import org.apache.cassandra.db.rows.Rows;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.db.rows.UnfilteredRowIterators;
 import org.apache.cassandra.db.transform.Transformation;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.index.IndexRegistry;
@@ -222,14 +223,51 @@ public class RowFilter implements Iterable<RowFilter.Expression>
     }
 
     /**
+     * Whether a replica can return a partition without matching rows as its static row alone, for its coordinator to
+     * reconcile, if the read asks for it (see {@link org.apache.cassandra.db.ReadCommand#returnsStaticCandidates()}).
+     * <p>
+     * For a read that needs reconciliation, a row can match with the static row of another replica, and replica
+     * filtering protection only reads the replicas that are silent for the static row in full for partitions that
+     * some replica returned. A replica that drops a partition whose static row satisfies the static expressions,
+     * because none of its rows in the command's slice match, can leave no replica returning it, e.g. on the page after
+     * the last matching row of the replica that has the static value.
+     */
+    public boolean canReturnStaticCandidates()
+    {
+        return needsReconciliation() && hasStaticExpression() && hasExpressionOnClusteringOrRegularColumns();
+    }
+
+    /**
+     * Returns the given unfiltered partition, which satisfies the static and partition key expressions but has no
+     * matching rows, as its partition deletion and static row alone if the static row has live data, or {@code null}.
+     * The coordinator holds the partitions whose merged static row has no live data until it reaches one that has
+     * some, so a static row with only deletions isn't returned. Like the rows that don't match, the markers are left
+     * out.
+     */
+    private static UnfilteredRowIterator staticRowOrNull(UnfilteredRowIterator partition, TableMetadata metadata, long nowInSec)
+    {
+        Row staticRow = partition.staticRow();
+        if (!staticRow.hasLiveData(nowInSec, metadata.enforceStrictLiveness()))
+            return null;
+
+        return UnfilteredRowIterators.noRowsIterator(metadata,
+                                                     partition.partitionKey(),
+                                                     staticRow,
+                                                     partition.partitionLevelDeletion(),
+                                                     partition.isReverseOrder());
+    }
+
+    /**
      * Note that the application of this transformation does not yet take {@link #isStrict()} into account. This means
      * that even when strict filtering is not safe, expressions will be applied as intersections rather than unions.
      * The filter will always be evaluated strictly in conjunction with replica filtering protection at the 
      * coordinator, however, even after CASSANDRA-19007 is addressed.
      * 
+     * @param staticCandidates whether to return partitions without matching rows as their static row alone (see
+     *                         {@link #canReturnStaticCandidates()}), only for unfiltered partitions
      * @see <a href="https://issues.apache.org/jira/browse/CASSANDRA-190007">CASSANDRA-19007</a>
      */
-    protected Transformation<BaseRowIterator<?>> filter(TableMetadata metadata, long nowInSec)
+    protected Transformation<BaseRowIterator<?>> filter(TableMetadata metadata, long nowInSec, boolean staticCandidates)
     {
         List<Expression> partitionLevelExpressions = new ArrayList<>();
         List<Expression> rowLevelExpressions = new ArrayList<>();
@@ -281,8 +319,11 @@ public class RowFilter implements Iterable<RowFilter.Expression>
 
                 if (filterNonStaticColumns && !iterator.hasNext())
                 {
+                    UnfilteredRowIterator candidate = staticCandidates
+                                                      ? staticRowOrNull((UnfilteredRowIterator) partition, metadata, nowInSec)
+                                                      : null;
                     iterator.close();
-                    return null;
+                    return candidate;
                 }
 
                 return iterator;
@@ -317,7 +358,22 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, long nowInSec)
     {
-        return expressions.isEmpty() ? iter : Transformation.apply(iter, filter(iter.metadata(), nowInSec));
+        return filter(iter, nowInSec, false);
+    }
+
+    /**
+     * Filters the provided iterator so that only the row satisfying the expression of this filter
+     * are included in the resulting iterator.
+     *
+     * @param iter the iterator to filter
+     * @param nowInSec the time of query in seconds.
+     * @param staticCandidates whether to return partitions without matching rows as their static row alone (see
+     *                         {@link #canReturnStaticCandidates()})
+     * @return the filtered iterator.
+     */
+    public UnfilteredPartitionIterator filter(UnfilteredPartitionIterator iter, long nowInSec, boolean staticCandidates)
+    {
+        return expressions.isEmpty() ? iter : Transformation.apply(iter, filter(iter.metadata(), nowInSec, staticCandidates));
     }
 
     /**
@@ -330,7 +386,7 @@ public class RowFilter implements Iterable<RowFilter.Expression>
      */
     public PartitionIterator filter(PartitionIterator iter, TableMetadata metadata, long nowInSec)
     {
-        return expressions.isEmpty() ? iter : Transformation.apply(iter, filter(metadata, nowInSec));
+        return expressions.isEmpty() ? iter : Transformation.apply(iter, filter(metadata, nowInSec, false));
     }
 
     /**
