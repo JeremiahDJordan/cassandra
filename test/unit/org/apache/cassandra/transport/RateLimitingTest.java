@@ -37,12 +37,15 @@ import org.junit.runners.Parameterized;
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.cql3.QueryOptions;
 import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.net.FrameEncoder;
 import org.apache.cassandra.transport.messages.QueryMessage;
 import org.apache.cassandra.utils.Throwables;
+import org.apache.cassandra.utils.memory.BufferPools;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import static org.apache.cassandra.Util.spinAssertEquals;
 import static org.apache.cassandra.transport.ProtocolVersion.V4;
@@ -137,6 +140,43 @@ public class RateLimitingTest extends CQLTester
     public void shouldReleaseLargeMessageOnBytesInFlightOverload() throws Exception
     {
         testBytesInFlightOverload(LARGE_PAYLOAD_THRESHOLD_BYTES * 2);
+    }
+
+    @Test
+    public void shouldReleaseBuffersOfOverloadedMultiFrameMessages() throws Exception
+    {
+        int payloadSize = FrameEncoder.Payload.MAX_SIZE * 3;
+        try (SimpleClient client = client().connect(false, true))
+        {
+            StorageService.instance.setNativeTransportRateLimitingEnabled(false);
+            QueryMessage queryMessage = new QueryMessage("CREATE TABLE IF NOT EXISTS " + KEYSPACE + ".atable (pk int PRIMARY KEY, v text)", queryOptions());
+            client.execute(queryMessage);
+
+            StorageService.instance.setNativeTransportRateLimitingEnabled(true);
+            ClientResourceLimits.GLOBAL_REQUEST_LIMITER.setRate(OVERLOAD_PERMITS_PER_SECOND, ticker);
+
+            // The first query takes the one available permit, and the others breach the limit.
+            client.execute(queryMessage(payloadSize));
+            long used = BufferPools.forNetworking().usedSizeInBytes();
+            for (int i = 0; i < 10; i++)
+            {
+                try
+                {
+                    client.execute(queryMessage(payloadSize));
+                    fail();
+                }
+                catch (RuntimeException e)
+                {
+                    assertTrue(Throwables.anyCauseMatches(e, cause -> cause instanceof OverloadedException));
+                }
+            }
+            long usedAfter = BufferPools.forNetworking().usedSizeInBytes();
+            assertTrue("network buffers in use grew from " + used + " to " + usedAfter, usedAfter < used + payloadSize);
+        }
+        finally
+        {
+            StorageService.instance.setNativeTransportRateLimitingEnabled(false);
+        }
     }
 
     private void testBytesInFlightOverload(int payloadSize) throws Exception
