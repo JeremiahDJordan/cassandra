@@ -190,8 +190,9 @@ public class FullRebuildEndCheckPendingBuildsTest extends SAITester
         // the check and the SAI build of the copy are held on two builder threads, the legacy build needs a third
         CompactionManager.instance.setConcurrentIndexBuilders(DatabaseDescriptor.getConcurrentIndexBuilders() + 1);
 
+        // fail in a method that the build calls, so that the build closes its key iterator
         Injections.inject(Injections.newCustom("fail_legacy_build_" + System.nanoTime())
-                                    .add(InvokePointBuilder.newInvokePoint().onClass(CollatedViewIndexBuilder.class).onMethod("build"))
+                                    .add(InvokePointBuilder.newInvokePoint().onClass(CollatedViewIndexBuilder.class).onMethod("extractIndexedColumns"))
                                     .add(ActionBuilder.newActionBuilder().actions()
                                                       .doThrow(RuntimeException.class, Expression.quote("Injected failure")))
                                     .build());
@@ -204,6 +205,7 @@ public class FullRebuildEndCheckPendingBuildsTest extends SAITester
                                                Optional.empty(), null);
         waitForAssert(() -> assertTrue(held.contains(built.descriptor)), 120, TimeUnit.SECONDS);
         waitForAssert(() -> assertFalse(cfs.indexManager.isIndexBuilding(legacy)), 120, TimeUnit.SECONDS);
+        waitForAssert(() -> assertTrue(cfs.indexManager.needsFullRebuild(legacy)), 120, TimeUnit.SECONDS);
         assertThat(cfs.indexManager.sstablesOfBuildsInProgress(v)).contains(built.descriptor);
         assertThat(cfs.indexManager.sstablesOfBuildsInProgress(legacy)).doesNotContain(built.descriptor);
 
