@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -40,6 +41,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.RowUpdateBuilder;
 
+import static org.apache.cassandra.db.ColumnFamilyStore.FlushReason.STARTUP;
 import static org.junit.Assert.assertTrue;
 
 public class CommitLogArchiverTest extends CQLTester
@@ -107,7 +109,7 @@ public class CommitLogArchiverTest extends CQLTester
         }
 
         CommitLog.instance.forceRecycleAllSegments();
-        CommitLog.instance.segmentManager.awaitManagementTasksCompletion();
+        CommitLog.instance.getSegmentManager().awaitManagementTasksCompletion();
         // If the number of files that under backup dir is bigger than 1, that means the
         // arhiver for commitlog is effective.
         assertTrue(dir.isDirectory() && Files.list(dir.toPath()).count() > 0);
@@ -128,15 +130,15 @@ public class CommitLogArchiverTest extends CQLTester
         assertRows(execute("SELECT * FROM %s"), row(4, 0, 0), row(4, 1, 1), row(3, 0, 0), row(3, 1, 1));
 
         CommitLog.instance.forceRecycleAllSegments();
-        CommitLog.instance.segmentManager.awaitManagementTasksCompletion();
+        CommitLog.instance.getSegmentManager().awaitManagementTasksCompletion();
         execute("TRUNCATE TABLE %s");
         assertRowCount(execute("SELECT * FROM %s"), 0);
 
         // replay log
         CommitLog.instance.archiver.maybeRestoreArchive();
-        CommitLogSegment.resetReplayLimit();
+        CommitLog.instance.getSegmentManager().resetReplayLimit();
         // restore archived files
-        CommitLog.instance.recoverFiles(CommitLog.instance.getUnmanagedFiles());
+        CommitLog.instance.recoverFiles(STARTUP, CommitLog.instance.getFilteredFiles(Optional.empty()));
         // restore poin time is rpiTime in microseconds , so row(4, 0, 0) and row(4, 1, 1) is skipped
         assertRows(execute("SELECT * FROM %s"), row(3, 0, 0), row(3, 1, 1));
 
@@ -156,13 +158,13 @@ public class CommitLogArchiverTest extends CQLTester
         assertRows(execute("SELECT * FROM %s"), row(1, 0, 0), row(1, 1, 1), row(2, 0, 0), row(2, 1, 1));
 
         CommitLog.instance.forceRecycleAllSegments();
-        CommitLog.instance.segmentManager.awaitManagementTasksCompletion();
+        CommitLog.instance.getSegmentManager().awaitManagementTasksCompletion();
         execute("TRUNCATE TABLE %s");
         assertRowCount(execute("SELECT * FROM %s"), 0);
         // replay log
         CommitLog.instance.archiver.maybeRestoreArchive();
-        CommitLogSegment.resetReplayLimit();
-        CommitLog.instance.recoverFiles(CommitLog.instance.getUnmanagedFiles());
+        CommitLog.instance.getSegmentManager().resetReplayLimit();
+        CommitLog.instance.recoverFiles(STARTUP, CommitLog.instance.getFilteredFiles(Optional.empty()));
         // restore poin time is rpiTime in millseconds, so row(2, 0, 0) and row(2, 1, 1) is skipped
         assertRows(execute("SELECT * FROM %s"), row(1, 0, 0), row(1, 1, 1));
     }
