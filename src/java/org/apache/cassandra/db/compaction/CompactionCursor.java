@@ -19,8 +19,10 @@
 package org.apache.cassandra.db.compaction;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Set;
 import java.util.UUID;
 import java.util.stream.Collectors;
 
@@ -92,7 +94,7 @@ public class CompactionCursor implements SSTableCursorMerger.MergeListener, Auto
             return SSTableCursor.empty();
 
         SSTableCursor merged = new SSTableCursorMerger(readers.stream()
-                                                              .map(r -> new SortedStringTableCursor(r, tokenRange, limiter))
+                                                              .map(r -> makeSSTableCursor(r, tokenRange, limiter))
                                                               .collect(Collectors.toList()),
                                                        metadata(),
                                                        this);
@@ -103,6 +105,22 @@ public class CompactionCursor implements SSTableCursorMerger.MergeListener, Auto
             merged = new SkipEmptyDataCursor(merged);
         }
         return merged;
+    }
+
+    /**
+     * The sstable cursor leaves out the data of a dropped column that is not newer than the drop (see
+     * DeserializationHelper.isDropped), which can leave a complex column, a row or a partition with no content. They
+     * are skipped, as the iterators skip them: the merger must not compare the versions of a column that has no data,
+     * and the writer must not get an empty partition.
+     */
+    private SSTableCursor makeSSTableCursor(SSTableReader reader, Range<Token> tokenRange, RateLimiter limiter)
+    {
+        SSTableCursor cursor = new SortedStringTableCursor(reader, tokenRange, limiter);
+        // read after the cursor is created: drop records are never removed, so this sees every drop the cursor applies
+        Set<ByteBuffer> dropped = metadata().droppedColumns.keySet();
+        return Iterables.any(reader.header.columns(), c -> dropped.contains(c.name.bytes))
+               ? new SkipEmptyDataCursor(cursor)
+               : cursor;
     }
 
     public SSTableCursor.Type copyOne(SSTableDataSink writer) throws IOException

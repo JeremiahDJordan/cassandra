@@ -44,6 +44,7 @@ import org.apache.cassandra.io.util.FileUtils;
 import org.apache.cassandra.io.util.RandomAccessReader;
 import org.apache.cassandra.io.util.ReadPattern;
 import org.apache.cassandra.schema.ColumnMetadata;
+import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.utils.ByteBufferUtil;
 
 /**
@@ -56,6 +57,7 @@ public class SortedStringTableCursor implements SSTableCursor
     private final SSTableReader sstable;
     private final DeserializationHelper helper;
     private final SerializationHeader header;
+    private final boolean skipStaticRows;
 
     private DecoratedKey partitionKey;
     private ClusteringPrefix<?> clusteringKey;
@@ -103,7 +105,13 @@ public class SortedStringTableCursor implements SSTableCursor
         {
             this.dataFile = dataFile;
             this.header = sstable.header;
-            this.helper = new DeserializationHelper(sstable.metadata(), sstable.descriptor.version.correspondingMessagingVersion(), DeserializationHelper.Flag.LOCAL);
+            TableMetadata metadata = sstable.metadata();
+            this.helper = new DeserializationHelper(metadata,
+                                                    sstable.descriptor.version.correspondingMessagingVersion(),
+                                                    DeserializationHelper.Flag.LOCAL);
+            // A table without static columns drops the static rows, even cells newer than the drop, as iterator
+            // compaction does (UnfilteredRowIterators.mergeStaticRows).
+            this.skipStaticRows = header.hasStatic() && header.isForSSTable() && metadata.staticColumns().isEmpty();
             this.sstable = sstable;
             this.activeRangeDeletion = DeletionTime.LIVE;
             this.regularColumns = toArray(header.columns(false));
@@ -248,6 +256,12 @@ public class SortedStringTableCursor implements SSTableCursor
             if (!header.hasStatic())
                 throw new IOException(String.format("Static row encountered in partition %s on table without static columns",
                                                     partitionKey.toString()));
+
+            if (skipStaticRows)
+            {
+                UnfilteredSerializer.serializer.skipRowBody(dataFile);
+                return false;
+            }
 
             clusteringKey = Clustering.STATIC_CLUSTERING;
         }
