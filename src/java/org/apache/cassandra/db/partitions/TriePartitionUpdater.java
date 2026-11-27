@@ -112,6 +112,8 @@ implements InMemoryTrie.UpsertTransformerWithKeyProducer<Object, Object>
         DeletionTime deletion = DeletionTime.merge(update.deletion, existing.deletion);
         if (deletion.deletes(livenessInfo))
             livenessInfo = LivenessInfo.EMPTY;
+        this.dataSize += (livenessInfo.dataSize() + deletion.dataSize())
+                         - (existing.livenessInfo.dataSize() + existing.deletion.dataSize());
 
         Object[] tree = BTreeRow.mergeRowBTrees(this,
                                                 existing.columnsBTree, update.columnsBTree,
