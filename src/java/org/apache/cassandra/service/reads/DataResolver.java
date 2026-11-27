@@ -122,7 +122,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         if (usesReplicaFilteringProtection())
             return resolveWithReplicaFilteringProtection(replicas, repairedDataTracker);
 
-        ResolveContext context = new ResolveContext(replicas, true);
+        ResolveContext context = new ResolveContext(replicas);
         return resolveWithReadRepair(context,
                                      i -> shortReadProtectedResponse(i, context, runOnShortRead),
                                      UnaryOperator.identity(),
@@ -151,9 +151,8 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
 
         /**
          * @param replicas the collection of {@link Endpoints} involved in the query
-         * @param enforceLimits whether or not to enforce counter limits in this context
          */
-        private ResolveContext(E replicas, boolean enforceLimits)
+        private ResolveContext(E replicas)
         {
             this.replicas = replicas;
             this.mergedResultCounter = command.limits().newCounter(command.nowInSec(),
@@ -162,8 +161,8 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                                                    enforceStrictLiveness);
 
             // In case of top-k query, do not trim reconciled rows here because QueryPlan#postProcessor()
-            // needs to compare all rows. Also avoid enforcing the limit if explicitly requested.
-            if (command.isTopK() || !enforceLimits)
+            // needs to compare all rows.
+            if (command.isTopK())
                 this.mergedResultCounter.onlyCount();
         }
 
@@ -250,10 +249,10 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         //      will be fetched from the first-phase iterator.
         // The first phase doesn't apply its merged result counter, which would count rows that the second phase filters
         // out. Replica filtering protection counts in it the first-phase rows that no replica is silent about and that
-        // match the row filter, which the second phase returns as they are, so that short read protection stops asking
-        // the replicas for more rows once those rows fill the limit.
+        // match the row filter, which the second phase returns as they are, as the second phase's counter counts them,
+        // so that short read protection stops asking the replicas for more rows once those rows fill the limits.
 
-        ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
+        ResolveContext firstPhaseContext = new ResolveContext(replicas);
         UnaryOperator<PartitionIterator> preCountFilter = preCountFilterForReplicaFilteringProtection();
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(replicaPlan().keyspace(),
                                                                              command,
@@ -270,7 +269,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                                                  i -> shortReadProtectedResponse(i, firstPhaseContext, null),
                                                                  null);
 
-        ResolveContext secondPhaseContext = new ResolveContext(replicas, true);
+        ResolveContext secondPhaseContext = new ResolveContext(replicas);
         PartitionIterator completedPartitions = resolveWithReadRepair(secondPhaseContext,
                                                                       i -> rfp.queryProtectedPartitions(firstPhasePartitions, i),
                                                                       preCountFilter,
