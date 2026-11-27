@@ -202,6 +202,10 @@ public class StorageAttachedIndex implements Index
     // Used to build indexes on newly added SSTables:
     private static final StorageAttachedIndexBuildingSupport INDEX_BUILDER_SUPPORT = new StorageAttachedIndexBuildingSupport();
 
+    /** How many times the initial build of an index builds the sstables it missed, see buildSSTablesMissedByInitialBuild. */
+    @VisibleForTesting
+    static final int MAX_BUILDS_OF_MISSED_SSTABLES = 10;
+
     private static final Set<String> VALID_OPTIONS = ImmutableSet.of(NonTokenizingOptions.CASE_SENSITIVE,
                                                                      NonTokenizingOptions.NORMALIZE,
                                                                      NonTokenizingOptions.ASCII,
@@ -443,7 +447,60 @@ public class StorageAttachedIndex implements Index
         // New storage-attached indexes will be available for queries after on disk index data are built.
         // Memtable data will be indexed via flushing triggered by schema change
         // We only want to validate the index files if we are starting up
-        return () -> startInitialBuild(baseCfs, StorageService.instance.isStarting(), decision.skipped()).get();
+        return () -> {
+            Object result = startInitialBuild(baseCfs, StorageService.instance.isStarting(), decision.skipped()).get();
+            if (!decision.skipped())
+                buildSSTablesMissedByInitialBuild();
+            return result;
+        };
+    }
+
+    /**
+     * Builds this index on the sstables that are still without it once its initial build is over, until there are
+     * none. The builders skip an sstable they can't reference any more: that's right when a compaction has replaced it
+     * (its result has the index, as its writers were created after the initial build stopped the compactions of the
+     * table), but not when that compaction was then stopped, which restores its sources as other readers.
+     *
+     * @throws IllegalStateException if some sstables are still without this index after several attempts
+     */
+    private void buildSSTablesMissedByInitialBuild() throws Exception
+    {
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(baseCfs);
+        if (group == null || !group.containsIndex(this))
+            return;
+
+        for (int builds = 0; ; builds++)
+        {
+            // Usually, every sstable is in the view: don't reload the index on all of them to find that out.
+            View view = indexContext.getView();
+            boolean anyMissing = false;
+            for (SSTableReader sstable : baseCfs.getSSTables(SSTableSet.CANONICAL))
+                anyMissing |= !view.containsSSTableIndex(sstable.descriptor) && !sstable.isMarkedCompacted();
+            if (!anyMissing)
+                return;
+            if (builds == MAX_BUILDS_OF_MISSED_SSTABLES)
+                throw new IllegalStateException(indexContext.logMessage("SSTables are still without this index after its initial build"));
+
+            List<SSTableReader> nonIndexed = findNonIndexedSSTables(baseCfs, group, false);
+            if (nonIndexed.isEmpty() || !group.containsIndex(this))
+                return;
+
+            logger.info(indexContext.logMessage("Building {} SSTables that are still without this index after its initial build: {}"),
+                        nonIndexed.size(), nonIndexed.stream().map(sstable -> sstable.descriptor).collect(Collectors.toList()));
+            buildSSTables(group, nonIndexed);
+        }
+    }
+
+    private void buildSSTables(StorageAttachedIndexGroup group, List<SSTableReader> sstables) throws Exception
+    {
+        List<ListenableFuture<?>> futures = new ArrayList<>();
+        for (List<SSTableReader> sstablesGroup : groupBySize(sstables, DatabaseDescriptor.getConcurrentCompactors()))
+        {
+            SortedMap<SSTableReader, Set<StorageAttachedIndex>> current = new TreeMap<>(SSTableReader.idComparator);
+            sstablesGroup.forEach(sstable -> current.put(sstable, Collections.singleton(this)));
+            futures.add(CompactionManager.instance.submitIndexBuild(new StorageAttachedIndexBuilder(group, current, false, true)));
+        }
+        Futures.allAsList(futures).get();
     }
 
     private Future<?> startInitialBuild(ColumnFamilyStore baseCfs, boolean validate, boolean skipIndexBuild)
