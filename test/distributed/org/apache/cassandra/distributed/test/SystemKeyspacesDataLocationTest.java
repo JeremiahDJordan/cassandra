@@ -68,7 +68,7 @@ public class SystemKeyspacesDataLocationTest extends TestBaseImpl
         return i.callOnInstance(() -> ColumnFamilyStore.getIfExists(SchemaConstants.SYSTEM_KEYSPACE_NAME, SystemKeyspace.PREPARED_STATEMENTS)
                                                        .getLiveSSTables().stream()
                                                        // sstables are located at <data-location>/<keyspace-name>/<table-name-with-id> so we need to go up two directories to get the data location
-                                                       .map(sstr -> sstr.descriptor.directory.getParentFile().getParentFile().toString())
+                                                       .map(sstr -> sstr.descriptor.directory.parent().parent().toString())
                                                        .collect(Collectors.toSet()));
     }
 
@@ -81,7 +81,7 @@ public class SystemKeyspacesDataLocationTest extends TestBaseImpl
                 String query = String.format("select * from %s.%s", keyspaceName, doubleQuote(tableMetadata.name));
                 QueryHandler.Prepared prepared = QueryProcessor.prepareInternal(query);
                 QueryProcessor.storePreparedStatement(query, keyspaceName, prepared);
-                preparedStatementsCFS.forceBlockingFlush();
+                preparedStatementsCFS.forceBlockingFlush(ColumnFamilyStore.FlushReason.UNIT_TESTS);
             }
         }
     }

@@ -18,7 +18,6 @@
 
 package org.apache.cassandra.io.sstable;
 
-import java.io.File;
 import java.io.IOException;
 import java.nio.file.Paths;
 import java.util.concurrent.CountDownLatch;
@@ -36,6 +35,7 @@ import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.cql3.CQLTester;
 import org.apache.cassandra.dht.Murmur3Partitioner;
+import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.schema.Schema;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -86,8 +86,8 @@ public class CQLSSTableWriterConcurrencyTest extends CQLTester
             if (i % 2 != 0)
             {
                 // dataDir and insert statement are only needed for the CQLSSTableWriter class
-                dataDirs[i] = Paths.get(baseDataDir, KEYSPACE, tableNames[i]).toFile();
-                assert dataDirs[i].mkdirs();
+                dataDirs[i] = new File(Paths.get(baseDataDir, KEYSPACE, tableNames[i]));
+                assert dataDirs[i].tryCreateDirectories();
                 insertStatements[i] = String.format("INSERT INTO %s.%s (k, v1, v2) VALUES (?, ?, ?)", KEYSPACE, tableNames[i]);
             }
 
