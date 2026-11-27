@@ -786,18 +786,20 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
                 // The index is only affected if the SSTable is live: for one that isn't yet, the failure fails the
                 // operation that was going to add it (a stream or import), and the index is fine without it. The
                 // writer then neither makes the index non-queryable nor rethrows, and the failure is handled below.
+                // A stop by a truncate that removed the SSTable isn't a failure of the index either (see build).
                 // Once our components are registered, every index we built uses them, maybe instead of Apache Cassandra
                 // ones (see completeSSTable), and the abort deletes them: all those indexes are affected.
-                Collection<StorageAttachedIndex> nonQueryable = registered && updateViews ? makeNonQueryable(indexes, t)
-                                                                                          : nonQueryableOnAbort;
+                boolean affected = updateViews && !(t instanceof CompactionInterruptedException && removedByTruncate(Collections.singleton(sstable)));
+                Collection<StorageAttachedIndex> nonQueryable = registered && affected ? makeNonQueryable(indexes, t)
+                                                                                       : nonQueryableOnAbort;
                 try
                 {
-                    indexWriter.abort(t, updateViews);
+                    indexWriter.abort(t, affected);
                 }
                 finally
                 {
                     // once the abort has deleted what the writer wrote
-                    if (updateViews)
+                    if (affected)
                         removeFromViews(sstable, nonQueryable, t);
                 }
             }
@@ -901,11 +903,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
 
     /**
      * Removes the SSTable from the views of the provided indexes, which its failed build has made non-queryable, as it
-     * may have deleted their files on it: a build of one of them in progress, which may have built the SSTable already
-     * (e.g. its initial build), then finds the SSTable missing from its view and builds it again before the index is
-     * made queryable (see StorageAttachedIndex#buildSSTablesMissedByInitialBuild). An initial build that has looked at
-     * its view just before still makes the index queryable without the SSTable, until a restart builds it. Not for an
-     * index dropped meanwhile, whose drop cleans up the files of the SSTables in its view.
+     * may have deleted their files on it, and makes them non-queryable again: a build of one of them that looks at
+     * its view after the removal builds the SSTable, and one that looked before (and so forgot that the index was made
+     * non-queryable, see StorageAttachedIndex#buildSSTablesMissedByInitialBuild) fails, or leaves the index
+     * non-queryable if it is over. Not for an index dropped meanwhile, whose drop cleans up the files of the SSTables
+     * in its view.
      */
     private void removeFromViews(SSTableReader sstable, Collection<StorageAttachedIndex> indexes, Throwable failure)
     {
@@ -916,6 +918,7 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             try
             {
                 index.getIndexContext().prepareSSTablesForRebuild(Collections.singleton(sstable));
+                index.makeIndexNonQueryable();
             }
             catch (Throwable e)
             {
@@ -1094,7 +1097,11 @@ public class StorageAttachedIndexBuilder extends SecondaryIndexBuilder
             components.invalidate(sstable, updateViews ? tracker : null);
             index.makeIndexNonQueryable();
             if (updateViews)
+            {
                 index.getIndexContext().prepareSSTablesForRebuild(Collections.singleton(sstable));
+                // as for a failed build, see removeFromViews
+                index.makeIndexNonQueryable();
+            }
         }
     }
 

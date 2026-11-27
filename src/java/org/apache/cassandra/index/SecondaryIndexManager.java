@@ -243,6 +243,12 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
     private final Map<String, AtomicInteger> inProgressBuilds = Maps.newConcurrentMap();
 
     /**
+     * The index instances whose running build must not make them queryable, see {@link #invalidateRunningBuilds}: not by
+     * name, so that the late invalidation of a dropped index doesn't fail the build of another index of its name.
+     */
+    private final Set<Index> invalidatedBuilds = Collections.newSetFromMap(new MapMaker().weakKeys().makeMap());
+
+    /**
      * The index instances that were removed and unregistered, whose builds no longer count under their name.
      */
     private final Set<Index> removedIndexes = Collections.newSetFromMap(new MapMaker().weakKeys().makeMap());
@@ -354,8 +360,19 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         // This is because Keyspace.open("system") can transitively attempt to open Keyspace.open("system")
         initialBuildTask.addCallback(
             success -> {
-                if (IndexBuildDecider.instance.isIndexQueryableAfterInitialBuild(baseCfs))
-                    markIndexBuilt(index, true);
+                if (IndexBuildDecider.instance.isIndexQueryableAfterInitialBuild(baseCfs) && !markIndexBuilt(index, true))
+                {
+                    IllegalStateException failure = failedDuringBuild(Collections.singleton(index));
+                    try
+                    {
+                        logAndMarkIndexesFailed(Collections.singleton(index), failure, true);
+                    }
+                    finally
+                    {
+                        initialization.tryFailure(failure);
+                    }
+                    return;
+                }
                 initialization.trySuccess(null);
             },
             failure -> {
@@ -1046,16 +1063,33 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                                {
                                    try
                                    {
+                                       Set<Index> failed = new HashSet<>();
                                        for (Index index : groupedIndexes)
                                        {
-                                           markIndexBuilt(index, isFullRebuild);
-                                           builtIndexes.add(index);
+                                           if (markIndexBuilt(index, isFullRebuild))
+                                               builtIndexes.add(index);
+                                           else
+                                               failed.add(index);
                                        }
                                        // the SSTables are in the views of these indexes now
                                        if (sstableBuild != null)
                                            sstableBuild.removeIndexes(groupedIndexes);
-                                       logger.info("Index build of {} completed", Index.joinNames(groupedIndexes));
-                                       build.set(o);
+                                       if (failed.isEmpty())
+                                       {
+                                           logger.info("Index build of {} completed", Index.joinNames(groupedIndexes));
+                                           build.set(o);
+                                           return;
+                                       }
+                                       IllegalStateException failure = failedDuringBuild(failed);
+                                       try
+                                       {
+                                           logAndMarkIndexesFailed(failed, failure, false);
+                                       }
+                                       finally
+                                       {
+                                           unbuiltIndexes.addAll(failed);
+                                           build.setException(failure);
+                                       }
                                    }
                                    catch (Throwable t)
                                    {
@@ -1194,6 +1228,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                             if (isFullRebuild)
                             {
                                 needsFullRebuild.remove(indexName);
+                                invalidatedBuilds.remove(index);
                                 makeIndexNonQueryable(index, Index.Status.FULL_REBUILD_STARTED);
                             }
 
@@ -1209,15 +1244,27 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
      *
      * @param index the index to be marked as built
      * @param isFullRebuild {@code true} if this method is invoked as a full index rebuild, {@code false} otherwise
+     * @return {@code false}, without marking it built, if it is a full rebuild that was invalidated while it ran (see
+     * {@link #invalidateRunningBuilds}): the caller marks it failed
      */
-    public synchronized void markIndexBuilt(Index index, boolean isFullRebuild)
+    public synchronized boolean markIndexBuilt(Index index, boolean isFullRebuild)
     {
         String indexName = index.getIndexMetadata().name;
         if (isReplaced(index) || removedIndexes.contains(index))
-            return;
+            return true;
+        if (isFullRebuild && invalidatedBuilds.remove(index))
+            return false;
 
         if (isFullRebuild)
+        {
             makeIndexQueryable(index, Index.Status.BUILD_SUCCEEDED);
+            // invalidated meanwhile, maybe after the index was made non-queryable (see invalidateRunningBuilds)
+            if (invalidatedBuilds.remove(index))
+            {
+                makeIndexNonQueryable(index, Index.Status.BUILD_FAILED);
+                return false;
+            }
+        }
 
         AtomicInteger counter = inProgressBuilds.get(indexName);
         if (counter != null)
@@ -1230,6 +1277,35 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
                     SystemKeyspace.setIndexBuilt(baseCfs.getKeyspaceName(), indexName);
             }
         }
+        return true;
+    }
+
+    /**
+     * Fails the full build of the specified index that is running, if a build of it is in progress, when it completes:
+     * the index lost data that build may have built already, so the build must not make it queryable. Not
+     * synchronized, as {@link #makeIndexNonQueryable}: indexes call it under their own locks.
+     */
+    public void invalidateRunningBuilds(Index index)
+    {
+        String indexName = index.getIndexMetadata().name;
+        AtomicInteger builds = inProgressBuilds.get(indexName);
+        if (builds != null && builds.get() > 0 && !isReplaced(index) && !removedIndexes.contains(index))
+            invalidatedBuilds.add(index);
+    }
+
+    /**
+     * Forgets what invalidated the running build of the specified index so far (see {@link #invalidateRunningBuilds}),
+     * when that build looks for what it still has to build: it builds what the index lost before then.
+     */
+    public void forgetRunningBuildInvalidations(Index index)
+    {
+        invalidatedBuilds.remove(index);
+    }
+
+    private static IllegalStateException failedDuringBuild(Collection<Index> indexes)
+    {
+        return new IllegalStateException(String.format("Index %s lost data while it was being built, and needs a full rebuild",
+                                                       Index.joinNames(indexes)));
     }
 
     /**
@@ -1307,6 +1383,7 @@ public class SecondaryIndexManager implements IndexRegistry, INotificationConsum
         writableIndexes.remove(indexName);
         needsFullRebuild.remove(indexName);
         inProgressBuilds.remove(indexName);
+        invalidatedBuilds.remove(index);
         if (indexes.get(indexName) != index)
             removedIndexes.add(index);
         // remove existing indexing status

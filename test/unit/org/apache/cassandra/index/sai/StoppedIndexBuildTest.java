@@ -681,6 +681,50 @@ public class StoppedIndexBuildTest extends SAITester
     }
 
     /**
+     * The full rebuild of w has built its SSTables and checked its view, and w loses one of them (it is loaded again
+     * without per-SSTable components) before the rebuild completes: the rebuild fails rather than make w queryable
+     * without the SSTable.
+     */
+    @Test
+    public void testFullRebuildCompletingAfterItsSSTableIsLost() throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        createIndex("CREATE CUSTOM INDEX ON %s(v) USING 'StorageAttachedIndex'");
+        String w = createIndex("CREATE CUSTOM INDEX ON %s(w) USING 'StorageAttachedIndex'");
+        writeSSTables();
+        StorageAttachedIndex index = (StorageAttachedIndex) cfs.indexManager.getIndexByName(w);
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+
+        // the builders of the rebuild are held once they are done, and the last one has checked the view
+        holdBuilders(InvokePointBuilder.newInvokePoint().onClass(StorageAttachedIndexBuilder.class).onMethod("build").atExit());
+        CompletableFuture<Throwable> rebuild = rebuildAsync(cfs, w);
+        waitForAssert(() -> assertThat(buildersHeld.get()).isEqualTo(CONCURRENT_COMPACTORS), 120, TimeUnit.SECONDS);
+        assertThat(index.getIndexContext().getView().getIndexes()).hasSize(SSTABLES);
+        SSTableReader lost = index.getIndexContext().getView().getIndexes().iterator().next().getSSTable();
+
+        // that SSTable loses its per-SSTable components, and is loaded again
+        group.descriptorFor(lost).perSSTableComponents().invalidate(lost, cfs.getTracker());
+        group.onSSTableChanged(Collections.singleton(lost), Collections.singleton(lost), group.getIndexes(), false);
+        assertFalse(index.getIndexContext().getView().containsSSTableIndex(lost.descriptor));
+        assertFalse(rebuild.isDone());
+
+        holdBuilders = false;
+        Throwable failure = rebuild.get(180, TimeUnit.SECONDS);
+        Injections.deleteAll();
+        waitForIndexBuildsToSettle();
+        assertNotNull("the rebuild must fail", failure);
+        assertThat(failure).hasStackTraceContaining("lost data while it was being built");
+        assertFalse("w must not be queryable without the SSTable", cfs.indexManager.isIndexQueryable(w));
+
+        // a rebuild brings it back
+        cfs.indexManager.rebuildIndexesBlocking(Collections.singleton(w));
+        assertTrue(cfs.indexManager.isIndexQueryable(w));
+        assertEquals(SSTABLES * ROWS_PER_SSTABLE, rows("w"));
+    }
+
+    /**
      * While a full rebuild of v is between deleting the per-SSTable components of an SSTable and those of v, a load of
      * the SSTables doesn't flag v as unable to serve it: the rebuild is building it and checks it when it is over.
      */
