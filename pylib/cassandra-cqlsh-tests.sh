@@ -23,7 +23,7 @@
 #
 ################################
 
-set -x
+[ $DEBUG ] && set -x
 
 WORKSPACE=$1
 
@@ -88,6 +88,10 @@ if [ "$cython" = "yes" ]; then
 else
   export CASS_DRIVER_NO_CYTHON=true
 fi
+
+# Force pip's legacy pkg_resources metadata backend (instead of the importlib.metadata
+# backend that pip defaults to on Python 3.11+). see ubuntu-test.docker
+export _PIP_USE_IMPORTLIB_METADATA=0
 
 # 'w' (wipe): the in-tree image's prebuilt venvs have src/cassandra-driver without its .git (see ubuntu-test.docker),
 # and for a directory that is not a git clone pip prompts instead of applying 's' (switch)

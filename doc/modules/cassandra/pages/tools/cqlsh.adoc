@@ -32,7 +32,8 @@ use.
 
 The performance of cqlsh's `COPY` operations can be improved by
 installing http://cython.org/[cython]. This will compile the python
-modules that are central to the performance of `COPY`.
+modules that are central to the performance of `COPY`. They can't be compiled on Python 3.12
+or higher.
 
 [[cqlshrc]]
 == cqlshrc
