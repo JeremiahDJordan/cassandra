@@ -27,6 +27,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.Queue;
 import java.util.function.Function;
 
+import javax.annotation.Nullable;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -116,6 +118,8 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /** Tracks whether or not we've already hit the failure threshold while evaluating a partition. */
     private boolean hitFailureThreshold = false;
 
+    /** Counts the first-phase rows that the second phase returns, unless the query has no limits. */
+    @Nullable
     private final CompleteRows completeRows;
 
     private int currentRowsCached = 0; // tracks the current number of cached rows
@@ -131,7 +135,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                                ConsistencyLevel consistency,
                                long queryStartNanoTime,
                                E sources,
-                               DataLimits.Counter completeRowsCounter,
+                               DataLimits.Counter firstPhaseCounter,
                                int cachedRowsWarnThreshold,
                                int cachedRowsFailThreshold)
     {
@@ -152,26 +156,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         this.cachedRowsWarnThreshold = cachedRowsWarnThreshold;
         this.cachedRowsFailThreshold = cachedRowsFailThreshold;
 
-        // Only GROUP BY limits need the rows counted after the row filter, see CompleteRows. Per-partition limits would
-        // need the rows counted by partition, and a filter on a static column can stop matching the rows of a partition
-        // when its static row is completed.
-        DataLimits limits = command.limits();
-        completeRows = !limits.isGroupByLimit()
-                       || limits.count() == DataLimits.NO_LIMIT
-                       || limits.perPartitionCount() != DataLimits.NO_LIMIT
-                       || hasStaticExpression(command.rowFilter())
-                       ? null
-                       : new CompleteRows(completeRowsCounter);
-    }
-
-    private static boolean hasStaticExpression(RowFilter filter)
-    {
-        for (RowFilter.Expression expression : filter.expressions())
-        {
-            if (expression.column().isStatic())
-                return true;
-        }
-        return false;
+        completeRows = command.limits().isUnlimited() ? null : new CompleteRows(firstPhaseCounter);
     }
 
     private UnfilteredPartitionIterator executeReadCommand(ReadCommand cmd, Replica source, ReplicaPlan.Shared<EndpointsForToken, ReplicaPlan.ForTokenRead> replicaPlan)
@@ -291,8 +276,13 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                             }
                         }
 
-                        if (!isPotentiallyOutdated && !isStatic && completeRows != null)
-                            completeRows.add(partitionKey, merged);
+                        if (completeRows != null)
+                        {
+                            if (isStatic)
+                                completeRows.setStaticRow(isPotentiallyOutdated ? null : merged);
+                            else
+                                completeRows.add(merged, !isPotentiallyOutdated);
+                        }
 
                         // If the row is potentially outdated (because some replica didn't send anything and so it _may_ be
                         // an outdated result that is only present because other replica have filtered the up-to-date result
@@ -323,38 +313,93 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     }
 
     /**
-     * Counts, in a counter of its own, the merged rows of the first phase that no replica is silent about and that match
-     * the row filter: the second phase returns them as they are. Short read protection takes from that counter that the
-     * merged result needs no more rows of a replica (see DataLimits#isCompleteWithLastRowOf), which the merged result
-     * counter of the first phase, which counts the merged rows before the row filter, can't tell.
+     * Counts, in the first phase's merged result counter, the rows that no replica is silent about and that match the
+     * row filter: the second phase returns them as they are, so short read protection stops asking for more rows once
+     * they fill the limits. The rows of a partition whose static row some replica is silent about aren't counted, as
+     * the static row that the second phase completes can stop matching the filter. The static row of a partition
+     * without merged rows is counted, as the counter counts a partition without rows, when the next partition starts and
+     * the filter has no part on rows. With a per-partition limit, the rows after a row that some replica is silent
+     * about aren't counted, as the second phase can return that row in their place.
      * <p>
      * A GROUP BY counter closes a group when the next one starts and expects each partition once, so it is given the
-     * start of each merged partition and each row as they come. The rows it doesn't count can only make more groups.
+     * start of each merged partition and each row as they come. A group whose last row is the last row of a replica's
+     * response tells short read protection that the replica isn't needed (see DataLimits#isCompleteWithLastRowOf). The
+     * rows it doesn't count can only make more groups.
      */
     private class CompleteRows
     {
         private final DataLimits.Counter counter;
+        // the parts of the row filter that the coordinator applies to the static row and to each row of a partition
+        private final RowFilter.FilterElement partitionLevelFilter;
+        private final RowFilter.FilterElement rowLevelFilter;
+
+        private DecoratedKey partitionKey;
+        private boolean partitionMatches;
+        // the merged static row of the partition if no replica is silent about it and it has live data, or null
+        private Row staticRow;
+        // whether the second phase can return rows of the partition, instead of its static row alone
+        private boolean mayHaveRows;
+        // whether the second phase can return rows of the partition that aren't counted, which, with a per-partition
+        // limit, take the place of the rows after them
+        private boolean mayHaveUncountedRows;
 
         private CompleteRows(DataLimits.Counter counter)
         {
             this.counter = counter;
+            this.partitionLevelFilter = command.rowFilter().root.partitionLevelTree();
+            this.rowLevelFilter = command.rowFilter().root.rowLevelTree();
         }
 
         private void startPartition(DecoratedKey key)
         {
+            // The coordinator filter returns a partition without rows for its static row when the filter has no part on
+            // rows (see RowFilter#filter)
+            if (staticRow != null && !mayHaveRows && partitionMatches && rowLevelFilter.isEmpty() && !counter.isDone())
+                counter.countStaticRow(staticRow);
+
+            partitionKey = key;
+            partitionMatches = partitionLevelFilter.isSatisfiedBy(command.metadata(), key, Rows.EMPTY_STATIC_ROW);
+            staticRow = null;
+            mayHaveRows = false;
+            mayHaveUncountedRows = false;
             if (!counter.isDone())
                 counter.countPartitionStart(key);
         }
 
-        private void add(DecoratedKey key, Row merged)
+        /**
+         * @param merged the merged static row, or {@code null} if some replica is silent about it
+         */
+        private void setStaticRow(@Nullable Row merged)
         {
-            if (counter.isDone())
+            Row row = merged == null ? null : purge(merged);
+            partitionMatches = merged != null
+                               && partitionLevelFilter.isSatisfiedBy(command.metadata(),
+                                                                     partitionKey,
+                                                                     row == null ? Rows.EMPTY_STATIC_ROW : row);
+            staticRow = merged == null ? null : row;
+        }
+
+        /**
+         * @param complete whether no replica is silent about the row
+         */
+        private void add(Row merged, boolean complete)
+        {
+            mayHaveRows = true;
+            mayHaveUncountedRows |= !complete;
+            // an iteration with the counter applied doesn't go past the rows that fill the limits of the partition
+            if (!complete || !partitionMatches || counter.isDoneForPartition()
+                || (mayHaveUncountedRows && command.limits().perPartitionCount() != DataLimits.NO_LIMIT))
                 return;
 
-            // The second phase purges the merged rows before filtering them
-            Row row = merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
-            if (row != null && command.rowFilter().isSatisfiedBy(command.metadata(), key, row, command.nowInSec()))
+            Row row = purge(merged);
+            if (row != null && rowLevelFilter.isSatisfiedBy(command.metadata(), partitionKey, row))
                 counter.countRow(row);
+        }
+
+        // The second phase purges the merged rows before filtering them
+        private Row purge(Row merged)
+        {
+            return merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
         }
     }
 

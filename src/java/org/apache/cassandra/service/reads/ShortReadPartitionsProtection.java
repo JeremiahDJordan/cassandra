@@ -66,9 +66,6 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
 
     protected final DataLimits.Counter singleResultCounter; // unmerged per-source counter
     private final DataLimits.Counter mergedResultCounter; // merged end-result counter
-    // counter of the merged rows that are in the result: the merged result counter, except in the first phase of replica
-    // filtering protection, whose merged result counter counts rows before the row filter
-    private final DataLimits.Counter resultRowsCounter;
 
     private DecoratedKey lastPartitionKey; // key of the last observed partition
 
@@ -83,7 +80,6 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
                                          Runnable preFetchCallback,
                                          DataLimits.Counter singleResultCounter,
                                          DataLimits.Counter mergedResultCounter,
-                                         DataLimits.Counter resultRowsCounter,
                                          long queryStartNanoTime)
     {
         this.command = command;
@@ -92,7 +88,6 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         this.preFetchCallback = preFetchCallback;
         this.singleResultCounter = singleResultCounter;
         this.mergedResultCounter = mergedResultCounter;
-        this.resultRowsCounter = resultRowsCounter;
         this.queryStartNanoTime = queryStartNanoTime;
     }
 
@@ -129,7 +124,6 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
                                                                          (cmd) -> executeReadCommand(cmd, sharedReplicaPlan),
                                                                          singleResultCounter,
                                                                          mergedResultCounter,
-                                                                         resultRowsCounter,
                                                                          () -> firstResponse != null && firstResponse.hasNext(),
                                                                          firstResponse != null);
         if (firstResponse != null)
@@ -148,7 +142,7 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
                && !command.isLimitedToOnePartition() // moreContents() only runs for range reads
                && !command.limits().isReplicaExhausted(singleResultCounter)
                // the start of the next partition completes the merged result, which then needs nothing of this one
-               && command.limits().isReplicaExhausted(resultRowsCounter)
+               && command.limits().isReplicaExhausted(mergedResultCounter)
                && partition.staticRow().isEmpty()
                && !partition.hasNext()
                && !firstResponse.hasNext();
@@ -162,7 +156,10 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
     public UnfilteredPartitionIterator moreContents()
     {
         // never try to request additional partitions from replicas if our reconciled partitions are already filled to the limit
-        assert !mergedResultCounter.isDone();
+        // (the merged result counter stops the iteration once it's done, except in the first phase of replica filtering
+        // protection, where it only counts the rows that are known to be returned, see DataResolver)
+        if (mergedResultCounter.isDone())
+            return null;
 
         // we do not apply short read protection when we have no limits at all
         assert !command.limits().isUnlimited();
@@ -188,7 +185,7 @@ public class ShortReadPartitionsProtection extends Transformation<UnfilteredRowI
         // the merged result needs no more rows from the replica (GROUP BY, see DataLimits#isCompleteWithLastRowOf)
         if (inFirstResponse && (lastRowsProtection != null
                                 ? lastRowsProtection.isCompleteWithLastRow()
-                                : command.limits().isCompleteWithLastRowOf(resultRowsCounter, singleResultCounter, null, null,
+                                : command.limits().isCompleteWithLastRowOf(mergedResultCounter, singleResultCounter, null, null,
                                                                            command.metadata().comparator, command.isReversed())))
             return null;
 

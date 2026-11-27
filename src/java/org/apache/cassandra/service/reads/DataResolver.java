@@ -23,6 +23,8 @@ import java.util.Collection;
 import java.util.List;
 import java.util.function.UnaryOperator;
 
+import javax.annotation.Nullable;
+
 import com.google.common.base.Joiner;
 
 import org.apache.cassandra.config.DatabaseDescriptor;
@@ -157,28 +159,18 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         return index.supportsReplicaFilteringProtection(command.rowFilter());
     }
 
-    private DataLimits.Counter newMergedResultCounter()
-    {
-        return command.limits().newCounter(command.nowInSec(), true, command.selectsFullPartition(), enforceStrictLiveness);
-    }
-
     protected class ResolveContext
     {
         public final E replicas;
         private final DataLimits.Counter mergedResultCounter;
-        // the counter of the merged rows that are in the result, see ShortReadPartitionsProtection#resultRowsCounter
-        private final DataLimits.Counter resultRowsCounter;
 
         private ResolveContext(E replicas)
         {
-            this(replicas, null);
-        }
-
-        private ResolveContext(E replicas, DataLimits.Counter resultRowsCounter)
-        {
             this.replicas = replicas;
-            this.mergedResultCounter = newMergedResultCounter();
-            this.resultRowsCounter = resultRowsCounter == null ? mergedResultCounter : resultRowsCounter;
+            this.mergedResultCounter = command.limits().newCounter(command.nowInSec(),
+                                                                   true,
+                                                                   command.selectsFullPartition(),
+                                                                   enforceStrictLiveness);
 
             // In case of top-k query, do not trim reconciled rows here because QueryPlan#postProcessor() needs to compare all rows
             if (command.isTopK())
@@ -197,11 +189,6 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         public DataLimits.Counter mergedResultCounter()
         {
             return mergedResultCounter;
-        }
-
-        public DataLimits.Counter resultRowsCounter()
-        {
-            return resultRowsCounter;
         }
 
         public boolean needShortReadProtection()
@@ -239,7 +226,6 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
                                                                                 () -> responses.clearUnsafe(i),
                                                                                 singleResultCounter,
                                                                                 context.mergedResultCounter(),
-                                                                                context.resultRowsCounter(),
                                                                                 queryStartNanoTime),
                                               singleResultCounter);
         }
@@ -279,29 +265,29 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         //      is no replica divergence, only rows in the partition being evalutated will be cached (then released
         //      when the partition is consumed).
         //   3) After a "complete" row is materialized, it must pass the row filter supplied by the original query
-        //      before it counts against the limit.
+        //      before it counts against the limit. If this "pre-count" filter causes a short read, additional rows
+        //      will be fetched from the first-phase iterator.
+        // The first phase doesn't apply its merged result counter, which would count rows that the second phase filters
+        // out; replica filtering protection counts in it the rows that the second phase returns as they are, as the
+        // second phase's counter counts them (see ReplicaFilteringProtection.CompleteRows).
 
-        // We need separate contexts, as each context has his own counter. The merged result counter of the first phase
-        // counts the merged rows before the row filter, so replica filtering protection counts in a counter of its own
-        // the rows that it knows to be in the result.
-        DataLimits.Counter completeRowsCounter = newMergedResultCounter().onlyCount();
-        ResolveContext firstPhaseContext = new ResolveContext(replicas, completeRowsCounter);
-        ResolveContext secondPhaseContext = new ResolveContext(replicas);
+        ResolveContext firstPhaseContext = new ResolveContext(replicas);
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(replicaPlan().keyspace(),
                                                                              command,
                                                                              replicaPlan().consistencyLevel(),
                                                                              queryStartNanoTime,
-                                                                             firstPhaseContext.replicas,
-                                                                             completeRowsCounter,
+                                                                             replicas,
+                                                                             firstPhaseContext.mergedResultCounter,
                                                                              DatabaseDescriptor.getCachedReplicaRowsWarnThreshold(),
                                                                              DatabaseDescriptor.getCachedReplicaRowsFailThreshold());
 
         PartitionIterator firstPhasePartitions = resolveInternal(firstPhaseContext,
                                                                  rfp.mergeController(),
                                                                  i -> shortReadProtectedResponse(i, firstPhaseContext),
-                                                                 UnaryOperator.identity(),
+                                                                 null,
                                                                  QueryInfoTracker.ReadTracker.NOOP);
 
+        ResolveContext secondPhaseContext = new ResolveContext(replicas);
         PartitionIterator completedPartitions = resolveWithReadRepair(secondPhaseContext,
                                                                       i -> rfp.queryProtectedPartitions(firstPhasePartitions, i),
                                                                       preCountFilterForReplicaFilteringProtection(),
@@ -324,7 +310,7 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
     private PartitionIterator resolveInternal(ResolveContext context,
                                               UnfilteredPartitionIterators.MergeListener mergeListener,
                                               ResponseProvider responseProvider,
-                                              UnaryOperator<PartitionIterator> preCountFilter,
+                                              @Nullable UnaryOperator<PartitionIterator> preCountFilter,
                                               QueryInfoTracker.ReadTracker resolveReadTracker)
     {
         int count = context.replicas.size();
@@ -353,7 +339,9 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         }
         Filter filter = new Filter(command.nowInSec(), command.metadata().enforceStrictLiveness());
         FilteredPartitions filtered = FilteredPartitions.filter(merged, filter);
-        PartitionIterator counted = Transformation.apply(preCountFilter.apply(filtered), context.mergedResultCounter);
+        PartitionIterator counted = preCountFilter == null
+                                    ? filtered
+                                    : Transformation.apply(preCountFilter.apply(filtered), context.mergedResultCounter);
         return Transformation.apply(counted, new EmptyPartitionsDiscarder());
     }
 
