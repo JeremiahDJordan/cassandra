@@ -413,6 +413,7 @@ public class EndpointGroupingCoordinator
                                                                                           () -> responses.clearUnsafe(i),
                                                                                           singleResultCounter,
                                                                                           context.mergedResultCounter(),
+                                                                                          context.resultRowsCounter(),
                                                                                           queryStartNanoTime),
                                                   singleResultCounter);
             }
@@ -433,9 +434,10 @@ public class EndpointGroupingCoordinator
                                                        Runnable preFetchCallback,
                                                        DataLimits.Counter singleResultCounter,
                                                        DataLimits.Counter mergedResultCounter,
+                                                       DataLimits.Counter resultRowsCounter,
                                                        long queryStartNanoTime)
             {
-                super(command, source, firstResponse, preFetchCallback, singleResultCounter, mergedResultCounter, queryStartNanoTime);
+                super(command, source, firstResponse, preFetchCallback, singleResultCounter, mergedResultCounter, resultRowsCounter, queryStartNanoTime);
             }
 
             @Override

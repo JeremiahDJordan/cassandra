@@ -23,6 +23,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.StringJoiner;
 
+import javax.annotation.Nullable;
+
 import com.google.common.annotations.VisibleForTesting;
 import org.apache.cassandra.db.*;
 import org.slf4j.Logger;
@@ -231,6 +233,34 @@ public abstract class DataLimits
         return isCounterBelowLimits(counter);
     }
 
+    /**
+     * Returns whether the merged result counted by {@code mergedCounter} needs no more rows from a replica whose last
+     * row so far is the row at {@code lastClustering} of {@code partitionKey}.
+     * <p>
+     * Only GROUP BY limits can tell, as their counters only count a group once the next one starts, and don't stop at
+     * the row or byte limit when they only count. The merged result needs no more rows from the replica when it has as
+     * many rows or bytes as the row or byte limit, or as many groups as the limit with its open group and the open
+     * group has all the rows of the replica: when the replica's last row is in a later group, or is the last row of the
+     * open group and the replica stopped at the end of a group or of its data, which the counter of the replica's
+     * response to the command tells, if the replica returned nothing else. When the open group is the last group of the
+     * previous page, of which the merged result has no row, it has all the rows of a replica whose response to the
+     * command has no row: the next row of that replica starts a new group.
+     *
+     * @param firstResponseCounter the counter of the replica's response to the command, if the replica returned nothing
+     * else, or {@code null}
+     * @param partitionKey the partition of the replica's last row, or {@code null} if the replica returned no row
+     * @param lastClustering the clustering of the replica's last row, or {@code null} if the replica returned no row
+     */
+    public boolean isCompleteWithLastRowOf(Counter mergedCounter,
+                                           @Nullable Counter firstResponseCounter,
+                                           @Nullable DecoratedKey partitionKey,
+                                           @Nullable Clustering<?> lastClustering,
+                                           ClusteringComparator comparator,
+                                           boolean reversed)
+    {
+        return false;
+    }
+
     public abstract DataLimits forPaging(PageSize pageSize);
     public abstract DataLimits forPaging(PageSize pageSize, ByteBuffer lastReturnedKey, int lastReturnedKeyRemaining);
 
@@ -373,6 +403,9 @@ public abstract class DataLimits
         // true means we count the bytes of rows at their full size, see countingFullRowSize()
         private boolean countsFullRowSize;
 
+        // the partition started by countPartitionStart()
+        private DecoratedKey countedPartitionKey;
+
         protected Counter(int nowInSec, boolean assumeLiveData, boolean enforceStrictLiveness)
         {
             this.nowInSec = nowInSec;
@@ -420,6 +453,26 @@ public abstract class DataLimits
         public RowIterator applyTo(RowIterator partition)
         {
             return (RowIterator) applyToPartition(partition);
+        }
+
+        /**
+         * Starts counting the rows of the given partition outside of an iteration, closing the previous partition, as
+         * when the counter is applied to the partitions of an iterator. Partitions must come in order, each one once.
+         */
+        public void countPartitionStart(DecoratedKey partitionKey)
+        {
+            if (countedPartitionKey != null)
+                onPartitionClose();
+            countedPartitionKey = partitionKey;
+            applyToPartition(partitionKey, Rows.EMPTY_STATIC_ROW);
+        }
+
+        /**
+         * Counts a row of the partition started by {@link #countPartitionStart(DecoratedKey)}.
+         */
+        public void countRow(Row row)
+        {
+            applyToRow(row);
         }
 
         /**
@@ -1073,6 +1126,52 @@ public abstract class DataLimits
             return groupByCounter.rowsCounted < rowLimit && groupByCounter.bytesCounted < bytesLimit && groups < groupLimit;
         }
 
+        @Override
+        public boolean isCompleteWithLastRowOf(Counter mergedCounter,
+                                               @Nullable Counter firstResponseCounter,
+                                               @Nullable DecoratedKey partitionKey,
+                                               @Nullable Clustering<?> lastClustering,
+                                               ClusteringComparator comparator,
+                                               boolean reversed)
+        {
+            GroupByAwareCounter merged = (GroupByAwareCounter) mergedCounter;
+            GroupByAwareCounter replica = (GroupByAwareCounter) firstResponseCounter;
+
+            // the merged result has as many rows, or bytes, as the row or byte limit
+            if (merged.rowsCounted >= rowLimit || merged.bytesCounted >= bytesLimit)
+                return true;
+
+            if (groupPerPartitionLimit != NO_LIMIT
+                || !merged.hasUnfinishedGroup
+                || merged.groupCounted + 1 < groupLimit)
+                return false;
+
+            // the open group is the last group of the previous page (see GroupingState)
+            if (merged.lastRowPartitionKey == null)
+                return replica != null && replica.rowsCounted == 0;
+
+            if (partitionKey == null || lastClustering == null)
+                return false;
+
+            int cmp = partitionKey.compareTo(merged.lastRowPartitionKey);
+            if (cmp == 0)
+                cmp = reversed ? comparator.compare(merged.lastRowClustering, lastClustering)
+                               : comparator.compare(lastClustering, merged.lastRowClustering);
+
+            if (cmp == 0)
+            {
+                // the replica stopped at the end of a group, or of its data, not at a row or byte limit
+                return replica != null && replica.rowsCounted < rowLimit && replica.bytesCounted < bytesLimit;
+            }
+
+            if (cmp < 0)
+                return false;
+
+            GroupMaker groupMaker = groupBySpec.newGroupMaker();
+            groupMaker.isNewGroup(merged.lastRowPartitionKey, merged.lastRowClustering);
+            return groupMaker.isNewGroup(partitionKey, lastClustering);
+        }
+
         protected class GroupByAwareCounter extends Counter
         {
             private final GroupMaker groupMaker;
@@ -1117,6 +1216,12 @@ public abstract class DataLimits
             protected int staticRowBytes;
 
             protected boolean hasReturnedRowsFromCurrentPartition;
+
+            /**
+             * The partition key and clustering of the last row counted.
+             */
+            protected DecoratedKey lastRowPartitionKey;
+            protected Clustering<?> lastRowClustering;
 
             private GroupByAwareCounter(int nowInSec,
                                         boolean assumeLiveData,
@@ -1241,6 +1346,8 @@ public abstract class DataLimits
                     hasUnfinishedGroup = true;
                     incrementRowCount(bytesLimit != NO_LIMIT ? rowSize(row) : 0);
                     hasReturnedRowsFromCurrentPartition = true;
+                    lastRowPartitionKey = currentPartitionKey;
+                    lastRowClustering = row.clustering();
                 }
 
                 return row;
