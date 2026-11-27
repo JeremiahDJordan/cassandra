@@ -4309,6 +4309,8 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
     {
         if(tag == null)
             tag = "";
+        else if (!tag.isEmpty())
+            Directories.validateSnapshotNameToClear(tag);
 
         Set<String> keyspaces = new HashSet<>();
         for (File dataDir : DatabaseDescriptor.getAllDataFileLocations())
