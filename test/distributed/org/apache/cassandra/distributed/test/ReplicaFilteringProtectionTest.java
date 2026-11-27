@@ -419,6 +419,45 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
     }
 
     /**
+     * Partition 1 has a newer non-match of c = 0 on node 2 and a newer deletion of c = 1 on node 1, and partition 0,
+     * next in token order, has them the other way around, so that short read protection reads more rows of each
+     * partition from both nodes. A page of rows that continues a partition counts the rows of the partition that the
+     * previous pages returned towards the per-partition limit.
+     */
+    @Test
+    public void testPerPartitionLimitAcrossPagesOfRangeRead()
+    {
+        String table = createTable("ppl_across_pages_of_range_read", "(k int, c int, v int, PRIMARY KEY (k, c))");
+        for (int k = 0; k <= 1; k++)
+            for (int c = 0; c < 6; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (?, ?, 1) USING TIMESTAMP 1", ALL, k, c);
+        write(2, "INSERT INTO %s (k, c, v) VALUES (1, 0, 2) USING TIMESTAMP 2", table);
+        write(1, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 1 AND c = 1", table);
+        write(1, "INSERT INTO %s (k, c, v) VALUES (0, 0, 2) USING TIMESTAMP 2", table);
+        write(2, "DELETE FROM %s USING TIMESTAMP 2 WHERE k = 0 AND c = 1", table);
+
+        assertRows(cluster.coordinator(1).executeWithPaging("SELECT k, c FROM " + table + " WHERE v = 1 PER PARTITION LIMIT 3 ALLOW FILTERING", ALL, 2),
+                   row(1, 2), row(1, 3), row(1, 4), row(0, 2), row(0, 3), row(0, 4));
+    }
+
+    /**
+     * Partition 1 has only a static row s = 7 on node 1, and a newer s = 0 on node 2, which doesn't return the
+     * partition, so the second phase completes its static row to s = 0. Partition 0, next in token order, has s = 7 and
+     * a row on both nodes, and partition 2 s = 7 and a row on node 1 only, past LIMIT 2 of node 1.
+     */
+    @Test
+    public void testStaticOnlyPartitionWithNewerStaticRowOnOtherReplica()
+    {
+        String table = createTable("static_only_with_newer_static_row", "(k int, c int, s int static, PRIMARY KEY (k, c))");
+        write(1, "INSERT INTO %s (k, s) VALUES (1, 7) USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, s) VALUES (1, 0) USING TIMESTAMP 2", table);
+        cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, s) VALUES (0, 0, 7) USING TIMESTAMP 1", ALL);
+        write(1, "INSERT INTO %s (k, c, s) VALUES (2, 0, 7) USING TIMESTAMP 1", table);
+
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 7 LIMIT 2 ALLOW FILTERING", ALL), row(0, 0), row(2, 0));
+    }
+
+    /**
      * Agreeing replicas return one row of each partition of 16 rows to a query with a per-partition limit of 1, or a
      * filter on a static column and a limit of 1, so replica filtering protection caches fewer rows than a fail
      * threshold of 8.
