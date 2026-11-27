@@ -105,6 +105,18 @@ public class DiskBoundaryManagerTest extends CQLTester
 
     }
 
+    @Test
+    public void testNoLocalRanges() throws Throwable
+    {
+        execute("INSERT INTO %s (id, x) VALUES (1, 'a')");
+        flush();
+        StorageService.instance.getTokenMetadata().clearUnsafe();
+
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        Assert.assertNull(cfs.getDiskBoundaries().getPositions());
+        assertFalse(cfs.hasMisplacedSSTables());
+    }
+
     private static void assertEquals(List<Directories.DataDirectory> dir1, Directories.DataDirectory[] dir2)
     {
         if (dir1.size() != dir2.length)

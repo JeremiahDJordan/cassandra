@@ -20,6 +20,7 @@ package org.apache.cassandra.db;
 
 import java.io.IOError;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import org.junit.Before;
@@ -27,18 +28,22 @@ import org.junit.BeforeClass;
 import org.junit.Test;
 
 import org.apache.cassandra.SchemaLoader;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.dht.ByteOrderedPartitioner;
 import org.apache.cassandra.exceptions.ConfigurationException;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
+import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.CorruptSSTableException;
+import org.apache.cassandra.io.sstable.SSTable;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.tools.StandaloneScrubber;
 import org.apache.cassandra.tools.ToolRunner;
 import org.apache.cassandra.tools.ToolRunner.ToolResult;
 import org.apache.cassandra.utils.ByteBufferUtil;
+import org.apache.cassandra.utils.ReflectionUtils;
 import org.apache.cassandra.utils.Throwables;
 import org.assertj.core.api.Assertions;
 
@@ -111,6 +116,35 @@ public class ScrubToolTest
 
         // check data is still there
         assertOrderedAll(cfs, 1);
+    }
+
+    @Test
+    public void testScrubDataAndStatsOnlyWithTool() throws Exception
+    {
+        ColumnFamilyStore cfs = keyspace.getColumnFamilyStore(CF);
+
+        fillCF(cfs, 10);
+        assertOrderedAll(cfs, 10);
+
+        for (SSTableReader sstable : cfs.getLiveSSTables())
+            for (Component component : SSTable.discoverComponentsFor(sstable.descriptor))
+                if (!component.equals(Component.DATA) && !component.equals(Component.STATS) && !component.equals(Component.COMPRESSION_INFO))
+                    assertTrue(sstable.descriptor.fileFor(component).tryDelete());
+
+        // only an offline tool may track an sstable without a first and last key
+        Field toolInitialized = ReflectionUtils.getField(DatabaseDescriptor.class, "toolInitialized");
+        toolInitialized.setAccessible(true);
+        toolInitialized.setBoolean(null, true);
+        try
+        {
+            ToolResult tool = ToolRunner.invokeClass(StandaloneScrubber.class, ksName, CF);
+            Assertions.assertThat(tool.getStdout()).contains("10 partitions in new sstable and 0 empty");
+            tool.assertOnCleanExit();
+        }
+        finally
+        {
+            toolInitialized.setBoolean(null, false);
+        }
     }
 
     @Test
