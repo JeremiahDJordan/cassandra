@@ -41,7 +41,6 @@ from decimal import Decimal
 from random import randint
 from io import StringIO
 from select import select
-from typing import Literal
 from uuid import UUID
 
 import configparser
@@ -61,6 +60,7 @@ from cqlshlib.displaying import NO_COLOR_MAP
 from cqlshlib.driver import cluster_factory
 from cqlshlib.formatting import format_value_default, CqlType, DateTimeFormat, EMPTY, get_formatter, BlobType
 from cqlshlib.sslhandling import ssl_settings
+from cqlshlib.util import profile_on, profile_off
 
 
 PROFILE_ON = False
