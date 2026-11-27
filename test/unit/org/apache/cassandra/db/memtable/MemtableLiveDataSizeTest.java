@@ -76,9 +76,19 @@ public class MemtableLiveDataSizeTest extends CQLTester
                      liveDataSize(INSERT + "1000 AND TTL 100000", update, delete));
     }
 
+    @Test
+    public void testRowDeletionOverCollection()
+    {
+        String delete = "DELETE FROM %s USING TIMESTAMP 2000 WHERE pk = 0 AND ck = ?";
+        assertEquals(liveDataSize(delete),
+                     liveDataSize("INSERT INTO %s (pk, ck, s) VALUES (0, ?, {1}) USING TIMESTAMP 1000", delete));
+        assertEquals(liveDataSize(delete),
+                     liveDataSize("UPDATE %s USING TIMESTAMP 1000 SET s = s + {1} WHERE pk = 0 AND ck = ?", delete));
+    }
+
     private long liveDataSize(String... writes)
     {
-        createTable("CREATE TABLE %s (pk int, ck int, v int, PRIMARY KEY (pk, ck)) WITH memtable = {'class': '" + memtable + "'}");
+        createTable("CREATE TABLE %s (pk int, ck int, v int, s set<int>, PRIMARY KEY (pk, ck)) WITH memtable = {'class': '" + memtable + "'}");
         for (int ck = 0; ck < 10; ck++)
         {
             for (String write : writes)
