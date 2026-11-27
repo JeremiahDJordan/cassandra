@@ -94,6 +94,9 @@ Upgrading
       output may need updating.
     - cqlsh supports Python 3.8-3.13 (CASSANDRA-20997). Python 3.6 and 3.7 are deprecated: bin/cqlsh runs cqlsh with
       them and prints "Warning: using deprecated version of Python" (CASSANDRA-19467). Python 2.7 is not supported.
+    - On Python 3.9+, cqlsh displays timestamps in the timezone set in cqlshrc or TZ without the pytz library
+      (CASSANDRA-17433). It looks the timezone up with Python's zoneinfo (the system's time zone database, then the
+      tzdata package) instead of pytz, so a name that only pytz knows is ignored with a warning.
     - Two non-frozen collections are compatible only if their values are serialization-compatible, not only
       value-compatible (CASSANDRA-16905): for example, a non-frozen map<int, varint> is no longer compatible with a
       map<int, bigint>. This applies where the type of a column is checked against an earlier type of the column,
