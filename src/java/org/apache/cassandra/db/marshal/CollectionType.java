@@ -307,10 +307,11 @@ public abstract class CollectionType<T> extends MultiCellCapableType<T>
         int separator = comparableBytes.next();
         while (separator != ByteSource.TERMINATOR)
         {
+            // Collections hold no nulls: a null component is an empty element of a type that encodes it as null.
             if (!ByteSourceInverse.nextComponentNull(separator))
                 buffers.add(elementType.fromComparableBytes(accessor, comparableBytes, version));
             else
-                buffers.add(null);
+                buffers.add(accessor.empty());
             separator = comparableBytes.next();
         }
         return CollectionSerializer.pack(buffers, accessor, buffers.size());

@@ -940,7 +940,6 @@ public class AbstractTypeByteSourceTest
     public void testNullComponentMarker()
     {
         // The OSS50 bytes are those of Apache Cassandra 5.0.9; OSS41 and LEGACY mark null components with 0x3f.
-        // Empty elements of collections decode as nulls.
         ByteBuffer zero = Int32Type.instance.decompose(0);
         ByteBuffer one = Int32Type.instance.decompose(1);
         ByteBuffer empty = ByteBufferUtil.EMPTY_BYTE_BUFFER;
@@ -952,12 +951,15 @@ public class AbstractTypeByteSourceTest
                                   "bf7ffffffec1bf7ffffffec7", "bf7ffffffec0bf7ffffffe");
         ListType<Integer> list = ListType.getInstance(Int32Type.instance, false);
         ByteBuffer listValue = CollectionSerializer.pack(Arrays.asList(one, empty, one), 3);
-        assertNullComponentMarker(list, listValue, CollectionSerializer.pack(Arrays.asList(one, null, one), 3),
+        assertNullComponentMarker(list, listValue, listValue,
                                   "40800000013e408000000138", "40800000013f408000000138");
-        assertNullComponentMarker(MapType.getInstance(Int32Type.instance, Int32Type.instance, false),
-                                  CollectionSerializer.pack(Arrays.asList(zero, one, one, empty), 2),
-                                  CollectionSerializer.pack(Arrays.asList(zero, one, one, null), 2),
-                                  "4080000000408000000140800000013e38", "4080000000408000000140800000013f38");
+        ByteBuffer setValue = CollectionSerializer.pack(Arrays.asList(empty, one), 2);
+        assertNullComponentMarker(SetType.getInstance(Int32Type.instance, false), setValue, setValue,
+                                  "3e408000000138", "3f408000000138");
+        ByteBuffer mapValue = CollectionSerializer.pack(Arrays.asList(empty, one, zero, one, one, empty), 3);
+        assertNullComponentMarker(MapType.getInstance(Int32Type.instance, Int32Type.instance, false), mapValue, mapValue,
+                                  "3e40800000014080000000408000000140800000013e38",
+                                  "3f40800000014080000000408000000140800000013f38");
         CompositeType composite = CompositeType.getInstance(Int32Type.instance, Int32Type.instance, Int32Type.instance);
         ByteBuffer compositeValue = composite.decompose(1, null, 1);
         assertNullComponentMarker(composite, compositeValue, compositeValue,
@@ -969,9 +971,12 @@ public class AbstractTypeByteSourceTest
 
     private void assertNullComponentMarker(AbstractType<?> type, ByteBuffer value, ByteBuffer decoded, String oss50, String oss41)
     {
-        Assert.assertEquals(version == ByteComparable.Version.OSS50 ? oss50 : oss41, toHex(type, value, version));
+        String encoded = version == ByteComparable.Version.OSS50 ? oss50 : oss41;
+        Assert.assertEquals(encoded, toHex(type, value, version));
         ByteSource.Peekable bytes = ByteSource.peekable(type.asComparableBytes(value, version));
-        Assert.assertEquals(ByteBufferUtil.bytesToHex(decoded), ByteBufferUtil.bytesToHex(type.fromComparableBytes(bytes, version)));
+        ByteBuffer read = type.fromComparableBytes(bytes, version);
+        Assert.assertEquals(ByteBufferUtil.bytesToHex(decoded), ByteBufferUtil.bytesToHex(read));
+        Assert.assertEquals(encoded, toHex(type, read, version));
     }
 
     private static String toHex(AbstractType<?> type, ByteBuffer value, ByteComparable.Version version)

@@ -209,12 +209,13 @@ public class MapType<K, V> extends CollectionType<Map<K, V>>
         int separator = comparableBytes.next();
         while (separator != ByteSource.TERMINATOR)
         {
+            // Maps hold no nulls: a null component is an empty key or value of a type that encodes it as null.
             buffers.add(ByteSourceInverse.nextComponentNull(separator)
-                        ? null
+                        ? accessor.empty()
                         : keysComparator.fromComparableBytes(accessor, comparableBytes, version));
             separator = comparableBytes.next();
             buffers.add(ByteSourceInverse.nextComponentNull(separator)
-                        ? null
+                        ? accessor.empty()
                         : valuesComparator.fromComparableBytes(accessor, comparableBytes, version));
             separator = comparableBytes.next();
         }
