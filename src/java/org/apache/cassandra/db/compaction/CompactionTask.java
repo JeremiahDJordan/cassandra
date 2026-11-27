@@ -287,13 +287,6 @@ public class CompactionTask extends AbstractCompactionTask
     private CompactionOperation createCompactionOperation(CompactionController controller, CompactionStrategy strategy)
     {
         Set<CompactionSSTable> fullyExpiredSSTables = controller.getFullyExpiredSSTables();
-        FullyExpiredSSTablesIndexNotifier.notifyIndexes(realm, fullyExpiredSSTables, transaction.opId());
-
-        if (!fullyExpiredSSTables.isEmpty())
-        {
-            logger.debug("Compaction {} dropping expired sstables: {}", transaction.opId().toString(), fullyExpiredSSTables);
-            fullyExpiredSSTables.forEach(reader -> { if (reader instanceof SSTableReader) transaction.obsolete((SSTableReader) reader); });
-        }
         Set<SSTableReader> actuallyCompact = new HashSet<>(inputSSTables());
         actuallyCompact.removeAll(fullyExpiredSSTables);
         // select SSTables to compact based on available disk space.
@@ -304,6 +297,15 @@ public class CompactionTask extends AbstractCompactionTask
             // and tracker will reflect the changed set of sstables made by LifecycleTransaction.cancel(),
             // so refreshing the overlaps will be based on the updated set of sstables.
             controller.refreshOverlaps();
+        }
+
+        FullyExpiredSSTablesIndexNotifier.notifyIndexes(realm, fullyExpiredSSTables, tokenRange(), transaction.opId());
+        // Obsoleting them now keeps early open from moving their starts. Tasks that keep their originals or share them
+        // with other tasks must not drop them on their own.
+        if (!fullyExpiredSSTables.isEmpty() && !keepOriginals && tokenRange() == null)
+        {
+            logger.debug("Compaction {} dropping expired sstables: {}", transaction.opIdString(), fullyExpiredSSTables);
+            fullyExpiredSSTables.forEach(reader -> { if (reader instanceof SSTableReader) transaction.obsolete((SSTableReader) reader); });
         }
 
         // Calculate the operation total sizes if not already set
@@ -577,10 +579,14 @@ public class CompactionTask extends AbstractCompactionTask
                     {
                         updateCompactionHistory(taskId, realm.getKeyspaceName(), realm.getTableName(), this);
                     }
-                    CompactionManager.instance.incrementRemovedExpiredSSTables(fullyExpiredSSTablesCount);
-                    if (!transaction.originals().isEmpty() && actuallyCompact.isEmpty())
-                        // this CompactionOperation only deleted fully expired SSTables without compacting anything
-                        CompactionManager.instance.incrementDeleteOnlyCompactions();
+                    // Tasks that keep their originals don't drop the fully expired SSTables
+                    if (!keepOriginals)
+                    {
+                        CompactionManager.instance.incrementRemovedExpiredSSTables(fullyExpiredSSTablesCount);
+                        if (!transaction.originals().isEmpty() && actuallyCompact.isEmpty())
+                            // this CompactionOperation only deleted fully expired SSTables without compacting anything
+                            CompactionManager.instance.incrementDeleteOnlyCompactions();
+                    }
                 }
 
                 if (logger.isDebugEnabled())
