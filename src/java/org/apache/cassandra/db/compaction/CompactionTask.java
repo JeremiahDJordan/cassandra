@@ -590,10 +590,14 @@ public class CompactionTask extends AbstractCompactionTask
                     {
                         updateCompactionHistory(taskId, realm.getKeyspaceName(), realm.getTableName(), this, ImmutableMap.of(COMPACTION_TYPE_PROPERTY, compactionType.type));
                     }
-                    CompactionManager.instance.incrementRemovedExpiredSSTables(fullyExpiredSSTablesCount);
-                    if (!transaction.originals().isEmpty() && actuallyCompact.isEmpty())
-                        // this CompactionOperation only deleted fully expired SSTables without compacting anything
-                        CompactionManager.instance.incrementDeleteOnlyCompactions();
+                    // Tasks that keep their originals don't drop the fully expired SSTables
+                    if (!keepOriginals)
+                    {
+                        CompactionManager.instance.incrementRemovedExpiredSSTables(fullyExpiredSSTablesCount);
+                        if (!transaction.originals().isEmpty() && actuallyCompact.isEmpty())
+                            // this CompactionOperation only deleted fully expired SSTables without compacting anything
+                            CompactionManager.instance.incrementDeleteOnlyCompactions();
+                    }
                 }
 
                 if (logger.isDebugEnabled())
