@@ -240,9 +240,8 @@ public class SSTableMetadataViewerTest extends OfflineToolUtils
         ToolResult tool = ToolRunner.invokeClass(SSTableMetadataViewer.class, sstableWithTombstones);
         assertTrue(tool.getStdout(), CharMatcher.ascii().matchesAllOf(tool.getStdout()));
         Assertions.assertThat(tool.getStdout()).contains(sstableWithTombstones.replaceAll("-Data\\.db$", ""));
-        Assertions.assertThat(tool.getStdout()).contains("minClusteringValues: [clust_key_1_1, clust_key_2_1]");
-        // Range tombstone end as a max clustering value, only the first clustering key is stored in metadata
-        Assertions.assertThat(tool.getStdout()).contains("maxClusteringValues: [clust_key_1_2]");
+        // Range tombstone end as the upper bound, which has only the first clustering key
+        Assertions.assertThat(tool.getStdout()).contains("covered clusterings: [clust_key_1_1:clust_key_2_1, clust_key_1_2]");
         assertTrue(tool.getStderr(), tool.getStderr().isEmpty());
         assertEquals(0, tool.getExitCode());
         assertGoodEnvPostTest();
