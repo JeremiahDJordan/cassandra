@@ -15,6 +15,8 @@
  */
 package org.apache.cassandra.db;
 
+import java.util.Collections;
+
 import com.google.common.collect.ImmutableMultimap;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -24,7 +26,9 @@ import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.dht.ByteOrderedPartitioner.BytesToken;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.locator.InetAddressAndPort;
 import org.apache.cassandra.locator.Replica;
+import org.apache.cassandra.locator.ReplicaLayout;
 import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.locator.TokenMetadataProvider;
 import org.apache.cassandra.schema.KeyspaceParams;
@@ -36,11 +40,11 @@ import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertNotSame;
 
 /**
- * Cleanup with a {@link TokenMetadataProvider} that keeps a keyspace's pending ranges in its own token metadata.
+ * Cleanup and writes with a {@link TokenMetadataProvider} that keeps a keyspace's token metadata apart from the node's.
  */
-public class CleanupKeyspaceTokenMetadataTest
+public class KeyspaceTokenMetadataTest
 {
-    private static final String KEYSPACE = "CleanupKeyspaceTokenMetadataTest";
+    private static final String KEYSPACE = "KeyspaceTokenMetadataTest";
     private static final String TABLE = "Standard1";
 
     @BeforeClass
@@ -62,6 +66,18 @@ public class CleanupKeyspaceTokenMetadataTest
 
         ColumnFamilyStore cfs = Keyspace.open(KEYSPACE).getColumnFamilyStore(TABLE);
         assertEquals(CompactionManager.AllSSTableOpStatus.ABORTED, CompactionManager.instance.performCleanup(cfs, 1));
+    }
+
+    @Test
+    public void testWritesIncludePendingReplicasOfKeyspaceTokenMetadata() throws Exception
+    {
+        TokenMetadata keyspaceTokenMetadata = StorageService.instance.getTokenMetadataForKeyspace(KEYSPACE);
+        Range<Token> range = new Range<>(new BytesToken(new byte[]{ 0 }), new BytesToken(new byte[]{ 2 }));
+        Replica pending = Replica.fullReplica(InetAddressAndPort.getByName("127.0.0.2"), range);
+        keyspaceTokenMetadata.setPendingRangesUnsafe(KEYSPACE, ImmutableMultimap.of(range, pending));
+
+        Token token = new BytesToken(new byte[]{ 1 });
+        assertEquals(Collections.singletonList(pending.endpoint()), ReplicaLayout.forTokenWriteLiveAndDown(Keyspace.open(KEYSPACE), token).pending().endpointList());
     }
 
     public static class KeyspaceTokenMetadataProvider implements TokenMetadataProvider
