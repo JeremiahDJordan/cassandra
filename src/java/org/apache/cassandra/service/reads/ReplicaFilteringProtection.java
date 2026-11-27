@@ -36,6 +36,7 @@ import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.Columns;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.DecoratedKey;
+import org.apache.cassandra.db.DeletionPurger;
 import org.apache.cassandra.db.DeletionTime;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.db.ReadCommand;
@@ -115,6 +116,8 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /** Tracks whether or not we've already hit the failure threshold while evaluating a partition. */
     private boolean hitFailureThreshold = false;
 
+    private final CompleteRows completeRows;
+
     private int currentRowsCached = 0; // tracks the current number of cached rows
     private int maxRowsCached = 0; // tracks the high watermark for the number of cached rows
 
@@ -128,6 +131,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                                ConsistencyLevel consistency,
                                long queryStartNanoTime,
                                E sources,
+                               DataLimits.Counter completeRowsCounter,
                                int cachedRowsWarnThreshold,
                                int cachedRowsFailThreshold)
     {
@@ -147,6 +151,27 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         this.cachedRowsWarnThreshold = cachedRowsWarnThreshold;
         this.cachedRowsFailThreshold = cachedRowsFailThreshold;
+
+        // Only GROUP BY limits need the rows counted after the row filter, see CompleteRows. Per-partition limits would
+        // need the rows counted by partition, and a filter on a static column can stop matching the rows of a partition
+        // when its static row is completed.
+        DataLimits limits = command.limits();
+        completeRows = !limits.isGroupByLimit()
+                       || limits.count() == DataLimits.NO_LIMIT
+                       || limits.perPartitionCount() != DataLimits.NO_LIMIT
+                       || hasStaticExpression(command.rowFilter())
+                       ? null
+                       : new CompleteRows(completeRowsCounter);
+    }
+
+    private static boolean hasStaticExpression(RowFilter filter)
+    {
+        for (RowFilter.Expression expression : filter.expressions())
+        {
+            if (expression.column().isStatic())
+                return true;
+        }
+        return false;
     }
 
     private UnfilteredPartitionIterator executeReadCommand(ReadCommand cmd, Replica source, ReplicaPlan.Shared<EndpointsForToken, ReplicaPlan.ForTokenRead> replicaPlan)
@@ -231,6 +256,9 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 for (int i = 0; i < sources.size(); i++)
                     builders.add(i, new PartitionBuilder(partitionKey, sources.get(i), columns, stats));
 
+                if (completeRows != null)
+                    completeRows.startPartition(partitionKey);
+
                 return new UnfilteredRowIterators.MergeListener()
                 {
                     @Override
@@ -263,6 +291,9 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                             }
                         }
 
+                        if (!isPotentiallyOutdated && !isStatic && completeRows != null)
+                            completeRows.add(partitionKey, merged);
+
                         // If the row is potentially outdated (because some replica didn't send anything and so it _may_ be
                         // an outdated result that is only present because other replica have filtered the up-to-date result
                         // out), then we skip the row. In other words, the results of the initial merging of results by this
@@ -289,6 +320,42 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 };
             }
         };
+    }
+
+    /**
+     * Counts, in a counter of its own, the merged rows of the first phase that no replica is silent about and that match
+     * the row filter: the second phase returns them as they are. Short read protection takes from that counter that the
+     * merged result needs no more rows of a replica (see DataLimits#isCompleteWithLastRowOf), which the merged result
+     * counter of the first phase, which counts the merged rows before the row filter, can't tell.
+     * <p>
+     * A GROUP BY counter closes a group when the next one starts and expects each partition once, so it is given the
+     * start of each merged partition and each row as they come. The rows it doesn't count can only make more groups.
+     */
+    private class CompleteRows
+    {
+        private final DataLimits.Counter counter;
+
+        private CompleteRows(DataLimits.Counter counter)
+        {
+            this.counter = counter;
+        }
+
+        private void startPartition(DecoratedKey key)
+        {
+            if (!counter.isDone())
+                counter.countPartitionStart(key);
+        }
+
+        private void add(DecoratedKey key, Row merged)
+        {
+            if (counter.isDone())
+                return;
+
+            // The second phase purges the merged rows before filtering them
+            Row row = merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
+            if (row != null && command.rowFilter().isSatisfiedBy(command.metadata(), key, row, command.nowInSec()))
+                counter.countRow(row);
+        }
     }
 
     private void incrementCachedRows()
