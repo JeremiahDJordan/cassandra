@@ -55,7 +55,6 @@ import org.apache.cassandra.utils.bytecomparable.ByteSourceInverse;
 import org.github.jamm.Unmetered;
 
 import static com.google.common.collect.Iterables.transform;
-import static org.apache.cassandra.config.CassandraRelevantProperties.DURATION_IN_MAPS_COMPATIBILITY_MODE;
 import static org.apache.cassandra.db.marshal.AbstractType.ComparisonType.CUSTOM;
 
 /**
@@ -784,16 +783,37 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
                : this;
     }
 
-    public final boolean referencesDuration()
-    {
-        return referencesDuration(false);
-    }
-
-    public boolean referencesDuration(boolean legacyMode)
+    public boolean referencesDuration()
     {
         // Note that non-complex types have no subtypes, so will return false, and DurationType overrides this to return
         // true.
-        return subTypes().stream().anyMatch(abstractType -> abstractType.referencesDuration(legacyMode));
+        return subTypes().stream().anyMatch(AbstractType::referencesDuration);
+    }
+
+    /**
+     * Whether a column of this type has a duration where values are sorted: anywhere in a primary key column, or in the
+     * keys or elements of a non-frozen map or set.
+     */
+    public boolean hasSortedDuration(boolean isPrimaryKeyColumn)
+    {
+        return sortedDurations(isPrimaryKeyColumn) > 0;
+    }
+
+    /**
+     * The number of durations where values are sorted in a column of this type, see {@link #hasSortedDuration}.
+     */
+    public int sortedDurations(boolean isPrimaryKeyColumn)
+    {
+        if (isPrimaryKeyColumn)
+            return durations();
+        return isMultiCell() && this instanceof MultiCellCapableType
+               ? ((MultiCellCapableType<?>) this).nameComparator().durations()
+               : 0;
+    }
+
+    private int durations()
+    {
+        return this instanceof DurationType ? 1 : subTypes().stream().mapToInt(AbstractType::durations).sum();
     }
 
     public final boolean referencesCounter()
@@ -842,12 +862,27 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
      *
      * @throws InvalidColumnTypeException if this type is not a valid column type for {@code columnName}.
      */
+    public final void validateForColumn(ByteBuffer columnName,
+                                        boolean isPrimaryKeyColumn,
+                                        boolean isCounterTable,
+                                        boolean isDroppedColumn,
+                                        boolean isForOfflineTool)
+    {
+        validateForColumn(columnName, isPrimaryKeyColumn, isCounterTable, isDroppedColumn, isForOfflineTool, false);
+    }
+
+    /**
+     * @param allowSortedDuration whether to accept a duration where values are sorted, see {@link #hasSortedDuration}.
+     *                            New columns must not have one (CNDB-9753), but existing schemas and sstables can, like
+     *                            a duration nested in a set element or a map key. Durations compare by their serialized
+     *                            bytes, so such columns are readable.
+     */
     public void validateForColumn(ByteBuffer columnName,
                                   boolean isPrimaryKeyColumn,
                                   boolean isCounterTable,
                                   boolean isDroppedColumn,
                                   boolean isForOfflineTool,
-                                  boolean durationLegacyMode)
+                                  boolean allowSortedDuration)
     {
         if (isPrimaryKeyColumn)
         {
@@ -860,13 +895,10 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
             // We don't allow durations in anything sorted (primary key here, or in the "name-comparator" part of
             // collections below). This isn't really a technical limitation, but duration sorts in a somewhat random
             // way, so CASSANDRA-11873 decided to reject them when sorting was involved.
-            if (referencesDuration(durationLegacyMode))
-            {
+            if (!allowSortedDuration && referencesDuration())
                 throw columnException(columnName,
-                                      "duration types are not supported within PRIMARY KEY columns. If you've just " +
-                                      "upgraded and the column type references a map that references a duration type in " +
-                                      "its key type, you may consider enabling %s", DURATION_IN_MAPS_COMPATIBILITY_MODE.name());
-            }
+                                      "duration types are not supported within PRIMARY KEY columns");
+
             if (comparisonType == ComparisonType.NOT_COMPARABLE)
                 throw columnException(columnName,
                                       "type %s is not comparable and cannot be used for PRIMARY KEY columns", asCQL3Type().toSchemaString());
@@ -894,16 +926,14 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
                 {
                     AbstractType<?> nameComparator = ((MultiCellCapableType<?>) this).nameComparator();
                     // As mentioned above, CASSANDRA-11873 decided to reject durations when sorting was involved.
-                    if (nameComparator.referencesDuration(durationLegacyMode))
+                    if (!allowSortedDuration && nameComparator.referencesDuration())
                     {
                         // Trying to profile a more precise error message
                         String what = this instanceof MapType
                                       ? "map keys"
                                       : (this instanceof SetType ? "sets" : category());
                         throw columnException(columnName,
-                                              "duration types are not supported within non-frozen %s. If you've just " +
-                                              "upgraded and the column type references a map that references a duration type in " +
-                                              "its key type, you may consider enabling %s", what, DURATION_IN_MAPS_COMPATIBILITY_MODE.name());
+                                              "duration types are not supported within non-frozen %s", what);
                     }
                 }
             }

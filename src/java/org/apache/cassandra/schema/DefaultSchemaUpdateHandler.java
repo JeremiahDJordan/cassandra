@@ -195,7 +195,8 @@ public class DefaultSchemaUpdateHandler implements SchemaUpdateHandler, IEndpoin
         // no-op
     }
 
-    private synchronized SchemaTransformationResult applyMutations(Collection<Mutation> schemaMutations)
+    @VisibleForTesting
+    synchronized SchemaTransformationResult applyMutations(Collection<Mutation> schemaMutations)
     {
         // fetch the current state of schema for the affected keyspaces only
         DistributedSchema before = schema;

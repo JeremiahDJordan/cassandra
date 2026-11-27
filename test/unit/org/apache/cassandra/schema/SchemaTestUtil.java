@@ -23,10 +23,12 @@ import java.util.Collection;
 import java.util.Collections;
 import java.util.UUID;
 
+import org.junit.Assert;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.cassandra.concurrent.Stage;
+import org.apache.cassandra.cql3.statements.schema.CreateTableStatement;
 import org.apache.cassandra.db.Mutation;
 import org.apache.cassandra.exceptions.AlreadyExistsException;
 import org.apache.cassandra.exceptions.ConfigurationException;
@@ -48,6 +50,29 @@ public class SchemaTestUtil
 
         logger.info("Create new Keyspace: {}", ksm);
         Schema.instance.transform(schema -> schema.withAddedOrUpdated(ksm));
+    }
+
+    /**
+     * The schema mutation that creates the table, as a node that has the table sends it to a peer. Unlike the
+     * announce methods, it does not validate the table.
+     */
+    public static Mutation createTableMutation(KeyspaceMetadata keyspace, TableMetadata table, long timestamp)
+    {
+        return SchemaKeyspace.makeCreateTableMutation(keyspace, table, timestamp).build();
+    }
+
+    /**
+     * Creates a table through a schema merge, as if received from a peer that has it, so that it can have types that
+     * CREATE TABLE rejects.
+     */
+    public static void createTableFromPeer(String keyspace, String table, String columns)
+    {
+        KeyspaceMetadata metadata = Schema.instance.getKeyspaceMetadata(keyspace);
+        String ddl = String.format("CREATE TABLE %s.%s (%s)", keyspace, table, columns);
+        TableMetadata tableMetadata = CreateTableStatement.parse(ddl, keyspace, metadata.types).build();
+        ((DefaultSchemaUpdateHandler) Schema.instance.updateHandler)
+        .applyMutations(Collections.singletonList(createTableMutation(metadata, tableMetadata, FBUtilities.timestampMicros())));
+        Assert.assertNotNull(Schema.instance.getTableMetadata(keyspace, table));
     }
 
     public static void announceNewTable(TableMetadata cfm)

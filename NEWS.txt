@@ -60,6 +60,14 @@ Upgrading
       communicate with AWS IMDS of version 2. This change is transparent, there does not need 
       to be done anything upon upgrade. Furthermore, IMDS of version 2 can be configured to be required in AWS EC2 console.
       Consult cassandra-rackdc.properties for more details. (CASSANDRA-16555)
+    - Existing tables with a duration where values are sorted (in a primary key column, or in the keys or elements of
+      a non-frozen map or set) now always load, from `system_schema`, from a peer's schema and from sstable headers,
+      and can be altered. Apache Cassandra creates such tables (e.g. `s set<frozen<tuple<duration, int>>>`), and so did
+      nodes before CNDB-9753 (e.g. `pk frozen<map<duration, text>>`). Loading such a column logs a warning, at most
+      once per hour per column. `cassandra.types.map.duration_in_map_compatibility_mode` (CNDB-9753), which was needed
+      to load durations in map keys, is no longer needed and is ignored. CREATE TABLE, ALTER TABLE ADD and ALTER TYPE
+      still reject such a type for a new column, and slice restrictions and CREATE INDEX on such a column are still
+      rejected.
 
 Deprecation
 ---------
