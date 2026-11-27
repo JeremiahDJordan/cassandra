@@ -215,7 +215,7 @@ public class BTreeComplexColumn extends ComplexColumnData
             boolean isShadowed = activeDeletion.deletes(cell);
             boolean isFetchedCell = cellTester == null || cellTester.fetches(path);
             boolean isQueriedCell = isQueriedColumn && isFetchedCell && (cellTester == null || cellTester.fetchedCellIsQueried(path));
-            boolean isSkippableCell = !isFetchedCell || (!isQueriedCell && cell.timestamp() < rowLiveness.timestamp());
+            boolean isSkippableCell = !isFetchedCell || (!isQueriedCell && DeserializationHelper.dropsOlderNotQueriedCells(rowLiveness) && cell.timestamp() < rowLiveness.timestamp());
             if (isForDropped || isShadowed || isSkippableCell)
                 return null;
             // We should apply the same "optimization" as in Cell.deserialize to avoid discrepances
