@@ -799,9 +799,10 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
      */
     public abstract ScrubPartitionIterator scrubPartitionsIterator() throws IOException;
 
+    /** @return the interval of this sstable, or {@code null} if it has no first and last key */
     public Interval<PartitionPosition, SSTableReader> getInterval()
     {
-        if (interval == null)
+        if (interval == null && getFirst() != null && getLast() != null)
             interval = Interval.create(getFirst(), getLast(), this); // races are benign; use getFirst/Last to allow overrides
         return interval;
     }
@@ -1338,7 +1339,7 @@ public abstract class SSTableReader extends SSTable implements SelfRefCounted<SS
      */
     public long estimatedKeys()
     {
-        return indexSummary.getEstimatedKeyCount();
+        return indexSummary == null ? 0 : indexSummary.getEstimatedKeyCount();
     }
 
     /**
