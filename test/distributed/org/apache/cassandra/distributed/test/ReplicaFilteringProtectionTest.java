@@ -19,17 +19,32 @@
 package org.apache.cassandra.distributed.test;
 
 import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.cassandra.cql3.PageSize;
+import org.apache.cassandra.cql3.QueryOptions;
+import org.apache.cassandra.cql3.QueryProcessor;
+import org.apache.cassandra.cql3.statements.SelectStatement;
+import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.Keyspace;
 import org.apache.cassandra.distributed.Cluster;
 import org.apache.cassandra.distributed.api.IInvokableInstance;
 import org.apache.cassandra.distributed.api.SimpleQueryResult;
+import org.apache.cassandra.distributed.impl.RowUtil;
 import org.apache.cassandra.exceptions.OverloadedException;
+import org.apache.cassandra.service.ClientState;
+import org.apache.cassandra.service.QueryState;
 import org.apache.cassandra.service.StorageService;
+import org.apache.cassandra.service.pager.PagingState;
+import org.apache.cassandra.transport.Dispatcher;
+import org.apache.cassandra.transport.ProtocolVersion;
+import org.apache.cassandra.transport.messages.ResultMessage;
 import org.assertj.core.api.Assertions;
 import org.assertj.core.api.ListAssert;
 
@@ -178,6 +193,48 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
         assertEquals(0, protectionQueryCount(cluster.get(1), tableName));
     }
 
+    @Test
+    public void testNoShortReadProtectionAtPerPartitionLimitOrStaticFilter()
+    {
+        String tableName = "no_srp_when_rows_fill_ppl";
+        String table = createTable(tableName, "(k int, c int, s int static, v int, PRIMARY KEY (k, c))");
+
+        // The same rows on both replicas, all of them match
+        for (int k = 0; k < PARTITIONS; k++)
+        {
+            cluster.coordinator(1).execute("INSERT INTO " + table + " (k, s) VALUES (?, 1)", ALL, k);
+            for (int c = 0; c < 10; c++)
+                cluster.coordinator(1).execute("INSERT INTO " + table + " (k, c, v) VALUES (?, ?, 1)", ALL, k, c);
+        }
+
+        // The rows both replicas return fill the per-partition limit, or the limit with a filter on the static column
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE v = 1 PER PARTITION LIMIT 2 LIMIT 5 ALLOW FILTERING", ALL),
+                   row(1, 0), row(1, 1), row(0, 0), row(0, 1), row(2, 0));
+        assertRows(cluster.coordinator(1).execute("SELECT k, c FROM " + table + " WHERE s = 1 LIMIT 2 ALLOW FILTERING", ALL),
+                   row(1, 0), row(1, 1));
+        assertEquals(0, shortReadProtectionRequestCount(cluster.get(1), tableName));
+        assertEquals(0, protectionQueryCount(cluster.get(1), tableName));
+    }
+
+    @Test
+    public void testPerPartitionLimitWithBytePaging()
+    {
+        String table = createTable("ppl_byte_paging", "(k int, c int, v int, pad text, PRIMARY KEY (k, c))");
+
+        // In partition 1, the first one, only node 1 has the small row c = 0, and both nodes have the large row c = 1.
+        // Only node 2 has partition 0.
+        write(1, "INSERT INTO %s (k, c, v, pad) VALUES (1, 0, 1, 'x') USING TIMESTAMP 1", table);
+        for (int node = 1; node <= REPLICAS; node++)
+            write(node, "INSERT INTO %s (k, c, v, pad) VALUES (1, 1, 1, '" + "x".repeat(300) + "') USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, c, v, pad) VALUES (0, 0, 1, 'x') USING TIMESTAMP 1", table);
+
+        // Node 2 returns c = 1 of partition 1, whose bytes fill the page, and which c = 0 replaces in the second phase,
+        // so node 2 is still asked for partition 0.
+        for (String limits : new String[]{ "PER PARTITION LIMIT 1", "PER PARTITION LIMIT 1 LIMIT 10" })
+            assertRows(executeWithBytePaging("SELECT k, c, pad FROM " + table + " WHERE v = 1 " + limits + " ALLOW FILTERING", 100),
+                       row(1, 0, "x"), row(0, 0, "x"));
+    }
+
     private String createTable(String name, String columns)
     {
         cluster.get(1).runOnInstance(() -> StorageService.instance.setCachedReplicaRowsWarnThreshold(DEFAULT_WARN_THRESHOLD));
@@ -185,6 +242,31 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
         String table = KEYSPACE + '.' + name;
         cluster.schemaChange("CREATE TABLE " + table + ' ' + columns + " WITH read_repair = 'NONE'");
         return table;
+    }
+
+    /**
+     * Executes the query from node 1 at ALL, with pages of the given size in bytes.
+     */
+    private static Object[][] executeWithBytePaging(String query, int pageSizeInBytes)
+    {
+        return cluster.get(1).callOnInstance(() -> {
+            ClientState clientState = ClientState.forInternalCalls();
+            SelectStatement statement = (SelectStatement) QueryProcessor.getStatement(query, clientState);
+            QueryState queryState = new QueryState(clientState);
+            List<Object[]> rows = new ArrayList<>();
+            PagingState pagingState = null;
+            do
+            {
+                QueryOptions options = QueryOptions.create(ConsistencyLevel.ALL, Collections.emptyList(), false,
+                                                           PageSize.inBytes(pageSizeInBytes), pagingState, null,
+                                                           ProtocolVersion.CURRENT, null);
+                ResultMessage.Rows page = statement.execute(queryState, options, Dispatcher.RequestTime.forImmediateExecution());
+                RowUtil.toIter(page).forEachRemaining(rows::add);
+                pagingState = page.result.metadata.getPagingState();
+            }
+            while (pagingState != null);
+            return rows.toArray(new Object[0][]);
+        });
     }
 
     private void write(int node, String cql, String table)

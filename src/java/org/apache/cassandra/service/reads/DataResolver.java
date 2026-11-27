@@ -163,17 +163,23 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         public final E replicas;
         private final DataLimits.Counter mergedResultCounter;
 
+        private ResolveContext(E replicas, boolean enforceLimits)
+        {
+            this(replicas, enforceLimits, command.limits());
+        }
+
         /**
          * @param replicas the collection of {@link Endpoints} involved in the query
          * @param enforceLimits whether or not to enforce counter limits in this context
+         * @param limits the limits of the merged result counter
          */
-        private ResolveContext(E replicas, boolean enforceLimits)
+        private ResolveContext(E replicas, boolean enforceLimits, DataLimits limits)
         {
             this.replicas = replicas;
-            this.mergedResultCounter = command.limits().newCounter(command.nowInSec(),
-                                                                   true,
-                                                                   command.selectsFullPartition(),
-                                                                   enforceStrictLiveness);
+            this.mergedResultCounter = limits.newCounter(command.nowInSec(),
+                                                         true,
+                                                         command.selectsFullPartition(),
+                                                         enforceStrictLiveness);
 
             // In case of top-k query, do not trim reconciled rows here because QueryPlan#postProcessor() needs to compare all rows
             if (command.isTopK() || !enforceLimits)
@@ -274,7 +280,12 @@ public class DataResolver<E extends Endpoints<E>, P extends ReplicaPlan.ForRead<
         // match the row filter, which the second phase returns as they are, so that short read protection stops asking
         // the replicas for more rows once those rows fill the limit.
 
-        ResolveContext firstPhaseContext = new ResolveContext(replicas, false);
+        // With a per-partition limit, the second phase can return a smaller row of a partition in place of a row that
+        // the first phase counts, so the first phase counts rows but not their bytes.
+        DataLimits firstPhaseLimits = command.limits().perPartitionCount() == DataLimits.NO_LIMIT
+                                      ? command.limits()
+                                      : command.limits().withBytesLimit(DataLimits.NO_LIMIT);
+        ResolveContext firstPhaseContext = new ResolveContext(replicas, false, firstPhaseLimits);
         UnaryOperator<PartitionIterator> preCountFilter = preCountFilterForReplicaFilteringProtection();
         ReplicaFilteringProtection<E> rfp = new ReplicaFilteringProtection<>(replicaPlan().keyspace(),
                                                                              command,

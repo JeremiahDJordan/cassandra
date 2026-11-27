@@ -184,13 +184,14 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         mergeListener = new QueryMergeListener();
 
-        // Per-partition limits would need the rows counted by partition. Without a row or group limit (no limit, or
-        // only a limit in bytes), the rows would be held and never counted. A filter on a static column can stop
-        // matching the rows of a partition when its static row is completed.
+        // Without a row, group or per-partition limit (no limit, or only a limit in bytes), the rows would be held and
+        // never counted. GROUP BY is left out with a per-partition limit, as a counter that only counts opens a group
+        // with the row past it, and with a filter on a static column, as its rows are filtered one at a time without
+        // the static row.
         DataLimits limits = command.limits();
-        completeRows = limits.count() == DataLimits.NO_LIMIT
-                       || limits.perPartitionCount() != DataLimits.NO_LIMIT
-                       || command.rowFilter().hasStaticExpression()
+        completeRows = limits.count() == DataLimits.NO_LIMIT && limits.perPartitionCount() == DataLimits.NO_LIMIT
+                       || limits.isGroupByLimit() && (limits.perPartitionCount() != DataLimits.NO_LIMIT
+                                                      || command.rowFilter().hasStaticExpression())
                        ? null
                        : new CompleteRows(firstPhaseCounter, rowFilter);
     }
@@ -305,8 +306,10 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 }
             }
 
-            if (complete && completeRows != null && !merged.isStatic())
-                completeRows.add(key, merged);
+            if (completeRows != null && merged.isStatic())
+                completeRows.setStaticRow(merged);
+            else if (complete && completeRows != null)
+                completeRows.add(merged);
         }
 
         @Override
@@ -520,11 +523,14 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
     /**
      * Counts, in the first phase's merged result counter, the rows that no replica is silent about and that match the
      * row filter: the second phase returns them as they are, so short read protection stops asking for more rows once
-     * they fill the limit. The rows are filtered and counted in batches big enough to fill the rest of the limit, or
-     * one at a time for GROUP BY.
+     * they fill the limit. The counter is given the start of each merged partition, so that it counts all the rows of
+     * a partition against its per-partition limit. It is given the rows as they come for GROUP BY, or else filtered in
+     * batches big enough to fill the rest of the limit or of the per-partition limit.
      * <p>
-     * A GROUP BY counter closes a group when the next one starts and expects each partition once, so it is given the
-     * start of each merged partition and each row as they come. A group whose last row is the last row of a replica's
+     * The rows are filtered with the merged static row of their partition. Every replica returned that partition, with
+     * its static row, so the second phase has the same static row.
+     * <p>
+     * A GROUP BY counter closes a group when the next one starts. A group whose last row is the last row of a replica's
      * response tells short read protection that the replica isn't needed (see DataLimits#isCompleteWithLastRowOf). The
      * rows it doesn't count can only make more groups.
      */
@@ -535,9 +541,10 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
         private final boolean groupBy;
         // whether the coordinator filter filters rows (see DataResolver#preCountFilterForReplicaFilteringProtection)
         private final boolean filtersRows;
-        private final List<DecoratedKey> keys = new ArrayList<>();
-        private final List<List<Row>> rows = new ArrayList<>();
-        private int pending = 0;
+        private final List<Row> rows = new ArrayList<>();
+        private DecoratedKey key;
+        // the purged static row of the current partition
+        private Row staticRow;
 
         private CompleteRows(DataLimits.Counter counter, UnaryOperator<PartitionIterator> rowFilter)
         {
@@ -549,13 +556,22 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
 
         private void startPartition(DecoratedKey key)
         {
-            if (groupBy && !counter.isDone())
+            count();
+            this.key = key;
+            staticRow = Rows.EMPTY_STATIC_ROW;
+            if (!counter.isDone())
                 counter.countPartitionStart(key);
         }
 
-        private void add(DecoratedKey key, Row merged)
+        private void setStaticRow(Row merged)
         {
-            if (counter.isDone())
+            Row purged = merged.purge(DeletionPurger.PURGE_ALL, command.nowInSec(), command.metadata().enforceStrictLiveness());
+            staticRow = purged == null ? Rows.EMPTY_STATIC_ROW : purged;
+        }
+
+        private void add(Row merged)
+        {
+            if (counter.isDoneForPartition())
                 return;
 
             // The second phase purges the merged rows before filtering them
@@ -571,56 +587,36 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 return;
             }
 
-            if (keys.isEmpty() || !keys.get(keys.size() - 1).equals(key))
-            {
-                keys.add(key);
-                rows.add(new ArrayList<>());
-            }
-            rows.get(rows.size() - 1).add(row);
-
-            if (++pending >= command.limits().count() - counter.rowsCounted())
+            rows.add(row);
+            if (rows.size() >= Math.min(command.limits().count() - counter.rowsCounted(),
+                                        command.limits().perPartitionCount() - counter.rowsCountedInCurrentPartition()))
                 count();
         }
 
         private void count()
         {
-            try (PartitionIterator partitions = counter.applyTo(rowFilter.apply(pendingPartitions())))
+            if (rows.isEmpty())
+                return;
+
+            try (PartitionIterator partitions = rowFilter.apply(PartitionIterators.singletonIterator(pendingRows())))
             {
-                PartitionIterators.consume(partitions);
+                while (partitions.hasNext())
+                {
+                    try (RowIterator partition = partitions.next())
+                    {
+                        while (partition.hasNext())
+                            counter.countRow(partition.next());
+                    }
+                }
             }
 
-            keys.clear();
             rows.clear();
-            pending = 0;
         }
 
-        private PartitionIterator pendingPartitions()
+        private RowIterator pendingRows()
         {
-            Iterator<DecoratedKey> keyIterator = keys.iterator();
-            Iterator<List<Row>> rowsIterator = rows.iterator();
-            return new PartitionIterator()
-            {
-                @Override
-                public boolean hasNext()
-                {
-                    return keyIterator.hasNext();
-                }
-
-                @Override
-                public RowIterator next()
-                {
-                    return partition(keyIterator.next(), rowsIterator.next().iterator());
-                }
-
-                @Override
-                public void close()
-                {
-                }
-            };
-        }
-
-        private RowIterator partition(DecoratedKey key, Iterator<Row> partitionRows)
-        {
+            Iterator<Row> partitionRows = rows.iterator();
+            Row partitionStaticRow = staticRow;
             return new RowIterator()
             {
                 @Override
@@ -650,7 +646,7 @@ public class ReplicaFilteringProtection<E extends Endpoints<E>>
                 @Override
                 public Row staticRow()
                 {
-                    return Rows.EMPTY_STATIC_ROW;
+                    return partitionStaticRow;
                 }
 
                 @Override

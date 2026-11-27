@@ -292,6 +292,123 @@ public class StrictFilteringTest extends TestBaseImpl
         assertEquals(srpRequestsBefore + 1, shortReadProtectionRequests("necessary_short_read_within_partition"));
     }
 
+    @Test
+    public void testNoShortReadAtPerPartitionLimitOrStaticFilter()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.no_srp_ppl_or_static (k int, c int, s int static, a int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.no_srp_ppl_or_static(s) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.no_srp_ppl_or_static(a) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnAllNodes(CLUSTER, KEYSPACE);
+
+        // The same rows on both replicas, all of them match
+        for (int k = 0; k < 4; k++)
+        {
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.no_srp_ppl_or_static(k, s) VALUES (?, 1)"), ConsistencyLevel.ALL, k);
+            for (int c = 0; c < 10; c++)
+                CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.no_srp_ppl_or_static(k, c, a) VALUES (?, ?, 1)"), ConsistencyLevel.ALL, k, c);
+        }
+
+        // The rows both replicas return fill the per-partition limit and the limit, also on pages of 2 rows, which
+        // end and start within a partition.
+        long srpRequestsBefore = shortReadProtectionRequests("no_srp_ppl_or_static");
+        String select = withKeyspace("SELECT k, c FROM %s.no_srp_ppl_or_static WHERE a = 1 PER PARTITION LIMIT 3 LIMIT 10");
+        Object[][] expected = new Object[][]{ row(1, 0), row(1, 1), row(1, 2), row(0, 0), row(0, 1), row(0, 2),
+                                              row(2, 0), row(2, 1), row(2, 2), row(3, 0) };
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), expected);
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 2), expected);
+
+        select = withKeyspace("SELECT k, c FROM %s.no_srp_ppl_or_static WHERE s = 1 LIMIT 5");
+        expected = new Object[][]{ row(1, 0), row(1, 1), row(1, 2), row(1, 3), row(1, 4) };
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), expected);
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select, ConsistencyLevel.ALL, 2), expected);
+        assertEquals(srpRequestsBefore, shortReadProtectionRequests("no_srp_ppl_or_static"));
+    }
+
+    @Test
+    public void testShortReadCountsPerPartitionOverFilteredRows()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.short_read_ppl_or (k int, c int, a int, b int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.short_read_ppl_or(a) USING 'sai'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.short_read_ppl_or(b) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnAllNodes(CLUSTER, KEYSPACE);
+
+        for (int c = 1; c < 4; c++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.short_read_ppl_or(k, c, a, b) VALUES (1, ?, 1, 0) USING TIMESTAMP 1"), ConsistencyLevel.ALL, c);
+        for (int c = 0; c < 2; c++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.short_read_ppl_or(k, c, a, b) VALUES (0, ?, 1, 0) USING TIMESTAMP 1"), ConsistencyLevel.ALL, c);
+
+        // Both nodes return c = 0 of partition 1, the first one, which doesn't match after the merge
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.short_read_ppl_or(k, c, a) VALUES (1, 0, 1) USING TIMESTAMP 1"));
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.short_read_ppl_or(k, c, b) VALUES (1, 0, 0) USING TIMESTAMP 3"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.short_read_ppl_or(k, c, a) VALUES (1, 0, 0) USING TIMESTAMP 2"));
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.short_read_ppl_or(k, c, b) VALUES (1, 0, 1) USING TIMESTAMP 1"));
+
+        // Each node is asked once for the rest of partition 1
+        String select = withKeyspace("SELECT k, c FROM %s.short_read_ppl_or WHERE a = 1 OR b = 1 PER PARTITION LIMIT 2 LIMIT 4");
+        long srpRequestsBefore = shortReadProtectionRequests("short_read_ppl_or");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(1, 1), row(1, 2), row(0, 0), row(0, 1));
+        assertEquals(srpRequestsBefore + 2, shortReadProtectionRequests("short_read_ppl_or"));
+    }
+
+    @Test
+    public void testNecessaryShortReadAtPerPartitionLimit()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.necessary_short_read_ppl (k int, c int, a int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.necessary_short_read_ppl(a) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnAllNodes(CLUSTER, KEYSPACE);
+
+        for (int c = 0; c < 6; c++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.necessary_short_read_ppl(k, c, a) VALUES (1, ?, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL, c);
+        for (int c = 0; c < 10; c++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.necessary_short_read_ppl(k, c, a) VALUES (0, ?, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL, c);
+
+        // Partition 1, the first one, has a newer non-matching version of c = 0 on node 2 and a newer deletion of c = 1
+        // on node 1. Partition 0 has them the other way around.
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.necessary_short_read_ppl(k, c, a) VALUES (1, 0, 2) USING TIMESTAMP 2"));
+        CLUSTER.get(1).executeInternal(withKeyspace("DELETE FROM %s.necessary_short_read_ppl USING TIMESTAMP 2 WHERE k = 1 AND c = 1"));
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.necessary_short_read_ppl(k, c, a) VALUES (0, 0, 2) USING TIMESTAMP 2"));
+        CLUSTER.get(2).executeInternal(withKeyspace("DELETE FROM %s.necessary_short_read_ppl USING TIMESTAMP 2 WHERE k = 0 AND c = 1"));
+
+        // Each node returns rows of each partition that the other node is silent about, so both are asked for more rows
+        // of the partition, up to its per-partition limit, unpaged and on pages that end within a partition. With
+        // LIMIT 3, partition 0 gets the row of the limit that partition 1 leaves; with PER PARTITION LIMIT 5, the rows
+        // of partition 1 don't count for partition 0.
+        String select = withKeyspace("SELECT k, c FROM %s.necessary_short_read_ppl WHERE a = 1 PER PARTITION LIMIT ");
+        Object[][] perPartitionLimit3 = new Object[][]{ row(1, 2), row(1, 3), row(1, 4), row(0, 2), row(0, 3), row(0, 4) };
+        long srpRequestsBefore = shortReadProtectionRequests("necessary_short_read_ppl");
+        assertRows(CLUSTER.coordinator(1).execute(select + 3, ConsistencyLevel.ALL), perPartitionLimit3);
+        assertRows(CLUSTER.coordinator(1).executeWithPaging(select + 3, ConsistencyLevel.ALL, 2), perPartitionLimit3);
+        assertRows(CLUSTER.coordinator(1).execute(select + "2 LIMIT 3", ConsistencyLevel.ALL), row(1, 2), row(1, 3), row(0, 2));
+        assertRows(CLUSTER.coordinator(1).execute(select + 5, ConsistencyLevel.ALL),
+                   row(1, 2), row(1, 3), row(1, 4), row(1, 5), row(0, 2), row(0, 3), row(0, 4), row(0, 5), row(0, 6));
+        Assertions.assertThat(shortReadProtectionRequests("necessary_short_read_ppl")).isGreaterThan(srpRequestsBefore);
+    }
+
+    @Test
+    public void testNecessaryShortReadWithNewerStaticRow()
+    {
+        CLUSTER.schemaChange(withKeyspace("CREATE TABLE %s.necessary_short_read_static (k int, c int, s int static, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'"));
+        CLUSTER.schemaChange(withKeyspace("CREATE INDEX ON %s.necessary_short_read_static(s) USING 'sai'"));
+        SAIUtil.waitForIndexQueryableOnAllNodes(CLUSTER, KEYSPACE);
+
+        CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.necessary_short_read_static(k, s) VALUES (1, 1) USING TIMESTAMP 1"), ConsistencyLevel.ALL);
+        for (int c = 0; c < 4; c++)
+            CLUSTER.coordinator(1).execute(withKeyspace("INSERT INTO %s.necessary_short_read_static(k, c) VALUES (1, ?) USING TIMESTAMP 1"), ConsistencyLevel.ALL, c);
+
+        // Node 2 has a newer non-matching static row for partition 1, and only node 1 has partition 0
+        CLUSTER.get(2).executeInternal(withKeyspace("INSERT INTO %s.necessary_short_read_static(k, s) VALUES (1, 2) USING TIMESTAMP 2"));
+        CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.necessary_short_read_static(k, s) VALUES (0, 1) USING TIMESTAMP 1"));
+        for (int c = 0; c < 2; c++)
+            CLUSTER.get(1).executeInternal(withKeyspace("INSERT INTO %s.necessary_short_read_static(k, c) VALUES (0, ?) USING TIMESTAMP 1"), c);
+
+        // Node 1 returns rows of partition 1, which node 2 is silent about, so node 1 is asked for more, and returns
+        // the rows of partition 0.
+        String select = withKeyspace("SELECT k, c FROM %s.necessary_short_read_static WHERE s = 1 LIMIT 2");
+        long srpRequestsBefore = shortReadProtectionRequests("necessary_short_read_static");
+        assertRows(CLUSTER.coordinator(1).execute(select, ConsistencyLevel.ALL), row(0, 0), row(0, 1));
+        Assertions.assertThat(shortReadProtectionRequests("necessary_short_read_static")).isGreaterThan(srpRequestsBefore);
+    }
+
     private static long shortReadProtectionRequests(String table)
     {
         return CLUSTER.get(1).callOnInstance(() -> Keyspace.open(KEYSPACE).getColumnFamilyStore(table).metric.shortReadProtectionRequests.getCount());
