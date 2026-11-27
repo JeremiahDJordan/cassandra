@@ -21,7 +21,10 @@ import java.lang.invoke.MethodHandles;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
@@ -60,6 +63,7 @@ import org.apache.cassandra.index.sai.metrics.IndexGroupMetrics;
 import org.apache.cassandra.index.sai.metrics.TableQueryMetrics;
 import org.apache.cassandra.index.sai.metrics.TableStateMetrics;
 import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
+import org.apache.cassandra.index.sai.view.View;
 import org.apache.cassandra.index.transactions.IndexTransaction;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
@@ -405,13 +409,14 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                                                             Set<StorageAttachedIndex> indexes, boolean validate)
     {
         Set<StorageAttachedIndex> incomplete = new HashSet<>();
+        Map<StorageAttachedIndex, Set<SSTableReader>> unloadable = new HashMap<>();
         synchronized (contextsLock)
         {
             // The last index was dropped, which released the contexts (see removeIndex)
             if (indices.isEmpty())
                 return incomplete;
 
-            Optional<Set<SSTableContext>> optValid = contextManager.update(removed, added, validate, indices);
+            Optional<Set<SSTableContext>> optValid = contextManager.update(removed, added, validate, indices, unloadable);
             if (optValid.isEmpty())
             {
                 // This means at least one sstable had invalid per-sstable components, so mark all indexes non-queryable.
@@ -430,6 +435,34 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                     incomplete.add(index);
                 }
             }
+        }
+
+        // Indexes with complete components on an SSTable that can't be loaded, as its per-SSTable components are
+        // incomplete (see SSTableContextManager#update). Those that still have the SSTable in their view (now that the
+        // views are updated) go on serving it from the components they have open: that is every other index of the
+        // table while a full rebuild of one index rewrites the per-SSTable components, when something loads the
+        // SSTables of the table (e.g. the initial build of a new index). Those that don't can't serve it, so they
+        // can't stay queryable: their rebuild (rebuild_index, or the initial build at the next start) brings them back.
+        for (Map.Entry<StorageAttachedIndex, Set<SSTableReader>> entry : unloadable.entrySet())
+        {
+            StorageAttachedIndex index = entry.getKey();
+            View view = index.getIndexContext().getView();
+            List<Descriptor> missing = entry.getValue()
+                                            .stream()
+                                            .filter(sstable -> !view.containsSSTableIndex(sstable.descriptor))
+                                            .map(sstable -> sstable.descriptor)
+                                            .collect(Collectors.toList());
+            if (missing.isEmpty())
+                continue;
+            logger.warn(index.getIndexContext().logMessage("Index has complete components on {} SSTable(s) whose per-SSTable index " +
+                                                           "components are incomplete, so it can't serve them: making it " +
+                                                           "non-queryable until it is rebuilt (nodetool rebuild_index {} {} {}): {}"),
+                        missing.size(), baseCfs.keyspace.getName(), baseCfs.name, index.getIndexContext().getIndexName(),
+                        missing.stream().limit(10).collect(Collectors.toList()));
+            index.makeIndexNonQueryable();
+            // a build of the SSTables for this index must fail, rather than make the index queryable again
+            if (indexes.contains(index))
+                incomplete.add(index);
         }
         return incomplete;
     }
