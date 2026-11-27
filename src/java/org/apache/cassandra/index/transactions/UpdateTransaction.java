@@ -57,6 +57,10 @@ import org.apache.cassandra.db.rows.Row;
  *                                  *not* the incoming row, but the result of merging the incoming and existing
  *                                  rows.
  * commit()                      -- finally, finish is called when the new Partition is swapped into the Memtable
+ *
+ * A Memtable that applies updates atomically (see Memtable#appliesUpdatesAtomically()) calls abort() instead of
+ * commit() when it fails to apply the update. It then holds none of the update's rows and deletions, so
+ * implementations should not deliver any event they still hold. Other Memtables always call commit().
  */
 public interface UpdateTransaction extends IndexTransaction
 {
@@ -69,6 +73,19 @@ public interface UpdateTransaction extends IndexTransaction
      * @param updated the updated version, which includes the update merged with the existing version
      */
     void onUpdated(Row existing, Row updated);
+
+    /**
+     * Ends the transaction because the memtable failed to apply the update, and holds none of its rows and
+     * deletions. Called instead of {@link #commit}, and only by memtables that apply updates atomically.
+     * <p>
+     * Implementations that hold events until {@link #commit} should drop them, and end the transaction for the
+     * indexers. The default calls {@link #commit}: implementations that deliver events as they arrive cannot take them
+     * back.
+     */
+    default void abort()
+    {
+        commit();
+    }
 
     UpdateTransaction NO_OP = new UpdateTransaction()
     {

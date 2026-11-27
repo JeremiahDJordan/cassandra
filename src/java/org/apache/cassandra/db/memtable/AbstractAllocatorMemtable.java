@@ -74,6 +74,23 @@ public abstract class AbstractAllocatorMemtable extends AbstractMemtableWithComm
 
     private final long creationNano = System.nanoTime();
 
+    /**
+     * Aborts the index transaction of an update that failed with {@code cause}, which the caller is about to rethrow. A
+     * failure of the abort is added to {@code cause} as suppressed, so that it does not replace it.
+     */
+    static void abortIndexTransaction(UpdateTransaction indexer, Throwable cause)
+    {
+        try
+        {
+            indexer.abort();
+        }
+        catch (Throwable t)
+        {
+            if (t != cause)
+                cause.addSuppressed(t);
+        }
+    }
+
     @VisibleForTesting
     static MemtablePool createMemtableAllocatorPool()
     {

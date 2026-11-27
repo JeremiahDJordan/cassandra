@@ -55,6 +55,7 @@ import org.apache.cassandra.db.lifecycle.Tracker;
 import org.apache.cassandra.db.memtable.Memtable;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.index.Index;
+import org.apache.cassandra.index.IndexerFailures;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexComponent;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
@@ -233,6 +234,10 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                                 .filter(Objects::nonNull)
                                 .collect(Collectors.toSet());
 
+        // Only a memtable that applies updates atomically delivers events for an update it has already applied. On any
+        // other memtable an indexer failure fails the update before it is applied, so stop at the first one.
+        final boolean deliverToAll = memtable != null && memtable.appliesUpdatesAtomically();
+
         return indexers.isEmpty() ? null : new StorageAttachedIndex.IndexerAdapter()
         {
             @Override
@@ -265,9 +270,32 @@ public class StorageAttachedIndexGroup implements Index.Group, INotificationCons
                 forEach(indexer -> indexer.rangeTombstone(tombstone));
             }
 
+            // On a memtable that applies updates atomically, delivers the event to every SAI index, then throws the
+            // first failure; otherwise stops at the first failure, which fails the update before it is applied.
             private void forEach(Consumer<Index.Indexer> action)
             {
-                indexers.forEach(action);
+                if (!deliverToAll)
+                {
+                    indexers.forEach(action);
+                    return;
+                }
+
+                IndexerFailures failures = null;
+                for (Index.Indexer indexer : indexers)
+                {
+                    try
+                    {
+                        action.accept(indexer);
+                    }
+                    catch (Throwable t)
+                    {
+                        if (failures == null)
+                            failures = new IndexerFailures(baseCfs);
+                        failures.add(t);
+                    }
+                }
+                if (failures != null)
+                    failures.maybeFail();
             }
         };
     }

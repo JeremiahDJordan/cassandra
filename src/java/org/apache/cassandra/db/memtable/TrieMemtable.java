@@ -199,6 +199,14 @@ public class TrieMemtable extends AbstractAllocatorMemtable
         return FACTORY;
     }
 
+    @Override
+    public boolean appliesUpdatesAtomically()
+    {
+        // A failed merge leaves the trie without any of the update's rows and deletions, and put() completes the index
+        // transaction under the shard lock.
+        return true;
+    }
+
     public boolean isClean()
     {
         for (MemtableShard shard : shards)
@@ -675,6 +683,8 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                 // The stats give the minimum local deletion time, which goes down before the update is visible, for the
                 // reads that purge the tombstones older than it
                 stats = stats.mergeWith(update.stats());
+
+                Throwable mergeFailure = null;
                 try
                 {
                     indexer.start();
@@ -699,6 +709,11 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                     allocator.onHeap().adjust((data.usedSizeOnHeap() - onHeap) + updater.heapSize, opGroup);
                     partitionCount += updater.partitionsAdded;
                 }
+                catch (Throwable t)
+                {
+                    mergeFailure = t;
+                    throw t;
+                }
                 finally
                 {
                     updateMinTimestamp(update.stats().minTimestamp);
@@ -706,8 +721,12 @@ public class TrieMemtable extends AbstractAllocatorMemtable
                     updateCurrentOperations(update.operationCount());
 
                     columns = columns.mergeTo(update.columns());
-                    // last, so that a failure in Indexer#finish doesn't skip the updates above
-                    indexer.commit();
+                    // Last, so that a failure in Indexer#finish doesn't skip the updates above. A failed merge leaves
+                    // the trie without any of the update's rows and deletions, so the indexes must not see it either.
+                    if (mergeFailure == null)
+                        indexer.commit();
+                    else
+                        abortIndexTransaction(indexer, mergeFailure);
                 }
             }
             finally
