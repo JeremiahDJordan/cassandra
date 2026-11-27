@@ -102,6 +102,14 @@ public class CompositeCompactionTask extends AbstractCompactionTask
     }
 
     @Override
+    public AbstractCompactionTask setRewriteTrieForm(boolean rewriteTrieForm)
+    {
+        for (AbstractCompactionTask task : tasks)
+            task.setRewriteTrieForm(rewriteTrieForm);
+        return super.setRewriteTrieForm(rewriteTrieForm);
+    }
+
+    @Override
     public void addObserver(CompactionObserver compObserver)
     {
         for (AbstractCompactionTask task : tasks)

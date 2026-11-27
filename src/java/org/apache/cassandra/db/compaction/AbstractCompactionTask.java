@@ -56,6 +56,7 @@ public abstract class AbstractCompactionTask
     protected ILifecycleTransaction transaction;
     protected boolean isUserDefined;
     protected OperationType compactionType;
+    protected boolean rewriteTrieForm = CassandraRelevantProperties.COMPACTION_REWRITE_TRIE_FORM.getBoolean();
     protected TableOperationObserver opObserver;
     protected final List<CompactionObserver> compObservers;
 
@@ -303,6 +304,16 @@ public abstract class AbstractCompactionTask
     public AbstractCompactionTask setCompactionType(OperationType compactionType)
     {
         this.compactionType = compactionType;
+        return this;
+    }
+
+    /**
+     * Rewrite the keys of the input sstables into the form of the table's trie memtable, see
+     * {@link org.apache.cassandra.db.memtable.TrieDecodedForm}.
+     */
+    public AbstractCompactionTask setRewriteTrieForm(boolean rewriteTrieForm)
+    {
+        this.rewriteTrieForm = rewriteTrieForm;
         return this;
     }
 

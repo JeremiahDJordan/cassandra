@@ -46,6 +46,7 @@ import org.apache.cassandra.db.compaction.CompactionRealm;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.TableOperation;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.memtable.TrieDecodedForm;
 import org.apache.cassandra.db.partitions.ImmutableBTreePartition;
 import org.apache.cassandra.db.partitions.Partition;
 import org.apache.cassandra.db.rows.AbstractCell;
@@ -98,6 +99,7 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
     protected final ReadWriteLock fileAccessLock = new ReentrantReadWriteLock();
     protected final RandomAccessReader dataFile;
     protected final ScrubInfo scrubInfo;
+    private final TrieDecodedForm trieDecodedForm;
 
     protected final NegativeLocalDeletionInfoMetrics negativeLocalDeletionInfoMetrics = new NegativeLocalDeletionInfoMetrics();
     protected final OverwrittenTTLInfoMetrics overwrittenTTLInfoMetrics = new OverwrittenTTLInfoMetrics();
@@ -162,6 +164,17 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
                         : sstable.openDataReaderForScan(CompactionManager.instance.getRateLimiter());
 
         this.scrubInfo = new ScrubInfo(dataFile, sstable, fileAccessLock.readLock());
+
+        // decoded with the header's types, which the scrubbed sstable keeps
+        this.trieDecodedForm = options.rewriteTrieForm
+                               ? TrieDecodedForm.of(realm.metadata().params.memtable.factory(),
+                                                    new ClusteringComparator(sstable.header.clusteringTypes()),
+                                                    sstable.header.columns())
+                               : null;
+        if (options.rewriteTrieForm)
+            outputHandler.output(trieDecodedForm != null
+                                 ? "Starting scrub that rewrites keys into the form of the table's trie memtable"
+                                 : "Not rewriting keys: the table doesn't use a trie memtable, or its keys decode to the same bytes");
 
         if (options.overwriteTTLMode == IScrubber.OverwriteTTLMode.REINSERT_OVERFLOWED_TTL)
             outputHandler.output("Starting scrub with reinsert overflowed TTL option");
@@ -246,7 +259,7 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
         try (SSTableWriter inOrderWriter = CompactionManager.createWriter(realm, destination, expectedBloomFilterSize, repairedAt, metadata.pendingRepair, metadata.isTransient, sstable, transaction))
         {
             for (Partition partition : outOfOrder)
-                inOrderWriter.append(partition.unfilteredIterator());
+                inOrderWriter.append(withTrieDecodedForm(partition.unfilteredIterator()));
             inOrderWriter.setRepairedAt(-1);
             inOrderWriter.setMaxDataAge(sstable.maxDataAge);
             newInOrderSstable = inOrderWriter.finish(true, null);
@@ -300,7 +313,7 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
         // to the outOfOrder set that will be later written to a new SSTable.
         RowMergingSSTableIterator rowMergingIterator = getRowMergingIterator(key);
         try (OrderCheckerIterator sstableIterator = new OrderCheckerIterator(getIterator(rowMergingIterator), realm.metadata().comparator);
-             UnfilteredRowIterator iterator = withValidation(sstableIterator, dataFile.getFile()))
+             UnfilteredRowIterator iterator = withValidation(withTrieDecodedForm(sstableIterator), dataFile.getFile()))
         {
             if (prevKey != null && prevKey.compareTo(key) > 0)
             {
@@ -324,6 +337,11 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
         }
 
         return true;
+    }
+
+    private UnfilteredRowIterator withTrieDecodedForm(UnfilteredRowIterator partition)
+    {
+        return trieDecodedForm != null ? trieDecodedForm.apply(partition, sstable) : partition;
     }
 
     private RowMergingSSTableIterator getRowMergingIterator(DecoratedKey key)
@@ -365,6 +383,9 @@ public abstract class SortedTableScrubber<R extends SSTableReaderWithFilter> imp
     {
         if (th instanceof Error && !(th instanceof AssertionError || th instanceof IOError))
             throw (Error) th;
+        // fails the scrub rather than skipping a partition that isn't corrupt
+        if (th instanceof TrieDecodedForm.RefusedException)
+            throw (TrieDecodedForm.RefusedException) th;
     }
 
     protected void throwIfCannotContinue(DecoratedKey key, Throwable th)

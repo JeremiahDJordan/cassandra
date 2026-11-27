@@ -383,6 +383,13 @@ public class NodeProbe implements AutoCloseable
 
     public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, IScrubber.OverwriteTTLMode overwriteTTLMode, boolean bumpTTLTimestamp, int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
     {
+        return scrub(disableSnapshot, skipCorrupted, checkData, overwriteTTLMode, bumpTTLTimestamp, false, jobs, keyspaceName, tables);
+    }
+
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, IScrubber.OverwriteTTLMode overwriteTTLMode, boolean bumpTTLTimestamp, boolean rewriteTrieForm, int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
+    {
+        if (rewriteTrieForm)
+            return ssProxy.scrub(disableSnapshot, skipCorrupted, checkData, overwriteTTLMode.name(), bumpTTLTimestamp, true, jobs, keyspaceName, tables);
         // Route through boolean method unless NO_TTL is requested to preserve compatibility with older nodes during rolling upgrades
         if (overwriteTTLMode == IScrubber.OverwriteTTLMode.NO_TTL)
             return ssProxy.scrub(disableSnapshot, skipCorrupted, checkData, overwriteTTLMode.name(), bumpTTLTimestamp, jobs, keyspaceName, tables);
@@ -397,6 +404,14 @@ public class NodeProbe implements AutoCloseable
 
     public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, long maxSSTableTimestamp, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException
     {
+        return upgradeSSTables(keyspaceName, excludeCurrentVersion, maxSSTableTimestamp, false, jobs, tableNames);
+    }
+
+    public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, long maxSSTableTimestamp, boolean rewriteTrieForm, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException
+    {
+        // the older signature unless the rewrite is requested, for nodes without it
+        if (rewriteTrieForm)
+            return ssProxy.upgradeSSTables(keyspaceName, excludeCurrentVersion, maxSSTableTimestamp, true, jobs, tableNames);
         return ssProxy.upgradeSSTables(keyspaceName, excludeCurrentVersion, maxSSTableTimestamp, jobs, tableNames);
     }
 
@@ -439,9 +454,14 @@ public class NodeProbe implements AutoCloseable
 
     public void scrub(PrintStream out, boolean disableSnapshot, boolean skipCorrupted, boolean checkData, IScrubber.OverwriteTTLMode overwriteTTLMode, boolean bumpTTLTimestamp, int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
     {
+        scrub(out, disableSnapshot, skipCorrupted, checkData, overwriteTTLMode, bumpTTLTimestamp, false, jobs, keyspaceName, tables);
+    }
+
+    public void scrub(PrintStream out, boolean disableSnapshot, boolean skipCorrupted, boolean checkData, IScrubber.OverwriteTTLMode overwriteTTLMode, boolean bumpTTLTimestamp, boolean rewriteTrieForm, int jobs, String keyspaceName, String... tables) throws IOException, ExecutionException, InterruptedException
+    {
         checkJobs(out, jobs);
         perform(out, keyspaceName,
-                () -> scrub(disableSnapshot, skipCorrupted, checkData, overwriteTTLMode, bumpTTLTimestamp, jobs, keyspaceName, tables),
+                () -> scrub(disableSnapshot, skipCorrupted, checkData, overwriteTTLMode, bumpTTLTimestamp, rewriteTrieForm, jobs, keyspaceName, tables),
                 "scrubbing");
     }
 
@@ -462,9 +482,14 @@ public class NodeProbe implements AutoCloseable
 
     public void upgradeSSTables(PrintStream out, String keyspaceName, boolean excludeCurrentVersion, long maxSSTableTimestamp, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException
     {
+        upgradeSSTables(out, keyspaceName, excludeCurrentVersion, maxSSTableTimestamp, false, jobs, tableNames);
+    }
+
+    public void upgradeSSTables(PrintStream out, String keyspaceName, boolean excludeCurrentVersion, long maxSSTableTimestamp, boolean rewriteTrieForm, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException
+    {
         checkJobs(out, jobs);
         perform(out, keyspaceName,
-                () -> upgradeSSTables(keyspaceName, excludeCurrentVersion, maxSSTableTimestamp, jobs, tableNames),
+                () -> upgradeSSTables(keyspaceName, excludeCurrentVersion, maxSSTableTimestamp, rewriteTrieForm, jobs, tableNames),
                 "upgrading sstables");
     }
 

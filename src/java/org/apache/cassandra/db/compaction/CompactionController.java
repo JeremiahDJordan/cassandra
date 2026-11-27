@@ -67,6 +67,7 @@ public class CompactionController extends AbstractCompactionController
     private final RateLimiter limiter;
     private final long minTimestamp;
     private final Map<SSTableReader, FileDataInput> openDataFiles = new HashMap<>();
+    private boolean provideTombstoneSources = true;
 
     protected CompactionController(CompactionRealm realm, long maxValue)
     {
@@ -309,9 +310,17 @@ public class CompactionController extends AbstractCompactionController
         return !realm.onlyPurgeRepairedTombstones() || compactingRepaired;
     }
 
+    /**
+     * Stops providing tombstone sources, so that garbage is only collected within the compacted sstables.
+     */
+    void disableTombstoneSources()
+    {
+        provideTombstoneSources = false;
+    }
+
     boolean shouldProvideTombstoneSources()
     {
-        return tombstoneOption != TombstoneOption.NONE && compactingRepaired() && overlapTracker != null;
+        return provideTombstoneSources && tombstoneOption != TombstoneOption.NONE && compactingRepaired() && overlapTracker != null;
     }
 
     // caller must close iterators

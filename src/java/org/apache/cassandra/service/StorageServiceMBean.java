@@ -433,6 +433,12 @@ public interface StorageServiceMBean extends NotificationEmitter
     public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, String overwriteTTLMode, boolean bumpTTLTimestamp, int jobs, String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
 
     /**
+     * @param rewriteTrieForm on tables that use a trie memtable, rewrite the keys into the form that memtable reads
+     *                        them back in
+     */
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, String overwriteTTLMode, boolean bumpTTLTimestamp, boolean rewriteTrieForm, int jobs, String keyspaceName, String... columnFamilies) throws IOException, ExecutionException, InterruptedException;
+
+    /**
      * Verify (checksums of) the given keyspace.
      * If tableNames array is empty, all CFs are verified.
      *
@@ -461,6 +467,13 @@ public interface StorageServiceMBean extends NotificationEmitter
     }
 
     public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, long maxSSTableTimestamp, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException;
+
+    /**
+     * @param rewriteTrieForm on tables that use a trie memtable, rewrite the keys into the form that memtable reads
+     *                        them back in, including the sstables already on the current version of the tables
+     *                        whose keys can change
+     */
+    public int upgradeSSTables(String keyspaceName, boolean excludeCurrentVersion, long maxSSTableTimestamp, boolean rewriteTrieForm, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException;
     public int recompressSSTables(String keyspaceName, int jobs, String... tableNames) throws IOException, ExecutionException, InterruptedException;
 
     /**

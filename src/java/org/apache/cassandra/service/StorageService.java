@@ -4194,10 +4194,22 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
 
     public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, String overwriteTTLMode, boolean bumpTTLTimestamp, int jobs, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException
     {
+        return scrub(disableSnapshot, skipCorrupted, checkData, overwriteTTLMode, bumpTTLTimestamp, false, jobs, keyspaceName, tableNames);
+    }
+
+    public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, String overwriteTTLMode, boolean bumpTTLTimestamp, boolean rewriteTrieForm, int jobs, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException
+    {
         IScrubber.OverwriteTTLMode mode = overwriteTTLMode == null || overwriteTTLMode.isEmpty()
                                           ? IScrubber.OverwriteTTLMode.NONE
                                           : IScrubber.OverwriteTTLMode.valueOf(overwriteTTLMode);
-        return scrub(disableSnapshot, skipCorrupted, checkData, mode, bumpTTLTimestamp, jobs, keyspaceName, tableNames);
+        IScrubber.Options options = IScrubber.options()
+                                             .skipCorrupted(skipCorrupted)
+                                             .checkData(checkData)
+                                             .overwriteTTLMode(mode)
+                                             .bumpTTLTimestamp(bumpTTLTimestamp)
+                                             .rewriteTrieForm(rewriteTrieForm)
+                                             .build();
+        return scrub(disableSnapshot, options, jobs, keyspaceName, tableNames);
     }
 
     public int scrub(boolean disableSnapshot, boolean skipCorrupted, boolean checkData, IScrubber.OverwriteTTLMode overwriteTTLMode, int jobs, String keyspaceName, String... tableNames) throws IOException, ExecutionException, InterruptedException
@@ -4279,6 +4291,16 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
         return rewriteSSTables(keyspaceName, skipIfCurrentVersion, skipIfNewerThanTimestamp, false, jobs, tableNames);
     }
 
+    public int upgradeSSTables(String keyspaceName,
+                               boolean skipIfCurrentVersion,
+                               long skipIfNewerThanTimestamp,
+                               boolean rewriteTrieForm,
+                               int jobs,
+                               String... tableNames) throws IOException, ExecutionException, InterruptedException
+    {
+        return rewriteSSTables(keyspaceName, skipIfCurrentVersion, skipIfNewerThanTimestamp, false, rewriteTrieForm, jobs, tableNames);
+    }
+
     public int recompressSSTables(String keyspaceName,
                                   int jobs,
                                   String... tableNames) throws IOException, ExecutionException, InterruptedException
@@ -4294,11 +4316,22 @@ public class StorageService extends NotificationBroadcasterSupport implements IE
                                int jobs,
                                String... tableNames) throws IOException, ExecutionException, InterruptedException
     {
+        return rewriteSSTables(keyspaceName, skipIfCurrentVersion, skipIfNewerThanTimestamp, skipIfCompressionMatches, false, jobs, tableNames);
+    }
+
+    public int rewriteSSTables(String keyspaceName,
+                               final boolean skipIfCurrentVersion,
+                               final long skipIfNewerThanTimestamp,
+                               final boolean skipIfCompressionMatches,
+                               final boolean rewriteTrieForm,
+                               int jobs,
+                               String... tableNames) throws IOException, ExecutionException, InterruptedException
+    {
         CompactionManager.AllSSTableOpStatus status = CompactionManager.AllSSTableOpStatus.SUCCESSFUL;
         logger.info("Starting {} on {}.{}", OperationType.UPGRADE_SSTABLES, keyspaceName, Arrays.toString(tableNames));
         for (ColumnFamilyStore cfStore : getValidColumnFamilies(true, true, keyspaceName, tableNames))
         {
-            CompactionManager.AllSSTableOpStatus oneStatus = cfStore.sstablesRewrite(skipIfCurrentVersion, skipIfNewerThanTimestamp, skipIfCompressionMatches, jobs);
+            CompactionManager.AllSSTableOpStatus oneStatus = cfStore.sstablesRewrite(skipIfCurrentVersion, skipIfNewerThanTimestamp, skipIfCompressionMatches, rewriteTrieForm, jobs);
             if (oneStatus != CompactionManager.AllSSTableOpStatus.SUCCESSFUL)
                 status = oneStatus;
         }

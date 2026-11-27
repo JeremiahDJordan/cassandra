@@ -51,10 +51,12 @@ import org.apache.cassandra.db.compaction.unified.UnifiedCompactionTask;
 import org.apache.cassandra.db.compaction.writers.CompactionAwareWriter;
 import org.apache.cassandra.db.compaction.writers.DefaultCompactionWriter;
 import org.apache.cassandra.db.lifecycle.ILifecycleTransaction;
+import org.apache.cassandra.db.memtable.TrieDecodedForm;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.io.FSWriteError;
+import org.apache.cassandra.io.sstable.ISSTableScanner;
 import org.apache.cassandra.io.sstable.ScannerList;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.io.sstable.metadata.MetadataCollector;
@@ -90,6 +92,8 @@ public class CompactionTask extends AbstractCompactionTask
     @Nullable
     private final CompactionStrategy strategy;
     protected OperationTotals totals;
+    /** The form the inputs are rewritten into, if {@link #rewriteTrieForm}; set when the operation is created. */
+    private TrieDecodedForm trieDecodedForm;
 
     public CompactionTask(CompactionRealm realm,
                           ILifecycleTransaction txn,
@@ -142,6 +146,8 @@ public class CompactionTask extends AbstractCompactionTask
             this.tombstoneOption = tombstoneOption;
             setCompactionType(OperationType.GARBAGE_COLLECT);
             setUserDefined(true);
+            // the tombstones of the other sstables that the inputs are collected against are read as written
+            setRewriteTrieForm(false);
         }
 
         @Override
@@ -328,14 +334,20 @@ public class CompactionTask extends AbstractCompactionTask
         assert !Iterables.any(transaction.originals(), sstable -> !sstable.descriptor.cfname.equals(realm.getTableName()));
 
 
+        trieDecodedForm = rewriteTrieForm ? TrieDecodedForm.of(realm.metadata()) : null;
+        // the overlapping sstables that tombstone sources come from are read as written
+        if (trieDecodedForm != null)
+            controller.disableTombstoneSources();
+
         // Cursors currently don't support:
         boolean compactByIterators = !ALLOW_CURSOR_COMPACTION.getBoolean()
                                      || strategy != null && !strategy.supportsCursorCompaction()  // strategy does not support it
                                      || controller.shouldProvideTombstoneSources()  // garbagecollect
                                      || realm.getIndexManager().hasIndexes()  // indexes
-                                     || realm.metadata().enforceStrictLiveness();   // strict liveness
+                                     || realm.metadata().enforceStrictLiveness()   // strict liveness
+                                     || trieDecodedForm != null;   // rewriting keys into the trie memtable's form
 
-        logger.debug("Compacting in {} by {}: {} {} {} {} {}",
+        logger.debug("Compacting in {} by {}: {} {} {} {} {} {}",
                      realm.toString(),
                      compactByIterators ? "iterators" : "cursors",
                      ALLOW_CURSOR_COMPACTION.getBoolean() ? "" : "cursors disabled",
@@ -344,7 +356,8 @@ public class CompactionTask extends AbstractCompactionTask
                                                                              : "",
                      controller.shouldProvideTombstoneSources() ? "tombstone sources" : "",
                      realm.getIndexManager().hasIndexes() ? "has indexes" : "",
-                     realm.metadata().enforceStrictLiveness() ? "strict liveness" : "");
+                     realm.metadata().enforceStrictLiveness() ? "strict liveness" : "",
+                     trieDecodedForm != null ? "rewriting into the trie form" : "");
 
         if (compactByIterators)
             return new CompactionOperationIterator(controller, actuallyCompact, fullyExpiredSSTables.size());
@@ -762,7 +775,9 @@ public class CompactionTask extends AbstractCompactionTask
             this.scanners = strategy != null ? strategy.getScanners(actuallyCompact, rangeList)
                                              : ScannerList.of(actuallyCompact, rangeList);
             // We use `this` rather than `sharedProgress()` because the `TableOperation` tracks individual compactions.
-            this.compactionIterator = new CompactionIterator(compactionType, scanners.scanners, controller, FBUtilities.nowInSeconds(), taskId, null, this);
+            // each input is rewritten before the merge, so that rows whose keys become equal are reconciled
+            List<ISSTableScanner> inputs = trieDecodedForm != null ? trieDecodedForm.apply(scanners.scanners) : scanners.scanners;
+            this.compactionIterator = new CompactionIterator(compactionType, inputs, controller, FBUtilities.nowInSeconds(), taskId, null, this);
             return compactionIterator.getOperation();
         }
 

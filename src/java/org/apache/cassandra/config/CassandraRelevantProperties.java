@@ -225,6 +225,13 @@ public enum CassandraRelevantProperties
     COMPACTION_RATE_LIMIT_GRANULARITY_IN_KB("compaction_rate_limit_granularity_in_kb"),
 
     /**
+     * If this is true, compaction of a table that uses a trie memtable rewrites the clustering keys, range tombstone
+     * bounds and cell paths of its input sstables into the form that memtable reads them back in, see
+     * {@link org.apache.cassandra.db.memtable.TrieDecodedForm}.
+     */
+    COMPACTION_REWRITE_TRIE_FORM("cassandra.compaction.rewrite_trie_form", "false"),
+
+    /**
      * If this is true, compaction will not verify that sstables selected for compaction are marked compacted.
      */
     COMPACTION_SKIP_COMPACTING_STATE_CHECKING("cassandra.compaction.skip_compacting_state_checking", "false"),

@@ -76,6 +76,11 @@ public class Scrub extends NodeToolCmd
                           "made at exactly timestamp + 1. (default false)")
     private boolean bumpTTLTimestamp = false;
 
+    @Option(title = "rewrite_trie_form",
+            name = {"--rewrite-trie-form"},
+            description = StandaloneScrubber.REWRITE_TRIE_FORM_OPTION_DESCRIPTION)
+    private boolean rewriteTrieForm = false;
+
     @Option(title = "jobs",
             name = {"-j", "--jobs"},
             description = "Number of sstables to scrub simultanously, set to 0 to use all available compaction threads")
@@ -99,7 +104,7 @@ public class Scrub extends NodeToolCmd
             {
                 probe.scrub(probe.output().out, disableSnapshot, skipCorrupted, !noValidation,
                             reinsertOverflowedTTL ? IScrubber.OverwriteTTLMode.REINSERT_OVERFLOWED_TTL : overwriteTTLMode,
-                            bumpTTLTimestamp, jobs, keyspace, tableNames);
+                            bumpTTLTimestamp, rewriteTrieForm, jobs, keyspace, tableNames);
             }
             catch (IllegalArgumentException e)
             {

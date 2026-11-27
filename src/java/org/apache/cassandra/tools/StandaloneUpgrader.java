@@ -37,6 +37,7 @@ import org.apache.cassandra.db.compaction.CompactionManager;
 import org.apache.cassandra.db.compaction.OperationType;
 import org.apache.cassandra.db.compaction.Upgrader;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.memtable.TrieDecodedForm;
 import org.apache.cassandra.io.sstable.Component;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.format.SSTableReader;
@@ -53,6 +54,7 @@ public class StandaloneUpgrader
     private static final String DEBUG_OPTION  = "debug";
     private static final String HELP_OPTION  = "help";
     private static final String KEEP_SOURCE = "keep-source";
+    private static final String REWRITE_TRIE_FORM_OPTION = "rewrite-trie-form";
 
     public static void main(String args[])
     {
@@ -83,6 +85,7 @@ public class StandaloneUpgrader
                 lister.includeBackups(false);
 
             Collection<SSTableReader> readers = new ArrayList<>();
+            boolean rewritesKeys = options.rewriteTrieForm && TrieDecodedForm.of(cfs.metadata()) != null;
 
             // Upgrade sstables in id order
             for (Map.Entry<Descriptor, Set<Component>> entry : lister.sortedList())
@@ -94,7 +97,7 @@ public class StandaloneUpgrader
                 try
                 {
                     SSTableReader sstable = SSTableReader.openNoValidation(entry.getKey(), components, cfs);
-                    if (sstable.descriptor.version.equals(DatabaseDescriptor.getSelectedSSTableFormat().getLatestVersion()))
+                    if (!rewritesKeys && sstable.descriptor.version.equals(DatabaseDescriptor.getSelectedSSTableFormat().getLatestVersion()))
                     {
                         sstable.selfRef().release();
                         continue;
@@ -117,7 +120,7 @@ public class StandaloneUpgrader
             {
                 try (LifecycleTransaction txn = LifecycleTransaction.offline(OperationType.UPGRADE_SSTABLES, sstable))
                 {
-                    Upgrader upgrader = new Upgrader(cfs, txn, handler);
+                    Upgrader upgrader = new Upgrader(cfs, txn, handler, rewritesKeys);
                     upgrader.upgrade(options.keepSource);
                 }
                 catch (Exception e)
@@ -154,6 +157,7 @@ public class StandaloneUpgrader
 
         public boolean debug;
         public boolean keepSource;
+        public boolean rewriteTrieForm;
 
         private Options(String keyspace, String cf, String snapshot)
         {
@@ -194,6 +198,7 @@ public class StandaloneUpgrader
 
                 opts.debug = cmd.hasOption(DEBUG_OPTION);
                 opts.keepSource = cmd.hasOption(KEEP_SOURCE);
+                opts.rewriteTrieForm = cmd.hasOption(REWRITE_TRIE_FORM_OPTION);
 
                 return opts;
             }
@@ -217,6 +222,7 @@ public class StandaloneUpgrader
             options.addOption(null, DEBUG_OPTION,          "display stack traces");
             options.addOption("h",  HELP_OPTION,           "display this help message");
             options.addOption("k",  KEEP_SOURCE,           "do not delete the source sstables");
+            options.addOption(null, REWRITE_TRIE_FORM_OPTION, StandaloneScrubber.REWRITE_TRIE_FORM_OPTION_DESCRIPTION);
             return options;
         }
 

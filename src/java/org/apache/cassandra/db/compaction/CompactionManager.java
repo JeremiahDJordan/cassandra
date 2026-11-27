@@ -83,6 +83,7 @@ import org.apache.cassandra.db.lifecycle.SSTableIntervalTree;
 import org.apache.cassandra.db.lifecycle.SSTableSet;
 import org.apache.cassandra.db.lifecycle.View;
 import org.apache.cassandra.db.lifecycle.WrappedLifecycleTransaction;
+import org.apache.cassandra.db.memtable.TrieDecodedForm;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
 import org.apache.cassandra.db.view.ViewBuilderTask;
 import org.apache.cassandra.dht.AbstractBounds;
@@ -611,9 +612,20 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
                                                     final boolean skipIfCompressionMatches,
                                                     int jobs) throws InterruptedException, ExecutionException
     {
+        return performSSTableRewrite(cfs, skipIfCurrentVersion, skipIfOlderThanTimestamp, skipIfCompressionMatches, false, jobs);
+    }
+
+    public AllSSTableOpStatus performSSTableRewrite(final ColumnFamilyStore cfs,
+                                                    final boolean skipIfCurrentVersion,
+                                                    final long skipIfOlderThanTimestamp,
+                                                    final boolean skipIfCompressionMatches,
+                                                    final boolean rewriteTrieForm,
+                                                    int jobs) throws InterruptedException, ExecutionException
+    {
+        boolean rewritesKeys = rewriteTrieForm && TrieDecodedForm.of(cfs.metadata()) != null;
         return performSSTableRewrite(cfs, (sstable) -> {
-            // Skip if descriptor version matches current version
-            if (skipIfCurrentVersion && sstable.descriptor.version.equals(sstable.descriptor.getFormat().getLatestVersion()))
+            // Skip if descriptor version matches current version, unless the keys are rewritten
+            if (skipIfCurrentVersion && !rewritesKeys && sstable.descriptor.version.equals(sstable.descriptor.getFormat().getLatestVersion()))
                 return false;
 
             // Skip if SSTable creation time is past given timestamp
@@ -628,7 +640,7 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
                 return false;
 
             return true;
-        }, jobs);
+        }, rewritesKeys, jobs);
     }
 
     /**
@@ -637,6 +649,14 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
      * @param sstableFilter sstables for which predicate returns {@link false} will be excluded
      */
     public AllSSTableOpStatus performSSTableRewrite(final ColumnFamilyStore cfs, Predicate<SSTableReader> sstableFilter, int jobs) throws InterruptedException, ExecutionException
+    {
+        return performSSTableRewrite(cfs, sstableFilter, false, jobs);
+    }
+
+    /**
+     * As above, and if {@code rewriteTrieForm}, rewrites the keys into the form of the table's trie memtable.
+     */
+    public AllSSTableOpStatus performSSTableRewrite(final ColumnFamilyStore cfs, Predicate<SSTableReader> sstableFilter, boolean rewriteTrieForm, int jobs) throws InterruptedException, ExecutionException
     {
         return parallelAllSSTableOperation(cfs, new OneSSTableOperation()
         {
@@ -664,6 +684,8 @@ public class CompactionManager implements CompactionManagerMBean, ICompactionMan
                 AbstractCompactionTask task = cfs.getCompactionStrategy().createCompactionTask(txn, NO_GC, Long.MAX_VALUE);
                 task.setUserDefined(true);
                 task.setCompactionType(OperationType.UPGRADE_SSTABLES);
+                if (rewriteTrieForm)
+                    task.setRewriteTrieForm(true);
                 task.execute(active);
             }
         }, jobs, OperationType.UPGRADE_SSTABLES, TableOperation.StopTrigger.UPGRADE_SSTABLES);

@@ -48,9 +48,16 @@ public class StandaloneUpgraderTest extends OfflineToolUtils
                        "hard links to live sstables.\n" + 
                        "--\n" + 
                        "Options are:\n" + 
-                       "    --debug         display stack traces\n" + 
-                       " -h,--help          display this help message\n" + 
-                       " -k,--keep-source   do not delete the source sstables\n";
+                       "    --debug               display stack traces\n" +
+                       " -h,--help                display this help message\n" +
+                       " -k,--keep-source         do not delete the source sstables\n" +
+                       "    --rewrite-trie-form   On tables that use a trie memtable, rewrite\n" +
+                       "                          clustering keys, range tombstone bounds, set\n" +
+                       "                          elements and map keys into the form that\n" +
+                       "                          memtable reads them back in. A partition that\n" +
+                       "                          can't be rewritten fails the rewrite of its\n" +
+                       "                          sstable, which is kept; other sstables may\n" +
+                       "                          already be rewritten.\n";
         Assertions.assertThat(tool.getStdout()).isEqualTo(help);
     }
 

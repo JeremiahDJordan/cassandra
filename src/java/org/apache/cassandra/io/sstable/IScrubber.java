@@ -101,8 +101,9 @@ public interface IScrubber extends Closeable
         public final boolean overrideTxnIsOffline;
         public final OverwriteTTLMode overwriteTTLMode;
         public final boolean bumpTTLTimestamp;
+        public final boolean rewriteTrieForm;
 
-        private Options(boolean checkData, boolean reinsertOverflowedTTLRows, boolean skipCorrupted, boolean overrideTxnIsOffline, OverwriteTTLMode overwriteTTLMode, boolean bumpTTLTimestamp)
+        private Options(boolean checkData, boolean reinsertOverflowedTTLRows, boolean skipCorrupted, boolean overrideTxnIsOffline, OverwriteTTLMode overwriteTTLMode, boolean bumpTTLTimestamp, boolean rewriteTrieForm)
         {
             this.checkData = checkData;
             this.reinsertOverflowedTTLRows = reinsertOverflowedTTLRows;
@@ -110,6 +111,7 @@ public interface IScrubber extends Closeable
             this.overrideTxnIsOffline = overrideTxnIsOffline;
             this.overwriteTTLMode = overwriteTTLMode;
             this.bumpTTLTimestamp = bumpTTLTimestamp;
+            this.rewriteTrieForm = rewriteTrieForm;
         }
 
         @Override
@@ -121,6 +123,7 @@ public interface IScrubber extends Closeable
                    .add("skipCorrupted=" + skipCorrupted)
                    .add("overwriteTTLMode=" + overwriteTTLMode)
                    .add("bumpTTLTimestamp=" + bumpTTLTimestamp)
+                   .add("rewriteTrieForm=" + rewriteTrieForm)
                    .toString();
         }
 
@@ -131,6 +134,7 @@ public interface IScrubber extends Closeable
             private boolean overrideTxnIsOffline = false;
             private OverwriteTTLMode overwriteTTLMode = OverwriteTTLMode.NONE;
             private boolean bumpTTLTimestamp = false;
+            private boolean rewriteTrieForm = false;
 
             public Builder checkData()
             {
@@ -206,12 +210,22 @@ public interface IScrubber extends Closeable
                 return this;
             }
 
+            /**
+             * Rewrite the keys into the form of the table's trie memtable, see
+             * {@link org.apache.cassandra.db.memtable.TrieDecodedForm}.
+             */
+            public Builder rewriteTrieForm(boolean rewriteTrieForm)
+            {
+                this.rewriteTrieForm = rewriteTrieForm;
+                return this;
+            }
+
             public Options build()
             {
                 if (bumpTTLTimestamp && overwriteTTLMode != OverwriteTTLMode.NO_TTL)
                     throw new IllegalArgumentException("bumpTTLTimestamp can only be used with overwriteTTLMode " + OverwriteTTLMode.NO_TTL);
                 boolean reinsert = overwriteTTLMode == OverwriteTTLMode.REINSERT_OVERFLOWED_TTL;
-                return new Options(checkData, reinsert, skipCorrupted, overrideTxnIsOffline, overwriteTTLMode, bumpTTLTimestamp);
+                return new Options(checkData, reinsert, skipCorrupted, overrideTxnIsOffline, overwriteTTLMode, bumpTTLTimestamp, rewriteTrieForm);
             }
         }
     }

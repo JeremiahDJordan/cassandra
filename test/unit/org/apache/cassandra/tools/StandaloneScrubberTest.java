@@ -78,6 +78,10 @@ public class StandaloneScrubberTest extends OfflineToolUtils
                        "                                maximum supported expiration date of 2038-01-19T03:14:06+00:00. The rows are rewritten\n" +
                        "                                with the original timestamp incremented by one millisecond to override/supersede any\n" +
                        "                                potential tombstone that may have been generated during compaction of the affected rows.\n" +
+                       "    --rewrite-trie-form         On tables that use a trie memtable, rewrite clustering keys, range tombstone bounds, set\n" +
+                       "                                elements and map keys into the form that memtable reads them back in. A partition that\n" +
+                       "                                can't be rewritten fails the rewrite of its sstable, which is kept; other sstables may\n" +
+                       "                                already be rewritten.\n" +
                        " -s,--skip-corrupted            skip corrupt rows in counter tables\n" +
                        " -v,--verbose                   verbose output\n";
         Assertions.assertThat(tool.getStdout()).isEqualTo(help);

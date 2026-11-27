@@ -25,6 +25,7 @@ import com.google.common.collect.Sets;
 import org.apache.cassandra.db.DecoratedKey;
 import org.apache.cassandra.db.SerializationHeader;
 import org.apache.cassandra.db.lifecycle.LifecycleTransaction;
+import org.apache.cassandra.db.memtable.TrieDecodedForm;
 import org.apache.cassandra.io.sstable.Descriptor;
 import org.apache.cassandra.io.sstable.SSTableRewriter;
 import org.apache.cassandra.io.sstable.ScannerList;
@@ -48,8 +49,14 @@ public class Upgrader
     private final CompactionController controller;
 
     private final OutputHandler outputHandler;
+    private final TrieDecodedForm trieDecodedForm;
 
     public Upgrader(CompactionRealm realm, LifecycleTransaction txn, OutputHandler outputHandler)
+    {
+        this(realm, txn, outputHandler, false);
+    }
+
+    public Upgrader(CompactionRealm realm, LifecycleTransaction txn, OutputHandler outputHandler, boolean rewriteTrieForm)
     {
         this.realm = realm;
         this.transaction = txn;
@@ -57,6 +64,7 @@ public class Upgrader
         this.outputHandler = outputHandler;
         this.directory = new File(sstable.getFilename()).parent();
         this.controller = new UpgradeController(realm);
+        this.trieDecodedForm = rewriteTrieForm ? TrieDecodedForm.of(realm.metadata()) : null;
     }
 
     private SSTableWriter createCompactionWriter(StatsMetadata metadata)
@@ -84,7 +92,9 @@ public class Upgrader
         long nowInSec = FBUtilities.nowInSeconds();
         try (SSTableRewriter writer = SSTableRewriter.construct(realm, transaction, keepOriginals, CompactionTask.getMaxDataAge(transaction.originals()));
              ScannerList scanners = ScannerList.of(transaction.originals(), null);
-             CompactionIterator iter = new CompactionIterator(transaction.opType(), scanners.scanners, controller, nowInSec, nextTimeUUID()))
+             CompactionIterator iter = new CompactionIterator(transaction.opType(),
+                                                              trieDecodedForm != null ? trieDecodedForm.apply(scanners.scanners) : scanners.scanners,
+                                                              controller, nowInSec, nextTimeUUID()))
         {
             writer.switchWriter(createCompactionWriter(sstable.getSSTableMetadata()));
             iter.setTargetDirectory(writer.currentWriter().getFilename());

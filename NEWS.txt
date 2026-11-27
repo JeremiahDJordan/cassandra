@@ -577,11 +577,6 @@ Upgrading
       when the index finishes the update, on any memtable). A write that fails this way while the rebuild runs is
       missed again, and needs another rebuild. On a memtable that doesn't flush for index builds, a rebuild can't
       repair such a row.
-    - Trie memtables read an empty value of a fixed-size type inside a tuple or user type clustering key, such as the
-      second component of (1, blobAsInt(0x), 1), back as null. The two compare as different keys, so a DELETE or
-      UPDATE of such a row on a trie memtable doesn't match the copies of the row in SSTables written with the empty
-      value (by a skip-list memtable, an earlier release, Apache Cassandra or streaming): the deleted row stays
-      visible, and an update leaves two rows, also once the memtable is flushed and the SSTables are compacted.
     - Storage-attached indexes (SAI) on the entries of a map with decimal keys or values now find the entries whose
       decimal equals the queried one whatever its scale (2.5 and 2.50), for indexes written at the on-disk versions
       before "db" (e.g. "aa"). Before, they only found the entries written with the queried bytes, and after a
@@ -674,6 +669,48 @@ Upgrading
       -Dcassandra.trie_index_format_version must be a released bti version (aa, ac, ad, ba, bb, ca, cb, cc or da);
       other values fail startup.
       Snapshots and backups taken outside of the mode aren't rewritten.
+    - Trie memtables read clustering keys, range tombstone bounds, set elements and map keys back from their
+      byte-comparable form, which can differ from the form written by a skip-list memtable. An empty value of a
+      fixed-length type (such as an int written as an empty blob) in a tuple or user type comes back as a null
+      component, which sorts differently: on a table that switched from a skip-list memtable to a trie memtable, a
+      DELETE or UPDATE of such a key doesn't match its copy in the older sstables, so a DELETE leaves the row visible
+      and an UPDATE leaves two rows. SAI refuses such writes to indexed tables, but with an SAI index created after
+      them, compaction of the older sstables with newer ones fails with "Cannot index the row ...: its clustering has
+      an empty value". Other values come back in another form of an equal value (a decimal with another scale, a
+      varint without redundant sign bytes), which replicas holding different forms see as different data in digests
+      and repair.
+      To rewrite the older sstables into the form of the table's trie memtable, once every node uses the trie memtable
+      for the table: run nodetool disableautocompaction for the table on every node and let the compactions of the
+      table that are already running or queued finish (the command only stops new automatic compactions), then run
+      nodetool upgradesstables --rewrite-trie-form on every node (it includes the sstables already on the current
+      version of the tables whose keys can change), or nodetool scrub --rewrite-trie-form, and then nodetool
+      enableautocompaction; sstableupgrade and sstablescrub take --rewrite-trie-form too. Then run nodetool
+      rebuild_index for the legacy secondary indexes on such columns, whose index tables keep the written form, and
+      then repair. Alternatively, -Dcassandra.compaction.rewrite_trie_form=true makes compactions other than
+      garbagecollect (background, major, user-defined, upgradesstables, recompresssstables, relocatesstables,
+      automatic sstable upgrades and sstablesplit) rewrite their input sstables, merging the rows of different
+      sstables whose keys become equal; set it only for a nodetool upgradesstables -a run and remove it afterwards, as
+      every compaction of such tables decodes all keys while it is set, and a refused partition makes the table's
+      background compactions fail on every attempt. A compaction that rewrites keys doesn't collect garbage against
+      overlapping sstables (provide_overlapping_tombstones), which are read in their written form. Without the option
+      or property, scrub and compaction don't change keys.
+      After the rewrite, rows, set elements and map keys match deletions in other sstables as they would through the
+      table's trie memtable once those writes are flushed to separate sstables: a row that a range or point deletion
+      of the other form didn't cover can become hidden, and a covered one visible. With trie_stage3 this can differ
+      from what the memtable returns for the same writes while they are in one memtable or one flushed sstable.
+      The rewrite of an sstable fails, leaving that sstable in place, on a partition it can't rewrite, such as one
+      that holds a key in both forms, written while the table used a skip-list memtable (a row and a deletion of the
+      other form of its key), or one with a range tombstone whose bound ends with such an empty value; the error names
+      the reason, the table, sstable and partition. Other sstables of the same run may already be rewritten, and
+      running the rewrite again leaves them as they are. Until every sstable of the table is rewritten, as during the
+      run or after a refused or stopped one, rows of the rewritten sstables meet the deletions of the others as
+      written, so such a row can be hidden or shown, and a compaction without the rewrite in that state, including the
+      table-wide garbagecollect below, can make that change permanent, also in partitions other than the refused one.
+      To rewrite a refused partition of the live table, delete it, run nodetool flush and nodetool garbagecollect on
+      the table (on a table with only_purge_repaired_tombstones, garbagecollect only collects repaired sstables),
+      write its rows again, and run the rewrite again. For a refused sstable of a snapshot given to sstableupgrade,
+      leave the live table as it is and upgrade the snapshot without --rewrite-trie-form; rewrite the table after
+      restoring the snapshot.
 
 5.0.9
 =====

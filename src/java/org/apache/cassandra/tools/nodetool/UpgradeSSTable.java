@@ -29,6 +29,7 @@ import org.apache.commons.lang3.exception.ExceptionUtils;
 import org.apache.cassandra.db.compaction.CompactionInterruptedException;
 import org.apache.cassandra.tools.NodeProbe;
 import org.apache.cassandra.tools.NodeTool.NodeToolCmd;
+import org.apache.cassandra.tools.StandaloneScrubber;
 
 @Command(name = "upgradesstables", description = "Rewrite sstables (for the requested tables) that are not on the current version (thus upgrading them to said current version)")
 public class UpgradeSSTable extends NodeToolCmd
@@ -45,6 +46,11 @@ public class UpgradeSSTable extends NodeToolCmd
             name = {"-t", "--max-timestamp"},
             description = "Use -t to compact only SSTables that have local creation time _older_ than the given timestamp")
     private long maxSSTableTimestamp = Long.MAX_VALUE;
+
+    @Option(title = "rewrite_trie_form",
+            name = {"--rewrite-trie-form"},
+            description = StandaloneScrubber.REWRITE_TRIE_FORM_OPTION_DESCRIPTION + " Includes the sstables already on the current version of the tables whose keys can change.")
+    private boolean rewriteTrieForm = false;
 
     @Option(title = "jobs",
             name = {"-j", "--jobs"},
@@ -65,13 +71,13 @@ public class UpgradeSSTable extends NodeToolCmd
                 {
                     if (retries > 0)
                         Thread.sleep(500);
-                    probe.upgradeSSTables(probe.output().out, keyspace, !includeAll, maxSSTableTimestamp, jobs, tableNames);
+                    probe.upgradeSSTables(probe.output().out, keyspace, !includeAll, maxSSTableTimestamp, rewriteTrieForm, jobs, tableNames);
                     break;
                 }
                 catch (RuntimeException cie)
                 {
                     // Spin retry. See CASSANDRA-18635
-                    if (ExceptionUtils.indexOfThrowable(cie, CompactionInterruptedException.class) != -1 && retries == 4)
+                    if (ExceptionUtils.indexOfThrowable(cie, CompactionInterruptedException.class) == -1 || retries == 4)
                         throw (cie);
                 }
                 catch (Exception e)

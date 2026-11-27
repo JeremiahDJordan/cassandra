@@ -66,6 +66,10 @@ public class StandaloneScrubber
                                                                             "The rows are rewritten with the original timestamp incremented by one millisecond " +
                                                                             "to override/supersede any potential tombstone that may have been generated " +
                                                                             "during compaction of the affected rows.";
+    public static final String REWRITE_TRIE_FORM_OPTION_DESCRIPTION = "On tables that use a trie memtable, rewrite clustering keys, range tombstone bounds, " +
+                                                                      "set elements and map keys into the form that memtable reads them back in. " +
+                                                                      "A partition that can't be rewritten fails the rewrite of its sstable, which is " +
+                                                                      "kept; other sstables may already be rewritten.";
 
     private static final String TOOL_NAME = "sstablescrub";
     private static final String VERBOSE_OPTION  = "verbose";
@@ -77,6 +81,7 @@ public class StandaloneScrubber
     private static final String REINSERT_OVERFLOWED_TTL_OPTION = "reinsert-overflowed-ttl";
     private static final String OVERWRITE_TTL_OPTION = "overwrite-ttl";
     private static final String BUMP_TTL_TIMESTAMP_OPTION = "bump-ttl-timestamp";
+    private static final String REWRITE_TRIE_FORM_OPTION = "rewrite-trie-form";
     /**
      * This option was logically removed from the code, but to avoid breaking backwards compatability the option remains
      */
@@ -321,6 +326,8 @@ public class StandaloneScrubber
                     opts.bumpTTLTimestamp(true);
                 }
 
+                opts.rewriteTrieForm(cmd.hasOption(REWRITE_TRIE_FORM_OPTION));
+
                 if (cmd.hasOption(HEADERFIX_OPTION))
                     System.err.println(String.format("Option %s is deprecated and no longer functional", HEADERFIX_OPTION));
                 return opts;
@@ -377,6 +384,7 @@ public class StandaloneScrubber
                                                                "with their original timestamp incremented by one, so that they supersede " +
                                                                "un-scrubbed expiring copies and expiration tombstones of the same cells. " +
                                                                "It changes writetime() and can override a write or delete made at exactly timestamp + 1.");
+            options.addOption(null, REWRITE_TRIE_FORM_OPTION, REWRITE_TRIE_FORM_OPTION_DESCRIPTION);
             return options;
         }
 
