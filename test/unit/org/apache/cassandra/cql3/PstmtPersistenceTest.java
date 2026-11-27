@@ -394,9 +394,8 @@ public class PstmtPersistenceTest extends CQLTester
         {
             MD5Digest id = prepareStatement("INSERT INTO %s (key, val) VALUES (?, ?) USING TIMESTAMP " + cnt, clientState);
             QueryHandler.Prepared prepared = handler.getPrepared(id);
-            int cacheEntrySize = QueryProcessor.measurePStatementCacheEntrySize(id, prepared);
-            assertTrue(cacheEntrySize > 0);
-            accumulatedSize += cacheEntrySize;
+            assertTrue(prepared.pstmntSize > -1);
+            accumulatedSize += prepared.pstmntSize;
             if (statementsLoadedWhenFull == -1 && accumulatedSize > QueryProcessor.PREPARED_STATEMENT_CACHE_SIZE_BYTES)
             {
                 statementsLoadedWhenFull = cnt;
