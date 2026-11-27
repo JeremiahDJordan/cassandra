@@ -845,11 +845,24 @@ public abstract class AbstractType<T> implements Comparator<ByteBuffer>, Assignm
      */
     public boolean hasSortedDuration(boolean isPrimaryKeyColumn)
     {
+        return sortedDurations(isPrimaryKeyColumn) > 0;
+    }
+
+    /**
+     * The number of durations where values are sorted in a column of this type, see {@link #hasSortedDuration}.
+     */
+    public int sortedDurations(boolean isPrimaryKeyColumn)
+    {
         if (isPrimaryKeyColumn)
-            return referencesDuration();
-        return isMultiCell()
-               && this instanceof MultiCellCapableType
-               && ((MultiCellCapableType<?>) this).nameComparator().referencesDuration();
+            return durations();
+        return isMultiCell() && this instanceof MultiCellCapableType
+               ? ((MultiCellCapableType<?>) this).nameComparator().durations()
+               : 0;
+    }
+
+    private int durations()
+    {
+        return this instanceof DurationType ? 1 : subTypes().stream().mapToInt(AbstractType::durations).sum();
     }
 
     public final boolean referencesCounter()
