@@ -189,6 +189,6 @@ public class EndpointsForToken extends Endpoints<EndpointsForToken>
 
     public static EndpointsForToken pending(String keyspace, Token token)
     {
-        return StorageService.instance.getTokenMetadata().pendingEndpointsForToken(token, keyspace);
+        return StorageService.instance.getTokenMetadataForKeyspace(keyspace).pendingEndpointsForToken(token, keyspace);
     }
 }
