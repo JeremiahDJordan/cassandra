@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.base.Predicates;
 import org.junit.After;
@@ -61,6 +62,7 @@ public class IndexBuildDuringCompactionTest extends SAITester
     private static volatile ColumnFamilyStore holdTable;
     private static volatile boolean hold;
     private static volatile boolean holding;
+    private static final AtomicInteger buildsToSkip = new AtomicInteger();
 
     @Before
     public void saveConfig()
@@ -243,6 +245,81 @@ public class IndexBuildDuringCompactionTest extends SAITester
         stopCompactions(cfs, compaction);
         assertAllRowsFound("v", SSTABLES * LARGE_ROWS_PER_SSTABLE);
         assertAllRowsFound("w", SSTABLES * LARGE_ROWS_PER_SSTABLE);
+    }
+
+    /**
+     * The initial build of an index has selected its sstables when a compaction replaces them and is stopped (as a
+     * cleanup would), restoring them as other readers that the builders can't reference: the build still builds them.
+     */
+    @Test
+    public void testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped() throws Throwable
+    {
+        testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped(0);
+    }
+
+    /**
+     * As above, when only the last of the builds of the sstables the initial build missed builds them.
+     */
+    @Test
+    public void testMissedSSTablesBuiltByTheLastBuild() throws Throwable
+    {
+        testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped(StorageAttachedIndex.MAX_BUILDS_OF_MISSED_SSTABLES - 1);
+    }
+
+    private void testInitialBuildWhenCompactionReplacingItsSSTablesIsStopped(int skippedBuilds) throws Throwable
+    {
+        createTable("CREATE TABLE %s (k int PRIMARY KEY, v int, w int, pad blob)");
+        disableCompaction();
+        ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
+        createIndex(String.format(CREATE_INDEX_TEMPLATE, "v"));
+        waitForTableIndexesQueryable();
+        writeLargeSSTables();
+        DatabaseDescriptor.setSSTablePreemptiveOpenIntervalInMiB(1);
+
+        // Hold the initial build of a new index once it has selected its sstables
+        Injections.Barrier holdBuild = Injections.newBarrier("hold_initial_build_after_selection", 2, false)
+                                                 .add(InvokePointBuilder.newInvokePoint()
+                                                                        .onClass(StorageAttachedIndex.class)
+                                                                        .onMethod("findNonIndexedSSTables")
+                                                                        .atExit())
+                                                 .build();
+        Injections.inject(holdBuild);
+        String index = createIndexAsync(String.format(CREATE_INDEX_TEMPLATE, "w"));
+        waitForAssert(() -> assertThat(holdBuild.getCount()).isEqualTo(1), 60, TimeUnit.SECONDS);
+
+        // Start a compaction, hold it once it has moved the starts of its sources, and stop it
+        CompletableFuture<Void> compaction = startCompactionHeldOnceStartsAreMoved(cfs);
+        stopCompactions(cfs, compaction);
+
+        buildsToSkip.set(skippedBuilds);
+        Injections.inject(Injections.newCustom("skip_builds_of_missed_sstables")
+                                    .add(InvokePointBuilder.newInvokePoint()
+                                                           .onClass(StorageAttachedIndex.class)
+                                                           .onMethod("buildSSTables"))
+                                    .add(ActionBuilder.newActionBuilder()
+                                                      .conditions()
+                                                      .when(Expression.expr(IndexBuildDuringCompactionTest.class.getName())
+                                                                      .method("skipBuild")
+                                                                      .args())
+                                                      .actions()
+                                                      .doReturn(""))
+                                    .build());
+
+        // Let the initial build go on
+        holdBuild.countDown();
+        holdBuild.disable();
+        waitForAssert(() -> assertThat(cfs.indexManager.isIndexBuilding(index)).isFalse(), 120, TimeUnit.SECONDS);
+
+        assertThat(cfs.indexManager.isIndexQueryable(index)).isTrue();
+        assertAllRowsFound("v", SSTABLES * LARGE_ROWS_PER_SSTABLE);
+        assertAllRowsFound("w", SSTABLES * LARGE_ROWS_PER_SSTABLE);
+    }
+
+    /** Called by the injected rule at each build of the sstables an initial build missed: whether to skip it. */
+    @SuppressWarnings("unused")
+    public static boolean skipBuild()
+    {
+        return buildsToSkip.getAndDecrement() > 0;
     }
 
     private CompletableFuture<Void> startCompactionHeldOnceStartsAreMoved(ColumnFamilyStore cfs) throws Throwable
