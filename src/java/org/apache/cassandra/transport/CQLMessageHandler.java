@@ -701,9 +701,23 @@ public class CQLMessageHandler<M extends Message> extends AbstractMessageHandler
         protected void onComplete()
         {
             if (overload != Overload.NONE)
+            {
+                // the frames of an overloaded request are collected but not processed
+                releaseBuffers();
                 handleErrorAndRelease(buildOverloadedException(endpointReserveCapacity, globalReserveCapacity, overload), header);
+            }
             else if (!isCorrupt)
-                processRequest(assembleFrame(), backpressure);
+            {
+                try
+                {
+                    processRequest(assembleFrame(), backpressure);
+                }
+                finally
+                {
+                    // the request is decoded by now, and its body is a view of the buffers
+                    releaseBuffers();
+                }
+            }
         }
 
         protected void abort()
