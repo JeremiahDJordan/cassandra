@@ -143,6 +143,8 @@ public abstract class ReadCommand extends AbstractReadQuery
      */
     public static final String NON_STRICT_FILTERING_PARAM = "ds.sai.nonstrict";
     private static final byte[] NON_STRICT_FILTERING_PARAM_VALUE = { 1 };
+    private static final Map<String, byte[]> NON_STRICT_FILTERING_PARAMS =
+        Collections.singletonMap(NON_STRICT_FILTERING_PARAM, NON_STRICT_FILTERING_PARAM_VALUE);
 
     /**
      * The key of the custom message parameter that coordinators add to the reads that return static candidates (see
@@ -152,6 +154,8 @@ public abstract class ReadCommand extends AbstractReadQuery
      */
     public static final String STATIC_CANDIDATES_PARAM = "ds.static.candidates";
     private static final byte[] STATIC_CANDIDATES_PARAM_VALUE = { 1 };
+    private static final Map<String, byte[]> STATIC_CANDIDATES_PARAMS =
+        Collections.singletonMap(STATIC_CANDIDATES_PARAM, STATIC_CANDIDATES_PARAM_VALUE);
 
     // Expose the active command running so transitive calls can lookup this command.
     // This is useful for a few reasons, but mainly because the CQL query is here.
@@ -1310,7 +1314,7 @@ public abstract class ReadCommand extends AbstractReadQuery
     @VisibleForTesting
     static Message<ReadCommand> withNonStrictFilteringParam(Message<ReadCommand> message)
     {
-        return withCustomParam(message, NON_STRICT_FILTERING_PARAM, NON_STRICT_FILTERING_PARAM_VALUE);
+        return withCustomParam(message, NON_STRICT_FILTERING_PARAMS);
     }
 
     /**
@@ -1320,14 +1324,17 @@ public abstract class ReadCommand extends AbstractReadQuery
     @VisibleForTesting
     static Message<ReadCommand> withStaticCandidatesParam(Message<ReadCommand> message)
     {
-        return withCustomParam(message, STATIC_CANDIDATES_PARAM, STATIC_CANDIDATES_PARAM_VALUE);
+        return withCustomParam(message, STATIC_CANDIDATES_PARAMS);
     }
 
-    private static Message<ReadCommand> withCustomParam(Message<ReadCommand> message, String key, byte[] value)
+    private static Message<ReadCommand> withCustomParam(Message<ReadCommand> message, Map<String, byte[]> params)
     {
         Map<String, byte[]> existing = message.header.customParams();
-        Map<String, byte[]> customParams = existing == null ? new HashMap<>() : new HashMap<>(existing);
-        customParams.put(key, value);
+        if (existing == null || existing.isEmpty())
+            return message.withParam(ParamType.CUSTOM_MAP, params);
+
+        Map<String, byte[]> customParams = new HashMap<>(existing);
+        customParams.putAll(params);
         return message.withParam(ParamType.CUSTOM_MAP, customParams);
     }
 

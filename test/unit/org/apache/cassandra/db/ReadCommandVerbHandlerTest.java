@@ -144,6 +144,7 @@ public class ReadCommandVerbHandlerTest
         assertFalse(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withoutParam));
         Message<ReadCommand> withParam = ReadCommand.withNonStrictFilteringParam(withoutParam);
         assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withParam));
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(serializeRoundTrip(withParam)));
 
         // the parameter goes along with other custom parameters, and survives serialization
         Message<ReadCommand> withOtherParam = Message.builder(READ_REQ, command).from(peer()).withId(messageId()).withCustomParam("other", new byte[]{ 2 }).build();
@@ -191,6 +192,7 @@ public class ReadCommandVerbHandlerTest
         assertTrue(ReadCommandVerbHandler.coordinatorAsksForNonStrictFiltering(withParam));
         assertFalse(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(ReadCommand.withNonStrictFilteringParam(withoutParam)));
         assertTrue(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(serializeRoundTrip(withParam)));
+        assertTrue(ReadCommandVerbHandler.coordinatorAsksForStaticCandidates(serializeRoundTrip(ReadCommand.withStaticCandidatesParam(withoutParam))));
     }
 
     private static Message<ReadCommand> serializeRoundTrip(Message<ReadCommand> message) throws IOException
