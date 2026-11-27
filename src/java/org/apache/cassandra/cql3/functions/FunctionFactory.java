@@ -26,6 +26,7 @@ import java.util.stream.Collectors;
 import javax.annotation.Nullable;
 
 import org.apache.cassandra.cql3.AssignmentTestable;
+import org.apache.cassandra.cql3.ColumnSpecification;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.exceptions.InvalidRequestException;
 import org.apache.cassandra.schema.SchemaConstants;
@@ -114,6 +115,31 @@ public abstract class FunctionFactory
         }
 
         return doGetOrCreateFunction(args, types, receiverType);
+    }
+
+    /**
+     * Tests an argument of a function call that isn't assignable to its parameter type in the function that this
+     * factory built for the call, in case that type is the type inferred from the argument itself, like a collection
+     * literal of non-frozen values (see {@link AssignmentTestable#testAssignmentToInferredType}). The values are passed to
+     * the function in their frozen form.
+     *
+     * @return {@code NOT_ASSIGNABLE} if the parameter type isn't the type inferred from the argument, like a type taken
+     * from another argument (see {@link FunctionParameter#prefersTypeOfOtherArgument()})
+     */
+    public AssignmentTestable.TestResult testArgumentAgainstInferredType(String keyspace,
+                                                                         List<? extends AssignmentTestable> args,
+                                                                         int index,
+                                                                         ColumnSpecification receiver)
+    {
+        if (index >= parameters.size() || parameters.get(index).prefersTypeOfOtherArgument())
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
+        AssignmentTestable arg = args.get(index);
+        AbstractType<?> inferred = arg.getCompatibleTypeIfKnown(SchemaConstants.SYSTEM_KEYSPACE_NAME);
+        if (inferred == null || !inferred.udfType().equals(receiver.type))
+            return AssignmentTestable.TestResult.NOT_ASSIGNABLE;
+
+        return arg.testAssignmentToInferredType(keyspace, receiver);
     }
 
     protected void validateNumberOfArguments(int numArgs)

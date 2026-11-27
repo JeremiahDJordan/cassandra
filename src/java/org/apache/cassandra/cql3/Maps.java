@@ -138,12 +138,12 @@ public abstract class Maps
         AbstractType<?> valueType = null;
         for (Pair<T, T> entry : entries)
         {
-            keyType = selectType(keyType, mapper.apply(entry.left));
-            valueType = selectType(valueType, mapper.apply(entry.right));
+            keyType = Lists.selectElementType(keyType, mapper.apply(entry.left));
+            valueType = Lists.selectElementType(valueType, mapper.apply(entry.right));
         }
 
         if (keyType != null && valueType != null)
-            return MapType.getInstance(keyType, valueType, false);
+            return MapType.getInstance(keyType.freeze(), valueType.freeze(), false);
 
         return null;
     }
@@ -151,32 +151,17 @@ public abstract class Maps
     public static <T> MapType<?, ?> getPreferredCompatibleType(List<Pair<T, T>> entries,
                                                                java.util.function.Function<T, AbstractType<?>> mapper)
     {
-        Set<AbstractType<?>> keyTypes = entries.stream().map(Pair::left).map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> keyTypes = entries.stream().map(Pair::left).map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> keyType = AssignmentTestable.getCompatibleTypeIfKnown(keyTypes);
         if (keyType == null)
             return null;
 
-        Set<AbstractType<?>> valueTypes = entries.stream().map(Pair::right).map(mapper).filter(Objects::nonNull).collect(Collectors.toSet());
+        Set<AbstractType<?>> valueTypes = entries.stream().map(Pair::right).map(mapper).filter(Objects::nonNull).collect(Collectors.toCollection(LinkedHashSet::new));
         AbstractType<?> valueType = AssignmentTestable.getCompatibleTypeIfKnown(valueTypes);
         if (valueType == null)
             return null;
 
-        return  MapType.getInstance(keyType, valueType, false);
-    }
-
-    private static <T> AbstractType<?> selectType(AbstractType<?> type, AbstractType<?> otherType)
-    {
-        if (otherType == null)
-            return type;
-
-        if (type != null && !otherType.isCompatibleWith(type))
-        {
-            if (type.isCompatibleWith(otherType))
-                return type;
-
-            throw new InvalidRequestException("Invalid collection literal: all selectors must have the same CQL type inside collection literals");
-        }
-        return otherType;
+        return  MapType.getInstance(keyType.freeze(), valueType.freeze(), false);
     }
 
     public static class Literal extends Term.Raw
