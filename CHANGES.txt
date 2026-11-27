@@ -81,6 +81,7 @@
  * Avoid megamorphic calls when serializing and deserializing fixed-length values (CASSANDRA-21536)
  * Avoid megamorphic calls for Cell.timestamp/ttl/path/localDeletionTimeAsUnsignedInt methods (CASSANDRA-21526)
 Merged from 5.0:
+ * Fix short read protection losing GROUP BY groups and static rows of replicas that stop at the group limit (CASSANDRA-XXXXX)
  * Avoid needless short read protection requests in replica filtering protection when the rows that every replica returned fill the limit (CASSANDRA-XXXXX)
  * Assorted fixes for SAI replica reconciliation with multi-cell collections and range tombstones (CASSANDRA-21897)
  * Harden client STARTUP options (CASSANDRA-21755)

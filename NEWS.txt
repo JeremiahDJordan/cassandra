@@ -182,6 +182,18 @@ Upgrading
     reject sstables that would previously have been silently accepted despite being corrupted. Set
     entire_sstable_stream_digest_validation_enabled to false in cassandra.yaml to restore the old
     behavior. (CASSANDRA-21694)
+    - GROUP BY queries with a limit or a page size, at consistency levels that read several replicas, now make short
+      read protection requests when a replica returns as many groups as the limit and the reconciled result doesn't
+      have as many groups, or doesn't have all the rows of the replica's last group: such a replica may have more
+      groups, and it used to be taken for a replica without more data, so groups were lost. This applies to queries
+      over several partitions, and to queries restricted to one partition when the replicas' digests don't match.
+      When the replicas agree on the rows in those groups and stop at the group limit, no such request is made,
+      except for queries with a PER PARTITION LIMIT or a filter on a static column. The message "Requesting ... extra
+      rows from ... for short read protection" is now logged at DEBUG level instead of INFO. Replica filtering
+      protection now caches whole partitions for GROUP BY queries with a filter that are restricted to one partition,
+      as it already did for queries over several partitions, and the rows of short read protection requests add to
+      the rows it caches, so GROUP BY queries with a filter can now reach the cached_rows_fail_threshold of
+      replica_filtering_protection where they didn't before. (CASSANDRA-XXXXX)
     [The following is a placeholder, to be revised asap]
     - trickle_fsync is by default set to "true" instead of "false" in cassandra.yaml (see CASSANDRA-21572)
     - Upgrading to 5.1 is currently only supported from 4.0, 4.1 or 5.0. Clusters running earlier releases must first
