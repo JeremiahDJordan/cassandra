@@ -28,6 +28,7 @@ import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.IntPredicate;
 import java.util.stream.Collectors;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -702,21 +703,51 @@ public class MessagingService extends MessagingServiceMBeanImpl
             ConnectionType.MESSAGING_TYPES.forEach(type -> {
                 OutboundConnections connections = getOutbound(node, false);
                 OutboundConnection connection = connections != null ? connections.connectionFor(type) : null;
-                if (connection == null)
-                    return;
-
-                // a connection that isn't connected keeps the version of its last connection, or the one known when it
-                // was created, until it connects again and negotiates its version: count it with the version the node
-                // announced, capped to ours, unless that isn't known or is a DSE 6.x one, which connects on an older
-                // version
-                Integer announced = versions.getRawIfKnown(node);
-                int connectionVersion = connection.isConnected() || announced == null || announced >= VERSION_DSE_68
-                                        ? connection.messagingVersion()
-                                        : Math.min(announced, current_version);
-                if (connectionVersion < version)
+                if (connection != null && connectionVersion(node, connection) < version)
                     nodes.add(node);
             });
         }
         return nodes;
+    }
+
+    /**
+     * Whether any of our messaging connections to the given node uses a version the given predicate doesn't accept.
+     * A connection that isn't connected counts with the version we know the node announced, if we know it, capped to
+     * ours: it negotiates its version again when it connects, and until then keeps the one of its last connection, or
+     * the one known when it was created.
+     *
+     * @param node a node
+     * @param accepted the accepted messaging versions
+     * @return {@code true} if a connection to {@code node} uses a version that isn't accepted
+     */
+    public boolean hasConnectionWithVersionNotMatching(InetAddressAndPort node, IntPredicate accepted)
+    {
+        OutboundConnections connections = getOutbound(node, false);
+
+        if (connections == null)
+            return false;
+
+        for (ConnectionType type : ConnectionType.MESSAGING_TYPES)
+        {
+            OutboundConnection connection = connections.connectionFor(type);
+            if (connection != null && !accepted.test(connectionVersion(node, connection)))
+                return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * The messaging version of the given connection to the given node: the one it negotiated if it is connected, or else
+     * the version the node announced, capped to ours, unless that isn't known or is a DSE 6.x one, which connects on an
+     * older version. A connection that isn't connected keeps the version of its last connection, or the one known when
+     * it was created, until it connects again and negotiates its version.
+     */
+    private int connectionVersion(InetAddressAndPort node, OutboundConnection connection)
+    {
+        Integer announced = versions.getRawIfKnown(node);
+        return connection.isConnected() || announced == null || announced >= VERSION_DSE_68
+               ? connection.messagingVersion()
+               : Math.min(announced, current_version);
     }
 }

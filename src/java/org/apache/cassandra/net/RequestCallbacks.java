@@ -35,6 +35,7 @@ import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.db.ConsistencyLevel;
 import org.apache.cassandra.db.IMutation;
 import org.apache.cassandra.db.Mutation;
+import org.apache.cassandra.exceptions.IncompatibleMessagingVersionException;
 import org.apache.cassandra.exceptions.RequestFailureReason;
 import org.apache.cassandra.io.IVersionedAsymmetricSerializer;
 import org.apache.cassandra.locator.InetAddressAndPort;
@@ -44,6 +45,7 @@ import org.apache.cassandra.service.AbstractWriteResponseHandler;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.paxos.Commit;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.Throwables;
 
 import static java.lang.String.format;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
@@ -401,13 +403,36 @@ public class RequestCallbacks implements OutboundMessageCallbacks
     @Override
     public void onFailedSerialize(Message<?> message, InetAddressAndPort peer, int messagingVersion, int bytesWrittenToNetwork, Throwable failure)
     {
-        removeAndExpire(message, peer);
+        // A message that can't be serialized for the messaging version of the peer is never sent, and won't ever be, so
+        // fail the request right away rather than let it time out. Other failures, including the loss of the connection
+        // while a message is written, are handled like timeouts, as the request may succeed if tried again.
+        if (Throwables.isCausedBy(failure, IncompatibleMessagingVersionException.class))
+            removeAndFail(message, peer, RequestFailureReason.UNKNOWN);
+        else
+            removeAndExpire(message, peer);
     }
 
     @Override
     public void onDiscardOnClose(Message<?> message, InetAddressAndPort peer)
     {
         removeAndExpire(message, peer);
+    }
+
+    private void removeAndFail(Message<?> message, InetAddressAndPort peer, RequestFailureReason reason)
+    {
+        removeAndFail(message.id(), peer, reason);
+
+        /* in case of a write sent to a different DC, also fail all forwarding targets */
+        ForwardingInfo forwardTo = message.forwardTo();
+        if (null != forwardTo)
+            forwardTo.forEach((id, target) -> removeAndFail(id, target, reason));
+    }
+
+    private void removeAndFail(long id, InetAddressAndPort peer, RequestFailureReason reason)
+    {
+        CallbackInfo info = remove(id, peer);
+        if (null != info && info.invokeOnFailure())
+            INTERNAL_RESPONSE.submit(() -> info.callback.onFailure(info.peer, reason));
     }
 
     private void removeAndExpire(Message message, InetAddressAndPort peer)

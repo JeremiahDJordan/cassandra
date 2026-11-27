@@ -68,6 +68,7 @@ import org.apache.cassandra.metrics.TableMetrics;
 import org.apache.cassandra.sensors.SensorsCustomParams;
 import org.apache.cassandra.schema.ColumnMetadata;
 import org.apache.cassandra.schema.Schema;
+import org.apache.cassandra.schema.SchemaConstants;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.schema.TableMetadataRef;
 import org.apache.cassandra.cql3.restrictions.StatementRestrictions;
@@ -442,6 +443,12 @@ public class SelectStatement implements CQLStatement.SingleKeyspaceCqlStatement
         DataLimits dataLimits = getDataLimits(queryState, userLimit, perPartitionLimit, userOffset);
         IndexRegistry indexRegistry = IndexRegistry.obtain(table);
         RowFilter rowFilter = getRowFilter(options, queryState, indexRegistry);
+
+        // Reject the DataStax-only parts of the filter (operators, OR...) while there are nodes that can't
+        // deserialize them, such as Apache Cassandra nodes during an upgrade. Local tables are never sent to them.
+        // Other queries that only run locally (e.g. internal ones) are rejected too, as where they run isn't known here.
+        if (!table.isVirtual() && !SchemaConstants.isLocalSystemKeyspace(table.keyspace))
+            rowFilter.validateForPeers(table.keyspace, options.getConsistency());
 
         ReadQuery query = restrictions.isKeyRange()
                         ? getRangeCommand(queryState, options, columnFilter, rowFilter, dataLimits, nowInSec)
