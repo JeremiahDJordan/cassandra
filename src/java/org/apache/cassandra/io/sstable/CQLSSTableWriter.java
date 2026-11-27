@@ -589,7 +589,7 @@ public class CQLSSTableWriter implements Closeable
                 maxSSTableSizeInMiB = sorted ? -1L : DEFAULT_BUFFER_SIZE_IN_MIB_FOR_UNSORTED;
             }
 
-            synchronized (Schema.instance)
+            synchronized (CQLSSTableWriter.class)
             {
 
                 String keyspaceName = schemaStatement.keyspace();
