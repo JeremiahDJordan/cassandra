@@ -38,6 +38,8 @@ import javax.annotation.Nullable;
 import com.googlecode.concurrenttrees.radix.ConcurrentRadixTree;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
+import org.apache.cassandra.db.Clustering;
+import org.apache.cassandra.db.ClusteringComparator;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.AsciiType;
 import org.apache.cassandra.db.marshal.BooleanType;
@@ -49,6 +51,7 @@ import org.apache.cassandra.db.marshal.DecimalType;
 import org.apache.cassandra.db.marshal.InetAddressType;
 import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.LongType;
+import org.apache.cassandra.db.marshal.TupleType;
 import org.apache.cassandra.db.marshal.UTF8Type;
 import org.apache.cassandra.db.marshal.VectorType;
 import org.apache.cassandra.db.rows.Cell;
@@ -323,6 +326,61 @@ public class TypeUtil
         else if (isFrozen(type) && !type.isVector() && hasNonUniqueSerialization(type))
             return canonicalize(value, type);
         return value;
+    }
+
+    /**
+     * Whether the clustering has an empty value, such as {@code blobAsInt(0x)}, in a field of a tuple or UDT (also
+     * nested in another one or in a frozen collection) of a type that encodes an empty value as null. The field then
+     * has the byte-comparable form of a null field, which sorts before it, so the byte-comparable order of primary
+     * keys, which SAI requires to be the order of the rows, can differ from it, and the row decodes with a null field.
+     */
+    public static boolean hasEmptyFieldEncodedAsNull(ClusteringComparator comparator, Clustering<?> clustering)
+    {
+        for (int i = 0; i < clustering.size(); i++)
+        {
+            ByteBuffer value = clustering.bufferAt(i);
+            if (value != null && hasEmptyFieldEncodedAsNull(comparator.subtype(i), value))
+                return true;
+        }
+        return false;
+    }
+
+    private static boolean hasEmptyFieldEncodedAsNull(AbstractType<?> type, ByteBuffer value)
+    {
+        type = type.unwrap();
+        if (!value.hasRemaining())
+            return false;
+
+        if (type instanceof TupleType)
+        {
+            TupleType tupleType = (TupleType) type;
+            ByteBuffer[] fields = tupleType.split(ByteBufferAccessor.instance, value);
+            for (int i = 0; i < fields.length; i++)
+            {
+                ByteBuffer field = fields[i];
+                if (field == null)
+                    continue;
+                AbstractType<?> fieldType = tupleType.type(i).unwrap();
+                if (field.hasRemaining() ? hasEmptyFieldEncodedAsNull(fieldType, field)
+                                         : fieldType.asComparableBytes(ByteBufferAccessor.instance, field, BYTE_COMPARABLE_VERSION) == null)
+                    return true;
+            }
+        }
+        else if (type instanceof CollectionType)
+        {
+            // the elements of a frozen list or set, or the keys and values of a frozen map
+            List<AbstractType<?>> elementTypes = type.subTypes();
+            int count = CollectionSerializer.readCollectionSize(value, ByteBufferAccessor.instance) * elementTypes.size();
+            int offset = CollectionSerializer.sizeOfCollectionSize();
+            for (int i = 0; i < count; i++)
+            {
+                ByteBuffer element = CollectionSerializer.readValue(value, ByteBufferAccessor.instance, offset);
+                offset += CollectionSerializer.sizeOfValue(element, ByteBufferAccessor.instance);
+                if (element != null && hasEmptyFieldEncodedAsNull(elementTypes.get(i % elementTypes.size()), element))
+                    return true;
+            }
+        }
+        return false;
     }
 
     /**
