@@ -19,6 +19,7 @@
 package org.apache.cassandra.utils.concurrent;
 
 import java.lang.ref.WeakReference;
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
@@ -33,6 +34,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.Assert;
 import org.junit.Test;
+
+import org.awaitility.Awaitility;
 
 import org.apache.cassandra.io.util.File;
 import org.apache.cassandra.io.util.FileUtils;
@@ -88,6 +91,30 @@ public class RefCountedTest
         System.gc();
         Thread.sleep(1000);
         Assert.assertTrue(tidier.tidied);
+    }
+
+    @Test
+    public void testOnLeak()
+    {
+        Queue<Object> leaked = new ConcurrentLinkedQueue<>();
+        Ref.setOnLeak(leaked::add);
+        try
+        {
+            Ref<?> ref = new Ref(null, new Tidier());
+            Object state = ref.state;
+            ref = null;
+            Awaitility.await().atMost(Duration.ofSeconds(30)).pollDelay(Duration.ofSeconds(1)).untilAsserted(() -> {
+                System.gc();
+                System.gc();
+                System.gc();
+                System.gc();
+                Assert.assertTrue(leaked.contains(state));
+            });
+        }
+        finally
+        {
+            Ref.setOnLeak(null);
+        }
     }
 
     @Test
