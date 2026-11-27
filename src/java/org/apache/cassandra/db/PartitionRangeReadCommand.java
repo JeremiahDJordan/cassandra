@@ -20,6 +20,8 @@ package org.apache.cassandra.db;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
+import com.google.common.annotations.VisibleForTesting;
+
 import org.apache.cassandra.cql3.CqlBuilder;
 import org.apache.cassandra.db.marshal.Redaction;
 import org.apache.cassandra.db.memtable.Memtable;
