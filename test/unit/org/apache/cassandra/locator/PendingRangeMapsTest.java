@@ -24,6 +24,7 @@ import java.net.UnknownHostException;
 
 import org.junit.Test;
 
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.dht.RandomPartitioner.BigIntegerToken;
 import org.apache.cassandra.dht.Range;
 import org.apache.cassandra.dht.Token;
@@ -35,6 +36,11 @@ import static org.junit.Assert.assertTrue;
 
 public class PendingRangeMapsTest
 {
+    static
+    {
+        DatabaseDescriptor.clientInitialization();
+    }
+
     private Range<Token> genRange(String left, String right)
     {
         return new Range<>(new BigIntegerToken(left), new BigIntegerToken(right));
