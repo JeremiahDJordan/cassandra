@@ -97,6 +97,12 @@ public final class Ref<T> implements RefCounted<T>
 {
     static final Logger logger = LoggerFactory.getLogger(Ref.class);
     public static final boolean DEBUG_ENABLED = System.getProperty("cassandra.debugrefcount", "false").equalsIgnoreCase("true");
+    static OnLeak ON_LEAK;
+
+    public interface OnLeak
+    {
+        void onLeak(Object state);
+    }
 
     final State state;
     final T referent;
@@ -260,6 +266,9 @@ public final class Ref<T> implements RefCounted<T>
             logger.error("LEAK DETECTED: a reference ({}) to {} was not released before the reference was garbage collected", id, globalState);
             if (DEBUG_ENABLED)
                 debug.log(id);
+            OnLeak onLeak = ON_LEAK;
+            if (onLeak != null)
+                onLeak.onLeak(this);
         }
     }
 
@@ -783,6 +792,11 @@ public final class Ref<T> implements RefCounted<T>
                 }
             }
         }
+    }
+
+    public static void setOnLeak(OnLeak onLeak)
+    {
+        ON_LEAK = onLeak;
     }
 
     @VisibleForTesting
