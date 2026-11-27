@@ -204,7 +204,7 @@ final class HintsDispatchExecutor
         {
             this.store = store;
             this.hostId = hostId;
-            this.rateLimiter = HintsRateLimiterFactory.instance.create(hostId);
+            this.rateLimiter = HintsRateLimiterFactory.instance.create(hostId, isTransfer);
         }
 
         DispatchHintsTask(HintsStore store, UUID hostId)
