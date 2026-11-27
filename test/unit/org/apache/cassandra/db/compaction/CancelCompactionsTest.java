@@ -511,7 +511,7 @@ public class CancelCompactionsTest extends CQLTester
         try
         {
             // force release should report the sessions as unsuccessful rather than throwing
-            CleanupSummary summary = cfs.releaseRepairData(sessions, true);
+            CleanupSummary summary = ActiveRepairService.instance.consistent.local.releaseRepairData(cfs, sessions, true);
             assertTrue(summary.successful.isEmpty());
             assertEquals(sessions, summary.unsuccessful);
         }

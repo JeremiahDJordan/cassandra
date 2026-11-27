@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -358,7 +359,8 @@ public class LocalSessions
         return releaseRepairData(cfs, sessionIds, force);
     }
 
-    private CleanupSummary releaseRepairData(ColumnFamilyStore cfs, Collection<UUID> sessions, boolean force)
+    @VisibleForTesting
+    public CleanupSummary releaseRepairData(ColumnFamilyStore cfs, Collection<UUID> sessions, boolean force)
     {
         if (force)
         {
@@ -366,8 +368,15 @@ public class LocalSessions
                 UUID session = sst.getPendingRepair();
                 return session != null && sessions.contains(session);
             };
-            return cfs.runWithCompactionsDisabled(() -> doReleaseRepairData(cfs, sessions),
-                                                  predicate, false, true, true, TableOperation.StopTrigger.CLEANUP);
+            CleanupSummary summary = cfs.runWithCompactionsDisabled(() -> doReleaseRepairData(cfs, sessions),
+                                                                    predicate, false, true, true, TableOperation.StopTrigger.CLEANUP);
+            if (summary == null)
+            {
+                logger.warn("Unable to cancel in-progress compactions for {}.{}, could not force release repair data for sessions {}",
+                            cfs.keyspace.getName(), cfs.name, sessions);
+                return new CleanupSummary(cfs, Collections.emptySet(), new HashSet<>(sessions));
+            }
+            return summary;
         }
         else
         {
