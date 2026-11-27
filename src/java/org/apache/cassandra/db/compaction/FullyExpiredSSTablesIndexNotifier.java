@@ -21,6 +21,7 @@ package org.apache.cassandra.db.compaction;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
+import javax.annotation.Nullable;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -30,6 +31,8 @@ import org.apache.cassandra.db.WriteContext;
 import org.apache.cassandra.db.rows.Row;
 import org.apache.cassandra.db.rows.Unfiltered;
 import org.apache.cassandra.db.rows.UnfilteredRowIterator;
+import org.apache.cassandra.dht.Range;
+import org.apache.cassandra.dht.Token;
 import org.apache.cassandra.index.Index;
 import org.apache.cassandra.index.SecondaryIndexManager;
 import org.apache.cassandra.index.transactions.IndexTransaction;
@@ -60,17 +63,19 @@ public final class FullyExpiredSSTablesIndexNotifier
 
     /**
      * Calls {@link Index.Indexer#removeRow(Row)} for every row (including static rows) of the given fully expired
-     * SSTables, for every index of the realm that asks for it.
+     * SSTables within the given token range, for every index of the realm that asks for it.
      * <p>
      * This is best-effort: a failure to read an SSTable or a failure in an indexer is logged, and doesn't prevent the
      * SSTable from being dropped.
      *
      * @param realm the realm the SSTables belong to
      * @param fullyExpiredSSTables the fully expired SSTables that are about to be dropped
+     * @param range the token range of the operation, or null for the whole SSTables
      * @param operationId the id of the operation that drops the SSTables, for logging
      */
     public static void notifyIndexes(CompactionRealm realm,
                                      Collection<? extends CompactionSSTable> fullyExpiredSSTables,
+                                     @Nullable Range<Token> range,
                                      TimeUUID operationId)
     {
         if (fullyExpiredSSTables.isEmpty())
@@ -111,7 +116,7 @@ public final class FullyExpiredSSTablesIndexNotifier
                 // A read error (e.g. a corrupt SSTable that is fully expired) or a failure in a custom indexer must not
                 // silently leave the SSTable undropped, or every subsequent compaction would hit the same failure,
                 // leaving the expired SSTables permanently stuck.
-                try (ISSTableScanner scanner = ((SSTableReader) expiredSSTable).getScanner())
+                try (ISSTableScanner scanner = ((SSTableReader) expiredSSTable).getScanner(range))
                 {
                     while (scanner.hasNext())
                     {
