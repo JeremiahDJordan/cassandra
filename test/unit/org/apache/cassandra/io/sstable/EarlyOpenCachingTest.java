@@ -77,7 +77,7 @@ public class EarlyOpenCachingTest extends CQLTester
         {
             String pkey = getRandom().nextAsciiString(10, 10);
             for (int j = 0; j < 100; j++)
-                execute("INSERT INTO %s (pkey, ckey, val) VALUES (?, ?, ?)", pkey, "" + j, ByteBuffer.allocate(1000));
+                execute("INSERT INTO %s (pkey, ckey, val) VALUES (?, ?, ?)", pkey, "" + j, ByteBuffer.allocate(300));
         }
         flush();
         ColumnFamilyStore cfs = getCurrentColumnFamilyStore();
