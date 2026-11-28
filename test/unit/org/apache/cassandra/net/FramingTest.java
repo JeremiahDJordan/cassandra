@@ -26,6 +26,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import org.junit.AfterClass;
@@ -37,6 +39,9 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.channel.embedded.EmbeddedChannel;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.io.IVersionedSerializer;
 import org.apache.cassandra.io.compress.BufferType;
@@ -163,6 +168,139 @@ public class FramingTest
         frames.release();
         Assert.assertNull(decoder.stash);
         Assert.assertTrue(decoder.frames.isEmpty());
+    }
+
+    @Test
+    public void testCorruptHeaderSplitAcrossReads()
+    {
+        FrameDecoder decoder = FrameDecoderCrc.create(GlobalBufferPoolAllocator.instance);
+        AtomicBoolean inactive = new AtomicBoolean();
+        EmbeddedChannel channel = channel(decoder, inactive);
+        List<FrameDecoder.Frame> frames = new ArrayList<>();
+        decoder.activate(frames::add);
+
+        ByteBuf frame = crcFrame();
+        // flip a bit of the header CRC
+        frame.setByte(4, frame.getByte(4) ^ 1);
+        channel.writeInbound(copy(frame, 0, 3));
+        channel.writeInbound(copy(frame, 3, frame.readableBytes() - 3));
+        frame.release();
+
+        Assert.assertEquals(1, frames.size());
+        Assert.assertTrue(frames.get(0) instanceof FrameDecoder.CorruptFrame);
+        Assert.assertNull(decoder.stash);
+
+        channel.close();
+        Assert.assertTrue(inactive.get());
+    }
+
+    @Test
+    public void testReadAfterDiscard()
+    {
+        FrameDecoder decoder = FrameDecoderCrc.create(GlobalBufferPoolAllocator.instance);
+        AtomicBoolean inactive = new AtomicBoolean();
+        EmbeddedChannel channel = channel(decoder, inactive);
+        // consumes the first frame and stops, as a handler does after a fatal error in the frame's last message
+        decoder.activate(frame -> {
+            ((FrameDecoder.IntactFrame) frame).consume();
+            decoder.discard();
+            return false;
+        });
+
+        ByteBuf first = crcFrame();
+        ByteBuf second = crcFrame();
+        // two reads in one read loop
+        channel.writeInbound(copy(first, 0, first.readableBytes()), copy(second, 0, second.readableBytes()));
+        first.release();
+        second.release();
+
+        Assert.assertTrue(decoder.frames.isEmpty());
+        channel.close();
+        Assert.assertTrue(inactive.get());
+    }
+
+    @Test
+    public void testDiscardAfterDeferredClose() throws IOException
+    {
+        CountingAllocator allocator = new CountingAllocator();
+        FrameDecoder decoder = FrameDecoderCrc.create(allocator);
+        EmbeddedChannel channel = channel(decoder, new AtomicBoolean());
+        AtomicInteger deliveries = new AtomicInteger();
+        // pauses on the first delivery, then discards on the next, as a handler does after a fatal error
+        decoder.activate(frame -> {
+            if (deliveries.getAndIncrement() > 0)
+                decoder.discard();
+            return false;
+        });
+
+        ByteBuf frame = crcFrame();
+        channel.writeInbound(copy(frame, 0, frame.readableBytes()));
+        frame.release();
+        channel.close();
+        Assert.assertEquals(0, allocator.released.get());
+
+        decoder.reactivate();
+        Assert.assertTrue(decoder.frames.isEmpty());
+        Assert.assertEquals(1, allocator.released.get());
+    }
+
+    @Test
+    public void testReactivateAfterDiscard() throws IOException
+    {
+        CountingAllocator allocator = new CountingAllocator();
+        FrameDecoder decoder = FrameDecoderCrc.create(allocator);
+        EmbeddedChannel channel = channel(decoder, new AtomicBoolean());
+        decoder.activate(frame -> {
+            ((FrameDecoder.IntactFrame) frame).consume();
+            return false;
+        });
+
+        ByteBuf frame = crcFrame();
+        channel.writeInbound(copy(frame, 0, frame.readableBytes()));
+        frame.release();
+        decoder.discard();
+        channel.close();
+        Assert.assertEquals(1, allocator.released.get());
+
+        decoder.reactivate();
+        Assert.assertFalse(decoder.isActive());
+        Assert.assertEquals(1, allocator.released.get());
+    }
+
+    private static class CountingAllocator extends BufferPoolAllocator
+    {
+        final AtomicInteger released = new AtomicInteger();
+
+        @Override
+        void release()
+        {
+            released.incrementAndGet();
+        }
+    }
+
+    private static EmbeddedChannel channel(FrameDecoder decoder, AtomicBoolean inactive)
+    {
+        return new EmbeddedChannel(decoder, new ChannelInboundHandlerAdapter()
+        {
+            @Override
+            public void channelInactive(ChannelHandlerContext ctx)
+            {
+                inactive.set(true);
+            }
+        });
+    }
+
+    private static ByteBuf crcFrame()
+    {
+        FrameEncoder.Payload payload = FrameEncoderCrc.instance.allocator().allocate(true, 32);
+        payload.buffer.put(new byte[32]);
+        payload.finish();
+        return FrameEncoderCrc.instance.encode(true, payload.buffer);
+    }
+
+    private static ByteBuf copy(ByteBuf from, int index, int length)
+    {
+        return GlobalBufferPoolAllocator.instance.directBuffer(length).writeBytes(from, index, length);
     }
 
     private static void verify(byte[] expect, ShareableBytes actual)

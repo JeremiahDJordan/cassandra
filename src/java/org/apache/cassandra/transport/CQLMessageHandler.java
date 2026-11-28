@@ -308,6 +308,7 @@ public class CQLMessageHandler<M extends Message> extends AbstractMessageHandler
             // transform the exception to a fatal one so the exception handler closes the channel
             if (!exception.isFatal())
                 exception = ProtocolException.toFatalException(exception);
+            decoder.discard();
             handleError(exception, streamId);
             return false;
         }
@@ -379,6 +380,7 @@ public class CQLMessageHandler<M extends Message> extends AbstractMessageHandler
                     e = new ProtocolException("Error encountered decoding CQL message: " + e.getMessage());
                 }
                 e = ProtocolException.toFatalException((ProtocolException) e);
+                decoder.discard();
                 continueProcessing = false;
             }
             handleErrorAndRelease(e, request.header);
@@ -489,6 +491,7 @@ public class CQLMessageHandler<M extends Message> extends AbstractMessageHandler
             {
                 // Hard fail on any decoding error as we can't trust the subsequent frames of
                 // the large message
+                decoder.discard();
                 handleError(ProtocolException.toFatalException(extracted.error()));
                 return false;
             }
@@ -642,6 +645,7 @@ public class CQLMessageHandler<M extends Message> extends AbstractMessageHandler
                 processSubsequentFrameOfLargeMessage(frame);
         }
 
+        decoder.discard();
         handleError(ProtocolException.toFatalException(new ProtocolException(error)));
     }
 
