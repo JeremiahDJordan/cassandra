@@ -238,11 +238,11 @@ public class TypeUtil
     public static void toComparableBytes(ByteBuffer value, AbstractType<?> type, byte[] bytes)
     {
         if (isInetAddress(type))
-            ByteBufferUtil.arrayCopy(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, 16);
+            ByteBufferUtil.arrayCopy(value, value.position(), bytes, 0, 16);
         else if (isBigInteger(type))
-            ByteBufferUtil.arrayCopy(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, 20);
+            ByteBufferUtil.arrayCopy(value, value.position(), bytes, 0, 20);
         else if (type instanceof DecimalType)
-            ByteBufferUtil.arrayCopy(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, DECIMAL_APPROXIMATION_BYTES);
+            ByteBufferUtil.arrayCopy(value, value.position(), bytes, 0, DECIMAL_APPROXIMATION_BYTES);
         else
             ByteSourceInverse.readBytesMustFit(type.asComparableBytes(value, BYTE_COMPARABLE_VERSION), bytes);
     }
@@ -421,7 +421,7 @@ public class TypeUtil
     {
         if (value.remaining() == 4)
         {
-            int position = value.hasArray() ? value.arrayOffset() + value.position() : value.position();
+            int position = value.position();
             ByteBuffer mapped = ByteBuffer.allocate(16);
             System.arraycopy(IPV4_PREFIX, 0, mapped.array(), 0, IPV4_PREFIX.length);
             ByteBufferUtil.arrayCopy(value, position, mapped, IPV4_PREFIX.length, value.remaining());
@@ -455,7 +455,7 @@ public class TypeUtil
     public static ByteBuffer encodeBigInteger(ByteBuffer value)
     {
         int size = value.remaining();
-        int position = value.hasArray() ? value.arrayOffset() + value.position() : value.position();
+        int position = value.position();
         byte[] bytes = new byte[20];
         if (size < 16)
         {
