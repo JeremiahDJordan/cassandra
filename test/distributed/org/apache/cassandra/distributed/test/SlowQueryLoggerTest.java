@@ -151,7 +151,7 @@ public class SlowQueryLoggerTest extends TestBaseImpl
     public void testLogsReadMetrics()
     {
         cluster.schemaChange(format("CREATE TABLE %s.%s (k int, c int, v int, l int, s int, PRIMARY KEY (k, c))"));
-        cluster.schemaChange(format("CREATE INDEX legacy_idx ON %s.%s (l)"));
+        cluster.schemaChange(format("CREATE INDEX legacy_idx ON %s.%s (l) USING 'legacy_local_table'"));
         cluster.schemaChange(format("CREATE CUSTOM INDEX sai_idx ON %s.%s (s) USING 'StorageAttachedIndex'"));
         int numPartitions = 10;
         int numClusterings = 10;
