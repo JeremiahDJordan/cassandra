@@ -50,6 +50,26 @@ public class FastByteOperationsTest
         testCopy(bytes1, wrap1(bytes1, false), wrap2(empty, false), UO);
     }
 
+    @Test
+    public void testFastByteCopyFromArray()
+    {
+        byte[] bytes1 = new byte[128];
+        rand.nextBytes(bytes1);
+        testCopy(bytes1, wrap2(new byte[128], true), PJO);
+        testCopy(bytes1, wrap2(new byte[128], false), PJO);
+        testCopy(bytes1, wrap2(new byte[128], true), UO);
+        testCopy(bytes1, wrap2(new byte[128], false), UO);
+    }
+
+    private void testCopy(byte[] canon, ByteBuffer trg, FastByteOperations.ByteOperations ops)
+    {
+        byte[] result = new byte[canon.length - 10];
+        int trgPosition = trg.position() + 5;
+        ops.copy(canon, 10, trg, trgPosition, result.length);
+        ops.copy(trg, trgPosition, result, 0, result.length);
+        assert firstdiff(Arrays.copyOfRange(canon, 10, canon.length), result) < 0;
+    }
+
     private void testCopy(byte[] canon, ByteBuffer src, ByteBuffer trg, FastByteOperations.ByteOperations ops)
     {
         byte[] result = new byte[src.remaining()];
@@ -114,6 +134,18 @@ public class FastByteOperationsTest
         buf.limit(buf.position() + bytes.length);
         buf.duplicate().put(bytes);
         return buf;
+    }
+
+    @Test
+    public void testFastByteComparisonOfBufferRange()
+    {
+        byte[] bytes = new byte[128];
+        rand.nextBytes(bytes);
+        for (ByteBuffer buffer : new ByteBuffer[]{ wrap1(bytes, false), wrap1(bytes, true) })
+        {
+            assert PJO.compare(buffer, buffer.position(), bytes.length - 10, bytes, 0, bytes.length - 10) == 0;
+            assert UO.compare(buffer, buffer.position(), bytes.length - 10, bytes, 0, bytes.length - 10) == 0;
+        }
     }
 
     private void testComparisons(byte[] bytes1, byte[] bytes2)
