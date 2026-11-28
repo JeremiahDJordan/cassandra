@@ -84,6 +84,7 @@ import org.apache.cassandra.index.sai.disk.format.IndexComponentType;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
 import org.apache.cassandra.index.sai.disk.format.Version;
 import org.apache.cassandra.index.sai.disk.v1.SegmentBuilder;
+import org.apache.cassandra.index.sai.metrics.TableQueryMetrics;
 import org.apache.cassandra.index.sai.plan.Plan;
 import org.apache.cassandra.index.sai.plan.StorageAttachedIndexQueryPlan;
 import org.apache.cassandra.index.sai.plan.StorageAttachedIndexSearcher;
@@ -262,6 +263,35 @@ public class SAITester extends CQLTester
     public void removeAllInjections()
     {
         Injections.deleteAll();
+    }
+
+    /** Set by tests whose row count estimates fail on purpose. */
+    protected boolean expectEstimateFailures = false;
+
+    /**
+     * Fails the test if a row count estimate failed, unless {@link #expectEstimateFailures} is set.
+     */
+    @After
+    public void checkNoEstimateFailed()
+    {
+        if (expectEstimateFailures || Schema.instance.getKeyspaceInstance(KEYSPACE) == null)
+            return;
+
+        for (ColumnFamilyStore cfs : Keyspace.open(KEYSPACE).getColumnFamilyStores())
+            assertEquals("Row count estimates failed in the queries of " + cfs.name +
+                         " (see the warnings of QueryController)", 0, estimateFailures(cfs));
+    }
+
+    /**
+     * Returns the TotalEstimateFailures table query metric of the table, 0 if it has no SAI index.
+     */
+    protected static long estimateFailures(ColumnFamilyStore cfs)
+    {
+        StorageAttachedIndexGroup group = StorageAttachedIndexGroup.getIndexGroup(cfs);
+        TableQueryMetrics metrics = group == null ? null : group.queryMetrics();
+        TableQueryMetrics.PerTable all =
+            metrics == null ? null : metrics.perTableMetrics.get(TableQueryMetrics.QueryKind.ALL);
+        return all == null ? 0 : all.totalEstimateFailures.getCount();
     }
 
     /**
