@@ -262,7 +262,7 @@ public class FastByteOperations
             if (trg.hasArray())
                 System.arraycopy(src, srcPosition, trg.array(), trg.arrayOffset() + trgPosition, length);
             else
-                copy(null, srcPosition + theUnsafe.getLong(src, Unsafe.ARRAY_BYTE_BASE_OFFSET), trg, trgPosition, length);
+                copy((Object) src, (long) srcPosition + Unsafe.ARRAY_BYTE_BASE_OFFSET, trg, trgPosition, length);
         }
 
         public void copy(ByteBuffer srcBuf, int srcPosition, ByteBuffer trgBuf, int trgPosition, int length)
@@ -445,11 +445,9 @@ public class FastByteOperations
             if (buffer1.hasArray())
                 return compare(buffer1.array(), buffer1.arrayOffset() + position1, length1, buffer2, offset2, length2);
 
-            if (position1 != buffer1.position())
-            {
-                buffer1 = buffer1.duplicate();
-                buffer1.position(position1);
-            }
+            buffer1 = buffer1.duplicate();
+            buffer1.position(position1);
+            buffer1.limit(position1 + length1);
 
             return compare(buffer1, ByteBuffer.wrap(buffer2, offset2, length2));
         }
@@ -505,7 +503,9 @@ public class FastByteOperations
                 System.arraycopy(src, srcPosition, trg.array(), trg.arrayOffset() + trgPosition, length);
                 return;
             }
-            trg.duplicate().put(src, srcPosition, length);
+            trg = trg.duplicate();
+            trg.position(trgPosition);
+            trg.put(src, srcPosition, length);
         }
 
         public void copy(ByteBuffer src, int srcPosition, ByteBuffer trg, int trgPosition, int length)
