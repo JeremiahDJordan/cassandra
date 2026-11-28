@@ -151,11 +151,14 @@ public class CommitLogPolicyBytemanTest
         Assert.assertFalse(CommitLog.instance.shouldRejectMutations());
 
         failSync = true;
+        // the sync thread can be parked for the whole sync period, so wake it
+        CommitLog.instance.requestExtraSync();
         await().atMost(2, TimeUnit.SECONDS)
                 .until(() -> CommitLog.instance.shouldRejectMutations());
         Assert.assertThrows(FSWriteError.class, () -> CommitLog.instance.add(m));
 
         failSync = false;
+        CommitLog.instance.requestExtraSync();
         await().atMost(2, TimeUnit.SECONDS)
                 .until(() -> !CommitLog.instance.shouldRejectMutations());
         CommitLog.instance.add(m);
