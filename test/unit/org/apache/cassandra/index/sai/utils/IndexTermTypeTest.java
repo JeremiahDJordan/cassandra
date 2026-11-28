@@ -18,7 +18,9 @@
 
 package org.apache.cassandra.index.sai.utils;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collections;
@@ -32,6 +34,8 @@ import org.apache.cassandra.cql3.FieldIdentifier;
 import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CompositeType;
+import org.apache.cassandra.db.marshal.DecimalType;
+import org.apache.cassandra.db.marshal.InetAddressType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.ListType;
@@ -49,6 +53,7 @@ import org.apache.cassandra.utils.ByteBufferUtil;
 import org.apache.cassandra.utils.bytecomparable.ByteComparable;
 
 import static org.apache.cassandra.index.sai.SAITester.getRandom;
+import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertTrue;
@@ -284,5 +289,44 @@ public class IndexTermTypeTest
             ByteComparable t1 = ByteComparable.fixedLength(b1);
             assertTrue("#" + i, ByteComparable.compare(t0, t1, ByteComparable.Version.OSS50) <= 0);
         }
+    }
+
+    @Test
+    public void testEncodeHeapBufferWithArrayOffset() throws Exception
+    {
+        testEncodeWithArrayOffset(InetAddressType.instance, InetAddressType.instance.decompose(InetAddress.getByName("127.0.0.1")));
+        testEncodeWithArrayOffset(InetAddressType.instance, InetAddressType.instance.decompose(InetAddress.getByName("2001:db8::1")));
+        testEncodeWithArrayOffset(IntegerType.instance, IntegerType.instance.decompose(BigInteger.valueOf(-123456789)));
+        testEncodeWithArrayOffset(IntegerType.instance, IntegerType.instance.decompose(BigInteger.valueOf(13).pow(100)));
+        testEncodeWithArrayOffset(DecimalType.instance, DecimalType.instance.decompose(new BigDecimal("-12345678.9")));
+    }
+
+    private static void testEncodeWithArrayOffset(AbstractType<?> type, ByteBuffer raw)
+    {
+        IndexTermType indexTermType = indexTermType(type, IndexTarget.Type.SIMPLE);
+        ByteBuffer encoded = indexTermType.asIndexBytes(raw);
+        assertEquals(encoded, indexTermType.asIndexBytes(withArrayOffset(raw)));
+
+        byte[] expected = new byte[indexTermType.fixedSizeOf()];
+        indexTermType.toComparableBytes(encoded, expected);
+        byte[] actual = new byte[indexTermType.fixedSizeOf()];
+        indexTermType.toComparableBytes(withArrayOffset(encoded), actual);
+        assertArrayEquals(expected, actual);
+    }
+
+    /**
+     * Returns a heap buffer with the content of {@code value} at a non-zero position, over an array that starts at a
+     * non-zero offset, with other bytes around it.
+     */
+    private static ByteBuffer withArrayOffset(ByteBuffer value)
+    {
+        byte[] array = new byte[value.remaining() + 64];
+        Arrays.fill(array, (byte) 0x5a);
+        ByteBuffer buffer = ByteBuffer.wrap(array, 16, array.length - 16).slice();
+        buffer.position(16);
+        buffer.put(value.duplicate());
+        buffer.limit(buffer.position()).position(16);
+        assertEquals(16, buffer.arrayOffset());
+        return buffer;
     }
 }
