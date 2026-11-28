@@ -17,6 +17,7 @@
 package org.apache.cassandra.index.sai;
 
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 import com.google.common.collect.Iterables;
@@ -26,6 +27,7 @@ import org.junit.Test;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.index.sai.disk.StorageAttachedIndexWriter;
 import org.apache.cassandra.index.sai.disk.format.IndexDescriptor;
+import org.apache.cassandra.index.sai.disk.io.IndexFileUtils;
 import org.apache.cassandra.inject.ActionBuilder;
 import org.apache.cassandra.inject.Expression;
 import org.apache.cassandra.inject.Injection;
@@ -88,6 +90,28 @@ public class StorageAttachedIndexBuilderTest extends SAITester
         {
             columnFamilyStore = null;
         }
+    }
+
+    @Test
+    public void testRebuildDoesNotRecomputeChecksumsOfDeletedComponents() throws Throwable
+    {
+        createTable("CREATE TABLE %s (id text PRIMARY KEY, value text)");
+        String index = createIndex(String.format(CREATE_INDEX_TEMPLATE, "value"));
+        execute("INSERT INTO %s (id, value) VALUES ('k1', 'v1')");
+        flush();
+
+        // the rebuild deletes the components and writes them again under the same names
+        Injections.Counter recomputes = Injections.newCounter("checksum_recomputes_" + UUID.randomUUID())
+                                                  .add(InvokePointBuilder.newInvokePoint()
+                                                                         .onClass(IndexFileUtils.class.getName() + "$IncrementalChecksumSequentialWriter")
+                                                                         .onMethod("recalculateFileChecksum"))
+                                                  .build();
+        Injections.inject(recomputes);
+
+        rebuildIndexes(index);
+
+        assertThat(recomputes.get()).isZero();
+        assertThat(verifyChecksum(getIndexContext(index))).isTrue();
     }
 
     // called by byteman
