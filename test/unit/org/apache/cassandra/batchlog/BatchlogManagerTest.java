@@ -32,6 +32,7 @@ import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.schema.Schema;
 import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.cql3.UntypedResultSet;
 import org.apache.cassandra.db.ColumnFamilyStore;
 import org.apache.cassandra.db.DecoratedKey;
@@ -68,6 +69,7 @@ public class BatchlogManagerTest
     private static final String CF_STANDARD3 = "Standard3";
     private static final String CF_STANDARD4 = "Standard4";
     private static final String CF_STANDARD5 = "Standard5";
+    private static final String CF_DROPPED = "Dropped";
 
     static PartitionerSwitcher sw;
 
@@ -83,7 +85,8 @@ public class BatchlogManagerTest
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD2, 1, BytesType.instance),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD3, 1, BytesType.instance),
                                     SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD4, 1, BytesType.instance),
-                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD5, 1, BytesType.instance));
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD5, 1, BytesType.instance),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_DROPPED, 1, BytesType.instance));
     }
 
     @AfterClass
@@ -270,6 +273,35 @@ public class BatchlogManagerTest
             assertEquals("name" + i, result.one().getString("name"));
             assertEquals("val" + i, result.one().getString("val"));
         }
+    }
+
+    @Test
+    public void testReplayWithDroppedTable() throws Exception
+    {
+        TableMetadata dropped = Schema.instance.getTableMetadata(KEYSPACE1, CF_DROPPED);
+        TableMetadata live = Schema.instance.getTableMetadata(KEYSPACE1, CF_STANDARD4);
+
+        List<Mutation> mutations = new ArrayList<>(2);
+        mutations.add(new RowUpdateBuilder(dropped, FBUtilities.timestampMicros(), ByteBufferUtil.bytes(0))
+                      .clustering("name0")
+                      .add("val", "val0")
+                      .build());
+        mutations.add(new RowUpdateBuilder(live, FBUtilities.timestampMicros(), ByteBufferUtil.bytes(1))
+                      .clustering("name1")
+                      .add("val", "val1")
+                      .build());
+
+        long timestamp = currentTimeMillis() - BatchlogManager.getBatchlogTimeout();
+        BatchlogManager.store(Batch.createLocal(atUnixMillis(timestamp, 0), timestamp * 1000, mutations));
+        SchemaTestUtil.announceTableDrop(KEYSPACE1, CF_DROPPED);
+
+        BatchlogManager.instance.startBatchlogReplay().get();
+
+        // The mutation for the dropped table is left out, the batch's other mutations are replayed.
+        assertEquals(0, BatchlogManager.instance.countAllBatches());
+        UntypedResultSet result = executeInternal(String.format("SELECT * FROM \"%s\".\"%s\" WHERE key = int_as_blob(1)", KEYSPACE1, CF_STANDARD4));
+        assertEquals("name1", result.one().getString("name"));
+        assertEquals("val1", result.one().getString("val"));
     }
 
     @Test
