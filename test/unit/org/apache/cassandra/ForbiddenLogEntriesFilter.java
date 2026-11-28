@@ -24,7 +24,6 @@ import java.util.function.Consumer;
 
 import com.google.common.collect.ImmutableSet;
 import com.google.common.collect.Sets;
-import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import ch.qos.logback.classic.Level;
@@ -59,16 +58,6 @@ public class ForbiddenLogEntriesFilter extends Filter<ILoggingEvent>
     public void addLoggerToFollow(String name)
     {
         followedLoggerNames.add(name);
-    }
-
-    public void addLoggerToFollow(Class<?> clazz)
-    {
-        followedLoggerNames.add(LoggerFactory.getLogger(clazz).getName());
-    }
-
-    public void addLoggerToFollow(Logger logger)
-    {
-        followedLoggerNames.add(logger.getName());
     }
 
     public void addExpectedPhrase(String phrase)
