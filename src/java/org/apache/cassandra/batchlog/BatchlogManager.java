@@ -55,6 +55,7 @@ import org.apache.cassandra.db.marshal.BytesType;
 import org.apache.cassandra.db.marshal.UUIDType;
 import org.apache.cassandra.db.partitions.PartitionUpdate;
 import org.apache.cassandra.dht.Token;
+import org.apache.cassandra.exceptions.UnknownTableException;
 import org.apache.cassandra.exceptions.WriteFailureException;
 import org.apache.cassandra.exceptions.WriteTimeoutException;
 import org.apache.cassandra.gms.IFailureDetector;
@@ -288,7 +289,7 @@ public class BatchlogManager implements BatchlogManagerMBean
                 }
                 else
                 {
-                    remove(id); // no write mutations were sent (either expired or all CFs involved truncated).
+                    remove(id); // no write mutations were sent (either expired or all CFs involved truncated or dropped).
                     ++totalBatchesReplayed;
                 }
             }
@@ -399,6 +400,8 @@ public class BatchlogManager implements BatchlogManagerMBean
         private int addMutations(int version, List<ByteBuffer> serializedMutations) throws IOException
         {
             int ret = 0;
+            int skipped = 0;
+            TableId unknownTableId = null;
             for (ByteBuffer serializedMutation : serializedMutations)
             {
                 ret += serializedMutation.remaining();
@@ -406,7 +409,18 @@ public class BatchlogManager implements BatchlogManagerMBean
                 {
                     addMutation(Mutation.serializer.deserialize(in, version));
                 }
+                catch (UnknownTableException e)
+                {
+                    unknownTableId = e.id;
+                    ++skipped;
+                }
             }
+
+            if (skipped > 0)
+                logger.warn("Skipped {} mutation(s) of batch {} for unknown tables, such as the table with id {}; their updates of other tables, if any, are lost",
+                            skipped,
+                            id,
+                            unknownTableId);
 
             return ret;
         }
