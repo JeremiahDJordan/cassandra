@@ -179,6 +179,7 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
 
     private boolean isActive;
     private boolean isClosed;
+    private boolean isCleanedUp;
     private ChannelHandlerContext ctx;
     private FrameProcessor processor = NO_PROCESSOR;
 
@@ -256,6 +257,10 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
         }
         while (!frames.isEmpty())
             frames.poll().release();
+
+        // channelInactive left the close to the delivery that would have emptied the queue
+        if (isClosed)
+            close();
     }
 
     /**
@@ -288,6 +293,13 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
 
     void channelRead(ShareableBytes bytes) throws IOException
     {
+        // bytes still read after the decoder was discarded would keep channelInactive from closing it
+        if (processor == CLOSED_PROCESSOR)
+        {
+            bytes.release();
+            return;
+        }
+
         decode(frames, bytes);
 
         if (isActive)
@@ -323,11 +335,15 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
      */
     private boolean deliver(FrameProcessor processor) throws IOException
     {
-        boolean deliver = true;
+        // a discarded decoder stays inactive
+        boolean deliver = this.processor != CLOSED_PROCESSOR;
         while (deliver && !frames.isEmpty())
         {
             Frame frame = frames.peek();
             deliver = processor.process(frame);
+            // the processor discarded this decoder, and with it the frame
+            if (this.processor == CLOSED_PROCESSOR)
+                return false;
 
             assert !deliver || frame.isConsumed();
             if (deliver || frame.isConsumed())
@@ -364,6 +380,10 @@ public abstract class FrameDecoder extends ChannelInboundHandlerAdapter
 
     private void close()
     {
+        if (isCleanedUp)
+            return;
+
+        isCleanedUp = true;
         discard();
         ctx.fireChannelInactive();
         allocator.release();

@@ -81,7 +81,8 @@ abstract class FrameDecoderWith8bHeader extends FrameDecoder
                 CorruptFrame c = verifyHeader(header);
                 if (c != null)
                 {
-                    discard();
+                    allocator.put(stash);
+                    stash = null;
                     into.add(c);
                     return;
                 }

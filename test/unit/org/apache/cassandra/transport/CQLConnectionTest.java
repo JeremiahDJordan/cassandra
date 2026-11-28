@@ -27,6 +27,7 @@ import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.*;
 
@@ -312,6 +313,57 @@ public class CQLConnectionTest
     }
 
     @Test
+    public void testUnrecoverableEnvelopeDecodingErrorInLargeMessage()
+    {
+        // An error while decoding the Envelope header of a large message
+        // is fatal, as its subsequent frames can't be skipped. The client
+        // expects a second response, so it waits until the server has closed
+        // the connection.
+        int totalBytesPerEnvelope = MAX_FRAMED_PAYLOAD_SIZE + 1024;
+        IntFunction<Envelope> envelopeProvider = mutatedEnvelopeProvider(i -> i == 0, b -> b.put(4, (byte)99),
+                                                                         totalBytesPerEnvelope, totalBytesPerEnvelope);
+        Predicate<ErrorMessage> errorCheck = error -> error.error.getMessage().contains("Unknown opcode 99");
+        testFrameCorruption(2, Codec.crc(alloc), envelopeProvider, Function.identity(), 0, errorCheck);
+    }
+
+    @Test
+    public void testNoProcessingAfterCorruptFrame()
+    {
+        // The first message fills a frame and the second follows in a frame of its own,
+        // which isn't processed once the corrupt first frame has failed the connection.
+        int firstEnvelopeSize = MAX_FRAMED_PAYLOAD_SIZE - 100;
+        IntFunction<Envelope> envelopeProvider = i -> i == 0 ? randomEnvelope(i, Message.Type.OPTIONS, firstEnvelopeSize, firstEnvelopeSize)
+                                                             : randomEnvelope(i, Message.Type.OPTIONS);
+        Function<ByteBuf, ByteBuf> corruptor = new Function<ByteBuf, ByteBuf>()
+        {
+            boolean corrupted = false;
+            public ByteBuf apply(ByteBuf msg)
+            {
+                if (!corrupted)
+                {
+                    flipBit(msg, msg.readerIndex() + 100);
+                    corrupted = true;
+                }
+                return msg;
+            }
+        };
+        AtomicInteger decoded = new AtomicInteger();
+        Message.Decoder<Message.Request> decoder = new FixedDecoder()
+        {
+            @Override
+            Message.Request decode(Channel channel, Envelope source)
+            {
+                decoded.incrementAndGet();
+                return super.decode(channel, source);
+            }
+        };
+        Predicate<ErrorMessage> errorCheck =
+            error -> error.error.getMessage().contains("unrecoverable CRC mismatch detected in frame body");
+        testFrameCorruption(2, Codec.crc(alloc), envelopeProvider, corruptor, 0, decoder, errorCheck);
+        assertEquals(0, decoded.get());
+    }
+
+    @Test
     public void testNegativeEnvelopeBodySize()
     {
         // A negative value for the body length of an envelope is essentially a
@@ -490,6 +542,8 @@ public class CQLConnectionTest
             assertTrue(errorPredicate.test((ErrorMessage) response));
 
             observer.verifier().accept(expectedBytesAllocated);
+            // the server closed the connection and released its resources
+            assertTrue(observer.released.await(10, TimeUnit.SECONDS));
         }
         catch (Exception e)
         {
@@ -529,11 +583,16 @@ public class CQLConnectionTest
 
     private IntFunction<Envelope> mutatedEnvelopeProvider(IntPredicate streamIdMatcher, Consumer<ByteBuffer> headerMutator)
     {
+        return mutatedEnvelopeProvider(streamIdMatcher, headerMutator, 100, 1024);
+    }
+
+    private IntFunction<Envelope> mutatedEnvelopeProvider(IntPredicate streamIdMatcher, Consumer<ByteBuffer> headerMutator, int minSize, int maxSize)
+    {
         // enables tests to mutate Envelope headers as they're serialized into a Frame
         // payload. For instance, a test may modify the header length or set the opcode
         // to something invalid to simulate a buggy client. Frame level CRCs will remain
         // valid, so this can be used to exercise the CQL encoding layer.
-        return (i) -> new MutableEnvelope(randomEnvelope(i, Message.Type.OPTIONS))
+        return (i) -> new MutableEnvelope(randomEnvelope(i, Message.Type.OPTIONS, minSize, maxSize))
         {
             @Override
             Consumer<ByteBuffer> headerTransform()
@@ -775,6 +834,7 @@ public class CQLConnectionTest
                 public void release()
                 {
                     delegate.release();
+                    allocationObserver.released.signalAll();
                 }
             };
         }
@@ -789,6 +849,7 @@ public class CQLConnectionTest
     {
         volatile InstrumentedLimit endpoint;
         volatile InstrumentedLimit global;
+        final SimpleCondition released = new SimpleCondition();
 
         final boolean strict;
 
