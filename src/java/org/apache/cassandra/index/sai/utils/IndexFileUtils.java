@@ -72,6 +72,14 @@ public class IndexFileUtils
                                                                                     .maximumSize(4096)
                                                                                     .build();
 
+    /**
+     * Forgets the checksum of a deleted file, so a new file written under the same name doesn't start from it.
+     */
+    public static void invalidateChecksum(File file)
+    {
+        checksumCache.invalidate(file.path());
+    }
+
     @VisibleForTesting
     protected IndexFileUtils(SequentialWriterOption writerOption)
     {
