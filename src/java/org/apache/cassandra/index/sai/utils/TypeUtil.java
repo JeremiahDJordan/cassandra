@@ -248,11 +248,11 @@ public class TypeUtil
     public static void toComparableBytes(ByteBuffer value, AbstractType<?> type, byte[] bytes)
     {
         if (isInetAddress(type))
-            ByteBufferUtil.copyBytes(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, INET_ADDRESS_SIZE);
+            ByteBufferUtil.copyBytes(value, value.position(), bytes, 0, INET_ADDRESS_SIZE);
         else if (isBigInteger(type))
-            ByteBufferUtil.copyBytes(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, BIG_INTEGER_APPROXIMATION_BYTES);
+            ByteBufferUtil.copyBytes(value, value.position(), bytes, 0, BIG_INTEGER_APPROXIMATION_BYTES);
         else if (isBigDecimal(type))
-            ByteBufferUtil.copyBytes(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, DECIMAL_APPROXIMATION_BYTES);
+            ByteBufferUtil.copyBytes(value, value.position(), bytes, 0, DECIMAL_APPROXIMATION_BYTES);
         else
             ByteSourceInverse.readBytesMustFit(type.asComparableBytes(value, BYTE_COMPARABLE_VERSION), bytes);
     }
@@ -429,7 +429,7 @@ public class TypeUtil
     {
         if (value.remaining() == 4)
         {
-            int position = value.hasArray() ? value.arrayOffset() + value.position() : value.position();
+            int position = value.position();
             ByteBuffer mapped = ByteBuffer.allocate(INET_ADDRESS_SIZE);
             System.arraycopy(IPV4_PREFIX, 0, mapped.array(), 0, IPV4_PREFIX.length);
             ByteBufferUtil.copyBytes(value, position, mapped, IPV4_PREFIX.length, value.remaining());
@@ -463,7 +463,7 @@ public class TypeUtil
     public static ByteBuffer encodeBigInteger(ByteBuffer value)
     {
         int size = value.remaining();
-        int position = value.hasArray() ? value.arrayOffset() + value.position() : value.position();
+        int position = value.position();
         byte[] bytes = new byte[BIG_INTEGER_APPROXIMATION_BYTES];
         if (size < BIG_INTEGER_APPROXIMATION_BYTES - Integer.BYTES)
         {
