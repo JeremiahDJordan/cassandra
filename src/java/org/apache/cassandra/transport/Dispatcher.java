@@ -109,63 +109,79 @@ public class Dispatcher
 
     CompletableFuture<Message.Response> processRequest(ServerConnection connection, Message.Request request, Overload backpressure)
     {
-        long queryStartNanoTime = System.nanoTime();
-        if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
-            ClientWarn.instance.captureWarnings();
-
-        if (backpressure == Overload.REQUESTS)
+        try
         {
-            String message = String.format("Request breached global limit of %d requests/second and triggered backpressure.",
-                                           ClientResourceLimits.getNativeTransportMaxRequestsPerSecond());
-            
-            NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
-            ClientWarn.instance.warn(message);
+            long queryStartNanoTime = System.nanoTime();
+            if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
+                ClientWarn.instance.captureWarnings();
+
+            if (backpressure == Overload.REQUESTS)
+            {
+                String message = String.format("Request breached global limit of %d requests/second and triggered backpressure.",
+                                               ClientResourceLimits.getNativeTransportMaxRequestsPerSecond());
+
+                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
+                ClientWarn.instance.warn(message);
+            }
+            else if (backpressure == Overload.BYTES_IN_FLIGHT)
+            {
+                String message = String.format("Request breached limit(s) on bytes in flight (Endpoint: %d, Global: %d) and triggered backpressure.",
+                                               ClientResourceLimits.getEndpointLimit(), ClientResourceLimits.getGlobalLimit());
+
+                NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
+                ClientWarn.instance.warn(message);
+            }
+
+            QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion());
+
+            Message.logger.trace("Received: {}, v={}", request, connection.getVersion());
+            connection.requests.inc();
+            return request.execute(qstate, queryStartNanoTime)
+                          .whenComplete((result, ignored) -> {
+                              try
+                              {
+                                  result.setStreamId(request.getStreamId());
+                                  result.setWarnings(ClientWarn.instance.getWarnings());
+                                  result.attach(connection);
+                                  connection.applyStateTransition(request.type, result.type);
+                              }
+                              finally
+                              {
+                                  ClientWarn.instance.resetWarnings();
+                              }
+                          });
         }
-        else if (backpressure == Overload.BYTES_IN_FLIGHT)
+        catch (Throwable t)
         {
-            String message = String.format("Request breached limit(s) on bytes in flight (Endpoint: %d, Global: %d) and triggered backpressure.",
-                                           ClientResourceLimits.getEndpointLimit(), ClientResourceLimits.getGlobalLimit());
-            
-            NoSpamLogger.log(logger, NoSpamLogger.Level.INFO, 1, TimeUnit.MINUTES, message);
-            ClientWarn.instance.warn(message);
+            ClientWarn.instance.resetWarnings();
+            return CompletableFuture.failedFuture(t);
         }
-
-        QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion());
-
-        Message.logger.trace("Received: {}, v={}", request, connection.getVersion());
-        connection.requests.inc();
-        return request.execute(qstate, queryStartNanoTime)
-                      .whenComplete((result, ignored) -> {
-                          try
-                          {
-                              result.setStreamId(request.getStreamId());
-                              result.setWarnings(ClientWarn.instance.getWarnings());
-                              result.attach(connection);
-                              connection.applyStateTransition(request.type, result.type);
-                          }
-                          finally
-                          {
-                              ClientWarn.instance.resetWarnings();
-                          }
-                      });
     }
 
     static CompletableFuture<Message.Response> processInit(ServerConnection connection, StartupMessage request)
     {
-        long queryStartNanoTime = System.nanoTime();
-        if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
-            ClientWarn.instance.captureWarnings();
+        try
+        {
+            long queryStartNanoTime = System.nanoTime();
+            if (connection.getVersion().isGreaterOrEqualTo(ProtocolVersion.V4))
+                ClientWarn.instance.captureWarnings();
 
-        QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion());
+            QueryState qstate = connection.validateNewMessage(request.type, connection.getVersion());
 
-        Message.logger.trace("Received: {}, v={}", request, connection.getVersion());
-        connection.requests.inc();
-        return request.execute(qstate, queryStartNanoTime).whenComplete((result, ignored) -> {
-            result.setStreamId(request.getStreamId());
-            result.setWarnings(ClientWarn.instance.getWarnings());
-            result.attach(connection);
-            connection.applyStateTransition(request.type, result.type);
-        });
+            Message.logger.trace("Received: {}, v={}", request, connection.getVersion());
+            connection.requests.inc();
+            return request.execute(qstate, queryStartNanoTime).whenComplete((result, ignored) -> {
+                result.setStreamId(request.getStreamId());
+                result.setWarnings(ClientWarn.instance.getWarnings());
+                result.attach(connection);
+                connection.applyStateTransition(request.type, result.type);
+            });
+        }
+        catch (Throwable t)
+        {
+            ClientWarn.instance.resetWarnings();
+            return CompletableFuture.failedFuture(t);
+        }
     }
 
     private void flush(FlushItem<?> item)

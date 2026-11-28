@@ -124,6 +124,8 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                             }
                             else
                             {
+                                allocator.release(inbound.header.bodySizeInBytes);
+                                allocator.release();
                                 Throwable cause = future.cause();
                                 if (null == cause)
                                     cause = new ServerError("Unexpected error establishing connection");
@@ -157,9 +159,19 @@ public class InitialConnectionHandler extends ByteToMessageDecoder
                         }
                         else
                         {
-                            ErrorMessage message = ErrorMessage.fromException(new ProtocolException(String.format("Unexpected error %s", error.getMessage())));
+                            if (version.isGreaterOrEqualTo(ProtocolVersion.V5))
+                            {
+                                allocator.release(inbound.header.bodySizeInBytes);
+                                allocator.release();
+                            }
+                            ProtocolException cause = error instanceof ProtocolException
+                                                      ? (ProtocolException) error
+                                                      : new ProtocolException(String.format("Unexpected error %s", error.getMessage()));
+                            ErrorMessage message = ErrorMessage.fromException(cause);
+                            message.setStreamId(startup.getStreamId());
                             Envelope encoded = message.encode(version);
-                            ctx.writeAndFlush(encoded);
+                            ChannelPromise closeChannel = AsyncChannelPromise.withListener(ctx, f -> ctx.close());
+                            ctx.writeAndFlush(encoded, closeChannel);
                         }
                     });
                     break;
