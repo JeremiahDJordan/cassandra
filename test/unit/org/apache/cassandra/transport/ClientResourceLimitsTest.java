@@ -19,6 +19,7 @@
 package org.apache.cassandra.transport;
 
 import java.io.IOException;
+import java.util.Collections;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
@@ -41,6 +42,7 @@ import org.apache.cassandra.db.virtual.*;
 import org.apache.cassandra.exceptions.OverloadedException;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.transport.messages.QueryMessage;
+import org.apache.cassandra.transport.messages.StartupMessage;
 import org.apache.cassandra.utils.FBUtilities;
 import org.awaitility.Awaitility;
 
@@ -301,6 +303,65 @@ public class ClientResourceLimitsTest extends CQLTester
             query.append('a');
         query.append("')");
         return new QueryMessage(query.toString(), V5_DEFAULT_OPTIONS);
+    }
+
+    @Test
+    public void testStartupOnReadyConnectionV4() throws IOException
+    {
+        testStartupOnReadyConnection(ProtocolVersion.V4);
+    }
+
+    @Test
+    public void testStartupOnReadyConnectionV5() throws IOException
+    {
+        testStartupOnReadyConnection(ProtocolVersion.V5);
+    }
+
+    private void testStartupOnReadyConnection(ProtocolVersion version) throws IOException
+    {
+        try (SimpleClient client = SimpleClient.builder(nativeAddr.getHostAddress(), nativePort)
+                                               .protocolVersion(version)
+                                               .useBeta()
+                                               .build()
+                                               .connect(false))
+        {
+            try
+            {
+                client.execute(new StartupMessage(Collections.singletonMap(StartupMessage.CQL_VERSION, QueryProcessor.CQL_VERSION.toString())));
+                fail();
+            }
+            catch (RuntimeException e)
+            {
+                assertTrue(e.getCause() instanceof ProtocolException);
+            }
+        }
+        Awaitility.await()
+                  .atMost(10, TimeUnit.SECONDS)
+                  .untilAsserted(() -> assertEquals(0, ClientResourceLimits.getCurrentGlobalUsage()));
+    }
+
+    @Test
+    public void testRefusedStartupV5() throws IOException
+    {
+        try (SimpleClient client = SimpleClient.builder(nativeAddr.getHostAddress(), nativePort)
+                                               .protocolVersion(ProtocolVersion.V5)
+                                               .useBeta()
+                                               .build())
+        {
+            client.establishConnection();
+            try
+            {
+                client.execute(new StartupMessage(Collections.singletonMap(StartupMessage.CQL_VERSION, "2.0.0")));
+                fail();
+            }
+            catch (RuntimeException e)
+            {
+                assertTrue(e.getCause() instanceof ProtocolException);
+            }
+        }
+        Awaitility.await()
+                  .atMost(10, TimeUnit.SECONDS)
+                  .untilAsserted(() -> assertEquals(0, ClientResourceLimits.getCurrentGlobalUsage()));
     }
 
     @Test
