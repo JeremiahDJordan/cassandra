@@ -24,9 +24,12 @@ import org.apache.cassandra.config.CassandraRelevantProperties;
 import org.junit.Test;
 
 import com.datastax.driver.core.ResultSet;
+import org.apache.cassandra.config.Config;
+import org.apache.cassandra.config.DatabaseDescriptor;
 import org.apache.cassandra.index.sai.disk.vector.CassandraOnHeapGraph;
 import org.apache.cassandra.index.sai.disk.vector.VectorSourceModel;
 import org.apache.cassandra.utils.Throwables;
+import org.assertj.core.api.Assertions;
 
 import javax.management.ObjectName;
 
@@ -102,9 +105,14 @@ public class IndexMetricsTest extends AbstractMetricsTest
             execute("INSERT INTO %s (id1, v1, v2) VALUES (?, ?, '0')", Integer.toString(i), i);
 
         assertEquals(10L, getMetricValue(objectName("LiveMemtableIndexWriteCount", KEYSPACE, table, index, "IndexMetrics")));
-        assertTrue((Long)getMetricValue(objectName("MemtableOnHeapIndexBytes", KEYSPACE, table, index, "IndexMetrics")) > 0);
-        assertTrue((Long)getMetricValue(objectName("MemtableOffHeapIndexBytes", KEYSPACE, table, index, "IndexMetrics")) > 0);
         assertEquals(0L, getMetricValue(objectName("MemtableIndexFlushCount", KEYSPACE, table, index, "IndexMetrics")));
+        assertTrue((Long) getMetricValue(objectName("MemtableOnHeapIndexBytes", KEYSPACE, table, index, "IndexMetrics")) > 0);
+        long bytes = (long) getMetricValue(objectName("MemtableOffHeapIndexBytes", KEYSPACE, table, index, "IndexMetrics"));
+        Config.MemtableAllocationType allocationType = DatabaseDescriptor.getMemtableAllocationType();
+        if (allocationType == Config.MemtableAllocationType.heap_buffers || allocationType == Config.MemtableAllocationType.unslabbed_heap_buffers)
+            Assertions.assertThat(bytes).isZero();
+        else
+            Assertions.assertThat(bytes).isPositive();
 
         waitForAssert(() -> {
             try
