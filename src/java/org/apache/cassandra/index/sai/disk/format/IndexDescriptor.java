@@ -763,6 +763,7 @@ public class IndexDescriptor
                 {
                     logger.warn("Unable to delete storage attached index component file {} due to {}.", file, e.getMessage(), e);
                 }
+                IndexFileUtils.invalidateChecksum(file);
             }
 
             @Override
