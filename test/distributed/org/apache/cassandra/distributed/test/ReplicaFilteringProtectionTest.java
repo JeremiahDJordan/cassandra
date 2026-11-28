@@ -20,6 +20,8 @@ package org.apache.cassandra.distributed.test;
 
 import java.io.IOException;
 
+import com.google.common.collect.Iterators;
+
 import org.assertj.core.api.ListAssert;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -217,12 +219,35 @@ public class ReplicaFilteringProtectionTest extends TestBaseImpl
                    row(1), row(2), row(7));
     }
 
+    @Test
+    public void testPagedPartitionReadWithMissedUpdates()
+    {
+        String table = createTable("paged_missed_updates", "(k int, c1 int, c2 int, s int static, v int, PRIMARY KEY (k, c1, c2))");
+
+        // Node 2 has two matching rows, node 1 newer versions of both that don't match.
+        write(2, "INSERT INTO %s (k, c1, c2, v, s) VALUES (0, 1, 0, 2, 1) USING TIMESTAMP 1", table);
+        write(2, "INSERT INTO %s (k, c1, c2, v, s) VALUES (0, 1, 1, 2, 2) USING TIMESTAMP 40", table);
+        write(1, "INSERT INTO %s (k, c1, c2, v) VALUES (0, 1, 0, 0) USING TIMESTAMP 59", table);
+        write(1, "INSERT INTO %s (k, c1, c2, v, s) VALUES (0, 1, 1, 0, 6) USING TIMESTAMP 184", table);
+
+        // Paged by 1, each page reads the partition with a limit, so it is completed at several checkpoints, and
+        // each of them can add a row to read by name from node 1.
+        String query = "SELECT c1, c2, v, s FROM " + table + " WHERE k = 0 AND c2 < 3 AND v > 0 ORDER BY c1 ASC ALLOW FILTERING";
+        assertRows(cluster.coordinator(1).execute(query, ALL));
+        assertRows(Iterators.toArray(cluster.coordinator(1).executeWithPaging(query, ALL, 1), Object[].class));
+    }
+
     private String createRangeTombstoneTable(String name)
+    {
+        return createTable(name, "(k int, c int, v int, PRIMARY KEY (k, c))");
+    }
+
+    private String createTable(String name, String columns)
     {
         cluster.get(1).runOnInstance(() -> StorageService.instance.setCachedReplicaRowsWarnThreshold(DEFAULT_WARN_THRESHOLD));
         cluster.get(1).runOnInstance(() -> StorageService.instance.setCachedReplicaRowsFailThreshold(DEFAULT_FAIL_THRESHOLD));
         String table = KEYSPACE + '.' + name;
-        cluster.schemaChange("CREATE TABLE " + table + " (k int, c int, v int, PRIMARY KEY (k, c)) WITH read_repair = 'NONE'");
+        cluster.schemaChange("CREATE TABLE " + table + ' ' + columns + " WITH read_repair = 'NONE'");
         return table;
     }
 
