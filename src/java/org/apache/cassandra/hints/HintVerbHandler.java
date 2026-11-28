@@ -19,6 +19,7 @@
 package org.apache.cassandra.hints;
 
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -32,6 +33,7 @@ import org.apache.cassandra.serializers.MarshalException;
 import org.apache.cassandra.service.StorageProxy;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.FBUtilities;
+import org.apache.cassandra.utils.NoSpamLogger;
 
 import static org.apache.cassandra.config.CassandraRelevantProperties.CUSTOM_HINTS_HANDLER;
 
@@ -64,10 +66,14 @@ public final class HintVerbHandler implements IVerbHandler<HintMessage>
         // is schema agreement between the sender and the receiver.
         if (hint == null)
         {
-            logger.trace("Failed to decode and apply a hint for {}: {} - table with id {} is unknown",
-                         address,
-                         hostId,
-                         message.payload.unknownTableID);
+            NoSpamLogger.log(logger,
+                             NoSpamLogger.Level.WARN,
+                             1,
+                             TimeUnit.SECONDS,
+                             "Failed to decode and apply a hint for {}: {} - table with id {} is unknown; the hint's updates of other tables, if any, are lost",
+                             address,
+                             hostId,
+                             message.payload.unknownTableID);
             respond(message);
             return;
         }
