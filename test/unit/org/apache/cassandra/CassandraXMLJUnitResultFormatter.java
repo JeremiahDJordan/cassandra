@@ -68,6 +68,14 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
     /** constant for unnnamed testsuites/cases */
     private static final String UNKNOWN = "unknown";
 
+    /**
+     * Longer system-out and system-err are kept in the XML as their first {@link #OUTPUT_HEAD_CHARS} and last
+     * {@link #OUTPUT_TAIL_CHARS} characters, as the test report loads every XML of a run into memory. Logger output
+     * is also in the test's log files.
+     */
+    static final int OUTPUT_HEAD_CHARS = 1 << 20;
+    static final int OUTPUT_TAIL_CHARS = 4 << 20;
+
     private static DocumentBuilder getDocumentBuilder() {
         try {
             return DocumentBuilderFactory.newInstance().newDocumentBuilder();
@@ -382,8 +390,18 @@ public class CassandraXMLJUnitResultFormatter implements JUnitResultFormatter, X
 
     private Element formatOutput(final String type, final String output) {
         final Element nested = doc.createElement(type);
-        nested.appendChild(doc.createCDATASection(output));
+        nested.appendChild(doc.createCDATASection(truncateOutput(output)));
         return nested;
+    }
+
+    private static String truncateOutput(final String output) {
+        final int omitted = output.length() - OUTPUT_HEAD_CHARS - OUTPUT_TAIL_CHARS;
+        if (omitted <= 0) {
+            return output;
+        }
+        return output.substring(0, OUTPUT_HEAD_CHARS) +
+               "\n--- " + omitted + " characters of output omitted, logger output is in the test's log files under build/test/logs ---\n" +
+               output.substring(output.length() - OUTPUT_TAIL_CHARS);
     }
 
     public void testIgnored(final Test test) {
