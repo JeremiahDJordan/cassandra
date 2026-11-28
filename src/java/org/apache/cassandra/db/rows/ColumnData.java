@@ -233,6 +233,14 @@ public abstract class ColumnData implements IMeasurableMemory
                         long structureAfter = result == null ? 0 : ComplexColumnData.EMPTY_SIZE
                                                                    + DeletionTime.LIVE.unsharedHeapSize()
                                                                    + BTree.sizeOnHeapOf(cells);
+                        if (result == null)
+                        {
+                            // The column's data size counts its complex deletion even when live, so release the
+                            // dropped column's deletion (and wrapper) through delete.
+                            ComplexColumnData dropped = new ComplexColumnData(existingComplex.column, BTree.empty(), existingComplex.complexDeletion());
+                            recordDeletion.delete(dropped);
+                            structureBefore -= dropped.unsharedHeapSizeExcludingData();
+                        }
                         recordDeletion.onAllocatedOnHeap(structureAfter - structureBefore);
                     }
                     return result;
