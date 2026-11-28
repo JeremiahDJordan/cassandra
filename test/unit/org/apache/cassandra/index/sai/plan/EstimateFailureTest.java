@@ -100,9 +100,17 @@ public class EstimateFailureTest extends SAITester
                                                          SAIUtil.currentVersion().onDiskFormat().indexFeatureSet(),
                                                          new QueryContext(),
                                                          null);
-        Plan.RowsIteration plan = (Plan.RowsIteration) controller.buildPlan();
-        Plan.KeysIteration keys = plan.firstNodeOfType(Plan.KeysIteration.class);
-        assertNotNull(keys);
-        return keys.expectedKeys();
+        try
+        {
+            Plan.RowsIteration plan = (Plan.RowsIteration) controller.buildPlan();
+            Plan.KeysIteration keys = plan.firstNodeOfType(Plan.KeysIteration.class);
+            assertNotNull(keys);
+            return keys.expectedKeys();
+        }
+        finally
+        {
+            // releases the SSTable indexes the plan referenced
+            controller.abort();
+        }
     }
 }
