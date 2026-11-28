@@ -86,10 +86,14 @@ public final class HintVerbHandler implements IVerbHandler<HintMessage>
                 return;
             }
 
-            logger.trace("Failed to decode and apply a hint for {}: {} - table with id {} is unknown",
-                         address,
-                         hostId,
-                         message.payload.unknownTableID);
+            NoSpamLogger.log(logger,
+                             NoSpamLogger.Level.WARN,
+                             1,
+                             TimeUnit.SECONDS,
+                             "Failed to decode and apply a hint for {}: {} - table with id {} is unknown; the hint's updates of other tables, if any, are lost",
+                             address,
+                             hostId,
+                             message.payload.unknownTableID);
             respond(message);
             return;
         }
