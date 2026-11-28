@@ -22,7 +22,7 @@ import org.apache.cassandra.io.util.File;
 
 public class CorruptSSTableException extends RuntimeException
 {
-    public final File path;
+    public final transient File path;
 
     public CorruptSSTableException(Throwable cause, File path)
     {

@@ -18,6 +18,10 @@
 
 package org.apache.cassandra.tools.nodetool;
 
+import java.io.IOException;
+import java.io.RandomAccessFile;
+
+import com.google.common.collect.Iterables;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
@@ -25,6 +29,8 @@ import org.apache.cassandra.SchemaLoader;
 import org.apache.cassandra.auth.AuthTestUtils;
 import org.apache.cassandra.auth.AuthenticatedUser;
 import org.apache.cassandra.cql3.CQLTester;
+import org.apache.cassandra.io.sstable.format.SSTableFormat;
+import org.apache.cassandra.io.sstable.format.SSTableReader;
 import org.apache.cassandra.tools.ToolRunner;
 
 import static org.apache.cassandra.auth.AuthTestUtils.ROLE_A;
@@ -47,6 +53,7 @@ public class VerifyTest extends CQLTester
         roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_A, AuthTestUtils.getLoginRoleOptions());
         roleManager.createRole(AuthenticatedUser.SYSTEM_USER, ROLE_B, AuthTestUtils.getLoginRoleOptions());
 
+        requireNetwork();
         startJMXServer();
     }
 
@@ -125,5 +132,25 @@ public class VerifyTest extends CQLTester
         "\n\n";
 
         assertThat(tool.getStdout()).isEqualTo(help);
+    }
+
+    @Test
+    public void testVerifyCorruptSSTableWithDiskFailurePolicy() throws IOException
+    {
+        createTable("CREATE TABLE %s (pk int PRIMARY KEY, v text) WITH compression = {'enabled': false}");
+        for (int i = 0; i < 1000; i++)
+            execute("INSERT INTO %s (pk, v) VALUES (?, ?)", i, "value" + i);
+        flush();
+
+        SSTableReader sstable = Iterables.getOnlyElement(getCurrentColumnFamilyStore().getLiveSSTables());
+        try (RandomAccessFile file = new RandomAccessFile(sstable.descriptor.fileFor(SSTableFormat.Components.DATA).toJavaIOFile(), "rw"))
+        {
+            file.seek(file.length() / 2);
+            file.write(new byte[64]);
+        }
+
+        ToolRunner.ToolResult tool = ToolRunner.invokeNodetool("verify", "--force", "--dfp", keyspace(), currentTable());
+        assertThat(tool.getExitCode()).isNotZero();
+        assertThat(tool.getStderr()).contains("error: Corrupted file: integrity check (digest) failed for " + sstable.getFilename());
     }
 }
