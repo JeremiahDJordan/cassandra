@@ -48,7 +48,6 @@ import java.util.stream.Stream;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Sets;
-import com.google.common.util.concurrent.Uninterruptibles;
 import org.junit.After;
 import org.junit.Assert;
 import org.junit.Assume;
@@ -1607,10 +1606,10 @@ public class SSTableReaderTest
         SSTableReader target = null;
         try
         {
+            // backdate the filter so that a rewrite gives a newer mtime whatever the file system's timestamp granularity
+            if (bfFile.exists())
+                Files.setLastModifiedTime(bfFile.toPath(), FileTime.from(Instant.EPOCH));
             FileTime bf0Time = bfFile.exists() ? Files.getLastModifiedTime(bfFile.toPath()) : FileTime.from(Instant.MIN);
-
-            // make sure we wait enough - some JDK implementations use seconds granularity and we need to wait a bit to actually see the change
-            Uninterruptibles.sleepUninterruptibly(1, Util.supportedMTimeGranularity);
 
             target = desc.getFormat().getReaderFactory().open(desc,
                                                               SSTableReader.discoverComponentsFor(desc),
