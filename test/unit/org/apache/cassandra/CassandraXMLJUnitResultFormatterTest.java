@@ -22,6 +22,7 @@ import java.io.ByteArrayOutputStream;
 
 import javax.xml.parsers.DocumentBuilderFactory;
 
+import org.apache.commons.lang3.StringUtils;
 import org.apache.tools.ant.taskdefs.optional.junit.JUnitTest;
 import org.junit.Before;
 import org.junit.Test;
@@ -31,6 +32,8 @@ import org.w3c.dom.NodeList;
 
 import junit.framework.AssertionFailedError; // checkstyle: permit this import
 
+import static org.apache.cassandra.CassandraXMLJUnitResultFormatter.OUTPUT_HEAD_CHARS;
+import static org.apache.cassandra.CassandraXMLJUnitResultFormatter.OUTPUT_TAIL_CHARS;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertTrue;
 
@@ -155,6 +158,39 @@ public class CassandraXMLJUnitResultFormatterTest
         assertEquals(0, failures.getLength());
         assertEquals(0, errors.getLength());
         assertEquals(0, skipped.getLength());
+    }
+
+    @Test
+    public void testLongOutputKeepsHeadAndTail() throws Exception
+    {
+        String head = StringUtils.repeat('h', OUTPUT_HEAD_CHARS);
+        String tail = StringUtils.repeat('t', OUTPUT_TAIL_CHARS);
+        formatter.setSystemOutput(head + StringUtils.repeat('o', 1000) + tail);
+        formatter.setSystemError(head + StringUtils.repeat('e', 10) + tail);
+
+        // system-out is kept only for suites with failures or errors
+        JUnitTest suite = new JUnitTest("org.apache.cassandra.SomeTest");
+        suite.setCounts(1, 1, 0, 0);
+        formatter.endTestSuite(suite);
+
+        Document doc = parseOutput();
+        assertEquals(head + "\n--- 1000 characters of output omitted, logger output is in the test's log files under build/test/logs ---\n" + tail,
+                     doc.getElementsByTagName("system-out").item(0).getTextContent());
+        assertEquals(head + "\n--- 10 characters of output omitted, logger output is in the test's log files under build/test/logs ---\n" + tail,
+                     doc.getElementsByTagName("system-err").item(0).getTextContent());
+    }
+
+    @Test
+    public void testOutputUpToLimitIsUnchanged() throws Exception
+    {
+        String output = StringUtils.repeat('o', OUTPUT_HEAD_CHARS + OUTPUT_TAIL_CHARS);
+        formatter.setSystemOutput(output);
+
+        JUnitTest suite = new JUnitTest("org.apache.cassandra.SomeTest");
+        suite.setCounts(1, 1, 0, 0);
+        formatter.endTestSuite(suite);
+
+        assertEquals(output, parseOutput().getElementsByTagName("system-out").item(0).getTextContent());
     }
 
     private Document parseOutput() throws Exception
