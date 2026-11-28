@@ -18,8 +18,12 @@ package org.apache.cassandra.io.sstable;
 
 import java.io.IOException;
 
+import org.apache.commons.lang3.SerializationUtils;
 import org.junit.Test;
 
+import org.apache.cassandra.io.FSReadError;
+import org.apache.cassandra.io.compress.CorruptBlockException;
+import org.apache.cassandra.io.util.CorruptFileException;
 import org.apache.cassandra.io.util.File;
 
 import static org.apache.cassandra.io.sstable.CorruptSSTableException.maybeWrapInCorruptSSTableException;
@@ -70,5 +74,19 @@ public class CorruptSSTableExceptionTest
         assertSame(failure, maybeWrapInCorruptSSTableException(failure, FILE));
         assertSame(failure, maybeWrapInCorruptSSTableException(failure, FILE.path()));
         assertEquals(OTHER_FILE, failure.file);
+    }
+
+    @Test
+    public void testSerializationKeepsMessages()
+    {
+        // JMX sends the failure of an operation to nodetool serialized
+        CorruptSSTableException failure = new CorruptSSTableException(new FSReadError(new CorruptFileException(new CorruptBlockException(FILE, 0, 1), FILE), FILE), FILE);
+        Throwable read = SerializationUtils.roundtrip(failure);
+        for (Throwable expected = failure; expected != null; expected = expected.getCause(), read = read.getCause())
+        {
+            assertEquals(expected.getClass(), read.getClass());
+            assertEquals(expected.getMessage(), read.getMessage());
+            assertEquals(expected.toString(), read.toString());
+        }
     }
 }

@@ -23,7 +23,7 @@ import org.apache.cassandra.io.util.File;
 
 public class CorruptBlockException extends IOException
 {
-    private final File file;
+    private final transient File file;
 
     public CorruptBlockException(File file, CompressionMetadata.Chunk chunk)
     {

@@ -25,7 +25,7 @@ import org.apache.cassandra.utils.DseLegacy;
 
 public class CorruptSSTableException extends RuntimeException
 {
-    public final File file;
+    public final transient File file;
 
     public CorruptSSTableException(Throwable cause, File file)
     {
