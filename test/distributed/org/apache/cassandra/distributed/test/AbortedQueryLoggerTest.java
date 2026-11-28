@@ -156,7 +156,7 @@ public class AbortedQueryLoggerTest extends TestBaseImpl
         setReadRowsBeforeDelay(2);
 
         cluster.schemaChange(format("CREATE TABLE %s.%s (k int, c int, v int, l int, s int, PRIMARY KEY (k, c))"));
-        cluster.schemaChange(format("CREATE INDEX legacy_idx ON %s.%s (l)"));
+        cluster.schemaChange(format("CREATE INDEX legacy_idx ON %s.%s (l) USING 'legacy_local_table'"));
         cluster.schemaChange(format("CREATE CUSTOM INDEX sai_idx ON %s.%s (s) USING 'StorageAttachedIndex'"));
         // the initial index builds flush the table, so they must finish before the writes to keep them in one flush
         cluster.forEach(i -> Awaitility.waitAtMost(30, TimeUnit.SECONDS)

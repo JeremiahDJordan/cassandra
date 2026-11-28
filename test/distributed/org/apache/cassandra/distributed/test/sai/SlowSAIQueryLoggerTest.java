@@ -453,7 +453,7 @@ public class SlowSAIQueryLoggerTest extends TestBaseImpl
         CassandraRelevantProperties.SAI_MONITORING_EXECUTION_INFO_ENABLED.setBoolean(true);
 
         // test with a legacy index, there should be no SAI execution info
-        cluster.schemaChange(format("CREATE INDEX legacy_idx ON %s.%s (l)"));
+        cluster.schemaChange(format("CREATE INDEX legacy_idx ON %s.%s (l) USING 'legacy_local_table'"));
         final String t = table;
         Awaitility.waitAtMost(1, TimeUnit.MINUTES).until(() -> cluster.get(1).callOnInstance(() -> {
             SecondaryIndexManager sim = Keyspace.open(KEYSPACE).getColumnFamilyStore(t).indexManager;
