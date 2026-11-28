@@ -19,6 +19,7 @@ package org.apache.cassandra.index.sai.disk;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
+import java.net.InetAddress;
 import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.Collection;
@@ -37,6 +38,7 @@ import org.apache.cassandra.cql3.statements.schema.IndexTarget;
 import org.apache.cassandra.db.marshal.AbstractType;
 import org.apache.cassandra.db.marshal.CompositeType;
 import org.apache.cassandra.db.marshal.DecimalType;
+import org.apache.cassandra.db.marshal.InetAddressType;
 import org.apache.cassandra.db.marshal.Int32Type;
 import org.apache.cassandra.db.marshal.IntegerType;
 import org.apache.cassandra.db.marshal.ListType;
@@ -351,5 +353,43 @@ public class TypeUtilTest extends SaiRandomizedTest
         var value2 = DecimalType.instance.compose(raw2);
         // this cannot be exact comparison, because `encode` truncates value and loses some precision
         assertEquals(value.doubleValue(), value2.doubleValue(), value.doubleValue() * 1.0e-15);
+    }
+
+    @Test
+    public void testEncodeHeapBufferWithArrayOffset() throws Exception
+    {
+        testEncodeWithArrayOffset(InetAddressType.instance, InetAddressType.instance.decompose(InetAddress.getByName("127.0.0.1")));
+        testEncodeWithArrayOffset(InetAddressType.instance, InetAddressType.instance.decompose(InetAddress.getByName("2001:db8::1")));
+        testEncodeWithArrayOffset(IntegerType.instance, IntegerType.instance.decompose(BigInteger.valueOf(-123456789)));
+        testEncodeWithArrayOffset(IntegerType.instance, IntegerType.instance.decompose(BigInteger.valueOf(13).pow(100)));
+        testEncodeWithArrayOffset(DecimalType.instance, DecimalType.instance.decompose(new BigDecimal("-12345678.9")));
+    }
+
+    private static void testEncodeWithArrayOffset(AbstractType<?> type, ByteBuffer raw)
+    {
+        ByteBuffer encoded = TypeUtil.asIndexBytes(raw, type);
+        assertEquals(encoded, TypeUtil.asIndexBytes(withArrayOffset(raw), type));
+
+        byte[] expected = new byte[TypeUtil.fixedSizeOf(type)];
+        TypeUtil.toComparableBytes(encoded, type, expected);
+        byte[] actual = new byte[TypeUtil.fixedSizeOf(type)];
+        TypeUtil.toComparableBytes(withArrayOffset(encoded), type, actual);
+        assertArrayEquals(expected, actual);
+    }
+
+    /**
+     * Returns a heap buffer with the content of {@code value} at a non-zero position, over an array that starts at a
+     * non-zero offset, with other bytes around it.
+     */
+    private static ByteBuffer withArrayOffset(ByteBuffer value)
+    {
+        byte[] array = new byte[value.remaining() + 64];
+        Arrays.fill(array, (byte) 0x5a);
+        ByteBuffer buffer = ByteBuffer.wrap(array, 16, array.length - 16).slice();
+        buffer.position(16);
+        buffer.put(value.duplicate());
+        buffer.limit(buffer.position()).position(16);
+        assertEquals(16, buffer.arrayOffset());
+        return buffer;
     }
 }
