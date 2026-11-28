@@ -257,7 +257,7 @@ abstract public class VectorCompactionTest extends VectorTester
     public void testOneToManyCompactionTooManyHoles()
     {
         int sstables = 2;
-        testOneToManyCompactionInternal(10, sstables);
+        testOneToManyCompactionHolesInternal(10, sstables);
         testOneToManyCompactionHolesInternal(MIN_PQ_ROWS, sstables);
     }
 
@@ -474,21 +474,16 @@ abstract public class VectorCompactionTest extends VectorTester
                 // When we have a row with a null vector, it is valid for the missing row vector(s) to be at the
                 // start or end of the sstable, and in that case, we actually skip them within the segment.
                 var postingsStructure = searcher.getPostingsStructure();
-                if (!nullValueObserved
-                    && isMissingRows
-                    && expectedStructure != V5VectorPostingsWriter.Structure.ZERO_OR_ONE_TO_MANY)
+                if (!nullValueObserved && isMissingRows)
                 {
+                    // versions before V5 postings write ZERO_OR_ONE_TO_MANY instead of ONE_TO_MANY
                     var struct = hasUniqueVectors
                                  ? V5VectorPostingsWriter.Structure.ONE_TO_ONE
-                                 : V5VectorPostingsWriter.tooManyOrdinalMappingHoles(searcher.graph.size(), numRows)
+                                 : !V5OnDiskFormat.writeV5VectorPostings(version)
+                                   || V5VectorPostingsWriter.tooManyOrdinalMappingHoles(searcher.graph.size(), numRows)
                                    ? V5VectorPostingsWriter.Structure.ZERO_OR_ONE_TO_MANY
                                    : V5VectorPostingsWriter.Structure.ONE_TO_MANY;
                     assertEquals(struct, postingsStructure);
-                }
-                else if (!nullValueObserved && expectedStructure == V5VectorPostingsWriter.Structure.ZERO_OR_ONE_TO_MANY)
-                {
-                    assertTrue(postingsStructure == V5VectorPostingsWriter.Structure.ZERO_OR_ONE_TO_MANY
-                               || postingsStructure == V5VectorPostingsWriter.Structure.ONE_TO_MANY);
                 }
                 else
                 {
