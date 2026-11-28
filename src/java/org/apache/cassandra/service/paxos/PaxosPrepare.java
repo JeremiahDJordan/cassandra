@@ -1190,7 +1190,10 @@ public class PaxosPrepare extends PaxosRequestCallback<PaxosPrepare.Response> im
                         SinglePartitionReadCommand readCommand = request.read;
                         // Allows txn recovery to read even if it would be blocked by migration away from Paxos
                         if (request.isForRecovery)
+                        {
                             readCommand = readCommand.withTransactionalSettings(false, readCommand.nowInSec());
+                            readCommand.withholdStaticCandidates();
+                        }
                         try (ReadExecutionController executionController = readCommand.executionController();
                              UnfilteredPartitionIterator iterator = readCommand.executeLocally(executionController, cm))
                         {
@@ -1256,6 +1259,8 @@ public class PaxosPrepare extends PaxosRequestCallback<PaxosPrepare.Response> im
             if ((flag & 1) != 0)
             {
                 SinglePartitionReadCommand readCommand = (SinglePartitionReadCommand) ReadCommand.serializer.deserialize(in, version);
+                // the coordinator reads these without static candidates (see Paxos#read)
+                readCommand.withholdStaticCandidates();
                 boolean isForRecovery = false;
                 if (version >= MessagingService.VERSION_60)
                     isForRecovery = in.readBoolean();

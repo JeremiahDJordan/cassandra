@@ -900,6 +900,8 @@ public class Paxos
         SinglePartitionReadCommand read = group.queries.get(0);
         // Allow potential txn conflicts since Paxos will manage them
         read = read.withTransactionalSettings(false, read.nowInSec());
+        // the reads piggybacked on prepare messages are read without static candidates on every replica (see PaxosPrepare)
+        read.withholdStaticCandidates();
         try (PaxosOperationLock lock = PaxosState.lock(read.partitionKey(), read.metadata(), deadline, consistencyForConsensus, false))
         {
             while (true)

@@ -71,7 +71,7 @@ public class ReadExecutionController implements AutoCloseable
         {
             DataLimits.Counter repairedReadCount = command.limits().newCounter(command.nowInSec(),
                                                                                false,
-                                                                               command.selectsFullPartition(),
+                                                                               command.countsPartitionsWithOnlyStaticData(),
                                                                                metadata().enforceStrictLiveness()).onlyCount();
             repairedDataInfo = new RepairedDataInfo(repairedReadCount);
         }
