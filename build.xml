@@ -319,7 +319,6 @@
         <string>--add-opens java.base/java.lang=ALL-UNNAMED</string>
         <string>--add-opens java.base/java.util=ALL-UNNAMED</string>
         <string>--add-opens java.base/java.nio=ALL-UNNAMED</string>
-        <string>--add-opens java.base/java.nio.file.attribute=ALL-UNNAMED</string>
 
         <string>--add-opens java.rmi/sun.rmi.transport.tcp=ALL-UNNAMED</string>
     </resources>
@@ -361,7 +360,6 @@
         <string>--add-opens java.base/java.util=ALL-UNNAMED</string>
         <string>--add-opens java.base/java.util.concurrent.atomic=ALL-UNNAMED</string>
         <string>--add-opens java.base/java.nio=ALL-UNNAMED</string>
-        <string>--add-opens java.base/java.nio.file.attribute=ALL-UNNAMED</string>
 
         <string>--add-opens java.rmi/sun.rmi.transport.tcp=ALL-UNNAMED</string>
     </resources>
@@ -429,8 +427,6 @@
         <string>--add-opens jdk.management.jfr/jdk.management.jfr=ALL-UNNAMED</string>
         <string>--add-opens jdk.management/com.sun.management.internal=ALL-UNNAMED</string>
         <string>--add-opens jdk.naming.dns/com.sun.jndi.dns=ALL-UNNAMED</string>
-        <!-- required for org.apache.cassandra.Util.getSupportedMTimeGranularity-->
-        <string>--add-opens java.base/java.nio.file.attribute=ALL-UNNAMED</string>
 
         <!-- below 2 were added to support jamm and fix BatchCommitLogTest -->
         <string>--add-opens java.base/java.util.concurrent=ALL-UNNAMED</string>
