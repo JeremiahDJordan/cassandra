@@ -46,6 +46,7 @@ import org.apache.cassandra.locator.TokenMetadata;
 import org.apache.cassandra.metrics.StorageMetrics;
 import org.apache.cassandra.schema.KeyspaceParams;
 import org.apache.cassandra.schema.SchemaConstants;
+import org.apache.cassandra.schema.SchemaTestUtil;
 import org.apache.cassandra.schema.TableMetadata;
 import org.apache.cassandra.service.StorageService;
 import org.apache.cassandra.utils.ByteBufferUtil;
@@ -78,6 +79,7 @@ public class BatchlogManagerInterceptorTest
     private static final String KEYSPACE1 = "BatchlogManagerInterceptorTest1";
     private static final String KEYSPACE2 = "BatchlogManagerInterceptorTest2";
     private static final String CF_STANDARD1 = "Standard1";
+    private static final String CF_DROPPED = "Dropped";
 
     static PartitionerSwitcher sw;
 
@@ -115,7 +117,8 @@ public class BatchlogManagerInterceptorTest
         SchemaLoader.prepareServer();
         SchemaLoader.createKeyspace(KEYSPACE1,
                                     KeyspaceParams.simple(1),
-                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1, 1, BytesType.instance));
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_STANDARD1, 1, BytesType.instance),
+                                    SchemaLoader.standardCFMD(KEYSPACE1, CF_DROPPED, 1, BytesType.instance));
         SchemaLoader.createKeyspace(KEYSPACE2,
                                     KeyspaceParams.simple(2),
                                     SchemaLoader.standardCFMD(KEYSPACE2, CF_STANDARD1, 1, BytesType.instance));
@@ -308,6 +311,28 @@ public class BatchlogManagerInterceptorTest
         assertEquals(observedBeforeCleanup, TestInterceptor.observedBatches.size());
         assertEquals(0, BatchlogManager.instance.countAllBatches());
         assertEquals(1, BatchlogManager.instance.getTotalBatchesReplayed() - initialReplayedBatches);
+    }
+
+    @Test
+    public void testBatchOfDroppedTableAwaitingInterceptorIsForgotten() throws Exception
+    {
+        TableMetadata cfm = Keyspace.open(KEYSPACE1).getColumnFamilyStore(CF_DROPPED).metadata();
+        storeReplayableBatch(cfm, 8765);
+
+        TestInterceptor.failCallbacks = true;
+        BatchlogManager.instance.startBatchlogReplay().get();
+        assertEquals(1, BatchlogManager.instance.countBatchesAwaitingInterceptor());
+
+        SchemaTestUtil.announceTableDrop(KEYSPACE1, CF_DROPPED);
+
+        int observedBeforeRetry = TestInterceptor.observedBatches.size();
+        TestInterceptor.failCallbacks = false;
+        BatchlogManager.instance.startBatchlogReplay().get();
+
+        // The batch's only table was dropped: the retained entry is forgotten without invoking the interceptor again.
+        assertEquals(0, BatchlogManager.instance.countBatchesAwaitingInterceptor());
+        assertEquals(observedBeforeRetry, TestInterceptor.observedBatches.size());
+        assertEquals(0, BatchlogManager.instance.countAllBatches());
     }
 
     /**
