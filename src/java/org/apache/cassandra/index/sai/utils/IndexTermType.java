@@ -539,11 +539,11 @@ public class IndexTermType
     public void toComparableBytes(ByteBuffer value, byte[] bytes)
     {
         if (isInetAddress())
-            ByteBufferUtil.copyBytes(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, INET_ADDRESS_SIZE);
+            ByteBufferUtil.copyBytes(value, value.position(), bytes, 0, INET_ADDRESS_SIZE);
         else if (isBigInteger())
-            ByteBufferUtil.copyBytes(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, BIG_INTEGER_APPROXIMATION_BYTES);
+            ByteBufferUtil.copyBytes(value, value.position(), bytes, 0, BIG_INTEGER_APPROXIMATION_BYTES);
         else if (isBigDecimal())
-            ByteBufferUtil.copyBytes(value, value.hasArray() ? value.arrayOffset() + value.position() : value.position(), bytes, 0, DECIMAL_APPROXIMATION_BYTES);
+            ByteBufferUtil.copyBytes(value, value.position(), bytes, 0, DECIMAL_APPROXIMATION_BYTES);
         else
             ByteSourceInverse.copyBytes(asComparableBytes(value, ByteComparable.Version.OSS50), bytes);
     }
@@ -856,7 +856,7 @@ public class IndexTermType
     {
         if (value.remaining() == 4)
         {
-            int position = value.hasArray() ? value.arrayOffset() + value.position() : value.position();
+            int position = value.position();
             ByteBuffer mapped = ByteBuffer.allocate(INET_ADDRESS_SIZE);
             System.arraycopy(IPV4_PREFIX, 0, mapped.array(), 0, IPV4_PREFIX.length);
             ByteBufferUtil.copyBytes(value, position, mapped, IPV4_PREFIX.length, value.remaining());
@@ -883,7 +883,7 @@ public class IndexTermType
     public static ByteBuffer encodeBigInteger(ByteBuffer value)
     {
         int size = value.remaining();
-        int position = value.hasArray() ? value.arrayOffset() + value.position() : value.position();
+        int position = value.position();
         byte[] bytes = new byte[BIG_INTEGER_APPROXIMATION_BYTES];
         if (size < BIG_INTEGER_APPROXIMATION_BYTES - Integer.BYTES)
         {
