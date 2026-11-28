@@ -23,15 +23,12 @@ import java.io.Closeable;
 import java.io.EOFException;
 import java.io.IOError;
 import java.io.IOException;
-import java.lang.reflect.Field;
 import java.math.BigInteger;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
 import java.nio.file.Path;
-import java.nio.file.attribute.FileTime;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -168,8 +165,6 @@ public class Util
     private static final Logger logger = LoggerFactory.getLogger(Util.class);
 
     private static List<UUID> hostIdPool = new ArrayList<>();
-
-    public final static TimeUnit supportedMTimeGranularity = getSupportedMTimeGranularity();
 
     public static IPartitioner testPartitioner()
     {
@@ -1288,22 +1283,6 @@ public class Util
     {
         Assertions.assertThat(Pair.create(v1, v2))
                   .matches(p -> predicate.apply(SSTableIdFactory.COMPARATOR.compare(p.left, p.right)));
-    }
-
-    private static TimeUnit getSupportedMTimeGranularity() {
-        try
-        {
-            Path p = Files.createTempFile(Util.class.getSimpleName(), "dummy-file");
-            FileTime ft = Files.getLastModifiedTime(p);
-            Files.deleteIfExists(p);
-            Field f = FileTime.class.getDeclaredField("unit");
-            f.setAccessible(true);
-            return (TimeUnit) f.get(ft);
-        }
-        catch (IOException |  NoSuchFieldException | IllegalAccessException e)
-        {
-            throw new AssertionError("Failed to read supported file modification time granularity");
-        }
     }
 
     public static void markNodeAsDead(InetAddressAndPort address)

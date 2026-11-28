@@ -77,9 +77,6 @@
 --add-opens jdk.management/com.sun.management.internal=ALL-UNNAMED
 --add-opens jdk.naming.dns/com.sun.jndi.dns=ALL-UNNAMED
 
-# required for org.apache.cassandra.Util.getSupportedMTimeGranularity
---add-opens java.base/java.nio.file.attribute=ALL-UNNAMED
-
 ### GC logging options -- uncomment to enable
 
 # Java 11 (and newer) GC logging options:
